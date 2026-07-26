@@ -6,6 +6,9 @@ pub mod clock;
 pub mod config;
 pub mod constraint;
 pub mod demand;
+pub mod flowfield;
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+pub mod flowfield_gpu;
 pub mod idm;
 pub mod map;
 pub mod meso;

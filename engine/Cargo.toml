@@ -6,6 +6,13 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# Fail the build (native, wasm, and `cargo test`) on unused code/imports — the
+# class of warning `cargo test` otherwise ignores. Exempts the public API, so it
+# won't flag pub items used only by the wasm bridge.
+[lints.rust]
+unused = "deny"
+dead_code = "deny"
+
 [features]
 # Off by default so the core stays dependency-free; enable to parse scraped
 # OSM JSON: `cargo test --features import`.

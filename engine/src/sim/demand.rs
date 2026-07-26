@@ -16,7 +16,8 @@ pub struct OdPair {
 }
 
 pub struct DemandGenerator {
-    routed: Vec<(f64, Vec<LinkId>)>,
+    /// `(rate_per_sec, origin, dest)` for OD pairs with at least one valid route.
+    pairs: Vec<(f64, LinkId, LinkId)>,
     seed: u64,
     tick: u64,
     next_id: u32,
@@ -25,11 +26,12 @@ pub struct DemandGenerator {
 
 impl DemandGenerator {
     pub fn new(world: &NetWorld, pairs: &[OdPair], seed: u64) -> Self {
-        let routed = pairs
+        let pairs = pairs
             .iter()
-            .filter_map(|p| world.network.route_links(p.origin, p.dest).map(|r| (p.rate_per_sec, r)))
+            .filter(|p| world.network.route_links(p.origin, p.dest).is_some())
+            .map(|p| (p.rate_per_sec, p.origin, p.dest))
             .collect();
-        Self { routed, seed, tick: 0, next_id: 0, spawned: 0 }
+        Self { pairs, seed, tick: 0, next_id: 0, spawned: 0 }
     }
 
     pub fn spawned(&self) -> u32 {
@@ -37,15 +39,19 @@ impl DemandGenerator {
     }
 
     pub fn step(&mut self, world: &mut NetWorld, dt: f64) {
-        for i in 0..self.routed.len() {
-            let (rate, route) = &self.routed[i];
-            let p = (rate * dt).min(1.0);
-            if rng::uniform01(self.seed, i as u32, self.tick, Stream::RouteChoice) < p {
-                let driver = class_of(self.seed, self.next_id).driver().sample(self.seed, self.next_id);
-                if world.spawn_routed(self.next_id, route.clone(), 5.0, driver) {
-                    self.spawned += 1;
+        // Route each new vehicle against *current* congestion, so demand steers
+        // around jams as they form (each spawn re-plans).
+        let costs = world.live_link_costs();
+        for i in 0..self.pairs.len() {
+            let (rate, origin, dest) = self.pairs[i];
+            if rng::uniform01(self.seed, i as u32, self.tick, Stream::RouteChoice) < (rate * dt).min(1.0) {
+                if let Some(route) = world.network.route_links_with_costs(origin, dest, &costs) {
+                    let driver = class_of(self.seed, self.next_id).driver().sample(self.seed, self.next_id);
+                    if world.spawn_routed(self.next_id, route, 5.0, driver) {
+                        self.spawned += 1;
+                    }
+                    self.next_id += 1;
                 }
-                self.next_id += 1;
             }
         }
         self.tick += 1;

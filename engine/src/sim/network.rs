@@ -85,6 +85,42 @@ pub struct Network {
     pub movements: Vec<Movement>,
     pub groups: Vec<SignalGroup>,
     pub programs: Vec<SignalProgram>,
+    /// Centreline polyline per link (from-node … intermediate bends … to-node);
+    /// a straight link is just its two endpoints. Vehicle placement and road
+    /// geometry follow this, so real OSM curves render and drive as curves.
+    pub polylines: Vec<Vec<[f64; 2]>>,
+}
+
+fn sub(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
+    [a[0] - b[0], a[1] - b[1]]
+}
+
+fn norm(v: [f64; 2]) -> f64 {
+    v[0].hypot(v[1])
+}
+
+fn unit(v: [f64; 2]) -> [f64; 2] {
+    let n = norm(v).max(1e-9);
+    [v[0] / n, v[1] / n]
+}
+
+/// The point and unit direction at arc-length `s` along a polyline (clamped).
+fn point_along(poly: &[[f64; 2]], s: f64) -> ([f64; 2], [f64; 2]) {
+    if poly.len() < 2 {
+        return (poly.first().copied().unwrap_or([0.0, 0.0]), [1.0, 0.0]);
+    }
+    let mut acc = 0.0;
+    for w in poly.windows(2) {
+        let seg = norm(sub(w[1], w[0]));
+        if s <= acc + seg {
+            let t = ((s - acc) / seg.max(1e-9)).clamp(0.0, 1.0);
+            let dir = unit(sub(w[1], w[0]));
+            return ([w[0][0] + (w[1][0] - w[0][0]) * t, w[0][1] + (w[1][1] - w[0][1]) * t], dir);
+        }
+        acc += seg;
+    }
+    let n = poly.len();
+    (poly[n - 1], unit(sub(poly[n - 1], poly[n - 2])))
 }
 
 impl Network {
@@ -206,51 +242,72 @@ impl Network {
     /// place vehicle instances.
     pub fn lane_point(&self, lane: LaneId, position: f64) -> [f64; 3] {
         let l = self.lane(lane);
-        let link = self.link(l.link);
-        let a = self.node(link.from).position;
-        let b = self.node(link.to).position;
-        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-        let seg = dx.hypot(dy).max(1e-6);
-        let t = (position / l.length.max(1e-6)).clamp(0.0, 1.0);
+        let poly = &self.polylines[l.link.idx()];
+        let (pt, dir) = point_along(poly, position.clamp(0.0, l.length));
         let off = (l.index_in_link as f64 + 0.5) * LANE_WIDTH;
-        let (nx, ny) = (dy / seg, -dx / seg);
-        [a[0] + dx * t + nx * off, a[1] + dy * t + ny * off, dy.atan2(dx)]
+        let n = [dir[1], -dir[0]]; // right-hand normal
+        [pt[0] + n[0] * off, pt[1] + n[1] * off, dir[1].atan2(dir[0])]
     }
 
-    /// Right-hand offset unit normal of a link's travel direction (the axis its
-    /// lanes are stacked along).
-    fn link_normal(&self, link: LinkId) -> ([f64; 2], [f64; 2], [f64; 2]) {
-        let lk = self.link(link);
-        let a = self.node(lk.from).position;
-        let b = self.node(lk.to).position;
-        let seg = (b[0] - a[0]).hypot(b[1] - a[1]).max(1e-6);
-        (a, b, [(b[1] - a[1]) / seg, -(b[0] - a[0]) / seg])
+    /// Smallest turn radius (m) the lane's centreline reaches between `position`
+    /// and `position + lookahead` — `f64::INFINITY` on a straight run.
+    pub fn min_radius_ahead(&self, lane: LaneId, position: f64, lookahead: f64) -> f64 {
+        let poly = &self.polylines[self.lane(lane).link.idx()];
+        if poly.len() < 3 {
+            return f64::INFINITY;
+        }
+        let mut acc = 0.0;
+        let mut best = f64::INFINITY;
+        for i in 1..poly.len() - 1 {
+            let seg_in = norm(sub(poly[i], poly[i - 1]));
+            acc += seg_in;
+            if acc < position {
+                continue;
+            }
+            if acc > position + lookahead {
+                break;
+            }
+            let a = unit(sub(poly[i], poly[i - 1]));
+            let b = unit(sub(poly[i + 1], poly[i]));
+            let cross = a[0] * b[1] - a[1] * b[0];
+            let dot = (a[0] * b[0] + a[1] * b[1]).clamp(-1.0, 1.0);
+            let angle = cross.atan2(dot).abs();
+            if angle > 1e-4 {
+                let seg_out = norm(sub(poly[i + 1], poly[i]));
+                best = best.min(0.5 * (seg_in + seg_out) / angle);
+            }
+        }
+        best
     }
 
-    /// Filled carriageway quad per link as `[cx0, cy0, cx1, cy1, width]`, where
-    /// the centreline is offset to cover all of the link's right-hand lanes.
+    /// Filled carriageway quads `[cx0, cy0, cx1, cy1, width]`, one per polyline
+    /// segment of each link (curved roads become several quads).
     pub fn road_strips(&self) -> Vec<[f64; 5]> {
-        (0..self.links.len() as u32)
-            .map(|i| {
-                let link = LinkId(i);
-                let (a, b, n) = self.link_normal(link);
-                let w = self.link(link).lane_count as f64 * LANE_WIDTH;
-                let c = w / 2.0;
-                [a[0] + n[0] * c, a[1] + n[1] * c, b[0] + n[0] * c, b[1] + n[1] * c, w]
-            })
-            .collect()
+        let mut out = Vec::new();
+        for i in 0..self.links.len() {
+            let w = self.links[i].lane_count as f64 * LANE_WIDTH;
+            let c = w / 2.0;
+            for seg in self.polylines[i].windows(2) {
+                let dir = unit(sub(seg[1], seg[0]));
+                let n = [dir[1] * c, -dir[0] * c];
+                out.push([seg[0][0] + n[0], seg[0][1] + n[1], seg[1][0] + n[0], seg[1][1] + n[1], w]);
+            }
+        }
+        out
     }
 
-    /// Interior lane-divider segments as `[x0, y0, x1, y1]`, one per boundary
-    /// between adjacent lanes of a link.
+    /// Interior lane-divider segments `[x0, y0, x1, y1]`, per polyline segment.
     pub fn lane_dividers(&self) -> Vec<[f64; 4]> {
         let mut out = Vec::new();
-        for i in 0..self.links.len() as u32 {
-            let link = LinkId(i);
-            let (a, b, n) = self.link_normal(link);
-            for k in 1..self.link(link).lane_count {
-                let off = k as f64 * LANE_WIDTH;
-                out.push([a[0] + n[0] * off, a[1] + n[1] * off, b[0] + n[0] * off, b[1] + n[1] * off]);
+        for i in 0..self.links.len() {
+            let lanes = self.links[i].lane_count;
+            for seg in self.polylines[i].windows(2) {
+                let dir = unit(sub(seg[1], seg[0]));
+                let (nx, ny) = (dir[1], -dir[0]);
+                for k in 1..lanes {
+                    let off = k as f64 * LANE_WIDTH;
+                    out.push([seg[0][0] + nx * off, seg[0][1] + ny * off, seg[1][0] + nx * off, seg[1][1] + ny * off]);
+                }
             }
         }
         out
@@ -317,6 +374,28 @@ mod tests {
         assert!((start[0] - 0.0).abs() < 1e-9 && (end[0] - 100.0).abs() < 1e-9);
         assert!((start[2]).abs() < 1e-9, "eastbound heading is 0 rad");
         assert!(start[1] < 0.0, "right-hand lane offset is negative-y for +x travel");
+    }
+
+    #[test]
+    fn lane_point_and_length_follow_a_curved_polyline() {
+        // L-shaped link (0,0) → bend (100,0) → (100,100).
+        let net = OsmMap {
+            nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 100.0, 100.0)],
+            links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 1, speed_limit: 20.0, geometry: vec![[100.0, 0.0]] }],
+        }
+        .build();
+        let lane = LaneId(0);
+        let len = net.lane(lane).length;
+        assert!((len - 200.0).abs() < 1.0, "arc length ~200, got {len}");
+        let mid = net.lane_point(lane, 100.0);
+        assert!((mid[0] - 100.0).abs() < 5.0 && mid[1].abs() < 5.0, "midpoint near the bend: {mid:?}");
+        assert!(net.min_radius_ahead(lane, 0.0, 200.0).is_finite(), "a bend has finite radius");
+    }
+
+    #[test]
+    fn straight_link_has_infinite_radius() {
+        let net = map::corridor_with_signal();
+        assert!(net.min_radius_ahead(LaneId(0), 0.0, 500.0).is_infinite());
     }
 
     #[test]

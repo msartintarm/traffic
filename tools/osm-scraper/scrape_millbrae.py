@@ -141,11 +141,16 @@ def build(raw, bbox):
         if signal:
             out_nodes[nid]["signal"] = signal
 
-    def emit_link(a, b, lanes, speed):
+    def geom_of(node_ids):
+        return [list(project(nodes[nid]["lat"], nodes[nid]["lon"], lat0, lon0)) for nid in node_ids]
+
+    def emit_link(a, b, lanes, speed, geometry):
         if (a, b) in emitted:
             return
         emitted.add((a, b))
-        out_links.append({"from_osm": a, "to_osm": b, "lanes": lanes, "speed_limit": speed})
+        out_links.append(
+            {"from_osm": a, "to_osm": b, "lanes": lanes, "speed_limit": speed, "geometry": geometry}
+        )
 
     for way in ways:
         tags = way["tags"]
@@ -163,9 +168,10 @@ def build(raw, bbox):
             if a != b:
                 emit_node(a)
                 emit_node(b)
-                emit_link(a, b, lanes, speed)
+                mid = geom_of(seq[block_start + 1 : i])  # intermediate bend points
+                emit_link(a, b, lanes, speed, mid)
                 if not oneway:
-                    emit_link(b, a, lanes, speed)
+                    emit_link(b, a, lanes, speed, list(reversed(mid)))
             block_start = i
 
     return {

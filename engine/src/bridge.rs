@@ -10,7 +10,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::render::camera::Camera;
 use crate::render::scene::{brake_intensity, class_color, class_dims, signal_color, signal_instance};
-use crate::render::{geometry, mass, Instance, StaticMesh};
+use crate::render::{geometry, Instance, StaticMesh};
 use crate::sim::clock::SimClock;
 use crate::sim::config::{SimConfig, VehicleClass};
 use crate::sim::demand::{DemandGenerator, OdPair};
@@ -297,23 +297,11 @@ impl Simulation {
 
     fn density_mesh(&self) -> StaticMesh {
         let net = &self.world.network;
-        let mut count = vec![0u32; net.links.len()];
+        let mut counts = vec![0u32; net.links.len()];
         for v in self.world.vehicles() {
-            count[net.lane(v.lane).link.idx()] += 1;
+            counts[net.lane(v.lane).link.idx()] += 1;
         }
-        let mut mesh = StaticMesh::default();
-        for (i, s) in net.road_strips().iter().enumerate() {
-            let link = net.link(LinkId(i as u32));
-            let lane = net.lane(link.lane_start);
-            let jam = (lane.length / 7.0 * link.lane_count as f64).max(1.0);
-            let ratio = mass::occupancy_ratio(count[i] as f64, jam);
-            if ratio < 0.2 {
-                continue;
-            }
-            let c = mass::congestion_color(ratio);
-            mesh.push_ribbon([s[0], s[1]], [s[2], s[3]], s[4] / 2.0, [c[0], c[1], c[2]], 3.0);
-        }
-        mesh
+        geometry::congestion_mesh(net, &counts)
     }
 
     fn signal_instance_vec(&self) -> Vec<Instance> {

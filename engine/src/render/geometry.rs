@@ -3,9 +3,9 @@
 //! [`StaticMesh`] (`center + offset` vertices) so the shader can hold every
 //! road/line to a minimum on-screen width at any zoom.
 
-use crate::sim::network::{Network, LANE_WIDTH};
+use crate::sim::network::{LinkId, Network, LANE_WIDTH};
 
-use super::StaticMesh;
+use super::{mass, StaticMesh};
 
 pub const ROAD_COLOR: [f32; 3] = [0.16, 0.18, 0.21];
 pub const JUNCTION_COLOR: [f32; 3] = [0.19, 0.21, 0.24];
@@ -61,6 +61,29 @@ pub fn marking_mesh(net: &Network) -> StaticMesh {
     mesh
 }
 
+/// Translucent congestion overlay: shade every polyline segment of a link busy
+/// enough to matter (`counts[link]` = vehicles on it). `light = 3` triggers the
+/// shader's translucent branch. Iterates *links* (a curved link is several
+/// segments), so it's independent of the strip count.
+pub fn congestion_mesh(net: &Network, counts: &[u32]) -> StaticMesh {
+    let mut mesh = StaticMesh::default();
+    for i in 0..net.links.len() {
+        let link = net.link(LinkId(i as u32));
+        let lane = net.lane(link.lane_start);
+        let jam = (lane.length / 7.0 * link.lane_count as f64).max(1.0);
+        let ratio = mass::occupancy_ratio(counts[i] as f64, jam);
+        if ratio < 0.2 {
+            continue;
+        }
+        let c = mass::congestion_color(ratio);
+        let half = link.lane_count as f64 * LANE_WIDTH / 2.0;
+        for seg in net.polylines[i].windows(2) {
+            mesh.push_ribbon(seg[0], seg[1], half, [c[0], c[1], c[2]], 3.0);
+        }
+    }
+    mesh
+}
+
 /// Quadratic Bézier point; `t` in `[0,1]`.
 pub fn bezier(a: [f64; 2], ctrl: [f64; 2], b: [f64; 2], t: f64) -> [f64; 2] {
     let u = 1.0 - t;
@@ -93,7 +116,7 @@ fn dashed_line(mesh: &mut StaticMesh, a: [f64; 2], b: [f64; 2], dash: f64, gap: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sim::map;
+    use crate::sim::map::{self, LinkSpec, NodeSpec, OsmMap};
 
     #[test]
     fn road_mesh_has_a_quad_per_link() {
@@ -121,6 +144,22 @@ mod tests {
     #[test]
     fn markings_are_produced_for_a_multi_lane_road() {
         assert!(!marking_mesh(&map::corridor_with_signal()).is_empty());
+    }
+
+    #[test]
+    fn congestion_mesh_handles_curved_links_with_valid_indices() {
+        // Regression: `road_strips` is per-segment, so density must iterate links,
+        // not strips. A curved (multi-segment) link must produce in-range indices.
+        let net = OsmMap {
+            nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 200.0, 100.0)],
+            links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 2, speed_limit: 20.0, geometry: vec![[100.0, 0.0], [150.0, 50.0]] }],
+        }
+        .build();
+        let mesh = congestion_mesh(&net, &[999]); // link 0 heavily congested
+        assert!(!mesh.is_empty(), "a congested curved link should shade");
+        assert!(mesh.indices.iter().all(|&i| (i as usize) < mesh.vertices.len()), "indices in range");
+        // an empty count → nothing shaded
+        assert!(congestion_mesh(&net, &[0]).is_empty());
     }
 
     #[test]

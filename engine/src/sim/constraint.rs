@@ -55,6 +55,8 @@ pub struct LongContext<'a> {
     pub yield_line: Option<f64>,
     /// A conflicting vehicle on a converging lane, projected onto this path.
     pub merge: Option<Obstacle>,
+    /// Speed to slow to for an upcoming curve (lateral-acceleration limit).
+    pub curve: Option<SpeedTarget>,
 }
 
 pub type Constraint = fn(&LongContext) -> f64;
@@ -66,6 +68,7 @@ pub const DEFAULT: &[Constraint] = &[
     car_following,
     stop_line,
     downstream_speed,
+    curve_speed,
     stop_sign,
     give_way,
     merge_yield,
@@ -93,16 +96,24 @@ pub fn stop_line(ctx: &LongContext) -> f64 {
     brake_to_line(ctx, ctx.stop_line)
 }
 
-/// Anticipatory braking so the vehicle reaches `speed_target.speed` by the time
-/// it arrives at `speed_target.distance` — the constant deceleration kinematics
-/// require. Not binding when already at or below the target.
-pub fn downstream_speed(ctx: &LongContext) -> f64 {
-    match ctx.speed_target {
-        Some(t) if ctx.speed > t.speed => {
-            (t.speed * t.speed - ctx.speed * ctx.speed) / (2.0 * t.distance.max(0.05))
-        }
+/// Anticipatory braking so the vehicle reaches a target speed by the time it
+/// arrives at the target distance — the constant-deceleration kinematics. Not
+/// binding when already at or below the target.
+fn brake_to_target(speed: f64, target: Option<SpeedTarget>) -> f64 {
+    match target {
+        Some(t) if speed > t.speed => (t.speed * t.speed - speed * speed) / (2.0 * t.distance.max(0.05)),
         _ => f64::INFINITY,
     }
+}
+
+/// Slow for a slower road ahead (speed-limit change / downstream link).
+pub fn downstream_speed(ctx: &LongContext) -> f64 {
+    brake_to_target(ctx.speed, ctx.speed_target)
+}
+
+/// Slow for an upcoming curve to the lateral-acceleration limit.
+pub fn curve_speed(ctx: &LongContext) -> f64 {
+    brake_to_target(ctx.speed, ctx.curve)
 }
 
 /// Mandatory halt at a stop sign: brake to a stationary line until the world
@@ -147,6 +158,7 @@ mod tests {
             stop_sign: None,
             yield_line: None,
             merge: None,
+            curve: None,
         }
     }
 
@@ -184,6 +196,15 @@ mod tests {
         assert!((a - (-4.2)).abs() < 1e-9);
         c.speed = 5.0; // already slower than target
         assert!(downstream_speed(&c).is_infinite());
+    }
+
+    #[test]
+    fn curve_speed_brakes_for_a_tight_bend() {
+        let mut c = ctx(20.0);
+        c.curve = Some(SpeedTarget { speed: 8.0, distance: 40.0 });
+        assert!(curve_speed(&c) < 0.0, "should slow for the curve");
+        c.speed = 6.0; // already under the curve speed
+        assert!(curve_speed(&c).is_infinite());
     }
 
     #[test]

@@ -47,17 +47,20 @@ impl NodeSpec {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LinkSpec {
     pub from_osm: i64,
     pub to_osm: i64,
     pub lanes: u32,
     pub speed_limit: f64,
+    /// Intermediate bend points (projected metres) between the from- and to-node;
+    /// empty for a straight link.
+    pub geometry: Vec<[f64; 2]>,
 }
 
 impl LinkSpec {
     pub fn oneway(from_osm: i64, to_osm: i64, lanes: u32, speed_limit: f64) -> Self {
-        Self { from_osm, to_osm, lanes, speed_limit }
+        Self { from_osm, to_osm, lanes, speed_limit, geometry: Vec::new() }
     }
 
     pub fn twoway(a: i64, b: i64, lanes: u32, speed_limit: f64) -> [Self; 2] {
@@ -87,7 +90,10 @@ impl OsmMap {
         for spec in &self.links {
             let from = id_of[&spec.from_osm];
             let to = id_of[&spec.to_osm];
-            let length = distance(net.nodes[from.idx()].position, net.nodes[to.idx()].position);
+            let mut polyline = vec![net.nodes[from.idx()].position];
+            polyline.extend(spec.geometry.iter().copied());
+            polyline.push(net.nodes[to.idx()].position);
+            let length = polyline.windows(2).map(|w| distance(w[0], w[1])).sum();
             let link_id = LinkId(net.links.len() as u32);
             let lane_start = LaneId(net.lanes.len() as u32);
             for i in 0..spec.lanes {
@@ -101,6 +107,7 @@ impl OsmMap {
                 });
             }
             net.links.push(Link { from, to, lane_start, lane_count: spec.lanes });
+            net.polylines.push(polyline);
         }
 
         let mut group_of_link: HashMap<u32, SignalGroupId> = HashMap::new();
@@ -188,6 +195,9 @@ mod json {
         to_osm: i64,
         lanes: u32,
         speed_limit: f64,
+        /// Intermediate bend points `[[x, y], …]` between the endpoints.
+        #[serde(default)]
+        geometry: Vec<[f64; 2]>,
     }
 
     #[derive(Deserialize)]
@@ -230,6 +240,7 @@ mod json {
                 to_osm: l.to_osm,
                 lanes: l.lanes.max(1),
                 speed_limit: l.speed_limit,
+                geometry: l.geometry,
             })
             .collect();
         Ok(OsmMap { nodes, links })

@@ -145,6 +145,26 @@ impl NetWorld {
         self.crashed
     }
 
+    /// Per-link travel time (ms) inflated by current occupancy — the live edge
+    /// weights that make routing congestion-reactive. A jammed link costs several
+    /// times its free-flow time, so routes computed with these steer around it.
+    pub fn live_link_costs(&self) -> Vec<u64> {
+        let mut count = vec![0u32; self.network.links.len()];
+        for v in &self.vehicles {
+            count[self.network.lane(v.lane).link.idx()] += 1;
+        }
+        (0..self.network.links.len() as u32)
+            .map(|i| {
+                let link = self.network.link(LinkId(i));
+                let lane = self.network.lane(link.lane_start);
+                let jam = (lane.length / 7.0 * link.lane_count as f64).max(1.0);
+                let ratio = (count[i as usize] as f64 / jam).min(3.0);
+                let base = self.network.link_travel_time_ms(LinkId(i)) as f64;
+                (base * (1.0 + 2.0 * ratio)) as u64
+            })
+            .collect()
+    }
+
     pub fn vehicles(&self) -> &[NetVehicle] {
         &self.vehicles
     }
@@ -475,6 +495,14 @@ impl NetWorld {
 
                 let merge = self.merge_conflict(veh, lane.length, intended, &nb);
 
+                // Slow for an upcoming curve to the lateral-acceleration limit.
+                const A_LAT: f64 = 3.0;
+                const CURVE_LOOKAHEAD: f64 = 45.0;
+                let curve = {
+                    let r = self.network.min_radius_ahead(veh.lane, veh.position, CURVE_LOOKAHEAD);
+                    r.is_finite().then(|| SpeedTarget { speed: (A_LAT * r).sqrt(), distance: CURVE_LOOKAHEAD })
+                };
+
                 let ctx = LongContext {
                     driver: &driver,
                     speed: veh.speed,
@@ -484,6 +512,7 @@ impl NetWorld {
                     stop_sign,
                     yield_line,
                     merge,
+                    curve,
                 };
                 let binding = constraint::binding_acceleration(&ctx, constraint::DEFAULT);
                 binding + constraint::accel_noise(driver.accel_noise, self.cfg.seed, veh.id, self.tick)
@@ -807,6 +836,24 @@ mod tests {
 
         assert_eq!(world.exited(), 8, "both queues should clear once the signal cycles");
         assert_eq!(world.crashed(), 0);
+    }
+
+    #[test]
+    fn congested_links_cost_more_than_empty_ones() {
+        let net = OsmMap {
+            nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 300.0, 0.0)],
+            links: vec![LinkSpec::oneway(1, 2, 1, 20.0)],
+        }
+        .build();
+        let base = net.link_travel_time_ms(LinkId(0));
+        let mut w = NetWorld::new(net, cfg());
+        let empty = w.live_link_costs()[0];
+        for i in 0..35u32 {
+            w.spawn(i, LaneId(0), 10.0 + i as f64 * 7.0, 0.0, DriverConfig::car());
+        }
+        let jammed = w.live_link_costs()[0];
+        assert_eq!(empty, base, "empty link is free-flow");
+        assert!(jammed > empty * 2, "a jammed link should cost several times more: {jammed} vs {empty}");
     }
 
     #[test]
@@ -1144,6 +1191,35 @@ mod tests {
     }
 
     #[test]
+    fn vehicles_slow_for_a_curve() {
+        // A long straight run-up into a ~20 m-radius bend (short arc segments).
+        let net = OsmMap {
+            nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 220.0, 20.0)],
+            links: vec![LinkSpec {
+                from_osm: 1,
+                to_osm: 2,
+                lanes: 1,
+                speed_limit: 30.0,
+                geometry: vec![[200.0, 0.0], [202.68, 10.0], [210.0, 17.32]],
+            }],
+        }
+        .build();
+        let mut w = NetWorld::new(net, cfg());
+        w.spawn(1, LaneId(0), 0.0, 20.0, DriverConfig { accel_noise: 0.0, ..DriverConfig::car() });
+        let mut min_speed_on_bend = f64::MAX;
+        for _ in 0..300 {
+            w.step();
+            if let Some(v) = w.vehicle(1) {
+                if v.position > 195.0 {
+                    min_speed_on_bend = min_speed_on_bend.min(v.speed);
+                }
+            }
+        }
+        // Cruises the straight near the 30 m/s limit, then slows markedly for the bend.
+        assert!(min_speed_on_bend < 16.0, "should slow into the bend, min {min_speed_on_bend}");
+    }
+
+    #[test]
     fn faster_vehicle_changes_lanes_to_overtake() {
         let net = OsmMap {
             nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 6000.0, 0.0)],
@@ -1168,6 +1244,86 @@ mod tests {
         let s = w.vehicle(1).unwrap();
         assert!(used_other_lane, "fast vehicle should use the adjacent lane");
         assert!(f.position > s.position, "and overtake the slow one: {} vs {}", f.position, s.position);
+    }
+
+    /// A busy scenario (mixed classes, signals, multi-lane, merges, curves-capable
+    /// network) plus its demand, for property/invariant regressions.
+    fn busy_scenario(seed: u64) -> (NetWorld, super::super::demand::DemandGenerator) {
+        use super::super::demand::{DemandGenerator, OdPair};
+        let net = super::super::map::millbrae_sample();
+        let world = NetWorld::new(net, SimConfig { seed, ..cfg() });
+        let n = world.network.links.len();
+        let mut pairs = Vec::new();
+        for o in 0..n {
+            for d in 0..n {
+                if o != d && world.network.route_links(LinkId(o as u32), LinkId(d as u32)).is_some_and(|r| r.len() >= 3) {
+                    pairs.push(OdPair { origin: LinkId(o as u32), dest: LinkId(d as u32), rate_per_sec: 0.3 });
+                }
+            }
+        }
+        let demand = DemandGenerator::new(&world, &pairs, seed);
+        (world, demand)
+    }
+
+    #[test]
+    fn safety_invariants_hold_over_a_busy_run() {
+        // Robust regression: across a long, busy, mixed-class run, at *every* tick
+        // no vehicle reverses, none meaningfully exceeds the fastest speed limit,
+        // and no two vehicles overlap on a lane. Catches a broad class of bugs
+        // (e.g. the leader-length overlap) without brittle magic numbers.
+        let (mut w, mut d) = busy_scenario(1);
+        let max_limit = w.network.lanes.iter().map(|l| l.speed_limit).fold(0.0, f64::max);
+        for _ in 0..1200 {
+            d.step(&mut w, cfg().dt);
+            w.step();
+            let mut by_lane: HashMap<u32, Vec<(f64, f64)>> = HashMap::new();
+            for v in w.vehicles() {
+                assert!(v.speed >= -1e-6, "no reversing: {}", v.speed);
+                assert!(v.speed <= max_limit + 1.5, "no gross speeding: {} > {}", v.speed, max_limit);
+                by_lane.entry(v.lane.0).or_default().push((v.position, v.driver.vehicle_length));
+            }
+            for cars in by_lane.values_mut() {
+                cars.sort_by(|a, b| a.0.total_cmp(&b.0));
+                for w2 in cars.windows(2) {
+                    let gap = w2[1].0 - w2[0].0 - w2[1].1;
+                    assert!(gap > -0.6, "vehicles overlap on a lane: gap {gap}");
+                }
+            }
+        }
+        assert_eq!(w.crashed(), 0);
+        assert!(d.spawned() > 100, "scenario should be busy");
+    }
+
+    #[test]
+    fn runs_are_reproducible_from_the_seed() {
+        // Same seed → identical aggregate outcome (a regression against accidental
+        // nondeterminism creeping into the tick).
+        let run = |seed: u64| {
+            let (mut w, mut d) = busy_scenario(seed);
+            for _ in 0..600 {
+                d.step(&mut w, cfg().dt);
+                w.step();
+            }
+            (w.vehicles().len(), w.exited(), w.crashed())
+        };
+        assert_eq!(run(7), run(7), "identical seeds must reproduce");
+        assert_ne!(run(7).0, run(8).0, "different seeds should differ");
+    }
+
+    #[test]
+    fn congestion_slows_drivers_below_free_flow() {
+        // Property regression for "driver slowness": under heavy demand the mean
+        // speed settles well under the road's free-flow limit (queues, signals,
+        // following all bite), rather than everyone cruising at the limit.
+        let (mut w, mut d) = busy_scenario(3);
+        for _ in 0..1500 {
+            d.step(&mut w, cfg().dt);
+            w.step();
+        }
+        let speeds: Vec<f64> = w.vehicles().iter().map(|v| v.speed).collect();
+        let mean = speeds.iter().sum::<f64>() / speeds.len().max(1) as f64;
+        let free_flow = w.network.lanes.iter().map(|l| l.speed_limit).fold(0.0, f64::max);
+        assert!(mean < free_flow * 0.75, "congested mean speed {mean} should be well below free-flow {free_flow}");
     }
 
     #[test]
