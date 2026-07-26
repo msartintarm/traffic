@@ -1,0 +1,49 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Off by default so the core stays dependency-free; enable to parse scraped
+# OSM JSON: `cargo test --features import`.
+import = ["dep:serde", "dep:serde_json"]
+# Optional GPU compute path for the mass layer. Off by default; when on, the
+# same meso.wgsl kernel runs on a real wgpu device (Vulkan/GL, incl. software
+# adapters like Mesa lavapipe) and is tested against the CPU reference:
+# `cargo test --features gpu`.
+gpu = ["dep:wgpu", "dep:pollster"]
+
+[dependencies]
+# Plain-data numeric crunching only in the sim core. GPU/DOM bridges are added
+# under feature/target gates so the sim/ layer runs and is tested under plain
+# `cargo test`, natively and fast, linking none of them by default.
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+bytemuck = { version = "1", features = ["derive"] }
+
+# Native GPU compute (the `gpu` feature). Software adapters are fine, so this
+# runs headless in CI without a physical GPU.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wgpu = { version = "26", default-features = false, features = ["vulkan", "gles", "wgsl"], optional = true }
+pollster = { version = "0.4", optional = true }
+
+# Browser entry point + WebGPU renderer: target-gated so `cargo test` never
+# links any of it while the wasm build exposes `Simulation` and `Renderer`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["HtmlCanvasElement"] }
+wgpu = { version = "26", default-features = false, features = ["webgpu", "webgl", "wgsl"] }
+
+[dev-dependencies]
+# Native shader validation: parse + type-check meso.wgsl under `cargo test` so a
+# WGSL typo fails CI instead of silently producing a blank GPU pass in a browser
+# (the discipline ../plant uses for scene.wgsl).
+naga = { version = "26", features = ["wgsl-in"] }
+
+[profile.release]
+opt-level = 3
+lto = true

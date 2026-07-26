@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""Scrape a drivable road graph from OpenStreetMap (via Overpass) and emit the
+JSON the engine's `sim::map::OsmMap` consumes.
+
+The output schema is the contract between this tool and the Rust engine:
+
+    {
+      "meta":  {"place", "bbox", "origin"},
+      "nodes": [{"osm_id", "x", "y", "control", "signal"?}],
+      "links": [{"from_osm", "to_osm", "lanes", "speed_limit"}]
+    }
+
+`x`/`y` are metres in a local equirectangular projection about the bbox centre
+(engine geometry is planar); `control` is one of uncontrolled|signal|stop|yield;
+`links` are already directed (two-way streets are emitted as two links), matching
+`LinkSpec`. Ways are split at every intersection node so a link spans exactly one
+block, which is what the signal/movement model expects.
+
+The bounding box is an input, never checked in. Supply it one of three ways
+(highest precedence first): `--bbox S W N E`, `--bbox-file PATH` (a gitignored
+file containing `S W N E`), or the `TRAFFIC_BBOX="S W N E"` environment variable.
+
+Usage:
+    python3 scrape_millbrae.py --bbox-file bbox.local --out millbrae.json
+"""
+
+import argparse
+import json
+import math
+import os
+import urllib.request
+from collections import defaultdict
+
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+DRIVABLE = {
+    "motorway", "trunk", "primary", "secondary", "tertiary",
+    "unclassified", "residential", "motorway_link", "trunk_link",
+    "primary_link", "secondary_link", "tertiary_link", "living_street",
+}
+
+DEFAULT_SPEED_MPH = {
+    "motorway": 65, "trunk": 55, "primary": 35, "secondary": 35,
+    "tertiary": 30, "residential": 25, "unclassified": 25, "living_street": 15,
+}
+
+
+def overpass_query(bbox):
+    s, w, n, e = bbox
+    return f"""
+    [out:json][timeout:60];
+    (
+      way["highway"]({s},{w},{n},{e});
+    );
+    (._;>;);
+    out body;
+    """
+
+
+def fetch(bbox):
+    data = urllib.request.urlopen(
+        urllib.request.Request(OVERPASS_URL, data=overpass_query(bbox).encode()),
+        timeout=90,
+    ).read()
+    return json.loads(data)
+
+
+def parse_speed_mps(tags, highway):
+    raw = tags.get("maxspeed")
+    mph = DEFAULT_SPEED_MPH.get(highway, 25)
+    if raw:
+        token = raw.split()[0]
+        try:
+            v = float(token)
+            mph = v if "mph" in raw else v / 1.60934
+        except ValueError:
+            pass
+    return round(mph * 0.44704, 2)
+
+
+def parse_lanes(tags, oneway):
+    try:
+        lanes = int(tags.get("lanes", ""))
+    except ValueError:
+        lanes = 0
+    if lanes <= 0:
+        return 1
+    return lanes if oneway else max(1, lanes // 2)
+
+
+def project(lat, lon, lat0, lon0):
+    x = math.radians(lon - lon0) * math.cos(math.radians(lat0)) * 6371000.0
+    y = math.radians(lat - lat0) * 6371000.0
+    return round(x, 2), round(y, 2)
+
+
+def build(raw, bbox):
+    nodes = {e["id"]: e for e in raw["elements"] if e["type"] == "node"}
+    ways = [
+        e for e in raw["elements"]
+        if e["type"] == "way" and e.get("tags", {}).get("highway") in DRIVABLE
+    ]
+
+    usage = defaultdict(int)
+    for way in ways:
+        for nid in way["nodes"]:
+            usage[nid] += 1
+    for way in ways:
+        for nid in (way["nodes"][0], way["nodes"][-1]):
+            usage[nid] += 1
+
+    def is_junction(nid):
+        return usage[nid] >= 2 or nodes[nid].get("tags", {}).get("highway") == "traffic_signals"
+
+    lat0 = (bbox[0] + bbox[2]) / 2
+    lon0 = (bbox[1] + bbox[3]) / 2
+
+    out_nodes, out_links, emitted = {}, [], set()
+
+    def emit_node(nid):
+        if nid in out_nodes:
+            return
+        n = nodes[nid]
+        tags = n.get("tags", {})
+        control = "uncontrolled"
+        signal = None
+        if tags.get("highway") == "traffic_signals":
+            control, signal = "signal", {"green_secs": 25.0, "yellow_secs": 4.0, "offset": 0.0}
+        elif tags.get("highway") == "stop":
+            control = "stop"
+        elif tags.get("highway") == "give_way":
+            control = "yield"
+        x, y = project(n["lat"], n["lon"], lat0, lon0)
+        out_nodes[nid] = {"osm_id": nid, "x": x, "y": y, "control": control}
+        if signal:
+            out_nodes[nid]["signal"] = signal
+
+    def emit_link(a, b, lanes, speed):
+        if (a, b) in emitted:
+            return
+        emitted.add((a, b))
+        out_links.append({"from_osm": a, "to_osm": b, "lanes": lanes, "speed_limit": speed})
+
+    for way in ways:
+        tags = way["tags"]
+        highway = tags["highway"]
+        oneway = tags.get("oneway") in ("yes", "true", "1") or highway == "motorway"
+        lanes = parse_lanes(tags, oneway)
+        speed = parse_speed_mps(tags, highway)
+
+        seq = way["nodes"]
+        block_start = 0
+        for i in range(1, len(seq)):
+            if not (is_junction(seq[i]) or i == len(seq) - 1):
+                continue
+            a, b = seq[block_start], seq[i]
+            if a != b:
+                emit_node(a)
+                emit_node(b)
+                emit_link(a, b, lanes, speed)
+                if not oneway:
+                    emit_link(b, a, lanes, speed)
+            block_start = i
+
+    return {
+        "meta": {"place": "Millbrae, CA", "bbox": bbox, "origin": [lat0, lon0]},
+        "nodes": list(out_nodes.values()),
+        "links": out_links,
+    }
+
+
+def resolve_bbox(args):
+    if args.bbox:
+        return tuple(args.bbox)
+    raw = None
+    if args.bbox_file:
+        with open(args.bbox_file) as f:
+            raw = f.read()
+    elif os.environ.get("TRAFFIC_BBOX"):
+        raw = os.environ["TRAFFIC_BBOX"]
+    if not raw:
+        raise SystemExit(
+            "no bounding box: pass --bbox S W N E, --bbox-file PATH, or set TRAFFIC_BBOX"
+        )
+    parts = raw.replace(",", " ").split()
+    if len(parts) != 4:
+        raise SystemExit(f"expected 4 bbox values (S W N E), got {len(parts)}")
+    return tuple(float(p) for p in parts)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default="millbrae.json")
+    ap.add_argument("--bbox", nargs=4, type=float, metavar=("S", "W", "N", "E"))
+    ap.add_argument("--bbox-file", dest="bbox_file")
+    args = ap.parse_args()
+
+    bbox = resolve_bbox(args)
+    graph = build(fetch(bbox), bbox)
+    with open(args.out, "w") as f:
+        json.dump(graph, f, indent=2)
+    print(f"wrote {args.out}: {len(graph['nodes'])} nodes, {len(graph['links'])} links")
+
+
+if __name__ == "__main__":
+    main()

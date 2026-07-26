@@ -1,0 +1,4 @@
+# Scraped extracts and bounding-box inputs are never checked in.
+*.json
+bbox*
+*.local
