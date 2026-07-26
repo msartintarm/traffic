@@ -167,7 +167,7 @@ impl Simulation {
     /// node, positioned around the junction and coloured by current state.
     pub fn signal_heads(&self) -> Vec<f32> {
         let net = &self.world.network;
-        let states = net.signal_states(self.world.time());
+        let states = self.world.signal_states();
         let mut out = Vec::new();
         for node in &net.nodes {
             let NodeControl::Signalized(program) = node.control else { continue };
@@ -318,7 +318,7 @@ impl Simulation {
 
     fn signal_instance_vec(&self) -> Vec<Instance> {
         let net = &self.world.network;
-        let states = net.signal_states(self.world.time());
+        let states = self.world.signal_states();
         let mut out = Vec::new();
         for node in &net.nodes {
             let NodeControl::Signalized(program) = node.control else { continue };

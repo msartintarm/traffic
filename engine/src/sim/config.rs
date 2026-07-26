@@ -25,6 +25,10 @@ pub struct DriverConfig {
     /// MOBIL politeness: how much this driver weighs the braking it would impose
     /// on others when changing lanes (0 = selfish, 1 = very considerate).
     pub politeness: f64,
+    /// Critical gap (s): the smallest time-to-arrival of priority traffic this
+    /// driver will accept when entering an unsignalized intersection. Shrinks with
+    /// waiting (impatience).
+    pub critical_gap: f64,
 }
 
 impl DriverConfig {
@@ -40,6 +44,7 @@ impl DriverConfig {
             reaction_time: 0.5,
             accel_noise: 0.2,
             politeness: 0.3,
+            critical_gap: 4.0,
         }
     }
 
@@ -55,6 +60,7 @@ impl DriverConfig {
             max_accel: self.max_accel * jitter(0.75, 1.25),
             comfort_decel: self.comfort_decel * jitter(0.75, 1.25),
             reaction_time: self.reaction_time * jitter(0.7, 1.3),
+            critical_gap: self.critical_gap * jitter(0.8, 1.2),
             ..*self
         }
     }

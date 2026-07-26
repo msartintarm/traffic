@@ -11,6 +11,7 @@ use super::constraint::{self, LongContext, Obstacle, SpeedTarget};
 use super::idm;
 use super::mobil::{self, MobilParams};
 use super::network::{LaneId, LinkId, MovementId, Network, NodeControl, NodeId};
+use super::signal::SignalState;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NetVehicle {
@@ -27,6 +28,8 @@ pub struct NetVehicle {
     /// Recent `(position, speed)` samples (newest last) so a follower can react
     /// to the leader's state as of its reaction time ago.
     history: Vec<(f64, f64)>,
+    /// Consecutive ticks spent essentially stopped — drives yield impatience.
+    wait_ticks: u32,
 }
 
 /// How many `(position, speed)` samples to retain — enough for the largest
@@ -60,6 +63,11 @@ pub struct NetWorld {
     /// Downstream lanes fed by more than one lane — the merge points; value is
     /// the list of feeding (from) lane ids.
     merges: HashMap<u32, Vec<u32>>,
+    /// Per-program actuated-signal state, indexed by `ProgramId`.
+    signals: Vec<SignalRuntime>,
+    /// Per-program approach links, indexed by signal-group bit — for demand
+    /// detection at each phase.
+    approaches: Vec<Vec<LinkId>>,
 }
 
 impl NetWorld {
@@ -72,13 +80,28 @@ impl NetWorld {
             }
         }
         merges.retain(|_, froms| froms.len() > 1);
-        Self { network, cfg, vehicles: Vec::new(), time: 0.0, tick: 0, exited: 0, crashed: 0, merges }
+
+        let signals = vec![SignalRuntime { phase: 0, elapsed: 0.0, yellow: false }; network.programs.len()];
+        let mut approaches = vec![Vec::new(); network.programs.len()];
+        for (i, node) in network.nodes.iter().enumerate() {
+            if let NodeControl::Signalized(pid) = node.control {
+                approaches[pid.idx()] = (0..network.links.len() as u32)
+                    .filter(|&li| network.links[li as usize].to == NodeId(i as u32))
+                    .map(LinkId)
+                    .collect();
+            }
+        }
+
+        Self {
+            network, cfg, vehicles: Vec::new(), time: 0.0, tick: 0, exited: 0, crashed: 0,
+            merges, signals, approaches,
+        }
     }
 
     pub fn spawn(&mut self, id: u32, lane: LaneId, position: f64, speed: f64, driver: DriverConfig) {
         self.vehicles.push(NetVehicle {
             id, lane, position, speed, driver, route: Vec::new(), route_idx: 0,
-            stopped_at: None, history: vec![(position, speed)],
+            stopped_at: None, history: vec![(position, speed)], wait_ticks: 0,
         });
     }
 
@@ -94,7 +117,7 @@ impl NetWorld {
         }
         self.vehicles.push(NetVehicle {
             id, lane, position: 0.0, speed, driver, route, route_idx: 0,
-            stopped_at: None, history: vec![(0.0, speed)],
+            stopped_at: None, history: vec![(0.0, speed)], wait_ticks: 0,
         });
         true
     }
@@ -307,9 +330,74 @@ impl NetWorld {
             })
     }
 
+    /// Current colour of a movement under the actuated signal runtime
+    /// (unsignalized movements are always green).
+    fn movement_state(&self, mid: MovementId) -> SignalState {
+        match self.network.movement(mid).signal_group {
+            None => SignalState::Green,
+            Some(g) => {
+                let group = self.network.groups[g.idx()];
+                self.signals[group.program.idx()].state_of(group.bit, &self.network.programs[group.program.idx()])
+            }
+        }
+    }
+
+    /// Colour of every signal group, indexed by group id — for rendering.
+    pub fn signal_states(&self) -> Vec<SignalState> {
+        self.network
+            .groups
+            .iter()
+            .map(|g| self.signals[g.program.idx()].state_of(g.bit, &self.network.programs[g.program.idx()]))
+            .collect()
+    }
+
+    /// Advance actuated signals: hold green while its approaches keep demand,
+    /// terminate on max-green or a gap-out with a conflicting approach waiting.
+    fn advance_signals(&mut self, dt: f64) {
+        let mut demand: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for v in &self.vehicles {
+            let lane = self.network.lane(v.lane);
+            if lane.length - v.position < DETECT {
+                demand.insert(lane.link.0);
+            }
+        }
+        for pid in 0..self.signals.len() {
+            let (n_phases, green_mask, yellow_dur) = {
+                let program = &self.network.programs[pid];
+                if program.phases.is_empty() {
+                    continue;
+                }
+                let ph = program.phases[self.signals[pid].phase];
+                (program.phases.len(), ph.green_mask, ph.yellow_secs)
+            };
+            let bit_has_demand = |served: bool| {
+                self.approaches[pid].iter().enumerate().any(|(bit, link)| {
+                    (green_mask & (1u64 << bit) != 0) == served && demand.contains(&link.0)
+                })
+            };
+            let mut rt = self.signals[pid];
+            rt.elapsed += dt;
+            if rt.yellow {
+                if rt.elapsed >= yellow_dur {
+                    rt.phase = (rt.phase + 1) % n_phases;
+                    rt.elapsed = 0.0;
+                    rt.yellow = false;
+                }
+            } else if n_phases > 1
+                && rt.elapsed >= MIN_GREEN
+                && bit_has_demand(false)
+                && (rt.elapsed >= MAX_GREEN || !bit_has_demand(true))
+            {
+                rt.yellow = true;
+                rt.elapsed = 0.0;
+            }
+            self.signals[pid] = rt;
+        }
+    }
+
     pub fn step(&mut self) {
         let dt = self.cfg.dt;
-        let now = self.time;
+        self.advance_signals(dt);
         self.lane_changes();
         let nb = self.neighbors();
 
@@ -361,11 +449,15 @@ impl NetWorld {
                         .get(&to_lane.0)
                         .is_some_and(|&f| self.vehicles[f].position < driver.vehicle_length + driver.min_gap)
                 });
-                let stop_line = match intended {
-                    Some(mid) if !self.network.movement_state(mid, now).is_go() => Some(to_line),
-                    _ if downstream_blocked => Some(to_line),
-                    _ => None,
-                };
+                // Signal: red always stops; yellow stops only if the vehicle can
+                // brake comfortably before the line (dilemma zone) — otherwise it
+                // proceeds and clears on yellow.
+                let signal_stop = intended.is_some_and(|mid| match self.movement_state(mid) {
+                    SignalState::Green => false,
+                    SignalState::Red => true,
+                    SignalState::Yellow => can_stop_before(veh.speed, driver.comfort_decel, to_line),
+                });
+                let stop_line = (signal_stop || downstream_blocked).then_some(to_line);
 
                 let speed_target = intended.and_then(|mid| {
                     let to = self.network.lane(self.network.movement(mid).to_lane);
@@ -434,8 +526,13 @@ impl NetWorld {
 
         let mut survivors = Vec::with_capacity(moved.len());
         for mut veh in moved {
-            let alive = self.advance_across_nodes(&mut veh, now, &mut front);
+            let alive = self.advance_across_nodes(&mut veh, &mut front);
             if alive {
+                if veh.speed < 0.5 {
+                    veh.wait_ticks += 1;
+                } else {
+                    veh.wait_ticks = 0;
+                }
                 veh.record();
                 let e = front.entry(veh.lane.0).or_insert(f64::MAX);
                 *e = e.min(veh.position - veh.driver.vehicle_length);
@@ -489,7 +586,9 @@ impl NetWorld {
     /// different link and will arrive within the critical gap — the signal to
     /// give way. `None` means clear to proceed.
     fn conflicting_priority_traffic(&self, i: usize, lane: LaneId, node: NodeId, nb: &Neighbors) -> Option<()> {
-        const CRITICAL_GAP: f64 = 4.0;
+        let me = &self.vehicles[i];
+        // Impatience: the longer we've waited, the smaller the gap we'll accept.
+        let critical = effective_critical_gap(me.driver.critical_gap, me.wait_ticks as f64 * self.cfg.dt);
         let my_link = self.network.lane(lane).link;
         let my_key = self.priority_key(my_link);
         for &j in nb.approaching.get(&node.0)? {
@@ -504,7 +603,7 @@ impl NetWorld {
             if self.priority_key(o_lane.link) <= my_key {
                 continue;
             }
-            if (o_lane.length - o.position) / o.speed.max(0.1) < CRITICAL_GAP {
+            if (o_lane.length - o.position) / o.speed.max(0.1) < critical {
                 return Some(());
             }
         }
@@ -540,14 +639,15 @@ impl NetWorld {
         best
     }
 
-    fn advance_across_nodes(&self, veh: &mut NetVehicle, now: f64, front: &mut HashMap<u32, f64>) -> bool {
+    fn advance_across_nodes(&self, veh: &mut NetVehicle, front: &mut HashMap<u32, f64>) -> bool {
         for _ in 0..8 {
             let lane = *self.network.lane(veh.lane);
             if veh.position < lane.length {
                 return true;
             }
             match self.intended_movement(veh) {
-                Some(mid) if self.network.movement_state(mid, now).is_go() => {
+                // Cross on green or yellow; hold only on red.
+                Some(mid) if self.movement_state(mid) != SignalState::Red => {
                     let to_lane = self.network.movement(mid).to_lane;
                     // `front` holds the nearest occupied rear; the crosser lands at
                     // ~0, so require that rear to be at least min_gap ahead.
@@ -591,9 +691,53 @@ struct Neighbors {
     approaching: HashMap<u32, Vec<usize>>,
 }
 
+/// Live state of one actuated signal program: which phase is running, how long
+/// it has, and whether it's in the phase's yellow clearance.
+#[derive(Clone, Copy, Debug)]
+struct SignalRuntime {
+    phase: usize,
+    elapsed: f64,
+    yellow: bool,
+}
+
+impl SignalRuntime {
+    fn state_of(&self, bit: u8, program: &super::signal::SignalProgram) -> SignalState {
+        if program.phases.is_empty() {
+            return SignalState::Red;
+        }
+        let served = program.phases[self.phase].green_mask & (1u64 << bit) != 0;
+        if !served {
+            SignalState::Red
+        } else if self.yellow {
+            SignalState::Yellow
+        } else {
+            SignalState::Green
+        }
+    }
+}
+
+/// Actuation timing: green is held at least `MIN_GREEN`, extended while vehicles
+/// keep arriving (gap-out) up to `MAX_GREEN`, and only terminated when a
+/// conflicting approach is waiting. Detection zone is `DETECT` metres back.
+const MIN_GREEN: f64 = 6.0;
+const MAX_GREEN: f64 = 45.0;
+const DETECT: f64 = 35.0;
+
 /// IDM acceleration for a vehicle placed at `pos`/`speed` on a lane with the
 /// given speed limit, following `leader` (or free road if none). Used to score
 /// hypothetical lane placements for MOBIL.
+/// Whether a vehicle can brake to a stop within `distance` at comfortable
+/// deceleration — the dilemma-zone test for whether to stop on yellow.
+fn can_stop_before(speed: f64, decel: f64, distance: f64) -> bool {
+    speed * speed / (2.0 * decel.max(0.1)) <= distance
+}
+
+/// The gap a driver will accept, shrinking from `base` as `waited` grows
+/// (impatience), floored so nobody nudges into genuinely unsafe traffic.
+fn effective_critical_gap(base: f64, waited: f64) -> f64 {
+    (base - 0.15 * waited).max(1.5)
+}
+
 fn idm_follow(follower: &NetVehicle, lane_speed_limit: f64, pos: f64, speed: f64, leader: Option<&NetVehicle>) -> f64 {
     let d = follower.driver.capped_to(lane_speed_limit);
     match leader {
@@ -645,21 +789,38 @@ mod tests {
     }
 
     #[test]
-    fn vehicle_stops_before_a_red_light() {
-        let net = signal_at(18.0); // through movement red across t∈[0,18)
-        let lane = approach_lane(&net);
-        let length = net.lane(lane).length;
+    fn actuated_signal_serves_both_competing_approaches() {
+        // Two full queues on conflicting approaches: an actuated signal must
+        // cycle to serve both (a stuck signal would strand one queue forever).
+        let net = signal_at(0.0);
+        let through = net.lanes_of(LinkId(0)).next().unwrap(); // 1->2
+        let cross = net.lanes_of(LinkId(2)).next().unwrap(); // 4->2
         let mut world = NetWorld::new(net, cfg());
-        world.spawn(1, lane, 0.0, 15.0, DriverConfig::car());
+        let tlen = world.network.lane(through).length;
+        let clen = world.network.lane(cross).length;
+        for i in 0..4u32 {
+            world.spawn(i, through, tlen - 8.0 - i as f64 * 7.0, 0.0, DriverConfig::car());
+            world.spawn(100 + i, cross, clen - 8.0 - i as f64 * 7.0, 0.0, DriverConfig::car());
+        }
 
-        world.run_ticks(85); // 17 s: braked to rest, still within the red window
+        world.run_ticks(900);
 
-        let v = world.vehicle(1).expect("still on the approach");
-        assert_eq!(v.lane, lane, "must not cross a red light");
-        assert!(v.speed < 0.5, "should be stopped, speed={}", v.speed);
-        assert!(v.position < length && v.position > length - 8.0,
-            "should be halted at the stop line, pos={} len={length}", v.position);
-        assert_eq!(world.exited(), 0);
+        assert_eq!(world.exited(), 8, "both queues should clear once the signal cycles");
+        assert_eq!(world.crashed(), 0);
+    }
+
+    #[test]
+    fn impatience_shrinks_the_accepted_gap_to_a_floor() {
+        assert_eq!(effective_critical_gap(4.0, 0.0), 4.0);
+        assert!(effective_critical_gap(4.0, 10.0) < 4.0, "waiting lowers the bar");
+        assert_eq!(effective_critical_gap(4.0, 1000.0), 1.5, "but never below the safety floor");
+    }
+
+    #[test]
+    fn dilemma_zone_decision() {
+        // Can stop comfortably before the line → stop; too fast/close → proceed.
+        assert!(can_stop_before(10.0, 1.5, 100.0)); // plenty of room
+        assert!(!can_stop_before(20.0, 1.5, 5.0)); // no chance — commit through
     }
 
     #[test]
