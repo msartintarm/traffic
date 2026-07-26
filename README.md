@@ -2,13 +2,11 @@
 
 [msartintarm.github.io/traffic](https://msartintarm.github.io/traffic)
 
-A large-scale traffic simulator that runs in the browser on the GPU, plays on
-discrete ticks, and imports real road maps from OpenStreetMap. The first map is
+A large-scale traffic simulator that runs in the browser on the GPU. The xcurrent map is
 **Millbrae, CA**.
 
-The architecture follows the sibling `../plant` project: one Rust crate compiled
-to WebAssembly, with the *simulation* kept as a pure, dependency-free core that
-runs and is exhaustively tested under plain `cargo test` — no GPU, no DOM, no
+The architecture: one Rust crate compiled to WebAssembly, with the *simulation* kept as a pure, dependency-free core that
+runs and tested under `cargo test` — no GPU, no DOM, no
 browser — and the GPU/browser concerns layered on top behind a `wasm32` gate.
 
 ## Design in one screen
