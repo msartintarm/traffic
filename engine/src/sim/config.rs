@@ -22,6 +22,9 @@ pub struct DriverConfig {
     /// Magnitude (m/s²) of one-sided acceleration jitter modelling imperfect
     /// throttle/hesitation. Only ever reduces acceleration, so it is collision-safe.
     pub accel_noise: f64,
+    /// MOBIL politeness: how much this driver weighs the braking it would impose
+    /// on others when changing lanes (0 = selfish, 1 = very considerate).
+    pub politeness: f64,
 }
 
 impl DriverConfig {
@@ -36,6 +39,7 @@ impl DriverConfig {
             vehicle_length: 5.0,
             reaction_time: 0.5,
             accel_noise: 0.2,
+            politeness: 0.3,
         }
     }
 

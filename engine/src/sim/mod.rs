@@ -9,6 +9,7 @@ pub mod demand;
 pub mod idm;
 pub mod map;
 pub mod meso;
+pub mod mobil;
 #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 pub mod meso_gpu;
 pub mod net_world;

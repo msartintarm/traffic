@@ -8,6 +8,8 @@ use std::collections::HashMap;
 
 use super::config::{DriverConfig, SimConfig};
 use super::constraint::{self, LongContext, Obstacle, SpeedTarget};
+use super::idm;
+use super::mobil::{self, MobilParams};
 use super::network::{LaneId, LinkId, MovementId, Network, NodeControl, NodeId};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -183,9 +185,132 @@ impl NetWorld {
         ((lane.speed_limit * 1000.0) as u64) << 40 | (l.lane_count as u64) << 24 | (link.0 as u64 & 0xFF_FFFF)
     }
 
+    /// MOBIL lane changes: evaluated on committed positions, applied before the
+    /// longitudinal update. Discretionary (overtake a slow leader into a freer
+    /// lane) and mandatory (move to a lane that serves the route's next link).
+    fn lane_changes(&mut self) {
+        let mut by_lane: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (i, v) in self.vehicles.iter().enumerate() {
+            by_lane.entry(v.lane.0).or_default().push(i);
+        }
+        for m in by_lane.values_mut() {
+            m.sort_by(|&a, &b| self.vehicles[a].position.total_cmp(&self.vehicles[b].position));
+        }
+        let mut changes: Vec<(usize, LaneId)> = Vec::new();
+        for i in 0..self.vehicles.len() {
+            if let Some(t) = self.best_lane_change(i, &by_lane) {
+                changes.push((i, t));
+            }
+        }
+        for (i, target) in changes {
+            let (pos, len) = (self.vehicles[i].position, self.vehicles[i].driver.vehicle_length);
+            if self.lane_slot_clear(target, pos, len, i) {
+                self.vehicles[i].lane = target;
+            }
+        }
+    }
+
+    fn best_lane_change(&self, i: usize, by_lane: &HashMap<u32, Vec<usize>>) -> Option<LaneId> {
+        let v = &self.vehicles[i];
+        let lane = *self.network.lane(v.lane);
+        let link = *self.network.link(lane.link);
+        let idx = lane.index_in_link as i64;
+        let cur_leader = self.nearest_ahead(v.lane, v.position, by_lane, i);
+        let a_self_cur = idm_follow(v, lane.speed_limit, v.position, v.speed, cur_leader.map(|j| &self.vehicles[j]));
+
+        let mut best: Option<(f64, LaneId)> = None;
+        for delta in [-1i64, 1] {
+            let ti = idx + delta;
+            if ti < 0 || ti >= link.lane_count as i64 {
+                continue;
+            }
+            let target = LaneId(link.lane_start.0 + ti as u32);
+            let limit = self.network.lane(target).speed_limit;
+
+            let a_self_new = idm_follow(
+                v,
+                limit,
+                v.position,
+                v.speed,
+                self.nearest_ahead(target, v.position, by_lane, i).map(|j| &self.vehicles[j]),
+            );
+
+            let (a_nf_cur, a_nf_new) = match self.nearest_behind(target, v.position, by_lane, i) {
+                Some(fj) => {
+                    let f = &self.vehicles[fj];
+                    let fl = self.nearest_ahead(target, f.position, by_lane, i).map(|j| &self.vehicles[j]);
+                    (
+                        idm_follow(f, limit, f.position, f.speed, fl),
+                        idm_follow(f, limit, f.position, f.speed, Some(v)),
+                    )
+                }
+                None => (0.0, 0.0),
+            };
+
+            let mandatory = self.mandatory_change(v, v.lane, target);
+            let params = MobilParams::new(v.driver.politeness);
+            if mobil::should_change(&params, a_self_cur, a_self_new, a_nf_cur, a_nf_new, mandatory) {
+                let gain = (a_self_new - a_self_cur) + if mandatory { 100.0 } else { 0.0 };
+                if best.is_none_or(|(g, _)| gain > g) {
+                    best = Some((gain, target));
+                }
+            }
+        }
+        best.map(|(_, t)| t)
+    }
+
+    fn nearest_ahead(&self, lane: LaneId, pos: f64, by_lane: &HashMap<u32, Vec<usize>>, exclude: usize) -> Option<usize> {
+        by_lane
+            .get(&lane.0)?
+            .iter()
+            .copied()
+            .filter(|&j| j != exclude && self.vehicles[j].position > pos)
+            .min_by(|&a, &b| self.vehicles[a].position.total_cmp(&self.vehicles[b].position))
+    }
+
+    fn nearest_behind(&self, lane: LaneId, pos: f64, by_lane: &HashMap<u32, Vec<usize>>, exclude: usize) -> Option<usize> {
+        by_lane
+            .get(&lane.0)?
+            .iter()
+            .copied()
+            .filter(|&j| j != exclude && self.vehicles[j].position < pos)
+            .max_by(|&a, &b| self.vehicles[a].position.total_cmp(&self.vehicles[b].position))
+    }
+
+    /// Whether the current lane can't serve the route's next link but `target` can.
+    fn mandatory_change(&self, veh: &NetVehicle, current: LaneId, target: LaneId) -> bool {
+        matches!(
+            (self.lane_serves_route(veh, current), self.lane_serves_route(veh, target)),
+            (Some(false), Some(true))
+        )
+    }
+
+    fn lane_serves_route(&self, veh: &NetVehicle, lane: LaneId) -> Option<bool> {
+        if veh.route.is_empty() || veh.route_idx + 1 >= veh.route.len() {
+            return None;
+        }
+        let next = veh.route[veh.route_idx + 1];
+        Some(self.network.movements_of(lane).iter().any(|m| self.network.lane(m.to_lane).link == next))
+    }
+
+    fn lane_slot_clear(&self, target: LaneId, pos: f64, len: f64, exclude: usize) -> bool {
+        self.vehicles
+            .iter()
+            .enumerate()
+            .filter(|(j, o)| *j != exclude && o.lane == target)
+            .all(|(_, o)| {
+                if o.position > pos {
+                    o.position - o.driver.vehicle_length - pos > 0.5
+                } else {
+                    pos - len - o.position > 0.5
+                }
+            })
+    }
+
     pub fn step(&mut self) {
         let dt = self.cfg.dt;
         let now = self.time;
+        self.lane_changes();
         let nb = self.neighbors();
 
         let accels: Vec<f64> = self
@@ -464,6 +589,17 @@ struct Neighbors {
     lane_front: HashMap<u32, usize>,
     by_lane: HashMap<u32, Vec<usize>>,
     approaching: HashMap<u32, Vec<usize>>,
+}
+
+/// IDM acceleration for a vehicle placed at `pos`/`speed` on a lane with the
+/// given speed limit, following `leader` (or free road if none). Used to score
+/// hypothetical lane placements for MOBIL.
+fn idm_follow(follower: &NetVehicle, lane_speed_limit: f64, pos: f64, speed: f64, leader: Option<&NetVehicle>) -> f64 {
+    let d = follower.driver.capped_to(lane_speed_limit);
+    match leader {
+        Some(l) => idm::acceleration(&d, speed, speed - l.speed, (l.position - pos - l.driver.vehicle_length).max(0.05)),
+        None => idm::free_acceleration(&d, speed),
+    }
 }
 
 fn integrate(v: &mut NetVehicle, accel: f64, dt: f64) {
@@ -847,6 +983,33 @@ mod tests {
     }
 
     #[test]
+    fn faster_vehicle_changes_lanes_to_overtake() {
+        let net = OsmMap {
+            nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 6000.0, 0.0)],
+            links: vec![LinkSpec::oneway(1, 2, 2, 30.0)],
+        }
+        .build();
+        let lanes: Vec<LaneId> = net.lanes_of(LinkId(0)).collect();
+        let mut w = NetWorld::new(net, cfg());
+        let slow = DriverConfig { desired_speed: 8.0, accel_noise: 0.0, ..DriverConfig::car() };
+        let fast = DriverConfig { desired_speed: 30.0, accel_noise: 0.0, ..DriverConfig::car() };
+        w.spawn(1, lanes[0], 300.0, 8.0, slow); // slow leader
+        w.spawn(2, lanes[0], 100.0, 20.0, fast); // fast follower, same lane
+
+        let mut used_other_lane = false;
+        for _ in 0..500 {
+            w.step();
+            if w.vehicle(2).is_some_and(|v| v.lane == lanes[1]) {
+                used_other_lane = true;
+            }
+        }
+        let f = w.vehicle(2).unwrap();
+        let s = w.vehicle(1).unwrap();
+        assert!(used_other_lane, "fast vehicle should use the adjacent lane");
+        assert!(f.position > s.position, "and overtake the slow one: {} vs {}", f.position, s.position);
+    }
+
+    #[test]
     fn mixed_class_traffic_does_not_crash_under_sustained_demand() {
         // Regression for the length-convention bug: a follower must reserve the
         // *leader's* length, and spawns/crossings must respect a long vehicle's
@@ -889,16 +1052,18 @@ mod tests {
         .build();
         let lanes: Vec<LaneId> = net.lanes_of(LinkId(0)).collect();
         let mut world = NetWorld::new(net, cfg());
-        let slow = DriverConfig { desired_speed: 8.0, ..DriverConfig::car() };
+        // A slow vehicle in lane 0 must not slow a vehicle in lane 1. (No lane-0
+        // follower here — that one would rightly change lanes; see the overtake
+        // test — this isolates cross-lane car-following independence.)
+        let slow = DriverConfig { desired_speed: 8.0, accel_noise: 0.0, ..DriverConfig::car() };
         world.spawn(1, lanes[0], 200.0, 8.0, slow);
-        world.spawn(2, lanes[0], 100.0, 8.0, DriverConfig::car());
-        world.spawn(3, lanes[1], 100.0, 8.0, DriverConfig::car());
+        world.spawn(3, lanes[1], 100.0, 8.0, DriverConfig { accel_noise: 0.0, ..DriverConfig::car() });
 
         world.run_ticks(1000);
 
-        let blocked = world.vehicle(2).unwrap();
+        let slow_v = world.vehicle(1).unwrap();
         let free = world.vehicle(3).unwrap();
-        assert!(blocked.speed < 9.0, "lane-0 follower is held back, speed={}", blocked.speed);
+        assert!(slow_v.speed < 9.0, "lane-0 vehicle stays slow, speed={}", slow_v.speed);
         assert!(free.speed > 20.0, "lane-1 vehicle is unaffected, speed={}", free.speed);
     }
 }
