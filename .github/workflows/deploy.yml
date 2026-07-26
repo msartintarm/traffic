@@ -40,24 +40,10 @@ jobs:
       - run: npm ci
         working-directory: web
 
-      # The real map is never committed (it carries GPS). Instead the bounding
-      # box lives in the TRAFFIC_BBOX repo secret ("S W N E") and the scraper
-      # regenerates web/public/map.json here. If the secret is unset or Overpass
-      # is unreachable, the deploy still succeeds on the built-in sample map.
-      - name: Fetch Millbrae map
-        continue-on-error: true
-        env:
-          TRAFFIC_BBOX: ${{ secrets.TRAFFIC_BBOX }}
-        run: |
-          if [ -z "$TRAFFIC_BBOX" ]; then
-            echo "TRAFFIC_BBOX secret not set — deploying with the built-in sample map"
-            exit 0
-          fi
-          python3 tools/osm-scraper/scrape_millbrae.py --out web/public/map.json
-
-      # `npm run build` runs the `prebuild` script, which rebuilds the wasm
-      # package (engine → web/public/wasm-pkg) before the Next export. The
-      # export copies web/public/map.json (if present) to /traffic/map.json.
+      # The Millbrae map (public OSM data, projected to local metres) is
+      # committed at web/public/map.json; `npm run build` runs `prebuild` to
+      # rebuild the wasm package, then the Next export copies the map to
+      # /traffic/map.json. GitHub Pages gzips it on the wire (~16 KB).
       - name: Build static export
         run: npm run build
         working-directory: web

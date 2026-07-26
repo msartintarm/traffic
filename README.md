@@ -2,11 +2,11 @@
 
 [msartintarm.github.io/traffic](https://msartintarm.github.io/traffic)
 
-A large-scale traffic simulator that runs in the browser on the GPU. The xcurrent map is
+A large-scale traffic simulator that runs in the browser on the GPU. The current map is
 **Millbrae, CA**.
 
 The architecture: one Rust crate compiled to WebAssembly, with the *simulation* kept as a pure, dependency-free core that
-runs and tested under `cargo test` — no GPU, no DOM, no
+runs and is tested under `cargo test` — no GPU, no DOM, no
 browser — and the GPU/browser concerns layered on top behind a `wasm32` gate.
 
 ## Design in one screen

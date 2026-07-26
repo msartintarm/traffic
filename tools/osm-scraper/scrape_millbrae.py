@@ -28,11 +28,18 @@ import argparse
 import json
 import math
 import os
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict
 
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_URLS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://lz4.overpass-api.de/api/interpreter",
+]
+RETRYABLE_STATUS = {429, 502, 503, 504}
 
 DRIVABLE = {
     "motorway", "trunk", "primary", "secondary", "tertiary",
@@ -58,17 +65,29 @@ def overpass_query(bbox):
     """
 
 
-def fetch(bbox):
-    req = urllib.request.Request(
-        OVERPASS_URL,
-        data=urllib.parse.urlencode({"data": overpass_query(bbox)}).encode(),
-        headers={
-            "User-Agent": "traffic-sim-osm-scraper/0.1 (github traffic sim)",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-        },
-    )
-    return json.loads(urllib.request.urlopen(req, timeout=90).read())
+def fetch(bbox, attempts=6):
+    body = urllib.parse.urlencode({"data": overpass_query(bbox)}).encode()
+    headers = {
+        "User-Agent": "traffic-sim-osm-scraper/0.1 (github traffic sim)",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+    }
+    last = None
+    for attempt in range(attempts):
+        url = OVERPASS_URLS[attempt % len(OVERPASS_URLS)]
+        try:
+            req = urllib.request.Request(url, data=body, headers=headers)
+            return json.loads(urllib.request.urlopen(req, timeout=180).read())
+        except urllib.error.HTTPError as err:
+            last = err
+            if err.code not in RETRYABLE_STATUS:
+                raise
+        except (urllib.error.URLError, TimeoutError) as err:
+            last = err
+        wait = min(2 ** attempt, 30)
+        print(f"overpass {url} failed ({last}); retry {attempt + 1}/{attempts} in {wait}s")
+        time.sleep(wait)
+    raise SystemExit(f"overpass unreachable after {attempts} attempts: {last}")
 
 
 def parse_speed_mps(tags, highway):
@@ -215,7 +234,7 @@ def main():
     bbox = resolve_bbox(args)
     graph = build(fetch(bbox), bbox)
     with open(args.out, "w") as f:
-        json.dump(graph, f, indent=2)
+        json.dump(graph, f, separators=(",", ":"))
     print(f"wrote {args.out}: {len(graph['nodes'])} nodes, {len(graph['links'])} links")
 
 
