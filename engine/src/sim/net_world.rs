@@ -22,6 +22,29 @@ pub struct NetVehicle {
     /// The stop-controlled node this vehicle has already halted at, so a stop
     /// sign is enforced once rather than forever.
     stopped_at: Option<NodeId>,
+    /// Recent `(position, speed)` samples (newest last) so a follower can react
+    /// to the leader's state as of its reaction time ago.
+    history: Vec<(f64, f64)>,
+}
+
+/// How many `(position, speed)` samples to retain — enough for the largest
+/// plausible reaction delay at the fixed timestep.
+const HISTORY_LEN: usize = 8;
+
+impl NetVehicle {
+    /// This vehicle's `(position, speed)` `ticks` steps ago (clamped to the
+    /// oldest sample available).
+    fn delayed(&self, ticks: usize) -> (f64, f64) {
+        let n = self.history.len();
+        self.history[n - 1 - ticks.min(n - 1)]
+    }
+
+    fn record(&mut self) {
+        self.history.push((self.position, self.speed));
+        if self.history.len() > HISTORY_LEN {
+            self.history.remove(0);
+        }
+    }
 }
 
 pub struct NetWorld {
@@ -29,7 +52,9 @@ pub struct NetWorld {
     cfg: SimConfig,
     vehicles: Vec<NetVehicle>,
     time: f64,
+    tick: u64,
     exited: u32,
+    crashed: u32,
     /// Downstream lanes fed by more than one lane — the merge points; value is
     /// the list of feeding (from) lane ids.
     merges: HashMap<u32, Vec<u32>>,
@@ -45,12 +70,13 @@ impl NetWorld {
             }
         }
         merges.retain(|_, froms| froms.len() > 1);
-        Self { network, cfg, vehicles: Vec::new(), time: 0.0, exited: 0, merges }
+        Self { network, cfg, vehicles: Vec::new(), time: 0.0, tick: 0, exited: 0, crashed: 0, merges }
     }
 
     pub fn spawn(&mut self, id: u32, lane: LaneId, position: f64, speed: f64, driver: DriverConfig) {
         self.vehicles.push(NetVehicle {
-            id, lane, position, speed, driver, route: Vec::new(), route_idx: 0, stopped_at: None,
+            id, lane, position, speed, driver, route: Vec::new(), route_idx: 0,
+            stopped_at: None, history: vec![(position, speed)],
         });
     }
 
@@ -61,17 +87,24 @@ impl NetWorld {
     pub fn spawn_routed(&mut self, id: u32, route: Vec<LinkId>, speed: f64, driver: DriverConfig) -> bool {
         let Some(&first) = route.first() else { return false };
         let Some(lane) = self.network.lanes_of(first).next() else { return false };
-        if !self.entrance_clear(lane, driver.vehicle_length + driver.min_gap) {
+        if !self.entrance_clear(lane, driver.min_gap) {
             return false;
         }
         self.vehicles.push(NetVehicle {
-            id, lane, position: 0.0, speed, driver, route, route_idx: 0, stopped_at: None,
+            id, lane, position: 0.0, speed, driver, route, route_idx: 0,
+            stopped_at: None, history: vec![(0.0, speed)],
         });
         true
     }
 
-    pub fn entrance_clear(&self, lane: LaneId, clearance: f64) -> bool {
-        self.vehicles.iter().filter(|v| v.lane == lane).all(|v| v.position > clearance)
+    /// Whether a vehicle can be placed at the start of `lane` without overlapping
+    /// one already there — measured against each occupant's *rear* (position minus
+    /// its own length), so long vehicles are accounted for.
+    pub fn entrance_clear(&self, lane: LaneId, min_gap: f64) -> bool {
+        self.vehicles
+            .iter()
+            .filter(|v| v.lane == lane)
+            .all(|v| v.position - v.driver.vehicle_length > min_gap)
     }
 
     pub fn time(&self) -> f64 {
@@ -80,6 +113,11 @@ impl NetWorld {
 
     pub fn exited(&self) -> u32 {
         self.exited
+    }
+
+    /// Vehicles removed from the road after a collision.
+    pub fn crashed(&self) -> u32 {
+        self.crashed
     }
 
     pub fn vehicles(&self) -> &[NetVehicle] {
@@ -162,18 +200,26 @@ impl NetWorld {
                 let control = self.network.node(node).control;
                 let to_line = (lane.length - veh.position).max(0.05);
 
+                // Reaction delay: perceive the leader's pose/speed as of the
+                // driver's reaction time ago. The perceived gap is capped by the
+                // true current gap (`min`), so IDM can never *under*-brake — it's
+                // collision-free in-lane. The delay instead shows up as realistic
+                // start-up lag: a follower is slow to notice the leader pulling
+                // away, so queues discharge with lost time.
                 let leader = if let Some(li) = nb.leader_of[i] {
                     let lead = &self.vehicles[li];
-                    Some(Obstacle {
-                        gap: lead.position - veh.position - driver.vehicle_length,
-                        speed: lead.speed,
-                    })
+                    let delay = (driver.reaction_time / dt).round() as usize;
+                    let (my_p, _) = veh.delayed(delay);
+                    let (lead_p, lead_v) = lead.delayed(delay);
+                    let delayed_gap = lead_p - my_p - lead.driver.vehicle_length;
+                    let current_gap = lead.position - veh.position - lead.driver.vehicle_length;
+                    Some(Obstacle { gap: delayed_gap.min(current_gap), speed: lead_v })
                 } else if let Some(mid) = intended {
                     let to_lane = self.network.movement(mid).to_lane;
                     nb.lane_front.get(&to_lane.0).map(|&front| {
                         let lead = &self.vehicles[front];
                         Obstacle {
-                            gap: (lane.length - veh.position) + lead.position - driver.vehicle_length,
+                            gap: (lane.length - veh.position) + lead.position - lead.driver.vehicle_length,
                             speed: lead.speed,
                         }
                     })
@@ -181,8 +227,18 @@ impl NetWorld {
                     None
                 };
 
+                // Don't-block-the-box: about to cross, but the downstream lane's
+                // entrance is occupied — hold at the line rather than land on top
+                // of a stopped vehicle (the main source of intersection crashes).
+                let downstream_blocked = intended.is_some_and(|mid| {
+                    let to_lane = self.network.movement(mid).to_lane;
+                    nb.lane_front
+                        .get(&to_lane.0)
+                        .is_some_and(|&f| self.vehicles[f].position < driver.vehicle_length + driver.min_gap)
+                });
                 let stop_line = match intended {
                     Some(mid) if !self.network.movement_state(mid, now).is_go() => Some(to_line),
+                    _ if downstream_blocked => Some(to_line),
                     _ => None,
                 };
 
@@ -212,29 +268,96 @@ impl NetWorld {
                     yield_line,
                     merge,
                 };
-                constraint::binding_acceleration(&ctx, constraint::DEFAULT)
+                let binding = constraint::binding_acceleration(&ctx, constraint::DEFAULT);
+                binding + constraint::accel_noise(driver.accel_noise, self.cfg.seed, veh.id, self.tick)
             })
             .collect();
 
-        let mut survivors = Vec::with_capacity(self.vehicles.len());
-        for (mut veh, a) in std::mem::take(&mut self.vehicles).into_iter().zip(accels) {
-            integrate(&mut veh, a, dt);
-            let lane = *self.network.lane(veh.lane);
-            let node = self.network.link(lane.link).to;
-            if matches!(self.network.node(node).control, NodeControl::Stop)
-                && veh.speed < 0.3
-                && (lane.length - veh.position) < veh.driver.vehicle_length + veh.driver.min_gap + 1.0
-            {
-                veh.stopped_at = Some(node);
+        // Integrate every vehicle in place (no crossing yet).
+        let mut moved: Vec<NetVehicle> = std::mem::take(&mut self.vehicles)
+            .into_iter()
+            .zip(accels)
+            .map(|(mut veh, a)| {
+                integrate(&mut veh, a, dt);
+                let lane = *self.network.lane(veh.lane);
+                let node = self.network.link(lane.link).to;
+                if matches!(self.network.node(node).control, NodeControl::Stop)
+                    && veh.speed < 0.3
+                    && (lane.length - veh.position) < veh.driver.vehicle_length + veh.driver.min_gap + 1.0
+                {
+                    veh.stopped_at = Some(node);
+                }
+                veh
+            })
+            .collect();
+
+        // Occupancy-aware crossing: process in id order, tracking each lane's
+        // frontmost (entrance-nearest) position, so a vehicle never crosses a
+        // node onto a spot another vehicle already holds. This makes
+        // intersection/merge overlaps impossible rather than after-the-fact.
+        // `front[lane]` = the nearest occupied point to the lane entrance (the
+        // rear = position − length of the closest-in vehicle), so a crosser never
+        // lands on top of a long vehicle already there.
+        moved.sort_by_key(|v| v.id);
+        let mut front: HashMap<u32, f64> = HashMap::new();
+        for v in &moved {
+            if v.position < self.network.lane(v.lane).length {
+                let e = front.entry(v.lane.0).or_insert(f64::MAX);
+                *e = e.min(v.position - v.driver.vehicle_length);
             }
-            if self.advance_across_nodes(&mut veh, now) {
+        }
+
+        let mut survivors = Vec::with_capacity(moved.len());
+        for mut veh in moved {
+            let alive = self.advance_across_nodes(&mut veh, now, &mut front);
+            if alive {
+                veh.record();
+                let e = front.entry(veh.lane.0).or_insert(f64::MAX);
+                *e = e.min(veh.position - veh.driver.vehicle_length);
                 survivors.push(veh);
             } else {
                 self.exited += 1;
             }
         }
         self.vehicles = survivors;
+        self.remove_crashes();
         self.time += dt;
+        self.tick += 1;
+    }
+
+    /// Detect rear-end overlaps within a lane (a follower's front past the
+    /// leader's rear) and take the crashed vehicles off the road, counting them.
+    /// Reaction delay makes this physically possible; behaviour should minimize
+    /// it over time. Crashes are resolved deterministically (scan by position).
+    fn remove_crashes(&mut self) {
+        const OVERLAP_TOL: f64 = 0.5;
+        let mut by_lane: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (i, v) in self.vehicles.iter().enumerate() {
+            by_lane.entry(v.lane.0).or_default().push(i);
+        }
+        let mut crashed = vec![false; self.vehicles.len()];
+        for members in by_lane.values_mut() {
+            members.sort_by(|&a, &b| self.vehicles[a].position.total_cmp(&self.vehicles[b].position));
+            for w in members.windows(2) {
+                let (rear, front) = (&self.vehicles[w[0]], &self.vehicles[w[1]]);
+                let gap = front.position - rear.position - front.driver.vehicle_length;
+                if gap < -OVERLAP_TOL {
+                    crashed[w[0]] = true;
+                    crashed[w[1]] = true;
+                }
+            }
+        }
+        if crashed.iter().any(|&c| c) {
+            let mut i = 0;
+            self.vehicles.retain(|_| {
+                let keep = !crashed[i];
+                i += 1;
+                if !keep {
+                    self.crashed += 1;
+                }
+                keep
+            });
+        }
     }
 
     /// `Some(())` when a higher-priority vehicle is approaching `node` from a
@@ -282,7 +405,7 @@ impl NetWorld {
                 }
                 let o_dist = self.network.lane(o.lane).length - o.position;
                 if o_dist < my_dist {
-                    let gap = my_dist - o_dist;
+                    let gap = my_dist - o_dist - o.driver.vehicle_length;
                     if best.is_none_or(|b| gap < b.gap) {
                         best = Some(Obstacle { gap, speed: o.speed });
                     }
@@ -292,7 +415,7 @@ impl NetWorld {
         best
     }
 
-    fn advance_across_nodes(&self, veh: &mut NetVehicle, now: f64) -> bool {
+    fn advance_across_nodes(&self, veh: &mut NetVehicle, now: f64, front: &mut HashMap<u32, f64>) -> bool {
         for _ in 0..8 {
             let lane = *self.network.lane(veh.lane);
             if veh.position < lane.length {
@@ -301,6 +424,13 @@ impl NetWorld {
             match self.intended_movement(veh) {
                 Some(mid) if self.network.movement_state(mid, now).is_go() => {
                     let to_lane = self.network.movement(mid).to_lane;
+                    // `front` holds the nearest occupied rear; the crosser lands at
+                    // ~0, so require that rear to be at least min_gap ahead.
+                    if front.get(&to_lane.0).is_some_and(|&rear| rear < veh.driver.min_gap) {
+                        veh.position = lane.length; // entrance occupied — hold at the line
+                        veh.speed = 0.0;
+                        return true;
+                    }
                     veh.position -= lane.length;
                     veh.lane = to_lane;
                     veh.stopped_at = None;
@@ -650,6 +780,101 @@ mod tests {
         }
         assert!(min_gap > 2.0, "vehicles overlapped at the merge: min gap {min_gap}");
         assert_eq!(world.exited(), 2, "both should clear the merge");
+    }
+
+    fn straight_link(length: f64) -> Network {
+        OsmMap {
+            nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, length, 0.0)],
+            links: vec![LinkSpec::oneway(1, 2, 1, 40.0)],
+        }
+        .build()
+    }
+
+    #[test]
+    fn reaction_delay_causes_start_up_lag() {
+        // A follower behind a leader that accelerates away travels less over the
+        // same window when it has a reaction delay (it's slow to notice the gap
+        // opening) — realistic start-up lost time — and never crashes.
+        let distance_travelled = |reaction: f64| {
+            let mut w = NetWorld::new(straight_link(6000.0), cfg());
+            let base = DriverConfig { accel_noise: 0.0, reaction_time: reaction, desired_speed: 25.0, ..DriverConfig::car() };
+            w.spawn(1, LaneId(0), 20.0, 0.0, base); // leader just ahead, from rest
+            w.spawn(2, LaneId(0), 0.0, 0.0, base); // follower from rest
+            for _ in 0..200 {
+                w.step();
+            }
+            (w.vehicle(2).map(|v| v.position).unwrap_or(0.0), w.vehicle(1).is_some() && w.vehicle(2).is_some())
+        };
+        let (delayed, ok_d) = distance_travelled(0.8);
+        let (instant, ok_i) = distance_travelled(0.0);
+        assert!(ok_d && ok_i, "neither should crash");
+        assert!(delayed > 0.0 && instant > 0.0);
+        assert!(delayed < instant, "reaction delay should lag start-up: {delayed} vs {instant}");
+    }
+
+    #[test]
+    fn acceleration_noise_keeps_speed_just_below_desired() {
+        let steady = |noise: f64| {
+            let mut w = NetWorld::new(straight_link(20000.0), cfg());
+            let d = DriverConfig { desired_speed: 20.0, accel_noise: noise, reaction_time: 0.0, ..DriverConfig::car() };
+            w.spawn(1, LaneId(0), 0.0, 20.0, d);
+            let (mut sum, mut n) = (0.0, 0);
+            for t in 0..1000 {
+                w.step();
+                if t >= 800 {
+                    if let Some(v) = w.vehicle(1) {
+                        sum += v.speed;
+                        n += 1;
+                    }
+                }
+            }
+            sum / n as f64
+        };
+        let without = steady(0.0);
+        let with = steady(0.4);
+        assert!((without - 20.0).abs() < 0.1, "noiseless reaches desired: {without}");
+        assert!(with < without - 0.1 && with > 15.0, "noise slows a little: {with}");
+    }
+
+    #[test]
+    fn overlapping_vehicles_crash_and_leave_the_road() {
+        let mut w = NetWorld::new(straight_link(1000.0), cfg());
+        w.spawn(1, LaneId(0), 100.0, 5.0, DriverConfig::car());
+        w.spawn(2, LaneId(0), 99.0, 5.0, DriverConfig::car()); // deep overlap into the leader
+        w.step();
+        assert_eq!(w.crashed(), 2);
+        assert_eq!(w.vehicles().len(), 0);
+    }
+
+    #[test]
+    fn mixed_class_traffic_does_not_crash_under_sustained_demand() {
+        // Regression for the length-convention bug: a follower must reserve the
+        // *leader's* length, and spawns/crossings must respect a long vehicle's
+        // rear — otherwise cars overlap trucks/buses. Runs a busy grid with a
+        // car/truck/bus mix and asserts nobody crashes.
+        use super::super::demand::{DemandGenerator, OdPair};
+        let net = super::super::map::millbrae_sample();
+        let mut w = NetWorld::new(net, cfg());
+        let n = w.network.links.len();
+        let mut pairs = Vec::new();
+        for o in 0..n {
+            for d in 0..n {
+                if o != d {
+                    if let Some(r) = w.network.route_links(LinkId(o as u32), LinkId(d as u32)) {
+                        if r.len() >= 3 {
+                            pairs.push(OdPair { origin: LinkId(o as u32), dest: LinkId(d as u32), rate_per_sec: 0.3 });
+                        }
+                    }
+                }
+            }
+        }
+        let mut demand = DemandGenerator::new(&w, &pairs, 1);
+        for _ in 0..1500 {
+            demand.step(&mut w, 0.2);
+            w.step();
+        }
+        assert!(demand.spawned() > 100, "scenario should be busy: {}", demand.spawned());
+        assert_eq!(w.crashed(), 0, "mixed-class traffic should not crash");
     }
 
     #[test]

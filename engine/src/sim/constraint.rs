@@ -15,6 +15,14 @@
 
 use super::config::DriverConfig;
 use super::idm;
+use super::rng::{self, Stream};
+
+/// One-sided acceleration jitter in `[-sigma, 0]`, added after the binding
+/// acceleration to model imperfect throttle/hesitation. It never *raises*
+/// acceleration, so it can't turn a safe following distance into a collision.
+pub fn accel_noise(sigma: f64, seed: u64, agent_id: u32, tick: u64) -> f64 {
+    -sigma * rng::uniform01(seed, agent_id, tick, Stream::AccelNoise)
+}
 
 /// A leader (moving or stationary) ahead in the vehicle's path.
 #[derive(Clone, Copy, Debug)]
@@ -198,6 +206,17 @@ mod tests {
         assert!(merge_yield(&c).is_infinite());
         c.merge = Some(Obstacle { gap: 6.0, speed: 6.0 });
         assert!(merge_yield(&c) < desired_speed(&c));
+    }
+
+    #[test]
+    fn accel_noise_is_nonpositive_and_bounded() {
+        for tick in 0..1000u64 {
+            let n = accel_noise(0.3, 7, 42, tick);
+            assert!((-0.3..=0.0).contains(&n), "noise {n} out of range");
+        }
+        // varies over time, and is reproducible for a fixed (seed, agent, tick)
+        assert_ne!(accel_noise(0.3, 7, 42, 1), accel_noise(0.3, 7, 42, 2));
+        assert_eq!(accel_noise(0.3, 7, 42, 5), accel_noise(0.3, 7, 42, 5));
     }
 
     #[test]

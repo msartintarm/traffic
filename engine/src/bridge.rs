@@ -9,10 +9,10 @@ use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 
 use crate::render::camera::Camera;
-use crate::render::scene::{brake_intensity, signal_color, signal_instance, VehicleClass};
+use crate::render::scene::{brake_intensity, class_color, class_dims, signal_color, signal_instance};
 use crate::render::{geometry, mass, Instance, StaticMesh};
 use crate::sim::clock::SimClock;
-use crate::sim::config::{DriverConfig, SimConfig};
+use crate::sim::config::{SimConfig, VehicleClass};
 use crate::sim::demand::{DemandGenerator, OdPair};
 use crate::sim::map;
 use crate::sim::net_world::NetWorld;
@@ -134,6 +134,11 @@ impl Simulation {
         self.world.vehicles().len() as u32
     }
 
+    /// Cumulative vehicles removed from the road after a collision.
+    pub fn crashed(&self) -> u32 {
+        self.world.crashed()
+    }
+
     /// `[x, y, heading, brake]` per vehicle: pose interpolated between the last
     /// two ticks by the clock's sub-tick `alpha`, and a brake-light intensity in
     /// `[0,1]` derived from deceleration.
@@ -242,21 +247,20 @@ impl Simulation {
     /// shader interpolates by `alpha`), class size/colour, and brake intensity.
     pub fn render_instances(&self) -> Vec<u8> {
         let dt = self.clock.dt() as f32;
-        let dims = VehicleClass::Car.dims();
-        let color = VehicleClass::Car.body_color();
         let instances: Vec<Instance> = self
             .world
             .vehicles()
             .iter()
             .map(|v| {
+                let class = VehicleClass::from_length(v.driver.vehicle_length);
                 let c = self.world.network.lane_point(v.lane, v.position);
                 let (cx, cy, ch, cs) = (c[0] as f32, c[1] as f32, c[2] as f32, v.speed as f32);
                 let [px, py, ph, ps] = self.prev.get(&v.id).copied().unwrap_or([cx, cy, ch, cs]);
                 Instance {
                     pos: [cx, cy],
                     prev_pos: [px, py],
-                    scale: dims,
-                    color,
+                    scale: class_dims(class),
+                    color: class_color(class),
                     heading: ch,
                     prev_heading: ph,
                     brake: brake_intensity((cs - ps) / dt),
@@ -382,7 +386,7 @@ fn build_demand(world: &NetWorld, seed: u64) -> DemandGenerator {
             pairs.push(OdPair { origin: o, dest: d, rate_per_sec: 0.2 });
         }
     }
-    DemandGenerator::new(world, &pairs, DriverConfig::car(), seed)
+    DemandGenerator::new(world, &pairs, seed)
 }
 
 /// Shortest signed angular difference `a → b`, so heading interpolation takes

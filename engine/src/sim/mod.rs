@@ -19,7 +19,7 @@ pub mod vehicle;
 pub mod world;
 
 pub use clock::{PlayState, SimClock};
-pub use config::{DriverConfig, SimConfig};
+pub use config::{DriverConfig, SimConfig, VehicleClass};
 pub use demand::{DemandGenerator, OdPair};
 pub use map::OsmMap;
 pub use net_world::{NetVehicle, NetWorld};

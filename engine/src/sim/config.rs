@@ -16,6 +16,12 @@ pub struct DriverConfig {
     pub accel_exponent: f64,
     pub min_gap: f64,
     pub vehicle_length: f64,
+    /// Perception–reaction delay in seconds: the driver responds to the traffic
+    /// situation as it was this long ago (0 = the idealized instantaneous IDM).
+    pub reaction_time: f64,
+    /// Magnitude (m/s²) of one-sided acceleration jitter modelling imperfect
+    /// throttle/hesitation. Only ever reduces acceleration, so it is collision-safe.
+    pub accel_noise: f64,
 }
 
 impl DriverConfig {
@@ -28,6 +34,8 @@ impl DriverConfig {
             accel_exponent: 4.0,
             min_gap: 2.0,
             vehicle_length: 5.0,
+            reaction_time: 0.5,
+            accel_noise: 0.2,
         }
     }
 
@@ -42,6 +50,7 @@ impl DriverConfig {
             time_headway: self.time_headway * jitter(0.7, 1.3),
             max_accel: self.max_accel * jitter(0.75, 1.25),
             comfort_decel: self.comfort_decel * jitter(0.75, 1.25),
+            reaction_time: self.reaction_time * jitter(0.7, 1.3),
             ..*self
         }
     }
@@ -50,6 +59,57 @@ impl DriverConfig {
         Self {
             desired_speed: self.desired_speed.min(speed_limit),
             ..*self
+        }
+    }
+}
+
+/// Vehicle class: distinct physical size and driving envelope. Behaviour is a
+/// [`DriverConfig`] preset; larger classes accelerate/brake more gently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VehicleClass {
+    Car,
+    Truck,
+    Bus,
+}
+
+impl VehicleClass {
+    pub fn driver(self) -> DriverConfig {
+        match self {
+            VehicleClass::Car => DriverConfig::car(),
+            VehicleClass::Truck => DriverConfig {
+                desired_speed: 25.0,
+                max_accel: 0.6,
+                comfort_decel: 1.1,
+                vehicle_length: 10.0,
+                ..DriverConfig::car()
+            },
+            VehicleClass::Bus => DriverConfig {
+                desired_speed: 22.0,
+                max_accel: 0.7,
+                comfort_decel: 1.2,
+                vehicle_length: 12.0,
+                ..DriverConfig::car()
+            },
+        }
+    }
+
+    pub fn width(self) -> f64 {
+        match self {
+            VehicleClass::Car => 2.0,
+            VehicleClass::Truck => 2.5,
+            VehicleClass::Bus => 2.55,
+        }
+    }
+
+    /// Classify a vehicle by its length so the renderer can size/colour it from
+    /// the per-vehicle `DriverConfig` alone (no extra stored field).
+    pub fn from_length(length: f64) -> VehicleClass {
+        if length >= 11.0 {
+            VehicleClass::Bus
+        } else if length >= 8.0 {
+            VehicleClass::Truck
+        } else {
+            VehicleClass::Car
         }
     }
 }
@@ -85,6 +145,33 @@ mod tests {
             // Length is not jittered.
             assert_eq!(d.vehicle_length, base.vehicle_length);
         }
+    }
+
+    #[test]
+    fn heavier_classes_are_slower_and_brake_more_gently() {
+        let car = VehicleClass::Car.driver();
+        let truck = VehicleClass::Truck.driver();
+        let bus = VehicleClass::Bus.driver();
+        assert!(truck.vehicle_length > car.vehicle_length);
+        assert!(bus.vehicle_length > truck.vehicle_length);
+        assert!(truck.max_accel < car.max_accel && truck.comfort_decel < car.comfort_decel);
+        assert!(truck.desired_speed < car.desired_speed);
+    }
+
+    #[test]
+    fn class_is_recovered_from_length() {
+        assert_eq!(VehicleClass::from_length(VehicleClass::Car.driver().vehicle_length), VehicleClass::Car);
+        assert_eq!(VehicleClass::from_length(VehicleClass::Truck.driver().vehicle_length), VehicleClass::Truck);
+        assert_eq!(VehicleClass::from_length(VehicleClass::Bus.driver().vehicle_length), VehicleClass::Bus);
+    }
+
+    #[test]
+    fn trucks_need_more_distance_to_stop() {
+        // Steady-following gap at 20 m/s is larger for a truck (gentler braking).
+        let v = 20.0;
+        let car_gap = super::super::idm::equilibrium_gap(&VehicleClass::Car.driver(), v);
+        let truck_gap = super::super::idm::equilibrium_gap(&VehicleClass::Truck.driver(), v);
+        assert!(truck_gap > car_gap, "truck {truck_gap} vs car {car_gap}");
     }
 
     #[test]

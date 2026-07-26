@@ -2,9 +2,23 @@
 //! lights from acceleration, signal heads from signal state, and LOD selection.
 //! Pure functions — the shader-facing counterpart of the sim's `scene`-style math.
 
+use crate::sim::config::VehicleClass;
 use crate::sim::signal::SignalState;
 
 use super::{Instance, Mesh, Vertex};
+
+/// Render `[length, width]` in metres for a vehicle class.
+pub fn class_dims(c: VehicleClass) -> [f32; 2] {
+    [c.driver().vehicle_length as f32, c.width() as f32]
+}
+
+pub fn class_color(c: VehicleClass) -> [f32; 3] {
+    match c {
+        VehicleClass::Car => [0.80, 0.82, 0.86],
+        VehicleClass::Truck => [0.86, 0.55, 0.24],
+        VehicleClass::Bus => [0.30, 0.52, 0.86],
+    }
+}
 
 /// A unit car mesh (extent ±0.5, scaled to metres per-instance): a matte body
 /// plus a red rear-lamp strip flagged `light = 1` so the shader makes it
@@ -19,32 +33,6 @@ pub fn unit_car_mesh() -> Mesh {
     }
     m.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
     m
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VehicleClass {
-    Car,
-    Truck,
-    Bus,
-}
-
-impl VehicleClass {
-    /// `[length, width]` in metres.
-    pub fn dims(self) -> [f32; 2] {
-        match self {
-            VehicleClass::Car => [4.6, 2.0],
-            VehicleClass::Truck => [10.0, 2.5],
-            VehicleClass::Bus => [12.0, 2.55],
-        }
-    }
-
-    pub fn body_color(self) -> [f32; 3] {
-        match self {
-            VehicleClass::Car => [0.80, 0.82, 0.86],
-            VehicleClass::Truck => [0.86, 0.55, 0.24],
-            VehicleClass::Bus => [0.30, 0.52, 0.86],
-        }
-    }
 }
 
 /// A vehicle as the renderer sees it: current and previous pose (for GPU
@@ -69,8 +57,8 @@ pub fn vehicle_instance(v: &VehicleView) -> Instance {
     Instance {
         pos: v.pos,
         prev_pos: v.prev_pos,
-        scale: v.class.dims(),
-        color: v.class.body_color(),
+        scale: class_dims(v.class),
+        color: class_color(v.class),
         heading: v.heading,
         prev_heading: v.prev_heading,
         brake: brake_intensity(v.accel),
@@ -131,8 +119,8 @@ mod tests {
 
     #[test]
     fn class_sizes_are_ordered() {
-        assert!(VehicleClass::Truck.dims()[0] > VehicleClass::Car.dims()[0]);
-        assert!(VehicleClass::Bus.dims()[0] > VehicleClass::Truck.dims()[0]);
+        assert!(class_dims(VehicleClass::Truck)[0] > class_dims(VehicleClass::Car)[0]);
+        assert!(class_dims(VehicleClass::Bus)[0] > class_dims(VehicleClass::Truck)[0]);
     }
 
     #[test]
@@ -148,7 +136,7 @@ mod tests {
         let inst = vehicle_instance(&v);
         assert_eq!(inst.pos, [10.0, 5.0]);
         assert_eq!(inst.prev_pos, [9.0, 5.0]);
-        assert_eq!(inst.scale, VehicleClass::Car.dims());
+        assert_eq!(inst.scale, class_dims(VehicleClass::Car));
         assert!(inst.brake > 0.0);
     }
 

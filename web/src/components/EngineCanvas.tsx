@@ -30,6 +30,8 @@ type Sim = {
   set_meters_per_pixel(mpp: number): void;
   meters_per_pixel(): number;
   camera_params(): Float32Array;
+  vehicle_count(): number;
+  crashed(): number;
   play(): void;
   pause(): void;
   set_speed(s: number): void;
@@ -57,6 +59,7 @@ export default function EngineCanvas() {
   const simRef = useRef<Sim | null>(null);
   const sceneRef = useRef<Scene | null>(null);
   const sliderRef = useRef<HTMLInputElement>(null);
+  const statsRef = useRef<HTMLSpanElement>(null);
   const fitMppRef = useRef(1);
   const [ready, setReady] = useState(false);
   const [playing, setPlaying] = useState(true);
@@ -174,6 +177,9 @@ export default function EngineCanvas() {
             const t = Math.log(sim.meters_per_pixel() / fitMppRef.current) / Math.log(1 / ZOOM_RANGE);
             sliderRef.current.value = String(Math.round(Math.min(1, Math.max(0, t)) * 1000));
           }
+          if (statsRef.current) {
+            statsRef.current.textContent = `${sim.vehicle_count()} vehicles · ${sim.crashed()} crashed`;
+          }
           raf = requestAnimationFrame(draw);
         };
         raf = requestAnimationFrame(draw);
@@ -234,6 +240,7 @@ export default function EngineCanvas() {
         </button>
         {!ready && !error && <span style={{ opacity: 0.6 }}>loading engine…</span>}
         {ready && <span style={{ opacity: 0.5, fontSize: 12 }}>{backend} · {mapLabel}</span>}
+        {ready && <span ref={statsRef} style={{ opacity: 0.7, fontSize: 12 }} />}
         {error && <span style={{ color: "#ff7b72" }}>engine failed: {error}</span>}
       </div>
       <p style={{ margin: "0 0 8px", opacity: 0.5, fontSize: 12 }}>

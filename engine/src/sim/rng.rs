@@ -9,6 +9,7 @@ pub enum Stream {
     DriverProfile = 0,
     GapAcceptance = 1,
     RouteChoice = 2,
+    AccelNoise = 3,
 }
 
 #[inline]

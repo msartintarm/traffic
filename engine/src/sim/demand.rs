@@ -4,7 +4,7 @@
 //! so spawns are Bernoulli per tick without threaded state. Congestion-reactive
 //! re-routing (recomputing the route against live travel times) plugs in later.
 
-use super::config::DriverConfig;
+use super::config::VehicleClass;
 use super::net_world::NetWorld;
 use super::network::LinkId;
 use super::rng::{self, Stream};
@@ -17,7 +17,6 @@ pub struct OdPair {
 
 pub struct DemandGenerator {
     routed: Vec<(f64, Vec<LinkId>)>,
-    driver: DriverConfig,
     seed: u64,
     tick: u64,
     next_id: u32,
@@ -25,12 +24,12 @@ pub struct DemandGenerator {
 }
 
 impl DemandGenerator {
-    pub fn new(world: &NetWorld, pairs: &[OdPair], driver: DriverConfig, seed: u64) -> Self {
+    pub fn new(world: &NetWorld, pairs: &[OdPair], seed: u64) -> Self {
         let routed = pairs
             .iter()
             .filter_map(|p| world.network.route_links(p.origin, p.dest).map(|r| (p.rate_per_sec, r)))
             .collect();
-        Self { routed, driver, seed, tick: 0, next_id: 0, spawned: 0 }
+        Self { routed, seed, tick: 0, next_id: 0, spawned: 0 }
     }
 
     pub fn spawned(&self) -> u32 {
@@ -42,7 +41,7 @@ impl DemandGenerator {
             let (rate, route) = &self.routed[i];
             let p = (rate * dt).min(1.0);
             if rng::uniform01(self.seed, i as u32, self.tick, Stream::RouteChoice) < p {
-                let driver = self.driver.sample(self.seed, self.next_id);
+                let driver = class_of(self.seed, self.next_id).driver().sample(self.seed, self.next_id);
                 if world.spawn_routed(self.next_id, route.clone(), 5.0, driver) {
                     self.spawned += 1;
                 }
@@ -50,6 +49,15 @@ impl DemandGenerator {
             }
         }
         self.tick += 1;
+    }
+}
+
+/// Vehicle-class mix: mostly cars, some trucks, a few buses.
+fn class_of(seed: u64, id: u32) -> VehicleClass {
+    match rng::uniform01(seed, id, 0, Stream::DriverProfile) {
+        u if u < 0.85 => VehicleClass::Car,
+        u if u < 0.97 => VehicleClass::Truck,
+        _ => VehicleClass::Bus,
     }
 }
 
@@ -76,15 +84,17 @@ mod tests {
         let net = corridor().build();
         let mut world = NetWorld::new(net, SimConfig::default_config());
         let pairs = [OdPair { origin: LinkId(0), dest: LinkId(1), rate_per_sec: 0.4 }];
-        let mut demand = DemandGenerator::new(&world, &pairs, DriverConfig::car(), 7);
+        let mut demand = DemandGenerator::new(&world, &pairs, 7);
 
         for _ in 0..300 {
             demand.step(&mut world, 0.2);
             world.step();
         }
 
-        assert!(demand.spawned() >= 12 && demand.spawned() <= 36,
-            "≈0.4/s over 60 s, got {}", demand.spawned());
+        // A class mix (slow trucks/buses) throttles a single entrance, so a
+        // sustained-but-below-demand stream is the realistic outcome.
+        assert!(demand.spawned() >= 8 && demand.spawned() <= 36,
+            "≈0.4/s over 60 s, throttled by the entrance, got {}", demand.spawned());
         assert!(world.exited() > 0, "spawned vehicles should reach the destination");
     }
 }
