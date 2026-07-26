@@ -17,7 +17,7 @@ fn unit_perp(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
     [dy / len, -dx / len]
 }
 
-fn corners(a: [f64; 2], b: [f64; 2], half_w: f64) -> [[f32; 2]; 4] {
+pub(crate) fn corners(a: [f64; 2], b: [f64; 2], half_w: f64) -> [[f32; 2]; 4] {
     let n = unit_perp(a, b);
     let off = [n[0] * half_w, n[1] * half_w];
     [

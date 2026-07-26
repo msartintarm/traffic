@@ -9,19 +9,23 @@ use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 
 use crate::render::camera::Camera;
-use crate::render::scene::{brake_intensity, signal_color, VehicleClass};
-use crate::render::{geometry, Instance};
+use crate::render::scene::{brake_intensity, signal_color, signal_instance, VehicleClass};
+use crate::render::{geometry, mass, Instance, Vertex};
 use crate::sim::clock::SimClock;
 use crate::sim::config::{DriverConfig, SimConfig};
+use crate::sim::demand::{DemandGenerator, OdPair};
 use crate::sim::map;
 use crate::sim::net_world::NetWorld;
-use crate::sim::network::{LaneId, NodeControl, LANE_WIDTH};
+use crate::sim::network::{LinkId, Network, NodeControl, LANE_WIDTH};
+use crate::sim::rng::{hash, Stream};
 
 #[wasm_bindgen]
 pub struct Simulation {
     world: NetWorld,
     clock: SimClock,
     seed: u64,
+    demand: DemandGenerator,
+    camera: Camera,
     /// `[x, y, heading, speed]` of each vehicle one tick ago, keyed by id, so the
     /// render interpolates pose between committed states (smooth at 60fps) and
     /// derives brake lights from the speed delta.
@@ -32,15 +36,67 @@ pub struct Simulation {
 impl Simulation {
     #[wasm_bindgen(constructor)]
     pub fn new(seed: u32) -> Simulation {
+        Self::assemble(map::millbrae_sample(), seed)
+    }
+
+    /// Load a network scraped by `tools/osm-scraper` (its JSON schema) and drive
+    /// origin–destination demand across it. Requires the `import` feature.
+    #[cfg(feature = "import")]
+    pub fn from_map_json(json: &str, seed: u32) -> Result<Simulation, JsValue> {
+        let map = map::OsmMap::from_json(json).map_err(|e| JsValue::from_str(&e))?;
+        Ok(Self::assemble(map.build(), seed))
+    }
+
+    fn assemble(network: Network, seed: u32) -> Simulation {
         let cfg = SimConfig { seed: seed as u64, ..SimConfig::default_config() };
-        let mut world = NetWorld::new(map::millbrae_sample(), cfg);
-        let driver = DriverConfig::car();
-        for i in 0..64u32 {
-            world.spawn(i, LaneId(i % 4), (i as f64) * 12.0 % 180.0, 8.0, driver.sample(cfg.seed, i));
-        }
+        let camera = Camera::fit_bounds(network.bounds(), [900.0, 600.0], 24.0);
+        let world = NetWorld::new(network, cfg);
+        let demand = build_demand(&world, cfg.seed);
         let mut clock = SimClock::new(&cfg);
         clock.play();
-        Simulation { world, clock, seed: cfg.seed, prev: HashMap::new() }
+        Simulation { world, clock, seed: cfg.seed, demand, camera, prev: HashMap::new() }
+    }
+
+    // --- camera control -------------------------------------------------------
+
+    pub fn set_viewport(&mut self, width: f32, height: f32) {
+        self.camera.viewport = [width as f64, height as f64];
+    }
+
+    /// Reset to a whole-network fit for the current viewport.
+    pub fn fit(&mut self) {
+        self.camera = Camera::fit_bounds(self.world.network.bounds(), self.camera.viewport, 24.0);
+    }
+
+    /// Pan by a drag delta in canvas pixels.
+    pub fn pan_pixels(&mut self, dx: f32, dy: f32) {
+        self.camera.pan_pixels(dx as f64, dy as f64);
+    }
+
+    /// Zoom by `factor` (<1 zooms in) about a canvas pixel (mouse wheel).
+    pub fn zoom_at(&mut self, factor: f32, sx: f32, sy: f32) {
+        self.camera.zoom_at(factor as f64, [sx as f64, sy as f64]);
+    }
+
+    pub fn set_meters_per_pixel(&mut self, mpp: f32) {
+        self.camera.meters_per_pixel = (mpp as f64).clamp(0.02, 10_000.0);
+    }
+
+    pub fn meters_per_pixel(&self) -> f32 {
+        self.camera.meters_per_pixel as f32
+    }
+
+    /// `[center_x, center_y, meters_per_pixel, viewport_w, viewport_h]` for the
+    /// 2D fallback transform.
+    pub fn camera_params(&self) -> Vec<f32> {
+        [
+            self.camera.center[0] as f32,
+            self.camera.center[1] as f32,
+            self.camera.meters_per_pixel as f32,
+            self.camera.viewport[0] as f32,
+            self.camera.viewport[1] as f32,
+        ]
+        .to_vec()
     }
 
     pub fn play(&mut self) {
@@ -56,15 +112,19 @@ impl Simulation {
     }
 
     pub fn single_step(&mut self) {
+        let dt = self.clock.dt();
         self.clock.single_step();
+        self.demand.step(&mut self.world, dt);
         self.world.step();
         self.prev = self.snapshot(); // discrete step: show the new state directly
     }
 
     pub fn advance(&mut self, real_elapsed_secs: f64) -> u32 {
         let ticks = self.clock.advance(real_elapsed_secs, 240);
+        let dt = self.clock.dt();
         for _ in 0..ticks {
             self.prev = self.snapshot(); // state before this tick
+            self.demand.step(&mut self.world, dt); // stream routed vehicles in
             self.world.step();
         }
         ticks
@@ -162,12 +222,9 @@ impl Simulation {
         mesh
     }
 
-    /// Column-major 4×4 view-projection fitting the whole network into a
-    /// `width`×`height` viewport.
-    pub fn view_proj(&self, width: f32, height: f32) -> Vec<f32> {
-        Camera::fit_bounds(self.world.network.bounds(), [width as f64, height as f64], 24.0)
-            .view_proj()
-            .to_vec()
+    /// Column-major 4×4 view-projection for the current camera.
+    pub fn view_proj(&self) -> Vec<f32> {
+        self.camera.view_proj().to_vec()
     }
 
     pub fn alpha(&self) -> f32 {
@@ -207,6 +264,64 @@ impl Simulation {
         self.world.vehicles().len() as u32
     }
 
+    /// Signal heads as raw `Instance` bytes for the emissive-disc draw.
+    pub fn signal_instances(&self) -> Vec<u8> {
+        bytemuck::cast_slice(&self.signal_instance_vec()).to_vec()
+    }
+
+    pub fn signal_instance_count(&self) -> u32 {
+        self.signal_instance_vec().len() as u32
+    }
+
+    /// Translucent congestion-overlay triangles for the far-LOD density view:
+    /// per-link carriageway quads coloured by live occupancy, emitted only for
+    /// links busy enough to matter. Flat `Vertex` floats (6 per vertex); vertex
+    /// count is `len / 6`.
+    pub fn density_vertices(&self) -> Vec<f32> {
+        let net = &self.world.network;
+        let mut count = vec![0u32; net.links.len()];
+        for v in self.world.vehicles() {
+            count[net.lane(v.lane).link.idx()] += 1;
+        }
+        let mut verts: Vec<Vertex> = Vec::new();
+        for (i, s) in net.road_strips().iter().enumerate() {
+            let link = net.link(LinkId(i as u32));
+            let lane = net.lane(link.lane_start);
+            let jam = (lane.length / 7.0 * link.lane_count as f64).max(1.0);
+            let ratio = mass::occupancy_ratio(count[i] as f64, jam);
+            if ratio < 0.15 {
+                continue;
+            }
+            let c = mass::congestion_color(ratio);
+            let color = [c[0], c[1], c[2]];
+            let quad = geometry::corners([s[0], s[1]], [s[2], s[3]], s[4] / 2.0);
+            for idx in [0, 1, 2, 0, 2, 3] {
+                verts.push(Vertex { pos: quad[idx], color, light: 3.0 });
+            }
+        }
+        bytemuck::cast_slice(&verts).to_vec()
+    }
+
+    fn signal_instance_vec(&self) -> Vec<Instance> {
+        let net = &self.world.network;
+        let states = net.signal_states(self.world.time());
+        let mut out = Vec::new();
+        for node in &net.nodes {
+            let NodeControl::Signalized(program) = node.control else { continue };
+            let mut k = 0usize;
+            for (gi, g) in net.groups.iter().enumerate() {
+                if g.program != program {
+                    continue;
+                }
+                let ang = std::f32::consts::TAU * k as f32 / 4.0;
+                let pos = [node.position[0] as f32 + 6.0 * ang.cos(), node.position[1] as f32 + 6.0 * ang.sin()];
+                out.push(signal_instance(pos, 1.6, states[gi]));
+                k += 1;
+            }
+        }
+        out
+    }
+
     fn snapshot(&self) -> HashMap<u32, [f32; 4]> {
         self.world
             .vehicles()
@@ -236,6 +351,28 @@ impl Simulation {
     pub fn seed(&self) -> f64 {
         self.seed as f64
     }
+}
+
+/// Sample origin–destination pairs whose routes cross at least one intersection,
+/// so the scenario shows continuous traffic flowing through the network.
+fn build_demand(world: &NetWorld, seed: u64) -> DemandGenerator {
+    let net: &Network = &world.network;
+    let link_count = net.links.len().max(1) as u64;
+    let pick = |salt: u32, attempt: u64| LinkId((hash(seed, salt, attempt, Stream::RouteChoice) % link_count) as u32);
+
+    let mut pairs = Vec::new();
+    let mut attempt = 0u64;
+    while pairs.len() < 32 && attempt < 2000 {
+        let (o, d) = (pick(1, attempt), pick(2, attempt));
+        attempt += 1;
+        if o == d {
+            continue;
+        }
+        if net.route_links(o, d).is_some_and(|r| r.len() >= 3) {
+            pairs.push(OdPair { origin: o, dest: d, rate_per_sec: 0.2 });
+        }
+    }
+    DemandGenerator::new(world, &pairs, DriverConfig::car(), seed)
 }
 
 /// Shortest signed angular difference `a → b`, so heading interpolation takes

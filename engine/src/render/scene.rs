@@ -78,6 +78,23 @@ pub fn vehicle_instance(v: &VehicleView) -> Instance {
     }
 }
 
+/// A unit emissive disc (radius 1, scaled per-instance) for signal heads;
+/// `light = 1` so the shader renders it fully lit in the instance colour.
+pub fn signal_head_mesh() -> Mesh {
+    const SIDES: usize = 10;
+    let white = [1.0, 1.0, 1.0];
+    let mut m = Mesh::default();
+    m.vertices.push(Vertex::lamp([0.0, 0.0], white, 1.0));
+    for k in 0..SIDES {
+        let a = std::f64::consts::TAU * k as f64 / SIDES as f64;
+        m.vertices.push(Vertex::lamp([a.cos() as f32, a.sin() as f32], white, 1.0));
+    }
+    for k in 0..SIDES as u32 {
+        m.indices.extend([0, 1 + k, 1 + (k + 1) % SIDES as u32]);
+    }
+    m
+}
+
 pub fn signal_color(state: SignalState) -> [f32; 3] {
     match state {
         SignalState::Red => [0.90, 0.11, 0.11],
@@ -141,6 +158,13 @@ mod tests {
         assert!(m.vertices.iter().any(|v| v.light == 0.0), "has matte body");
         assert!(m.vertices.iter().any(|v| v.light == 1.0), "has a brake lamp");
         assert_eq!(m.indices.len(), 12); // two quads
+    }
+
+    #[test]
+    fn signal_head_mesh_is_an_emissive_disc() {
+        let m = signal_head_mesh();
+        assert!(m.vertices.iter().all(|v| v.light == 1.0));
+        assert!(m.indices.len() >= 3 && m.indices.len() % 3 == 0);
     }
 
     #[test]

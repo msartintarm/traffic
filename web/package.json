@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "wasm:build": "cd ../engine && wasm-pack build --target web --out-dir ../web/public/wasm-pkg --out-name engine",
+    "wasm:build": "cd ../engine && wasm-pack build --target web --out-dir ../web/public/wasm-pkg --out-name engine -- --features import",
     "predev": "npm run wasm:build",
     "dev": "next dev -p 3000",
     "prebuild": "npm run wasm:build",

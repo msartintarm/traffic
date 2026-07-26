@@ -72,5 +72,8 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
         let e = 0.15 + 0.85 * in.brake;
         return vec4<f32>(in.color * e, 1.0);
     }
-    return vec4<f32>(in.color * 0.7, 1.0);
+    if (in.light < 2.5) {
+        return vec4<f32>(in.color * 0.7, 1.0);
+    }
+    return vec4<f32>(in.color, 0.55); // congestion overlay (translucent)
 }

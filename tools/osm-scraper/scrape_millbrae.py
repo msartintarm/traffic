@@ -28,6 +28,7 @@ import argparse
 import json
 import math
 import os
+import urllib.parse
 import urllib.request
 from collections import defaultdict
 
@@ -58,11 +59,16 @@ def overpass_query(bbox):
 
 
 def fetch(bbox):
-    data = urllib.request.urlopen(
-        urllib.request.Request(OVERPASS_URL, data=overpass_query(bbox).encode()),
-        timeout=90,
-    ).read()
-    return json.loads(data)
+    req = urllib.request.Request(
+        OVERPASS_URL,
+        data=urllib.parse.urlencode({"data": overpass_query(bbox)}).encode(),
+        headers={
+            "User-Agent": "traffic-sim-osm-scraper/0.1 (github traffic sim)",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+    )
+    return json.loads(urllib.request.urlopen(req, timeout=90).read())
 
 
 def parse_speed_mps(tags, highway):

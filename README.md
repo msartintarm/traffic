@@ -58,8 +58,10 @@ via a stateless counter-based RNG plus a fixed timestep. Correctness is asserted
   - `src/render/` — rendering, plant-style split: pure, native-tested math
     (`camera` pan/zoom/view-proj, `geometry` road/junction/marking meshes +
     turn-arc splines, `scene` instances/LOD/brake-lights/signal-heads, `mass`
-    congestion colouring) and a `naga`-validated `scene.wgsl` (static + instanced
-    with GPU-side interpolation). The wgpu device loop is the remaining wasm piece.
+    congestion colouring), a `naga`-validated `scene.wgsl` (static + instanced
+    with GPU-side interpolation), and `gpu.rs` — the `wgpu` device/surface/frame
+    loop (`Renderer`, wasm32-only) that uploads the baked world mesh once and
+    instance-draws vehicles, WebGPU with WebGL2 fallback.
   - `src/bridge.rs` — `wasm-bindgen` entry (`Simulation`), wasm32 only
 - `web/` — Next.js app (static export) that loads the wasm and renders in-browser
 - `tools/osm-scraper/` — Overpass scraper emitting the `OsmMap` JSON for Millbrae
@@ -96,17 +98,22 @@ npm run dev        # predev builds the wasm via wasm-pack
 Requires `wasm-pack` (`cargo install wasm-pack`). The page loads
 `Simulation`, ticks it each animation frame, and draws vehicle instances.
 
-## Import Millbrae
+## Import a real map (Millbrae)
+
+Scrape OpenStreetMap into the web app's map slot; the browser loads it
+automatically on next run, and origin–destination demand streams routed vehicles
+across its real intersections (falling back to `millbrae_sample()` if absent):
 
 ```
-cd tools/osm-scraper
-python3 scrape_millbrae.py --bbox-file bbox.local --out millbrae.json
+python3 tools/osm-scraper/scrape_millbrae.py --bbox S W N E --out web/public/map.json
+cd web && npm run dev            # serves /map.json; app prefers it over the sample
 ```
 
 The bounding box is an input, never checked in (flag, gitignored file, or
-`TRAFFIC_BBOX`). See that tool's README for the JSON schema — it lines up 1:1 with `NodeSpec` /
-`LinkSpec`. A small serde loader (behind a cargo feature) is the remaining step
-to swap `millbrae_sample()` for the scraped extract.
+`TRAFFIC_BBOX`), and `web/public/map.json` is gitignored (its `meta` carries real
+coordinates). `Simulation::from_map_json` (wasm, `--features import`) parses the
+scraper's JSON — field names line up 1:1 with `NodeSpec`/`LinkSpec` — and
+`build_demand` samples OD pairs whose routes cross ≥1 intersection.
 
 ## Build order / roadmap
 
@@ -124,5 +131,10 @@ to swap `millbrae_sample()` for the scraped extract.
    equal to the CPU reference on a software Vulkan adapter (`--features gpu`).
 9. ⏳ Scale the GPU runner to the whole network (per-link cell arrays) and profile
    toward 1M+; expose it through the browser bridge via WebGPU.
-10. ⏳ WebGPU **instanced renderer** for the micro layer (port `../plant`'s pipeline).
-11. ⏳ Couple the layers: promote mass-layer cells to micro vehicles near the camera.
+10. ✅ WebGPU **instanced renderer** (`render/gpu.rs`, WebGL2 fallback): baked world
+    mesh + instanced vehicles with GPU interpolation and brake lights; 2D canvas
+    retained as fallback. Data path verified; pixels need in-browser confirmation.
+11. ✅ Interactive camera (mouse-wheel zoom, zoom slider, right-drag pan, Fit) and a
+    translucent per-link **congestion overlay** (occupancy → colour) in the GPU
+    renderer; GPU signal heads. Remaining: camera tilt + day-night.
+12. ⏳ Couple the layers: promote mass-layer cells to micro vehicles near the camera.

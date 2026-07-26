@@ -36,6 +36,13 @@ pub struct Renderer {
     car_index_count: u32,
     inst_buf: wgpu::Buffer,
     inst_capacity: u64,
+    signal_vbuf: wgpu::Buffer,
+    signal_ibuf: wgpu::Buffer,
+    signal_index_count: u32,
+    signal_inst_buf: wgpu::Buffer,
+    signal_inst_capacity: u64,
+    density_vbuf: wgpu::Buffer,
+    density_capacity: u64,
     world: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
 }
 
@@ -165,13 +172,18 @@ impl Renderer {
         let car_vbuf = buffer_init(&device, "car-v", bytemuck::cast_slice(&car.vertices), wgpu::BufferUsages::VERTEX);
         let car_ibuf = buffer_init(&device, "car-i", bytemuck::cast_slice(&car.indices), wgpu::BufferUsages::INDEX);
 
-        let inst_capacity = 4096 * std::mem::size_of::<Instance>() as u64;
-        let inst_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("instances"),
-            size: inst_capacity,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let inst_stride = std::mem::size_of::<Instance>() as u64;
+        let inst_capacity = 4096 * inst_stride;
+        let inst_buf = instance_buffer(&device, inst_capacity);
+
+        let signal = scene::signal_head_mesh();
+        let signal_vbuf = buffer_init(&device, "sig-v", bytemuck::cast_slice(&signal.vertices), wgpu::BufferUsages::VERTEX);
+        let signal_ibuf = buffer_init(&device, "sig-i", bytemuck::cast_slice(&signal.indices), wgpu::BufferUsages::INDEX);
+        let signal_inst_capacity = 256 * inst_stride;
+        let signal_inst_buf = instance_buffer(&device, signal_inst_capacity);
+
+        let density_capacity = 8192 * std::mem::size_of::<Vertex>() as u64;
+        let density_vbuf = instance_buffer(&device, density_capacity);
 
         Ok(Renderer {
             surface,
@@ -187,6 +199,13 @@ impl Renderer {
             car_index_count: car.indices.len() as u32,
             inst_buf,
             inst_capacity,
+            signal_vbuf,
+            signal_ibuf,
+            signal_index_count: signal.indices.len() as u32,
+            signal_inst_buf,
+            signal_inst_capacity,
+            density_vbuf,
+            density_capacity,
             world: None,
         })
     }
@@ -210,7 +229,17 @@ impl Renderer {
     /// Draw a frame. `view_proj` is a 16-element column-major matrix, `alpha` the
     /// sub-tick blend, `instances` the raw `Instance` bytes, `count` the vehicle
     /// count.
-    pub fn render(&mut self, view_proj: Vec<f32>, alpha: f32, instances: Vec<u8>, count: u32) {
+    pub fn render(
+        &mut self,
+        view_proj: Vec<f32>,
+        alpha: f32,
+        instances: Vec<u8>,
+        count: u32,
+        signals: Vec<u8>,
+        signal_count: u32,
+        density: Vec<f32>,
+        density_count: u32,
+    ) {
         let mut cam = [0f32; 20];
         cam[..16].copy_from_slice(&view_proj);
         cam[16] = alpha;
@@ -219,14 +248,24 @@ impl Renderer {
         if !instances.is_empty() {
             if instances.len() as u64 > self.inst_capacity {
                 self.inst_capacity = (instances.len() as u64).next_power_of_two();
-                self.inst_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("instances"),
-                    size: self.inst_capacity,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
+                self.inst_buf = instance_buffer(&self.device, self.inst_capacity);
             }
             self.queue.write_buffer(&self.inst_buf, 0, &instances);
+        }
+        if !signals.is_empty() {
+            if signals.len() as u64 > self.signal_inst_capacity {
+                self.signal_inst_capacity = (signals.len() as u64).next_power_of_two();
+                self.signal_inst_buf = instance_buffer(&self.device, self.signal_inst_capacity);
+            }
+            self.queue.write_buffer(&self.signal_inst_buf, 0, &signals);
+        }
+        if !density.is_empty() {
+            let bytes: &[u8] = bytemuck::cast_slice(&density);
+            if bytes.len() as u64 > self.density_capacity {
+                self.density_capacity = (bytes.len() as u64).next_power_of_two();
+                self.density_vbuf = instance_buffer(&self.device, self.density_capacity);
+            }
+            self.queue.write_buffer(&self.density_vbuf, 0, bytes);
         }
 
         let frame = match self.surface.get_current_texture() {
@@ -260,12 +299,26 @@ impl Renderer {
                 pass.draw_indexed(0..*icount, 0, 0..1);
             }
 
+            if density_count > 0 {
+                pass.set_pipeline(&self.static_pipeline);
+                pass.set_vertex_buffer(0, self.density_vbuf.slice(..));
+                pass.draw(0..density_count, 0..1);
+            }
+
             if count > 0 {
                 pass.set_pipeline(&self.instanced_pipeline);
                 pass.set_vertex_buffer(0, self.car_vbuf.slice(..));
                 pass.set_vertex_buffer(1, self.inst_buf.slice(..));
                 pass.set_index_buffer(self.car_ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..self.car_index_count, 0, 0..count);
+            }
+
+            if signal_count > 0 {
+                pass.set_pipeline(&self.instanced_pipeline);
+                pass.set_vertex_buffer(0, self.signal_vbuf.slice(..));
+                pass.set_vertex_buffer(1, self.signal_inst_buf.slice(..));
+                pass.set_index_buffer(self.signal_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.signal_index_count, 0, 0..signal_count);
             }
         }
         self.queue.submit([encoder.finish()]);
@@ -276,6 +329,15 @@ impl Renderer {
 fn buffer_init(device: &wgpu::Device, label: &str, contents: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
     use wgpu::util::DeviceExt;
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents, usage })
+}
+
+fn instance_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("instances"),
+        size,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
 }
 
 fn err<E: std::fmt::Display>(e: E) -> JsValue {
