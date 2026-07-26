@@ -63,6 +63,15 @@ pub struct Lane {
     pub movement_count: u32,
 }
 
+/// A movement's turn direction, from the angle between the arriving and
+/// departing road directions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TurnType {
+    Through,
+    Left,
+    Right,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Movement {
     pub from_lane: LaneId,
@@ -249,6 +258,36 @@ impl Network {
         [pt[0] + n[0] * off, pt[1] + n[1] * off, dir[1].atan2(dir[0])]
     }
 
+    /// Unit direction of a link's final segment (heading as it reaches its
+    /// downstream node).
+    pub fn arrival_dir(&self, link: LinkId) -> [f64; 2] {
+        let poly = &self.polylines[link.idx()];
+        unit(sub(poly[poly.len() - 1], poly[poly.len() - 2]))
+    }
+
+    /// Unit direction of a link's first segment (heading as it leaves its
+    /// upstream node).
+    pub fn departure_dir(&self, link: LinkId) -> [f64; 2] {
+        let poly = &self.polylines[link.idx()];
+        unit(sub(poly[1], poly[0]))
+    }
+
+    /// Whether a movement goes straight, left, or right, from the signed angle
+    /// between the arriving and departing directions.
+    pub fn movement_turn(&self, mid: MovementId) -> TurnType {
+        let m = self.movement(mid);
+        let a = self.arrival_dir(self.lane(m.from_lane).link);
+        let b = self.departure_dir(self.lane(m.to_lane).link);
+        let ang = (a[0] * b[1] - a[1] * b[0]).atan2(a[0] * b[0] + a[1] * b[1]);
+        if ang > 0.5 {
+            TurnType::Left
+        } else if ang < -0.5 {
+            TurnType::Right
+        } else {
+            TurnType::Through
+        }
+    }
+
     /// Smallest turn radius (m) the lane's centreline reaches between `position`
     /// and `position + lookahead` — `f64::INFINITY` on a straight run.
     pub fn min_radius_ahead(&self, lane: LaneId, position: f64, lookahead: f64) -> f64 {
@@ -390,6 +429,21 @@ mod tests {
         let mid = net.lane_point(lane, 100.0);
         assert!((mid[0] - 100.0).abs() < 5.0 && mid[1].abs() < 5.0, "midpoint near the bend: {mid:?}");
         assert!(net.min_radius_ahead(lane, 0.0, 200.0).is_finite(), "a bend has finite radius");
+    }
+
+    #[test]
+    fn movement_turns_are_classified() {
+        // Corridor: through link 1→2 (heading +x) crossing at node 2, with exits
+        // east (2→4, straight) and north (2→5, a left turn).
+        let net = map::corridor_with_signal();
+        let through_lane = net.lanes_of(LinkId(0)).next().unwrap(); // link 1->2
+        let mut turns = std::collections::HashSet::new();
+        for k in 0..net.lane(through_lane).movement_count {
+            let mid = MovementId(net.lane(through_lane).movement_start.0 + k);
+            turns.insert(net.movement_turn(mid));
+        }
+        assert!(turns.contains(&TurnType::Through), "east exit is straight");
+        assert!(turns.contains(&TurnType::Left), "north exit is a left turn");
     }
 
     #[test]

@@ -4,3 +4,6 @@ web/.next/
 web/out/
 web/public/wasm-pkg/
 web/public/map.json
+web/*.tsbuildinfo
+__pycache__/
+*.pyc

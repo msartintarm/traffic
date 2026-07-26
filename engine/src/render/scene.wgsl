@@ -53,13 +53,18 @@ fn vs_instanced(
     @location(2) v_light: f32,
     @location(3) i_pos: vec2<f32>,
     @location(4) i_prev_pos: vec2<f32>,
-    @location(5) i_scale: vec2<f32>,
-    @location(6) i_color: vec3<f32>,
-    @location(7) i_heading: f32,
-    @location(8) i_prev_heading: f32,
-    @location(9) i_brake: f32,
+    @location(5) i_control: vec2<f32>,
+    @location(6) i_scale: vec2<f32>,
+    @location(7) i_color: vec3<f32>,
+    @location(8) i_heading: f32,
+    @location(9) i_prev_heading: f32,
+    @location(10) i_brake: f32,
 ) -> VOut {
-    let pos = mix(i_prev_pos, i_pos, cam.alpha);
+    // Quadratic Bézier prev → control → current: a straight line when the
+    // control is the midpoint, a corner-hugging arc when it's an intersection.
+    let t = cam.alpha;
+    let u = 1.0 - t;
+    let pos = u * u * i_prev_pos + 2.0 * u * t * i_control + t * t * i_pos;
     let heading = mix(i_prev_heading, i_heading, cam.alpha);
     let c = cos(heading);
     let s = sin(heading);

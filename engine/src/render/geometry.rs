@@ -9,8 +9,10 @@ use super::{mass, StaticMesh};
 
 pub const ROAD_COLOR: [f32; 3] = [0.16, 0.18, 0.21];
 pub const JUNCTION_COLOR: [f32; 3] = [0.19, 0.21, 0.24];
-pub const LANE_LINE_COLOR: [f32; 3] = [0.72, 0.72, 0.66];
-pub const EDGE_LINE_COLOR: [f32; 3] = [0.85, 0.85, 0.8];
+// Kept dimmer than the vehicle body colour so cars read clearly against them.
+pub const LANE_LINE_COLOR: [f32; 3] = [0.50, 0.50, 0.46]; // same-direction dashed dividers
+pub const EDGE_LINE_COLOR: [f32; 3] = [0.55, 0.55, 0.50]; // outer road edge
+pub const CENTER_LINE_COLOR: [f32; 3] = [0.85, 0.72, 0.20]; // yellow line by opposing traffic
 
 /// Filled carriageway ribbons, one per directed link.
 pub fn road_mesh(net: &Network) -> StaticMesh {
@@ -53,9 +55,11 @@ pub fn marking_mesh(net: &Network) -> StaticMesh {
         let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
         let len = dx.hypot(dy).max(1e-9);
         let n = [dy / len, -dx / len];
-        for side in [-1.0, 1.0] {
+        // Inner edge (side -1) borders opposing traffic → yellow centre line;
+        // outer edge (side +1) is the road edge.
+        for (side, color) in [(-1.0, CENTER_LINE_COLOR), (1.0, EDGE_LINE_COLOR)] {
             let off = [n[0] * half * side, n[1] * half * side];
-            mesh.push_ribbon([a[0] + off[0], a[1] + off[1]], [b[0] + off[0], b[1] + off[1]], 0.1, EDGE_LINE_COLOR, 0.0);
+            mesh.push_ribbon([a[0] + off[0], a[1] + off[1]], [b[0] + off[0], b[1] + off[1]], 0.1, color, 0.0);
         }
     }
     mesh
@@ -65,20 +69,23 @@ pub fn marking_mesh(net: &Network) -> StaticMesh {
 /// enough to matter (`counts[link]` = vehicles on it). `light = 3` triggers the
 /// shader's translucent branch. Iterates *links* (a curved link is several
 /// segments), so it's independent of the strip count.
-pub fn congestion_mesh(net: &Network, counts: &[u32]) -> StaticMesh {
+/// Bright overlay colour for the user-selected link.
+pub const HIGHLIGHT_COLOR: [f32; 3] = [0.25, 0.85, 1.0];
+
+pub fn congestion_mesh(net: &Network, counts: &[u32], selected: Option<usize>) -> StaticMesh {
     let mut mesh = StaticMesh::default();
     for i in 0..net.links.len() {
+        let is_selected = selected == Some(i);
         let link = net.link(LinkId(i as u32));
         let lane = net.lane(link.lane_start);
-        let jam = (lane.length / 7.0 * link.lane_count as f64).max(1.0);
-        let ratio = mass::occupancy_ratio(counts[i] as f64, jam);
-        if ratio < 0.2 {
+        let ratio = mass::occupancy_ratio(counts[i] as f64, (lane.length / 7.0 * link.lane_count as f64).max(1.0));
+        if !is_selected && ratio < 0.2 {
             continue;
         }
-        let c = mass::congestion_color(ratio);
+        let color = if is_selected { HIGHLIGHT_COLOR } else { let c = mass::congestion_color(ratio); [c[0], c[1], c[2]] };
         let half = link.lane_count as f64 * LANE_WIDTH / 2.0;
         for seg in net.polylines[i].windows(2) {
-            mesh.push_ribbon(seg[0], seg[1], half, [c[0], c[1], c[2]], 3.0);
+            mesh.push_ribbon(seg[0], seg[1], half, color, 3.0);
         }
     }
     mesh
@@ -155,11 +162,12 @@ mod tests {
             links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 2, speed_limit: 20.0, geometry: vec![[100.0, 0.0], [150.0, 50.0]] }],
         }
         .build();
-        let mesh = congestion_mesh(&net, &[999]); // link 0 heavily congested
+        let mesh = congestion_mesh(&net, &[999], None); // link 0 heavily congested
         assert!(!mesh.is_empty(), "a congested curved link should shade");
         assert!(mesh.indices.iter().all(|&i| (i as usize) < mesh.vertices.len()), "indices in range");
-        // an empty count → nothing shaded
-        assert!(congestion_mesh(&net, &[0]).is_empty());
+        // an empty count → nothing shaded, unless selected
+        assert!(congestion_mesh(&net, &[0], None).is_empty());
+        assert!(!congestion_mesh(&net, &[0], Some(0)).is_empty(), "a selected link is highlighted even when empty");
     }
 
     #[test]

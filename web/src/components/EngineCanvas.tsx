@@ -32,6 +32,8 @@ type Sim = {
   camera_params(): Float32Array;
   vehicle_count(): number;
   crashed(): number;
+  set_selected_link(i: number): void;
+  link_stats(i: number): Float32Array;
   play(): void;
   pause(): void;
   set_speed(s: number): void;
@@ -60,6 +62,10 @@ export default function EngineCanvas() {
   const sceneRef = useRef<Scene | null>(null);
   const sliderRef = useRef<HTMLInputElement>(null);
   const statsRef = useRef<HTMLSpanElement>(null);
+  const tipRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const roadsRef = useRef<{ name: string; pts: number[][] }[]>([]);
+  const selectedRef = useRef<number>(-1);
   const fitMppRef = useRef(1);
   const [ready, setReady] = useState(false);
   const [playing, setPlaying] = useState(true);
@@ -91,9 +97,51 @@ export default function EngineCanvas() {
       if (e.button === 2) panning.active = true;
     };
     const onMove = (e: MouseEvent) => {
-      if (!panning.active || !simRef.current) return;
-      const { sx, sy } = canvasScale();
-      simRef.current.pan_pixels(e.movementX * sx, e.movementY * sy);
+      const sim = simRef.current;
+      if (!sim) return;
+      const { sx, sy, rect } = canvasScale();
+      if (panning.active) {
+        sim.pan_pixels(e.movementX * sx, e.movementY * sy);
+        return;
+      }
+      // Hover: map the cursor to world space and name the nearest road.
+      const tip = tipRef.current;
+      if (!tip || roadsRef.current.length === 0) return;
+      const [cx, cy, mpp, vw, vh] = sim.camera_params();
+      const wx = cx + ((e.clientX - rect.left) * sx - vw / 2) * mpp;
+      const wy = cy - ((e.clientY - rect.top) * sy - vh / 2) * mpp;
+      let best = "";
+      let bestD = 12; // world metres; ~a lane-and-a-half
+      for (const road of roadsRef.current) {
+        if (!road.name || road.pts.length < 2) continue;
+        const d = distToPolyline(wx, wy, road.pts);
+        if (d < bestD) {
+          bestD = d;
+          best = road.name;
+        }
+      }
+      if (best) {
+        tip.textContent = best;
+        tip.style.left = `${e.clientX + 12}px`;
+        tip.style.top = `${e.clientY + 12}px`;
+        tip.style.display = "block";
+      } else {
+        tip.style.display = "none";
+      }
+    };
+    const onLeave = () => {
+      if (tipRef.current) tipRef.current.style.display = "none";
+    };
+    const onClick = (e: MouseEvent) => {
+      const sim = simRef.current;
+      if (!sim || e.button !== 0) return;
+      const { sx, sy, rect } = canvasScale();
+      const [cx, cy, mpp, vw, vh] = sim.camera_params();
+      const wx = cx + ((e.clientX - rect.left) * sx - vw / 2) * mpp;
+      const wy = cy - ((e.clientY - rect.top) * sy - vh / 2) * mpp;
+      const i = nearestLink(roadsRef.current, wx, wy, 12);
+      selectedRef.current = i;
+      sim.set_selected_link(i);
     };
     const onUp = () => {
       panning.active = false;
@@ -117,8 +165,10 @@ export default function EngineCanvas() {
         try {
           const res = await fetch(`${basePath()}/map.json`);
           if (res.ok && mod.Simulation.from_map_json) {
-            loaded = mod.Simulation.from_map_json(await res.text(), 0xc0ffee);
+            const text = await res.text();
+            loaded = mod.Simulation.from_map_json(text, 0xc0ffee);
             label = "OSM map";
+            roadsRef.current = buildLinks(text); // all links (index-aligned) for hover + click
           }
         } catch {
           loaded = null;
@@ -151,6 +201,8 @@ export default function EngineCanvas() {
         canvas.addEventListener("wheel", onWheel, { passive: false });
         canvas.addEventListener("contextmenu", onContext);
         canvas.addEventListener("mousedown", onDown);
+        canvas.addEventListener("mouseleave", onLeave);
+        canvas.addEventListener("click", onClick);
         window.addEventListener("mousemove", onMove);
         window.addEventListener("mouseup", onUp);
 
@@ -180,6 +232,18 @@ export default function EngineCanvas() {
           if (statsRef.current) {
             statsRef.current.textContent = `${sim.vehicle_count()} vehicles · ${sim.crashed()} crashed`;
           }
+          if (panelRef.current) {
+            const i = selectedRef.current;
+            if (i >= 0) {
+              const st = sim.link_stats(i);
+              const name = roadsRef.current[i]?.name || `link ${i}`;
+              panelRef.current.textContent =
+                `${name} — ${st[0] | 0} veh · ${Math.round(st[1] * 3.6)} km/h · ${Math.round(st[2])} veh/h · ${Math.round(st[3] * 100)}% full`;
+              panelRef.current.style.display = "block";
+            } else {
+              panelRef.current.style.display = "none";
+            }
+          }
           raf = requestAnimationFrame(draw);
         };
         raf = requestAnimationFrame(draw);
@@ -194,6 +258,8 @@ export default function EngineCanvas() {
       canvas.removeEventListener("wheel", onWheel);
       canvas.removeEventListener("contextmenu", onContext);
       canvas.removeEventListener("mousedown", onDown);
+      canvas.removeEventListener("mouseleave", onLeave);
+      canvas.removeEventListener("click", onClick);
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
@@ -244,16 +310,89 @@ export default function EngineCanvas() {
         {error && <span style={{ color: "#ff7b72" }}>engine failed: {error}</span>}
       </div>
       <p style={{ margin: "0 0 8px", opacity: 0.5, fontSize: 12 }}>
-        Mouse wheel to zoom · right-drag to pan · Fit to reset
+        Wheel to zoom · right-drag to pan · hover a road for its name · click to select · Fit to reset
       </p>
+      <div
+        ref={panelRef}
+        style={{
+          display: "none",
+          margin: "0 0 8px",
+          padding: "4px 10px",
+          background: "rgba(37,133,180,0.15)",
+          border: "1px solid #2585b4",
+          borderRadius: 6,
+          fontSize: 13,
+          fontVariantNumeric: "tabular-nums",
+        }}
+      />
       <canvas
         ref={canvasRef}
         width={900}
         height={600}
         style={{ width: "100%", maxWidth: 900, border: "1px solid #222", borderRadius: 8, display: "block" }}
       />
+      <div
+        ref={tipRef}
+        style={{
+          position: "fixed",
+          display: "none",
+          pointerEvents: "none",
+          padding: "2px 6px",
+          background: "rgba(11,14,19,0.9)",
+          color: "#e6edf3",
+          border: "1px solid #333",
+          borderRadius: 4,
+          fontSize: 12,
+          zIndex: 10,
+        }}
+      />
     </div>
   );
+}
+
+// ---- road-name hover --------------------------------------------------------
+
+/** All links as polylines (world coords), index-aligned with the engine's links,
+ * so a click maps to a link index. `name` may be empty. */
+function buildLinks(mapJson: string): { name: string; pts: number[][] }[] {
+  const m = JSON.parse(mapJson);
+  const node = new Map<number, number[]>(m.nodes.map((n: { osm_id: number; x: number; y: number }) => [n.osm_id, [n.x, n.y]]));
+  return m.links.map((l: { from_osm: number; to_osm: number; name?: string; geometry?: number[][] }) => {
+    const from = node.get(l.from_osm);
+    const to = node.get(l.to_osm);
+    return { name: l.name ?? "", pts: from && to ? [from, ...(l.geometry ?? []), to] : [] };
+  });
+}
+
+/** Nearest link index to a world point within `maxD` metres, or -1. */
+function nearestLink(links: { pts: number[][] }[], wx: number, wy: number, maxD: number): number {
+  let best = -1;
+  let bestD = maxD;
+  for (let i = 0; i < links.length; i++) {
+    if (links[i].pts.length < 2) continue;
+    const d = distToPolyline(wx, wy, links[i].pts);
+    if (d < bestD) {
+      bestD = d;
+      best = i;
+    }
+  }
+  return best;
+}
+
+function distToPolyline(px: number, py: number, pts: number[][]): number {
+  let best = Infinity;
+  for (let i = 1; i < pts.length; i++) {
+    best = Math.min(best, distToSegment(px, py, pts[i - 1], pts[i]));
+  }
+  return best;
+}
+
+function distToSegment(px: number, py: number, a: number[], b: number[]): number {
+  const dx = b[0] - a[0];
+  const dy = b[1] - a[1];
+  const len2 = dx * dx + dy * dy;
+  const t = len2 > 0 ? Math.max(0, Math.min(1, ((px - a[0]) * dx + (py - a[1]) * dy) / len2)) : 0;
+  return Math.hypot(px - (a[0] + t * dx), py - (a[1] + t * dy));
 }
 
 // ---- 2D canvas fallback -----------------------------------------------------

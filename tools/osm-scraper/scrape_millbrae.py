@@ -144,13 +144,16 @@ def build(raw, bbox):
     def geom_of(node_ids):
         return [list(project(nodes[nid]["lat"], nodes[nid]["lon"], lat0, lon0)) for nid in node_ids]
 
-    def emit_link(a, b, lanes, speed, geometry):
+    def emit_link(a, b, lanes, speed, geometry, name, ref):
         if (a, b) in emitted:
             return
         emitted.add((a, b))
-        out_links.append(
-            {"from_osm": a, "to_osm": b, "lanes": lanes, "speed_limit": speed, "geometry": geometry}
-        )
+        link = {"from_osm": a, "to_osm": b, "lanes": lanes, "speed_limit": speed, "geometry": geometry}
+        if name:
+            link["name"] = name  # road name, e.g. "El Camino Real"
+        if ref:
+            link["ref"] = ref  # route ref, e.g. "CA 82" — used to match real counts
+        out_links.append(link)
 
     for way in ways:
         tags = way["tags"]
@@ -158,6 +161,8 @@ def build(raw, bbox):
         oneway = tags.get("oneway") in ("yes", "true", "1") or highway == "motorway"
         lanes = parse_lanes(tags, oneway)
         speed = parse_speed_mps(tags, highway)
+        name = tags.get("name")
+        ref = tags.get("ref")
 
         seq = way["nodes"]
         block_start = 0
@@ -169,9 +174,9 @@ def build(raw, bbox):
                 emit_node(a)
                 emit_node(b)
                 mid = geom_of(seq[block_start + 1 : i])  # intermediate bend points
-                emit_link(a, b, lanes, speed, mid)
+                emit_link(a, b, lanes, speed, mid, name, ref)
                 if not oneway:
-                    emit_link(b, a, lanes, speed, list(reversed(mid)))
+                    emit_link(b, a, lanes, speed, list(reversed(mid)), name, ref)
             block_start = i
 
     return {

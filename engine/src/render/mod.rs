@@ -43,13 +43,16 @@ impl Vertex {
 pub struct Instance {
     pub pos: [f32; 2],
     pub prev_pos: [f32; 2],
+    /// Quadratic-Bézier control point for prev→current motion: the segment
+    /// midpoint for a straight move (curve degenerates to a line), or the
+    /// intersection node for a turn (the path bulges through the corner).
+    pub control: [f32; 2],
     pub scale: [f32; 2],
     pub color: [f32; 3],
     pub heading: f32,
     pub prev_heading: f32,
     /// 0 = coasting, 1 = braking; scales the rear-lamp emissive.
     pub brake: f32,
-    pub _pad: f32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -197,6 +200,20 @@ mod tests {
         assert_eq!(Lod::for_distance(10.0, 50.0, 200.0), Lod::Near);
         assert_eq!(Lod::for_distance(120.0, 50.0, 200.0), Lod::Mid);
         assert_eq!(Lod::for_distance(500.0, 50.0, 200.0), Lod::Far);
+    }
+
+    #[test]
+    fn instance_layout_matches_the_shader_stride() {
+        // The instanced vertex buffer packs these fields back-to-back; the GPU
+        // attribute offsets and scene.wgsl's `@location`s assume this layout.
+        assert_eq!(std::mem::size_of::<Instance>(), 56);
+        assert_eq!(std::mem::offset_of!(Instance, prev_pos), 8);
+        assert_eq!(std::mem::offset_of!(Instance, control), 16);
+        assert_eq!(std::mem::offset_of!(Instance, scale), 24);
+        assert_eq!(std::mem::offset_of!(Instance, color), 32);
+        assert_eq!(std::mem::offset_of!(Instance, heading), 44);
+        assert_eq!(std::mem::offset_of!(Instance, prev_heading), 48);
+        assert_eq!(std::mem::offset_of!(Instance, brake), 52);
     }
 
     #[test]

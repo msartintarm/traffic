@@ -57,12 +57,12 @@ pub fn vehicle_instance(v: &VehicleView) -> Instance {
     Instance {
         pos: v.pos,
         prev_pos: v.prev_pos,
+        control: [(v.pos[0] + v.prev_pos[0]) * 0.5, (v.pos[1] + v.prev_pos[1]) * 0.5],
         scale: class_dims(v.class),
         color: class_color(v.class),
         heading: v.heading,
         prev_heading: v.prev_heading,
         brake: brake_intensity(v.accel),
-        _pad: 0.0,
     }
 }
 
@@ -96,12 +96,12 @@ pub fn signal_instance(pos: [f32; 2], radius: f32, state: SignalState) -> Instan
     Instance {
         pos,
         prev_pos: pos,
+        control: pos, // static
         scale: [radius, radius],
         color: signal_color(state),
         heading: 0.0,
         prev_heading: 0.0,
         brake: 1.0, // fully emissive
-        _pad: 0.0,
     }
 }
 

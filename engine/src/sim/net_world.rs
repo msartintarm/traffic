@@ -10,7 +10,7 @@ use super::config::{DriverConfig, SimConfig};
 use super::constraint::{self, LongContext, Obstacle, SpeedTarget};
 use super::idm;
 use super::mobil::{self, MobilParams};
-use super::network::{LaneId, LinkId, MovementId, Network, NodeControl, NodeId};
+use super::network::{LaneId, LinkId, MovementId, Network, NodeControl, NodeId, TurnType};
 use super::signal::SignalState;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -68,6 +68,9 @@ pub struct NetWorld {
     /// Per-program approach links, indexed by signal-group bit — for demand
     /// detection at each phase.
     approaches: Vec<Vec<LinkId>>,
+    /// Cumulative vehicles that have entered each link (spawned onto it or
+    /// crossed onto it) — the raw counts calibration compares to real data.
+    link_entries: Vec<u32>,
 }
 
 impl NetWorld {
@@ -92,13 +95,38 @@ impl NetWorld {
             }
         }
 
+        let link_entries = vec![0u32; network.links.len()];
         Self {
             network, cfg, vehicles: Vec::new(), time: 0.0, tick: 0, exited: 0, crashed: 0,
-            merges, signals, approaches,
+            merges, signals, approaches, link_entries,
         }
     }
 
+    /// Measured flow (vehicles/hour) on each link, from entries so far over
+    /// elapsed sim time — the sim's own counts to calibrate against real data.
+    pub fn link_flows(&self) -> Vec<f64> {
+        let hours = (self.time / 3600.0).max(1e-9);
+        self.link_entries.iter().map(|&e| e as f64 / hours).collect()
+    }
+
+    /// Live per-link stats: `(vehicle_count, mean_speed_mps, occupancy_ratio)`.
+    pub fn link_stats(&self, link: LinkId) -> (u32, f64, f64) {
+        let l = self.network.link(link);
+        let lane = self.network.lane(l.lane_start);
+        let (mut count, mut sum) = (0u32, 0.0);
+        for v in &self.vehicles {
+            if self.network.lane(v.lane).link == link {
+                count += 1;
+                sum += v.speed;
+            }
+        }
+        let mean = if count > 0 { sum / count as f64 } else { 0.0 };
+        let jam = (lane.length / 7.0 * l.lane_count as f64).max(1.0);
+        (count, mean, (count as f64 / jam).min(1.0))
+    }
+
     pub fn spawn(&mut self, id: u32, lane: LaneId, position: f64, speed: f64, driver: DriverConfig) {
+        self.link_entries[self.network.lane(lane).link.idx()] += 1;
         self.vehicles.push(NetVehicle {
             id, lane, position, speed, driver, route: Vec::new(), route_idx: 0,
             stopped_at: None, history: vec![(position, speed)], wait_ticks: 0,
@@ -115,6 +143,7 @@ impl NetWorld {
         if !self.entrance_clear(lane, driver.min_gap) {
             return false;
         }
+        self.link_entries[self.network.lane(lane).link.idx()] += 1;
         self.vehicles.push(NetVehicle {
             id, lane, position: 0.0, speed, driver, route, route_idx: 0,
             stopped_at: None, history: vec![(0.0, speed)], wait_ticks: 0,
@@ -495,12 +524,22 @@ impl NetWorld {
 
                 let merge = self.merge_conflict(veh, lane.length, intended, &nb);
 
-                // Slow for an upcoming curve to the lateral-acceleration limit.
+                // Slow for an upcoming curve (lateral-accel limit) and for a turn
+                // through the next intersection; take whichever is more restrictive.
                 const A_LAT: f64 = 3.0;
                 const CURVE_LOOKAHEAD: f64 = 45.0;
-                let curve = {
+                let geom_curve = {
                     let r = self.network.min_radius_ahead(veh.lane, veh.position, CURVE_LOOKAHEAD);
                     r.is_finite().then(|| SpeedTarget { speed: (A_LAT * r).sqrt(), distance: CURVE_LOOKAHEAD })
+                };
+                let turn = intended.and_then(|mid| match self.network.movement_turn(mid) {
+                    TurnType::Left => Some(6.0),
+                    TurnType::Right => Some(5.0),
+                    TurnType::Through => None,
+                }).map(|speed| SpeedTarget { speed, distance: to_line });
+                let curve = match (geom_curve, turn) {
+                    (Some(a), Some(b)) => Some(if a.speed <= b.speed { a } else { b }),
+                    (a, b) => a.or(b),
                 };
 
                 let ctx = LongContext {
@@ -555,8 +594,13 @@ impl NetWorld {
 
         let mut survivors = Vec::with_capacity(moved.len());
         for mut veh in moved {
+            let pre_link = self.network.lane(veh.lane).link;
             let alive = self.advance_across_nodes(&mut veh, &mut front);
             if alive {
+                let post_link = self.network.lane(veh.lane).link;
+                if post_link != pre_link {
+                    self.link_entries[post_link.idx()] += 1;
+                }
                 if veh.speed < 0.5 {
                     veh.wait_ticks += 1;
                 } else {
@@ -620,6 +664,8 @@ impl NetWorld {
         let critical = effective_critical_gap(me.driver.critical_gap, me.wait_ticks as f64 * self.cfg.dt);
         let my_link = self.network.lane(lane).link;
         let my_key = self.priority_key(my_link);
+        let my_dir = self.network.arrival_dir(my_link);
+        let my_turn = self.intended_movement(me).map_or(TurnType::Through, |m| self.network.movement_turn(m));
         for &j in nb.approaching.get(&node.0)? {
             if j == i {
                 continue;
@@ -629,10 +675,11 @@ impl NetWorld {
             if o_lane.link == my_link || o.speed < 0.5 {
                 continue;
             }
-            if self.priority_key(o_lane.link) <= my_key {
+            if (o_lane.length - o.position) / o.speed.max(0.1) >= critical {
                 continue;
             }
-            if (o_lane.length - o.position) / o.speed.max(0.1) < critical {
+            let o_turn = self.intended_movement(o).map_or(TurnType::Through, |m| self.network.movement_turn(m));
+            if should_yield_to(my_turn, my_dir, o_turn, self.network.arrival_dir(o_lane.link), my_key, self.priority_key(o_lane.link)) {
                 return Some(());
             }
         }
@@ -755,6 +802,33 @@ const DETECT: f64 = 35.0;
 /// IDM acceleration for a vehicle placed at `pos`/`speed` on a lane with the
 /// given speed limit, following `leader` (or free road if none). Used to score
 /// hypothetical lane placements for MOBIL.
+/// Turning-movement conflict rule: whether a vehicle making `my_turn` from
+/// direction `my_dir` must yield to one making `o_turn` from `o_dir`.
+/// - Same direction (parallel): no node conflict (car-following handles it).
+/// - A right turn merges rather than crosses → doesn't yield here.
+/// - Opposing: only a left turn yields, and only to oncoming through/right.
+/// - Crossing: yield to the higher-priority approach.
+fn should_yield_to(
+    my_turn: TurnType,
+    my_dir: [f64; 2],
+    o_turn: TurnType,
+    o_dir: [f64; 2],
+    my_key: u64,
+    o_key: u64,
+) -> bool {
+    let rel = (my_dir[0] * o_dir[0] + my_dir[1] * o_dir[1]).clamp(-1.0, 1.0).acos();
+    if rel < 0.6 {
+        return false; // ~same heading — parallel streams
+    }
+    if my_turn == TurnType::Right {
+        return false; // right turn merges into the target road, not across
+    }
+    if rel > 2.5 {
+        return my_turn == TurnType::Left && o_turn != TurnType::Left; // left yields to oncoming
+    }
+    o_key > my_key // crossing — defer to the major approach
+}
+
 /// Whether a vehicle can brake to a stop within `distance` at comfortable
 /// deceleration — the dilemma-zone test for whether to stop on yellow.
 fn can_stop_before(speed: f64, decel: f64, distance: f64) -> bool {
@@ -836,6 +910,39 @@ mod tests {
 
         assert_eq!(world.exited(), 8, "both queues should clear once the signal cycles");
         assert_eq!(world.crashed(), 0);
+    }
+
+    #[test]
+    fn link_flow_reflects_entries_over_time() {
+        let mut w = NetWorld::new(straight_link(2000.0), cfg());
+        for i in 0..10u32 {
+            w.spawn(i, LaneId(0), 5.0 + i as f64 * 20.0, 5.0, DriverConfig::car());
+        }
+        for _ in 0..100 {
+            w.step(); // 20 s
+        }
+        // 10 entries over 20 s ⇒ ~1800 veh/hour on the entry link.
+        assert!((w.link_flows()[0] - 1800.0).abs() < 200.0, "flow {}", w.link_flows()[0]);
+    }
+
+    #[test]
+    fn link_stats_report_count_speed_and_occupancy() {
+        let mut w = NetWorld::new(straight_link(2000.0), cfg());
+        for i in 0..8u32 {
+            w.spawn(i, LaneId(0), 10.0 + i as f64 * 30.0, 12.0, DriverConfig::car());
+        }
+        w.step();
+        let (count, mean, occ) = w.link_stats(LinkId(0));
+        let manual: Vec<f64> = w.vehicles().iter().filter(|v| w.network.lane(v.lane).link == LinkId(0)).map(|v| v.speed).collect();
+        assert_eq!(count as usize, manual.len());
+        assert!((mean - manual.iter().sum::<f64>() / manual.len() as f64).abs() < 1e-9, "mean {mean}");
+        assert!((0.0..=1.0).contains(&occ) && occ > 0.0, "occupancy {occ}");
+    }
+
+    #[test]
+    fn link_stats_are_zeroed_for_an_empty_link() {
+        let w = NetWorld::new(straight_link(500.0), cfg());
+        assert_eq!(w.link_stats(LinkId(0)), (0, 0.0, 0.0));
     }
 
     #[test]
@@ -975,7 +1082,7 @@ mod tests {
         world.run_ticks(50); // clear the shared entrance before the next spawn
         assert!(world.spawn_routed(2, long, 12.0, DriverConfig::car()));
 
-        world.run_ticks(600);
+        world.run_ticks(1000); // turns slow vehicles, so allow more time
 
         assert_eq!(world.exited(), 2, "both routed vehicles reach their destination");
     }
@@ -1046,27 +1153,30 @@ mod tests {
 
     #[test]
     fn minor_road_yields_to_the_major_road_then_goes() {
+        // Minor goes *straight across* (south→north) the major (west→east), so the
+        // crossing conflict rule makes it defer to the higher-priority major. The
+        // minor's approach is short so it reaches the line first yet still yields.
         let net = OsmMap {
             nodes: vec![
-                NodeSpec::uncontrolled(1, -200.0, 0.0),
+                NodeSpec::uncontrolled(1, -120.0, 0.0),
                 NodeSpec { osm_id: 2, x: 0.0, y: 0.0, control: MapControl::Yield },
                 NodeSpec::uncontrolled(3, 200.0, 0.0),
-                NodeSpec::uncontrolled(4, 0.0, -200.0),
+                NodeSpec::uncontrolled(4, 0.0, -40.0),
                 NodeSpec::uncontrolled(5, 0.0, 200.0),
             ],
             links: vec![
-                LinkSpec::oneway(1, 2, 1, 25.0), // major approach
+                LinkSpec::oneway(1, 2, 1, 25.0), // major approach (long)
                 LinkSpec::oneway(2, 3, 1, 25.0), // major exit
-                LinkSpec::oneway(4, 2, 1, 10.0), // minor approach
-                LinkSpec::oneway(2, 5, 1, 10.0), // minor exit
+                LinkSpec::oneway(4, 2, 1, 10.0), // minor approach (short)
+                LinkSpec::oneway(2, 5, 1, 10.0), // minor exit (straight across)
             ],
         }
         .build();
         let major_app = net.lanes_of(LinkId(0)).next().unwrap();
         let minor_app = net.lanes_of(LinkId(2)).next().unwrap();
         let mut world = NetWorld::new(net, cfg());
-        world.spawn(10, major_app, 100.0, 20.0, DriverConfig::car()); // major, farther
-        world.spawn(20, minor_app, 180.0, 9.0, DriverConfig::car()); // minor, closer to line
+        world.spawn_routed(10, vec![LinkId(0), LinkId(1)], 20.0, DriverConfig::car()); // major through
+        world.spawn_routed(20, vec![LinkId(2), LinkId(3)], 9.0, DriverConfig::car()); // minor straight across
 
         let (mut major_cross, mut minor_cross) = (None, None);
         for t in 0..400 {
@@ -1188,6 +1298,49 @@ mod tests {
         w.step();
         assert_eq!(w.crashed(), 2);
         assert_eq!(w.vehicles().len(), 0);
+    }
+
+    #[test]
+    fn conflict_matrix_rules() {
+        let (east, west, north) = ([1.0, 0.0], [-1.0, 0.0], [0.0, 1.0]);
+        // A right turn merges rather than crosses → never yields at the node.
+        assert!(!should_yield_to(TurnType::Right, east, TurnType::Through, north, 0, 999));
+        // Opposing through movements don't conflict.
+        assert!(!should_yield_to(TurnType::Through, east, TurnType::Through, west, 0, 999));
+        // A left turn yields to the oncoming through.
+        assert!(should_yield_to(TurnType::Left, east, TurnType::Through, west, 999, 0));
+        // Crossing streams defer to the higher-priority approach.
+        assert!(should_yield_to(TurnType::Through, east, TurnType::Through, north, 0, 999));
+        assert!(!should_yield_to(TurnType::Through, east, TurnType::Through, north, 999, 0));
+    }
+
+    #[test]
+    fn turning_vehicles_slow_through_the_intersection() {
+        // Route forces a left turn (east approach → north exit) at node 2.
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, -200.0, 0.0),
+                NodeSpec::uncontrolled(2, 0.0, 0.0),
+                NodeSpec::uncontrolled(3, 0.0, 200.0),
+            ],
+            links: vec![LinkSpec::oneway(1, 2, 1, 25.0), LinkSpec::oneway(2, 3, 1, 25.0)],
+        }
+        .build();
+        let approach = net.lanes_of(LinkId(0)).next().unwrap();
+        let app_len = net.lane(approach).length;
+        let mut w = NetWorld::new(net, cfg());
+        w.spawn_routed(1, vec![LinkId(0), LinkId(1)], 22.0, DriverConfig { accel_noise: 0.0, ..DriverConfig::car() });
+
+        let mut speed_at_line = f64::MAX;
+        for _ in 0..200 {
+            w.step();
+            if let Some(v) = w.vehicle(1) {
+                if v.lane == approach && v.position > app_len - 10.0 {
+                    speed_at_line = speed_at_line.min(v.speed);
+                }
+            }
+        }
+        assert!(speed_at_line < 12.0, "should slow for the left turn, speed {speed_at_line}");
     }
 
     #[test]

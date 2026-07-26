@@ -1,0 +1,82 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            engine/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('engine/Cargo.lock') }}
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+
+      # The real map is never committed (it carries GPS). Instead the bounding
+      # box lives in the TRAFFIC_BBOX repo secret ("S W N E") and the scraper
+      # regenerates web/public/map.json here. If the secret is unset or Overpass
+      # is unreachable, the deploy still succeeds on the built-in sample map.
+      - name: Fetch Millbrae map
+        continue-on-error: true
+        env:
+          TRAFFIC_BBOX: ${{ secrets.TRAFFIC_BBOX }}
+        run: |
+          if [ -z "$TRAFFIC_BBOX" ]; then
+            echo "TRAFFIC_BBOX secret not set — deploying with the built-in sample map"
+            exit 0
+          fi
+          python3 tools/osm-scraper/scrape_millbrae.py --out web/public/map.json
+
+      # `npm run build` runs the `prebuild` script, which rebuilds the wasm
+      # package (engine → web/public/wasm-pkg) before the Next export. The
+      # export copies web/public/map.json (if present) to /traffic/map.json.
+      - name: Build static export
+        run: npm run build
+        working-directory: web
+        env:
+          NEXT_PUBLIC_BASE_PATH: /traffic
+
+      - name: Disable Jekyll processing
+        run: touch web/out/.nojekyll
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@v4
+        id: deployment

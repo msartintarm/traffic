@@ -1,0 +1,3 @@
+# Generated calibration targets and downloaded count data stay local.
+counts.json
+*.csv
