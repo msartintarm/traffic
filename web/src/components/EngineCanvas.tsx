@@ -13,6 +13,8 @@ type Sim = {
   world_bounds(): Float32Array;
   world_mesh_vertices(): Float32Array;
   world_mesh_indices(): Uint32Array;
+  marking_mesh_vertices(): Float32Array;
+  marking_mesh_indices(): Uint32Array;
   view_proj(): Float32Array;
   alpha(): number;
   render_instances(): Uint8Array;
@@ -20,6 +22,7 @@ type Sim = {
   signal_instances(): Uint8Array;
   signal_instance_count(): number;
   density_vertices(): Float32Array;
+  density_indices(): Uint32Array;
   set_viewport(w: number, h: number): void;
   fit(): void;
   pan_pixels(dx: number, dy: number): void;
@@ -33,16 +36,17 @@ type Sim = {
 };
 
 type Renderer = {
-  set_world_mesh(v: Float32Array, i: Uint32Array): void;
+  set_world_mesh(wv: Float32Array, wi: Uint32Array, mv: Float32Array, mi: Uint32Array): void;
   render(
     vp: Float32Array,
     alpha: number,
+    mpp: number,
     inst: Uint8Array,
     count: number,
     signals: Uint8Array,
     signalCount: number,
-    density: Float32Array,
-    densityCount: number,
+    densityV: Float32Array,
+    densityI: Uint32Array,
   ): void;
 };
 
@@ -127,7 +131,12 @@ export default function EngineCanvas() {
         let renderer: Renderer | null = null;
         try {
           renderer = await mod.Renderer.create(canvas);
-          renderer!.set_world_mesh(sim.world_mesh_vertices(), sim.world_mesh_indices());
+          renderer!.set_world_mesh(
+            sim.world_mesh_vertices(),
+            sim.world_mesh_indices(),
+            sim.marking_mesh_vertices(),
+            sim.marking_mesh_indices(),
+          );
           setBackend("WebGPU / WebGL2");
         } catch {
           renderer = null;
@@ -147,16 +156,16 @@ export default function EngineCanvas() {
           last = now;
           sim.advance(dt);
           if (renderer) {
-            const density = sim.density_vertices();
             renderer.render(
               sim.view_proj(),
               sim.alpha(),
+              sim.meters_per_pixel(),
               sim.render_instances(),
               sim.render_instance_count(),
               sim.signal_instances(),
               sim.signal_instance_count(),
-              density,
-              density.length / 6,
+              sim.density_vertices(),
+              sim.density_indices(),
             );
           } else {
             render2d(canvas, sim, sceneRef.current);

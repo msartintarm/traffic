@@ -81,6 +81,76 @@ impl Mesh {
     }
 }
 
+/// A static-geometry vertex stored as `center + offset` rather than a baked
+/// absolute position, so the vertex shader can expand `offset` (always
+/// perpendicular to a road/line) to a minimum on-screen width — keeping roads at
+/// least ~1px wide at any zoom instead of rasterizing to choppy sub-pixel slivers.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+pub struct StaticVertex {
+    pub center: [f32; 2],
+    pub offset: [f32; 2],
+    pub color: [f32; 3],
+    pub light: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StaticMesh {
+    pub vertices: Vec<StaticVertex>,
+    pub indices: Vec<u32>,
+}
+
+fn unit_perp(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let len = dx.hypot(dy).max(1e-9);
+    [dy / len, -dx / len]
+}
+
+impl StaticMesh {
+    pub fn is_empty(&self) -> bool {
+        self.vertices.is_empty()
+    }
+
+    pub fn extend(&mut self, other: &StaticMesh) {
+        let base = self.vertices.len() as u32;
+        self.vertices.extend_from_slice(&other.vertices);
+        self.indices.extend(other.indices.iter().map(|i| i + base));
+    }
+
+    /// A width-`2·half_w` ribbon quad along the centre segment `a→b`; the two
+    /// side offsets are perpendicular so the shader can widen them per-zoom.
+    pub fn push_ribbon(&mut self, a: [f64; 2], b: [f64; 2], half_w: f64, color: [f32; 3], light: f32) {
+        let n = unit_perp(a, b);
+        let off = [(n[0] * half_w) as f32, (n[1] * half_w) as f32];
+        let neg = [-off[0], -off[1]];
+        let (af, bf) = ([a[0] as f32, a[1] as f32], [b[0] as f32, b[1] as f32]);
+        let base = self.vertices.len() as u32;
+        for (center, offset) in [(af, neg), (bf, neg), (bf, off), (af, off)] {
+            self.vertices.push(StaticVertex { center, offset, color, light });
+        }
+        self.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
+    pub fn push_disc(&mut self, center: [f64; 2], radius: f64, color: [f32; 3]) {
+        const SIDES: u32 = 12;
+        let c = [center[0] as f32, center[1] as f32];
+        let base = self.vertices.len() as u32;
+        self.vertices.push(StaticVertex { center: c, offset: [0.0, 0.0], color, light: 0.0 });
+        for k in 0..SIDES {
+            let a = std::f64::consts::TAU * k as f64 / SIDES as f64;
+            self.vertices.push(StaticVertex {
+                center: c,
+                offset: [(radius * a.cos()) as f32, (radius * a.sin()) as f32],
+                color,
+                light: 0.0,
+            });
+        }
+        for k in 0..SIDES {
+            self.indices.extend([base, base + 1 + k, base + 1 + (k + 1) % SIDES]);
+        }
+    }
+}
+
 /// Level-of-detail tier, selected by on-screen distance. This is what makes
 /// 1M+ tractable: individual meshes only [`Lod::Near`], flat quads [`Lod::Mid`],
 /// and no per-car draw at all [`Lod::Far`] (the mass layer's density shading

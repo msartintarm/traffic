@@ -11,12 +11,18 @@
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
-use super::{scene, Instance, Vertex};
+use super::{scene, Instance, StaticVertex, Vertex};
 
 const CLEAR: wgpu::Color = wgpu::Color { r: 0.043, g: 0.055, b: 0.075, a: 1.0 };
 
+/// Lane markings vanish into sub-pixel noise when zoomed out; only draw them once
+/// the view is closer than this (world metres per pixel).
+const MARKING_MAX_MPP: f32 = 0.7;
+
 const VERTEX_ATTRS: [wgpu::VertexAttribute; 3] =
     wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x3, 2 => Float32];
+const STATIC_ATTRS: [wgpu::VertexAttribute; 4] =
+    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x3, 3 => Float32];
 const INSTANCE_ATTRS: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![
     3 => Float32x2, 4 => Float32x2, 5 => Float32x2, 6 => Float32x3, 7 => Float32, 8 => Float32, 9 => Float32
 ];
@@ -42,8 +48,11 @@ pub struct Renderer {
     signal_inst_buf: wgpu::Buffer,
     signal_inst_capacity: u64,
     density_vbuf: wgpu::Buffer,
-    density_capacity: u64,
+    density_ibuf: wgpu::Buffer,
+    density_vcap: u64,
+    density_icap: u64,
     world: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
+    markings: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
 }
 
 #[wasm_bindgen]
@@ -131,6 +140,11 @@ impl Renderer {
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &VERTEX_ATTRS,
         };
+        let static_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<StaticVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &STATIC_ATTRS,
+        };
         let instance_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Instance>() as u64,
             step_mode: wgpu::VertexStepMode::Instance,
@@ -164,7 +178,7 @@ impl Renderer {
                 cache: None,
             })
         };
-        let static_pipeline = make_pipeline("static", "vs_static", &[vertex_layout.clone()]);
+        let static_pipeline = make_pipeline("static", "vs_static", &[static_layout]);
         let instanced_pipeline =
             make_pipeline("instanced", "vs_instanced", &[vertex_layout, instance_layout]);
 
@@ -182,8 +196,10 @@ impl Renderer {
         let signal_inst_capacity = 256 * inst_stride;
         let signal_inst_buf = instance_buffer(&device, signal_inst_capacity);
 
-        let density_capacity = 8192 * std::mem::size_of::<Vertex>() as u64;
-        let density_vbuf = instance_buffer(&device, density_capacity);
+        let density_vcap = 8192 * std::mem::size_of::<StaticVertex>() as u64;
+        let density_vbuf = instance_buffer(&device, density_vcap);
+        let density_icap = 8192 * 4;
+        let density_ibuf = index_buffer(&device, density_icap);
 
         Ok(Renderer {
             surface,
@@ -205,17 +221,26 @@ impl Renderer {
             signal_inst_buf,
             signal_inst_capacity,
             density_vbuf,
-            density_capacity,
+            density_ibuf,
+            density_vcap,
+            density_icap,
             world: None,
+            markings: None,
         })
     }
 
-    /// Upload the baked road/junction/marking mesh once. `vertices` is the flat
-    /// `Vertex` array (pos.xy, color.rgb, light) and `indices` the triangle list.
-    pub fn set_world_mesh(&mut self, vertices: Vec<f32>, indices: Vec<u32>) {
-        let vbuf = buffer_init(&self.device, "world-v", bytemuck::cast_slice(&vertices), wgpu::BufferUsages::VERTEX);
-        let ibuf = buffer_init(&self.device, "world-i", bytemuck::cast_slice(&indices), wgpu::BufferUsages::INDEX);
-        self.world = Some((vbuf, ibuf, indices.len() as u32));
+    /// Upload the baked static geometry once. Roads+junctions (`world_*`) draw at
+    /// every zoom; markings (`mark_*`) only when zoomed in. Both are flat
+    /// `StaticVertex` arrays (center.xy, offset.xy, color.rgb, light).
+    pub fn set_world_mesh(&mut self, world_v: Vec<f32>, world_i: Vec<u32>, mark_v: Vec<f32>, mark_i: Vec<u32>) {
+        self.world = Some(self.upload_mesh("world", &world_v, &world_i));
+        self.markings = Some(self.upload_mesh("markings", &mark_v, &mark_i));
+    }
+
+    fn upload_mesh(&self, label: &str, vertices: &[f32], indices: &[u32]) -> (wgpu::Buffer, wgpu::Buffer, u32) {
+        let vbuf = buffer_init(&self.device, label, bytemuck::cast_slice(vertices), wgpu::BufferUsages::VERTEX);
+        let ibuf = buffer_init(&self.device, label, bytemuck::cast_slice(indices), wgpu::BufferUsages::INDEX);
+        (vbuf, ibuf, indices.len() as u32)
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -233,16 +258,18 @@ impl Renderer {
         &mut self,
         view_proj: Vec<f32>,
         alpha: f32,
+        mpp: f32,
         instances: Vec<u8>,
         count: u32,
         signals: Vec<u8>,
         signal_count: u32,
-        density: Vec<f32>,
-        density_count: u32,
+        density_v: Vec<f32>,
+        density_i: Vec<u32>,
     ) {
         let mut cam = [0f32; 20];
         cam[..16].copy_from_slice(&view_proj);
         cam[16] = alpha;
+        cam[17] = mpp;
         self.queue.write_buffer(&self.cam_buf, 0, bytemuck::cast_slice(&cam));
 
         if !instances.is_empty() {
@@ -259,13 +286,20 @@ impl Renderer {
             }
             self.queue.write_buffer(&self.signal_inst_buf, 0, &signals);
         }
-        if !density.is_empty() {
-            let bytes: &[u8] = bytemuck::cast_slice(&density);
-            if bytes.len() as u64 > self.density_capacity {
-                self.density_capacity = (bytes.len() as u64).next_power_of_two();
-                self.density_vbuf = instance_buffer(&self.device, self.density_capacity);
+        let density_count = density_i.len() as u32;
+        if density_count > 0 {
+            let vbytes: &[u8] = bytemuck::cast_slice(&density_v);
+            if vbytes.len() as u64 > self.density_vcap {
+                self.density_vcap = (vbytes.len() as u64).next_power_of_two();
+                self.density_vbuf = instance_buffer(&self.device, self.density_vcap);
             }
-            self.queue.write_buffer(&self.density_vbuf, 0, bytes);
+            self.queue.write_buffer(&self.density_vbuf, 0, vbytes);
+            let ibytes: &[u8] = bytemuck::cast_slice(&density_i);
+            if ibytes.len() as u64 > self.density_icap {
+                self.density_icap = (ibytes.len() as u64).next_power_of_two();
+                self.density_ibuf = index_buffer(&self.device, self.density_icap);
+            }
+            self.queue.write_buffer(&self.density_ibuf, 0, ibytes);
         }
 
         let frame = match self.surface.get_current_texture() {
@@ -292,17 +326,25 @@ impl Renderer {
             });
             pass.set_bind_group(0, &self.cam_bind_group, &[]);
 
+            pass.set_pipeline(&self.static_pipeline);
             if let Some((vbuf, ibuf, icount)) = &self.world {
-                pass.set_pipeline(&self.static_pipeline);
                 pass.set_vertex_buffer(0, vbuf.slice(..));
                 pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..*icount, 0, 0..1);
             }
 
             if density_count > 0 {
-                pass.set_pipeline(&self.static_pipeline);
                 pass.set_vertex_buffer(0, self.density_vbuf.slice(..));
-                pass.draw(0..density_count, 0..1);
+                pass.set_index_buffer(self.density_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..density_count, 0, 0..1);
+            }
+
+            if mpp < MARKING_MAX_MPP {
+                if let Some((vbuf, ibuf, icount)) = &self.markings {
+                    pass.set_vertex_buffer(0, vbuf.slice(..));
+                    pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..*icount, 0, 0..1);
+                }
             }
 
             if count > 0 {
@@ -336,6 +378,15 @@ fn instance_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
         label: Some("instances"),
         size,
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+fn index_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("indices"),
+        size,
+        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     })
 }

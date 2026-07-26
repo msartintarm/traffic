@@ -10,7 +10,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::render::camera::Camera;
 use crate::render::scene::{brake_intensity, signal_color, signal_instance, VehicleClass};
-use crate::render::{geometry, mass, Instance, Vertex};
+use crate::render::{geometry, mass, Instance, StaticMesh};
 use crate::sim::clock::SimClock;
 use crate::sim::config::{DriverConfig, SimConfig};
 use crate::sim::demand::{DemandGenerator, OdPair};
@@ -204,8 +204,7 @@ impl Simulation {
 
     // --- WebGPU renderer feed -------------------------------------------------
 
-    /// The baked static world mesh vertices, flat `[x, y, r, g, b, light]` per
-    /// vertex (roads + junctions + markings combined).
+    /// Roads + junctions as flat `StaticVertex` floats (drawn at all zooms).
     pub fn world_mesh_vertices(&self) -> Vec<f32> {
         bytemuck::cast_slice(&self.world_mesh().vertices).to_vec()
     }
@@ -214,11 +213,19 @@ impl Simulation {
         self.world_mesh().indices
     }
 
-    fn world_mesh(&self) -> crate::render::Mesh {
+    /// Lane markings as flat `StaticVertex` floats (drawn only when zoomed in).
+    pub fn marking_mesh_vertices(&self) -> Vec<f32> {
+        bytemuck::cast_slice(&geometry::marking_mesh(&self.world.network).vertices).to_vec()
+    }
+
+    pub fn marking_mesh_indices(&self) -> Vec<u32> {
+        geometry::marking_mesh(&self.world.network).indices
+    }
+
+    fn world_mesh(&self) -> StaticMesh {
         let net = &self.world.network;
         let mut mesh = geometry::road_mesh(net);
         mesh.extend(&geometry::junction_mesh(net));
-        mesh.extend(&geometry::marking_mesh(net));
         mesh
     }
 
@@ -273,33 +280,36 @@ impl Simulation {
         self.signal_instance_vec().len() as u32
     }
 
-    /// Translucent congestion-overlay triangles for the far-LOD density view:
-    /// per-link carriageway quads coloured by live occupancy, emitted only for
-    /// links busy enough to matter. Flat `Vertex` floats (6 per vertex); vertex
-    /// count is `len / 6`.
+    /// Translucent congestion-overlay mesh for the far-LOD density view: per-link
+    /// carriageway quads coloured by live occupancy, emitted only for links busy
+    /// enough to matter. `StaticVertex` floats; pair with [`density_indices`].
     pub fn density_vertices(&self) -> Vec<f32> {
+        bytemuck::cast_slice(&self.density_mesh().vertices).to_vec()
+    }
+
+    pub fn density_indices(&self) -> Vec<u32> {
+        self.density_mesh().indices
+    }
+
+    fn density_mesh(&self) -> StaticMesh {
         let net = &self.world.network;
         let mut count = vec![0u32; net.links.len()];
         for v in self.world.vehicles() {
             count[net.lane(v.lane).link.idx()] += 1;
         }
-        let mut verts: Vec<Vertex> = Vec::new();
+        let mut mesh = StaticMesh::default();
         for (i, s) in net.road_strips().iter().enumerate() {
             let link = net.link(LinkId(i as u32));
             let lane = net.lane(link.lane_start);
             let jam = (lane.length / 7.0 * link.lane_count as f64).max(1.0);
             let ratio = mass::occupancy_ratio(count[i] as f64, jam);
-            if ratio < 0.15 {
+            if ratio < 0.2 {
                 continue;
             }
             let c = mass::congestion_color(ratio);
-            let color = [c[0], c[1], c[2]];
-            let quad = geometry::corners([s[0], s[1]], [s[2], s[3]], s[4] / 2.0);
-            for idx in [0, 1, 2, 0, 2, 3] {
-                verts.push(Vertex { pos: quad[idx], color, light: 3.0 });
-            }
+            mesh.push_ribbon([s[0], s[1]], [s[2], s[3]], s[4] / 2.0, [c[0], c[1], c[2]], 3.0);
         }
-        bytemuck::cast_slice(&verts).to_vec()
+        mesh
     }
 
     fn signal_instance_vec(&self) -> Vec<Instance> {

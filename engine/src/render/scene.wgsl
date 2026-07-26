@@ -6,12 +6,16 @@
 struct Camera {
     view_proj: mat4x4<f32>,
     alpha: f32,
+    meters_per_pixel: f32,
     _pad0: f32,
     _pad1: f32,
-    _pad2: f32,
 };
 
 @group(0) @binding(0) var<uniform> cam: Camera;
+
+// Keep roads/lines at least this many world-metres of half-width per pixel, so a
+// thin ribbon never collapses below ~1.5px on screen and rasterizes cleanly.
+const MIN_HALF_PIXELS: f32 = 0.75;
 
 struct VOut {
     @builtin(position) clip: vec4<f32>,
@@ -22,12 +26,20 @@ struct VOut {
 
 @vertex
 fn vs_static(
-    @location(0) pos: vec2<f32>,
-    @location(1) color: vec3<f32>,
-    @location(2) light: f32,
+    @location(0) center: vec2<f32>,
+    @location(1) offset: vec2<f32>,
+    @location(2) color: vec3<f32>,
+    @location(3) light: f32,
 ) -> VOut {
+    let min_off = MIN_HALF_PIXELS * cam.meters_per_pixel;
+    let len = length(offset);
+    var world = center;
+    if (len > 1e-6) {
+        world = center + offset * (max(len, min_off) / len);
+    }
+
     var o: VOut;
-    o.clip = cam.view_proj * vec4<f32>(pos, 0.0, 1.0);
+    o.clip = cam.view_proj * vec4<f32>(world, 0.0, 1.0);
     o.color = color;
     o.light = light;
     o.brake = 0.0;
@@ -75,5 +87,5 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     if (in.light < 2.5) {
         return vec4<f32>(in.color * 0.7, 1.0);
     }
-    return vec4<f32>(in.color, 0.55); // congestion overlay (translucent)
+    return vec4<f32>(in.color, 0.45); // congestion overlay (translucent)
 }
