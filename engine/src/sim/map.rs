@@ -207,33 +207,64 @@ impl OsmMap {
 
         set_junction_setbacks(&mut net);
 
+        // Lane-channelised movements (California lane-use convention): rather than
+        // wire every approach lane to every exit — which at a big merged junction
+        // gives one lane six turns whose paths all fan out from the same point — we
+        // sort each approach's exits by turn angle and give each lane a contiguous
+        // *angular* slice, so the rightmost lane serves right turns and the leftmost
+        // serves lefts. Lane index increases leftward (lane 0 is the right lane).
         let mut movements: Vec<Movement> = Vec::new();
-        for lane_id in 0..net.lanes.len() {
-            let lane = net.lanes[lane_id];
-            let link = net.links[lane.link.idx()];
+        for in_li in 0..net.links.len() {
+            let link = net.links[in_li];
             let node = link.to;
-            let start = MovementId(movements.len() as u32);
+            let arr = net.arrival_dir(LinkId(in_li as u32));
+            // Valid onward links (skip U-turns by node identity and by geometry),
+            // as `(link, signed turn angle)`; ascending = rightmost turn first.
+            let mut onward: Vec<(usize, f64)> = Vec::new();
             for out_li in 0..net.links.len() {
                 let out = net.links[out_li];
                 if out.from != node || out.to == link.from {
                     continue;
                 }
-                // Skip heading reversals (U-turns) by geometry, not just node
-                // identity: merging a divided road's carriageways gives the two
-                // directions distinct terminus nodes, so the identity test above
-                // misses the U-turn onto the opposing carriageway — which would
-                // otherwise become a movement whose path runs backwards.
-                let arr = net.arrival_dir(lane.link);
                 let dep = net.departure_dir(LinkId(out_li as u32));
-                if arr[0] * dep[0] + arr[1] * dep[1] < -0.85 {
+                let dot = arr[0] * dep[0] + arr[1] * dep[1];
+                if dot < -0.85 {
                     continue; // ~>148°: a near-reversal onto the opposing carriageway
                 }
-                let to_index = lane.index_in_link.min(out.lane_count - 1);
-                let to_lane = LaneId(out.lane_start.0 + to_index);
-                movements.push(Movement { from_lane: LaneId(lane_id as u32), to_lane, node, signal_group: None });
+                onward.push((out_li, (arr[0] * dep[1] - arr[1] * dep[0]).atan2(dot)));
             }
-            net.lanes[lane_id].movement_start = start;
-            net.lanes[lane_id].movement_count = movements.len() as u32 - start.0;
+            onward.sort_by(|a, b| a.1.total_cmp(&b.1));
+
+            let (n, m) = (link.lane_count as usize, onward.len());
+            // Map a position in [0, from] to the nearest in [0, to].
+            let nearest = |x: usize, from: usize, to: usize| -> usize {
+                if from == 0 { 0 } else { ((x as f64) * (to as f64) / (from as f64)).round() as usize }
+            };
+            let mut lane_exits: Vec<std::collections::BTreeSet<usize>> = vec![Default::default(); n];
+            if m > 0 {
+                for i in 0..m {
+                    lane_exits[nearest(i, m - 1, n - 1)].insert(i); // every exit served
+                }
+                for (k, exits) in lane_exits.iter_mut().enumerate() {
+                    exits.insert(nearest(k, n - 1, m - 1)); // every lane serves its nearest
+                }
+            }
+            for (k, exits) in lane_exits.iter().enumerate() {
+                let lane_id = link.lane_start.0 + k as u32;
+                let start = MovementId(movements.len() as u32);
+                for &exit_i in exits {
+                    let out = net.links[onward[exit_i].0];
+                    let to_index = (k as u32).min(out.lane_count - 1);
+                    movements.push(Movement {
+                        from_lane: LaneId(lane_id),
+                        to_lane: LaneId(out.lane_start.0 + to_index),
+                        node,
+                        signal_group: None,
+                    });
+                }
+                net.lanes[lane_id as usize].movement_start = start;
+                net.lanes[lane_id as usize].movement_count = movements.len() as u32 - start.0;
+            }
         }
         net.movements = movements;
         net.build_interiors();

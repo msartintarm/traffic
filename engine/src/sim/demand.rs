@@ -120,10 +120,28 @@ fn sample_pairs(
         let d = dests[(rng::hash(seed, salt * 2 + 1, attempt, Stream::RouteChoice) as usize) % dests.len()];
         attempt += 1;
         if o != d && net.route_links(o, d).is_some_and(|r| r.len() >= 2) {
-            out.push(OdPair { origin: o, dest: d, rate_per_sec: 0.2 });
+            out.push(OdPair { origin: o, dest: d, rate_per_sec: capacity_rate(net, o) });
             found += 1;
         }
     }
+}
+
+/// Road capacity of a link as `lanes × speed_limit` (m/s) — a proxy for AADT that
+/// correlates with observed volumes (Caltrans counts), so demand favours the
+/// high-capacity roads (a freeway ramp / arterial like El Camino Real carries far
+/// more than a residential street). Calibratable against real counts later.
+fn link_capacity(net: &Network, link: LinkId) -> f64 {
+    let l = net.link(link);
+    l.lane_count as f64 * net.lane(l.lane_start).speed_limit
+}
+
+/// Spawn rate for a stream originating on `origin`, scaled by its road capacity
+/// relative to a typical arterial and clamped so no single road dominates or
+/// starves.
+fn capacity_rate(net: &Network, origin: LinkId) -> f64 {
+    const BASE: f64 = 0.2;
+    const REFERENCE: f64 = 30.0; // ~ a 2-lane, 15 m/s arterial
+    (BASE * link_capacity(net, origin) / REFERENCE).clamp(0.04, 0.9)
 }
 
 /// Vehicle-class mix: mostly cars, some trucks, a few buses.
@@ -171,6 +189,35 @@ mod tests {
         assert!(demand.spawned() >= 8 && demand.spawned() <= 36,
             "≈0.4/s over 60 s, throttled by the entrance, got {}", demand.spawned());
         assert!(world.exited() > 0, "spawned vehicles should reach the destination");
+    }
+
+    #[test]
+    fn demand_rate_scales_with_road_capacity() {
+        // A 4-way with a high-capacity entry (3 lanes, 30 m/s — a freeway-ramp-like
+        // road) and a low-capacity one (1 lane, 11 m/s — a local street). Demand
+        // originating on the big road spawns far faster, reflecting real volumes.
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, -200.0, 0.0), // H (high-capacity entry)
+                NodeSpec::uncontrolled(2, 0.0, -200.0), // L (low-capacity entry)
+                NodeSpec::uncontrolled(3, 0.0, 0.0),    // M (junction)
+                NodeSpec::uncontrolled(4, 200.0, 0.0),  // E (exit)
+                NodeSpec::uncontrolled(5, 0.0, 200.0),  // N (exit)
+            ],
+            links: vec![
+                LinkSpec::oneway(1, 3, 3, 30.0), // 0: H→M, big road
+                LinkSpec::oneway(2, 3, 1, 11.0), // 1: L→M, local
+                LinkSpec::oneway(3, 4, 2, 20.0), // 2: M→E
+                LinkSpec::oneway(3, 5, 2, 20.0), // 3: M→N
+            ],
+        }
+        .build();
+        assert!(capacity_rate(&net, LinkId(0)) > 3.0 * capacity_rate(&net, LinkId(1)),
+            "the big road spawns far faster: {} vs {}", capacity_rate(&net, LinkId(0)), capacity_rate(&net, LinkId(1)));
+        // boundary demand applies the capacity-scaled rate to each stream.
+        for p in &boundary_od_pairs(&net, 5, 20) {
+            assert_eq!(p.rate_per_sec, capacity_rate(&net, p.origin));
+        }
     }
 
     #[test]

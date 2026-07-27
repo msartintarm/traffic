@@ -1885,6 +1885,87 @@ mod tests {
     }
 
     #[test]
+    fn high_load_real_map_stays_bounded_and_flowing() {
+        // Browser-scale stress: the scraped map under saturating demand must stay
+        // *stable* — vehicle count bounded (self-limiting spawns, no runaway),
+        // throughput continues, and collisions stay a small fraction of completed
+        // trips (the engine degrades gracefully, it doesn't melt down or pile up).
+        use super::super::demand::{self, DemandGenerator};
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let net = super::super::map::OsmMap::from_json(&text).expect("map json").build();
+
+        let mut world = NetWorld::new(net, cfg());
+        let pairs = demand::boundary_od_pairs(&world.network, 1, 64); // saturating
+        let mut gen = DemandGenerator::new(&world, &pairs, 1);
+        world.install_router(&gen.destinations());
+
+        let mut peak = 0usize;
+        for tick in 0..3000 {
+            gen.step(&mut world, cfg().dt);
+            world.step();
+            peak = peak.max(world.vehicles().len());
+            assert!(world.vehicles().len() < 8000, "runaway vehicle count at tick {tick}");
+        }
+        assert!(world.exited() > 200, "sustained throughput under saturation, exited {}", world.exited());
+        assert!(peak > 100, "the map actually loads up under stress, peaked at {peak}");
+        // Collisions, if any, are a small fraction of completed trips — no pileup.
+        assert!(world.crashed() * 8 < world.exited(), "crashes stay a small fraction of trips: {} crashed vs {} exited", world.crashed(), world.exited());
+    }
+
+    #[test]
+    fn high_load_signalized_grid_saturates_gracefully() {
+        // A self-contained (no map.json) browser-scale stress: a 4×4 signalised grid
+        // driven into saturation. A dense grid gridlocks under heavy demand (a real
+        // phenomenon) — the point is that it does so *gracefully*: vehicle count
+        // stays bounded (spawns self-limit at blocked entrances, no runaway), some
+        // traffic still clears, and there's no collision pile-up.
+        use super::super::demand::{self, DemandGenerator};
+        let (rows, cols, d) = (4usize, 4usize, 220.0);
+        let plan = SignalPlan { green_secs: 12.0, yellow_secs: 3.0, offset: 0.0 };
+        let id = |r: usize, c: usize| (r * cols + c) as i64;
+        let mut nodes = Vec::new();
+        for r in 0..rows {
+            for c in 0..cols {
+                let (x, y) = (c as f64 * d, r as f64 * d);
+                let interior = r > 0 && r < rows - 1 && c > 0 && c < cols - 1;
+                nodes.push(if interior {
+                    NodeSpec::signalized(id(r, c), x, y, plan)
+                } else {
+                    NodeSpec::uncontrolled(id(r, c), x, y)
+                });
+            }
+        }
+        let mut links = Vec::new();
+        for r in 0..rows {
+            for c in 0..cols {
+                if c + 1 < cols {
+                    links.extend(LinkSpec::twoway(id(r, c), id(r, c + 1), 1, 15.0));
+                }
+                if r + 1 < rows {
+                    links.extend(LinkSpec::twoway(id(r, c), id(r + 1, c), 1, 15.0));
+                }
+            }
+        }
+        let net = OsmMap { nodes, links }.build();
+        let mut world = NetWorld::new(net, cfg());
+        let pairs = demand::boundary_od_pairs(&world.network, 3, 18);
+        assert!(!pairs.is_empty());
+        let mut gen = DemandGenerator::new(&world, &pairs, 3);
+        world.install_router(&gen.destinations());
+        let mut peak = 0usize;
+        for _ in 0..2500 {
+            gen.step(&mut world, cfg().dt);
+            world.step();
+            peak = peak.max(world.vehicles().len());
+            assert!(world.vehicles().len() < 3000, "bounded under load");
+        }
+        assert!(peak > 20, "the grid loads up under demand, peaked at {peak}");
+        assert!(world.exited() > 10, "some traffic still clears under saturation, exited {}", world.exited());
+        assert!(world.crashed() * 4 < world.exited() + 20, "no collision pile-up: {} crashed vs {} exited", world.crashed(), world.exited());
+    }
+
+    #[test]
     fn a_signalized_crossing_stays_collision_free_under_demand() {
         // Two conflicting through streams under sustained demand through a
         // signalized four-way: conflict-derived phasing plus all-red clearance

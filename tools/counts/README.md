@@ -7,23 +7,29 @@ vehicles/hour), and calibration tunes demand so those match observed counts.
 ## Real data (Millbrae, CA)
 
 The **Caltrans Traffic Census** publishes AADT (Annual Average Daily Traffic) for
-state routes. El Camino Real through Millbrae is **CA-82** — its OSM `ref` is
-`"CA 82"`, which the scraper now emits per link.
+state routes. US‑101 runs through the Millbrae box (~219k AADT — its OSM `ref` is
+`"US 101"`), and El Camino Real is **CA‑82** (`"CA 82"`, ~26.5k). The scraper
+emits `ref` per link, so counts join automatically.
 
-1. Download San Mateo County counts: <https://dot.ca.gov/programs/traffic-operations/census>
-2. Save a CSV of `identifier,aadt`, where `identifier` is an OSM road `ref`
-   (e.g. `CA 82`) or `name` (e.g. `El Camino Real`):
+### Automatic fetch (recommended)
 
-   ```csv
-   CA 82,32000
-   Millbrae Avenue,18000
-   ```
+`fetch_caltrans.py` pulls AADT straight from the public Caltrans `Traffic_AADT`
+ArcGIS service (no key) and writes the `ref,aadt` CSV — no manual download:
 
-3. Attach:
+```
+python3 fetch_caltrans.py --county SM --out caltrans.csv          # San Mateo county
+python3 attach_counts.py --map ../../web/public/map.json --counts caltrans.csv --synthesize --out counts.json
+```
 
-   ```
-   python3 attach_counts.py --map ../../web/public/map.json --counts caltrans.csv --out counts.json
-   ```
+`--synthesize` fills in local streets (no state-route `ref`) from road class, so
+every link gets a target. Pass `--bbox S W N E` to `fetch_caltrans.py` to scope
+AADT to just the map's box.
+
+### Manual (fallback)
+
+Download counts from <https://dot.ca.gov/programs/traffic-operations/census> and
+save a CSV of `identifier,aadt` (`ref` like `CA 82`, or `name` like `El Camino
+Real`), then run `attach_counts.py` as above.
 
 ## Without real data yet
 

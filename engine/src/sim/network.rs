@@ -669,17 +669,20 @@ mod tests {
 
     #[test]
     fn movement_turns_are_classified() {
-        // Corridor: through link 1→2 (heading +x) crossing at node 2, with exits
-        // east (2→4, straight) and north (2→5, a left turn).
+        // Corridor: link 1→2 (heading +x) with exits east (2→4, straight) and north
+        // (2→5, a left turn). Across the two-lane approach both exist, and the left
+        // is channelised onto the left lane (index increases leftward).
         let net = map::corridor_with_signal();
-        let through_lane = net.lanes_of(LinkId(0)).next().unwrap(); // link 1->2
-        let mut turns = std::collections::HashSet::new();
-        for k in 0..net.lane(through_lane).movement_count {
-            let mid = MovementId(net.lane(through_lane).movement_start.0 + k);
-            turns.insert(net.movement_turn(mid));
-        }
-        assert!(turns.contains(&TurnType::Through), "east exit is straight");
-        assert!(turns.contains(&TurnType::Left), "north exit is a left turn");
+        let lanes: Vec<LaneId> = net.lanes_of(LinkId(0)).collect();
+        let turns_of = |lane: LaneId| -> std::collections::HashSet<TurnType> {
+            (0..net.lane(lane).movement_count)
+                .map(|k| net.movement_turn(MovementId(net.lane(lane).movement_start.0 + k)))
+                .collect()
+        };
+        let all: std::collections::HashSet<TurnType> = lanes.iter().flat_map(|&l| turns_of(l)).collect();
+        assert!(all.contains(&TurnType::Through), "east exit is straight");
+        assert!(all.contains(&TurnType::Left), "north exit is a left turn");
+        assert!(turns_of(*lanes.last().unwrap()).contains(&TurnType::Left), "left turn is on the left lane");
     }
 
     #[test]
