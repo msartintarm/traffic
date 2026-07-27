@@ -211,8 +211,10 @@ impl OsmMap {
         // wire every approach lane to every exit — which at a big merged junction
         // gives one lane six turns whose paths all fan out from the same point — we
         // sort each approach's exits by turn angle and give each lane a contiguous
-        // *angular* slice, so the rightmost lane serves right turns and the leftmost
-        // serves lefts. Lane index increases leftward (lane 0 is the right lane).
+        // *angular* slice, so the left lane serves left turns and the right lane
+        // serves rights. `lane_point` places lane 0 adjacent to the centreline (the
+        // left lane) with higher indices toward the curb, so exits are ordered
+        // left-to-right and mapped in that same order onto lanes 0…n-1.
         let mut movements: Vec<Movement> = Vec::new();
         for in_li in 0..net.links.len() {
             let link = net.links[in_li];
@@ -233,7 +235,7 @@ impl OsmMap {
                 }
                 onward.push((out_li, (arr[0] * dep[1] - arr[1] * dep[0]).atan2(dot)));
             }
-            onward.sort_by(|a, b| a.1.total_cmp(&b.1));
+            onward.sort_by(|a, b| b.1.total_cmp(&a.1)); // leftmost turn first → lane 0
 
             let (n, m) = (link.lane_count as usize, onward.len());
             // Map a position in [0, from] to the nearest in [0, to].
@@ -1048,6 +1050,53 @@ mod tests {
                 "movement reverses down the arrival link"
             );
         }
+    }
+
+    #[test]
+    fn turns_are_channelised_left_to_right() {
+        // A 3-lane west approach into a 4-way: the LEFT turn must land on the
+        // left-hand lane, the RIGHT turn on the right-hand lane, with through in
+        // between — otherwise turning cars weave across the approach. Regression
+        // guard: lane 0 sits toward the centreline (`lane_point` places it there),
+        // so exits are ordered left→right onto ascending lane indices.
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(0, 0.0, 0.0),
+                NodeSpec::uncontrolled(1, -200.0, 0.0), // W, travel +x (east)
+                NodeSpec::uncontrolled(2, 200.0, 0.0),  // E (through)
+                NodeSpec::uncontrolled(3, 0.0, 200.0),  // N (left, i.e. +y)
+                NodeSpec::uncontrolled(4, 0.0, -200.0), // S (right)
+            ],
+            links: vec![
+                LinkSpec::oneway(1, 0, 3, 15.0), // 0: W→junction, three lanes
+                LinkSpec::oneway(0, 2, 1, 15.0), // 1: →E through
+                LinkSpec::oneway(0, 3, 1, 15.0), // 2: →N left
+                LinkSpec::oneway(0, 4, 1, 15.0), // 3: →S right
+            ],
+        }
+        .build();
+        let (mut lefts, mut throughs, mut rights) = (vec![], vec![], vec![]);
+        for lane in net.lanes_of(LinkId(0)) {
+            let idx = net.lane(lane).index_in_link;
+            for k in 0..net.lane(lane).movement_count {
+                match net.movement_turn(MovementId(net.lane(lane).movement_start.0 + k)) {
+                    TurnType::Left => lefts.push(idx),
+                    TurnType::Through => throughs.push(idx),
+                    TurnType::Right => rights.push(idx),
+                }
+            }
+        }
+        let min = |v: &[u32]| *v.iter().min().unwrap();
+        let max = |v: &[u32]| *v.iter().max().unwrap();
+        assert!(max(&lefts) <= min(&throughs), "left is left of through: {lefts:?} vs {throughs:?}");
+        assert!(max(&throughs) <= min(&rights), "through is left of right: {throughs:?} vs {rights:?}");
+
+        // Geometry: lower lane index really is the left lane. Travel is +x, so the
+        // left side is +y — lane 0 must sit farther +y than the last lane.
+        let lanes: Vec<LaneId> = net.lanes_of(LinkId(0)).collect();
+        let p0 = net.lane_point(lanes[0], 0.0);
+        let pn = net.lane_point(*lanes.last().unwrap(), 0.0);
+        assert!(p0[1] > pn[1], "lane 0 sits to the left (toward the centreline)");
     }
 
     #[test]

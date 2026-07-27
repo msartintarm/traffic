@@ -116,6 +116,65 @@ fn point_in_tri(t: [[f64; 2]; 3], p: [f64; 2]) -> bool {
     (s0 >= 0.0 && s1 >= 0.0 && s2 >= 0.0) || (s0 <= 0.0 && s1 <= 0.0 && s2 <= 0.0)
 }
 
+/// Scenario tests driven through the ASCII renderer: build a small map, run the
+/// sim, and both assert behaviour and (with `--nocapture`) *watch* it — the
+/// browser-free way to unit-test dynamic behaviour.
+#[cfg(test)]
+mod scenarios {
+    use super::*;
+    use crate::render::draw_world;
+    use crate::sim::config::{DriverConfig, SimConfig};
+    use crate::sim::map::{LinkSpec, NodeSpec, OsmMap};
+    use crate::sim::net_world::NetWorld;
+    use crate::sim::network::LinkId;
+
+    /// Render the world (roads + current vehicle poses) to ASCII.
+    fn snapshot(w: &NetWorld, center: [f64; 2], r: f64) -> Ascii {
+        let mut a = Ascii::centered(center, r, 22);
+        let poses: Vec<[f64; 3]> = w.vehicles().iter().map(|v| w.vehicle_world_pose(v)).collect();
+        draw_world(&w.network, &poses, &mut a);
+        a
+    }
+
+    #[test]
+    fn a_car_changes_into_its_turn_lane_before_the_junction() {
+        // 2-lane west approach into a 4-way; channelisation puts the left turn (to
+        // N) on the left lane (index 0, where cars spawn) and the right turn (to S)
+        // on the right lane. A car spawned in the left lane but bound for S must
+        // lane-change to reach its turn — which dest-routed cars only do now that
+        // next_link_on_path drives the mandatory change.
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(0, 0.0, 0.0),    // junction
+                NodeSpec::uncontrolled(1, -220.0, 0.0), // W (2-lane approach)
+                NodeSpec::uncontrolled(2, 220.0, 0.0),  // E (through)
+                NodeSpec::uncontrolled(3, 0.0, 220.0),  // N (left)
+                NodeSpec::uncontrolled(4, 0.0, -220.0), // S (right)
+            ],
+            links: vec![
+                LinkSpec::oneway(1, 0, 2, 15.0), // 0: W→junction, two lanes
+                LinkSpec::oneway(0, 2, 1, 15.0), // 1: →E through
+                LinkSpec::oneway(0, 3, 1, 15.0), // 2: →N left
+                LinkSpec::oneway(0, 4, 1, 15.0), // 3: →S right
+            ],
+        }
+        .build();
+        let mut w = NetWorld::new(net, SimConfig::default_config());
+        w.install_router(&[LinkId(3)]); // destination: the right-turn exit (→S)
+        assert!(w.spawn_to(1, LinkId(0), LinkId(3), 10.0, DriverConfig::car()), "spawns in the left lane");
+
+        for t in 0..300 {
+            w.step();
+            if t == 40 {
+                println!("\nturn-lane change (car should be shifting right):\n{}", snapshot(&w, [-40.0, -40.0], 90.0).render());
+            }
+        }
+        // The car reached the right-turn exit link — it found its turn lane.
+        assert!(w.link_flows()[3] > 0.0, "the car reached the right-turn exit (changed into its turn lane)");
+        assert_eq!(w.crashed(), 0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

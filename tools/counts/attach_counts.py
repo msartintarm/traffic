@@ -50,10 +50,17 @@ def load_observed(path):
 
 
 def aadt_for(link, observed):
-    for key in (link.get("ref"), link.get("name")):
-        if key and key.strip().lower() in observed:
-            return observed[key.strip().lower()], "observed"
-    return None, None
+    # OSM concurrencies pack several refs into one string ("I 280;CA 35"); try each.
+    keys = []
+    for field in (link.get("ref"), link.get("name")):
+        if field:
+            keys.extend(part.strip().lower() for part in field.split(";"))
+    # Prefer the highest-volume matching route on a concurrency.
+    best = None
+    for key in keys:
+        if key in observed and (best is None or observed[key] > best):
+            best = observed[key]
+    return (best, "observed") if best is not None else (None, None)
 
 
 def main():

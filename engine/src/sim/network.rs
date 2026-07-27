@@ -682,7 +682,8 @@ mod tests {
         let all: std::collections::HashSet<TurnType> = lanes.iter().flat_map(|&l| turns_of(l)).collect();
         assert!(all.contains(&TurnType::Through), "east exit is straight");
         assert!(all.contains(&TurnType::Left), "north exit is a left turn");
-        assert!(turns_of(*lanes.last().unwrap()).contains(&TurnType::Left), "left turn is on the left lane");
+        // lane 0 sits next to the centreline (the left lane) and carries the left.
+        assert!(turns_of(*lanes.first().unwrap()).contains(&TurnType::Left), "left turn is on the left lane");
     }
 
     #[test]
