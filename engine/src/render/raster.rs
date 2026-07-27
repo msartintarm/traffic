@@ -297,6 +297,32 @@ mod golden {
     }
 
     #[test]
+    #[ignore] // diagnostic: same-approach movement pairs whose interiors converge
+    fn dump_converging_turns() {
+        use crate::sim::network::MovementId;
+        let net = millbrae_junction(0);
+        let pts = |m: MovementId| -> Vec<[f64; 2]> {
+            let len = net.interior(m).len;
+            (0..=16).map(|i| { let p = net.interior_point(m, len * i as f64 / 16.0); [p[0], p[1]] }).collect()
+        };
+        for a in 0..net.movements.len() as u32 {
+            for b in a + 1..net.movements.len() as u32 {
+                let (ma, mb) = (net.movement(MovementId(a)), net.movement(MovementId(b)));
+                if ma.node != mb.node || net.lane(ma.from_lane).link != net.lane(mb.from_lane).link {
+                    continue; // only SAME-approach pairs
+                }
+                let (pa, pb) = (pts(MovementId(a)), pts(MovementId(b)));
+                let mind = pa.iter().flat_map(|p| pb.iter().map(move |q| (p[0] - q[0]).hypot(p[1] - q[1]))).fold(f64::MAX, f64::min);
+                if mind < 2.4 {
+                    println!("CONVERGE mv {a}(lane {},turn {:?}→link {}) & {b}(lane {},turn {:?}→link {}) min={mind:.2}m",
+                        net.lane(ma.from_lane).index_in_link, net.movement_turn(MovementId(a)), net.lane(ma.to_lane).link.0,
+                        net.lane(mb.from_lane).index_in_link, net.movement_turn(MovementId(b)), net.lane(mb.to_lane).link.0);
+                }
+            }
+        }
+    }
+
+    #[test]
     #[ignore] // diagnostic: link inventory for a junction fixture
     fn dump_junction_links() {
         use crate::sim::network::LinkId;

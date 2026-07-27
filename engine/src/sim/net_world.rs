@@ -109,6 +109,10 @@ pub struct NetWorld {
 /// congestion as it forms, rare enough that the recompute cost is negligible.
 const REROUTE_INTERVAL_SECS: f64 = 3.0;
 
+/// How far ahead a driver reads signals to ease off early for a red at the next
+/// intersection (metres) — anticipatory braking across the current link.
+const SIGNAL_LOOKAHEAD: f64 = 90.0;
+
 impl NetWorld {
     pub fn new(network: Network, cfg: SimConfig) -> Self {
         let mut merges: HashMap<u32, Vec<u32>> = HashMap::new();
@@ -280,6 +284,45 @@ impl NetWorld {
             return self.movement_to(veh.lane, veh.route[veh.route_idx + 1]);
         }
         Some(lane.movement_start)
+    }
+
+    /// The movement this vehicle would take if it were on `lane` — its flow-field
+    /// next hop from that lane. Used to look ahead past the current link (only for
+    /// destination-routed vehicles; explicit-route lookahead isn't supported).
+    fn intended_movement_from(&self, veh: &NetVehicle, lane: LaneId) -> Option<MovementId> {
+        if self.network.lane(lane).movement_count == 0 {
+            return None;
+        }
+        let (dest, router) = (veh.dest?, self.router.as_ref()?);
+        let next = router.next_hop(dest, self.network.lane(lane).link)?;
+        self.movement_to(lane, next)
+    }
+
+    /// Distance to the nearest **red** signal ahead along the vehicle's path,
+    /// looking past the immediate movement across up to a couple of links (within
+    /// [`SIGNAL_LOOKAHEAD`]). Lets a car ease off for a red one intersection away
+    /// instead of arriving at speed — anticipatory braking. `None` if the immediate
+    /// movement is itself red (handled directly) or nothing red is close.
+    fn red_ahead(&self, veh: &NetVehicle, immediate: Option<MovementId>, to_line: f64) -> Option<f64> {
+        let mv0 = immediate?;
+        if self.movement_state(mv0) == SignalState::Red {
+            return None; // the immediate stop line already handles this
+        }
+        let mut dist = to_line + self.network.interior(mv0).len;
+        let mut lane = self.network.movement(mv0).to_lane;
+        for _ in 0..2 {
+            dist += self.network.lane(lane).length;
+            if dist > SIGNAL_LOOKAHEAD {
+                return None;
+            }
+            let mv = self.intended_movement_from(veh, lane)?;
+            if self.movement_state(mv) == SignalState::Red {
+                return Some(dist);
+            }
+            dist += self.network.interior(mv).len;
+            lane = self.network.movement(mv).to_lane;
+        }
+        None
     }
 
     /// The movement from `from_lane` onto `next_link`, if one exists.
@@ -568,7 +611,11 @@ impl NetWorld {
                     SignalState::Red => true,
                     SignalState::Yellow => can_stop_before(veh.speed, driver.comfort_decel, to_line),
                 });
-                let stop_line = (signal_stop || downstream_blocked).then_some(to_line);
+                // Stop at the immediate line (red / blocked box), or ease toward a
+                // red one intersection ahead so the slowdown starts an earlier link.
+                let stop_line = (signal_stop || downstream_blocked)
+                    .then_some(to_line)
+                    .or_else(|| self.red_ahead(veh, intended, to_line));
 
                 let speed_target = intended.and_then(|mid| {
                     let to = self.network.lane(self.network.movement(mid).to_lane);
@@ -1733,6 +1780,56 @@ mod tests {
         // junctions are merged into one, so a smaller set of real intersections
         // cycle rather than sitting permanently green.
         assert!(multiphase >= 8, "most signalized intersections should cycle, got {multiphase}");
+    }
+
+    #[test]
+    fn a_car_brakes_early_for_a_red_at_the_next_intersection() {
+        // W →275m→ A →25m→ X(signalised 4-way) → E, with a cross street kept busy so
+        // X's through stays red. A through car should already be braking while still
+        // on the long W→A link — an earlier subsection — for the red one hop ahead.
+        let plan = SignalPlan { green_secs: 10.0, yellow_secs: 3.0, offset: 0.0 };
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, -300.0, 0.0), // W
+                NodeSpec::uncontrolled(2, -25.0, 0.0),  // A
+                NodeSpec::signalized(3, 0.0, 0.0, plan),// X
+                NodeSpec::uncontrolled(4, 200.0, 0.0),  // E
+                NodeSpec::uncontrolled(5, 0.0, -150.0), // S
+                NodeSpec::uncontrolled(6, 0.0, 150.0),  // N
+            ],
+            links: vec![
+                LinkSpec::oneway(1, 2, 1, 20.0), // 0: W→A
+                LinkSpec::oneway(2, 3, 1, 20.0), // 1: A→X (short)
+                LinkSpec::oneway(3, 4, 1, 20.0), // 2: X→E
+                LinkSpec::oneway(5, 3, 1, 20.0), // 3: S→X (cross)
+                LinkSpec::oneway(3, 6, 1, 20.0), // 4: X→N (cross)
+            ],
+        }
+        .build();
+        let mut w = NetWorld::new(net, cfg());
+        w.install_router(&[LinkId(2), LinkId(4)]);
+        let lane1 = w.network.lanes_of(LinkId(1)).next().unwrap();
+        let through = w.movement_to(lane1, LinkId(2)).expect("X has a through movement"); // A→X→E
+
+        let l0 = w.network.lane(w.network.lanes_of(LinkId(0)).next().unwrap()).length;
+        assert!(w.spawn_to(1, LinkId(0), LinkId(2), 16.0, DriverConfig::car()));
+        let mut braked_early = false;
+        let mut next = 100u32;
+        for t in 0..900 {
+            if t % 12 == 0 {
+                w.spawn_to(next, LinkId(3), LinkId(4), 12.0, DriverConfig::car()); // keep the cross busy
+                next += 1;
+            }
+            w.step();
+            if let Some(v) = w.vehicle(1) {
+                let on_w_a = v.lane == w.network.lanes_of(LinkId(0)).next().unwrap() && v.position < l0 - 1.0;
+                if on_w_a && w.movement_state(through) == SignalState::Red && v.speed < 10.0 {
+                    braked_early = true;
+                }
+            }
+        }
+        assert!(braked_early, "the car should slow on the earlier W→A link for the red one intersection ahead");
+        assert_eq!(w.crashed(), 0);
     }
 
     #[test]
