@@ -119,7 +119,7 @@ fn point_in_tri(t: [[f64; 2]; 3], p: [f64; 2]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::render::{draw_world, geometry::bezier};
+    use crate::render::draw_world;
     use crate::sim::config::{DriverConfig, SimConfig};
     use crate::sim::map::{arterial_intersection, LinkSpec, NodeSpec, OsmMap};
     use crate::sim::net_world::NetWorld;
@@ -145,15 +145,15 @@ mod tests {
         assert_eq!(a.cell_at_world([0.0, -38.0]), Some('#'), "south arm present");
     }
 
-    #[test]
-    fn ascii_reveals_a_merged_split_crossing() {
-        // A divided crossing split across two nodes 20 m apart, merged by target B.
+    /// A divided crossing split across two nodes 20 m apart (staggered cross
+    /// street), merged by target B — the case that produced skewed geometry.
+    fn merged_crossing() -> Network {
         let mut links = LinkSpec::twoway(1, 2, 2, 20.0).to_vec();
         links.extend(LinkSpec::twoway(10, 1, 2, 20.0));
         links.extend(LinkSpec::twoway(1, 11, 1, 13.0));
         links.extend(LinkSpec::twoway(2, 12, 2, 20.0));
         links.extend(LinkSpec::twoway(2, 13, 1, 13.0));
-        let net = OsmMap {
+        OsmMap {
             nodes: vec![
                 NodeSpec::uncontrolled(1, 0.0, 0.0),
                 NodeSpec::uncontrolled(2, 20.0, 0.0),
@@ -165,10 +165,39 @@ mod tests {
             links,
         }
         .merge_split_intersections()
-        .build();
+        .build()
+    }
+
+    #[test]
+    fn ascii_reveals_a_merged_split_crossing() {
+        let net = merged_crossing();
         let a = draw(&net, [10.0, 0.0], 45.0);
         println!("\nmerged split crossing (centroid ~[10,0]):\n{}", a.render());
         assert!(a.count('#') > 0, "the merged junction paves something");
+    }
+
+    fn tangent_at(net: &Network, m: MovementId, s: f64) -> [f64; 2] {
+        let p = net.interior_point(m, s);
+        [p[2].cos(), p[2].sin()]
+    }
+
+    #[test]
+    fn interiors_enter_and_exit_aligned_with_their_roads() {
+        // Every movement should leave its arrival lane heading along that road and
+        // meet its departure lane heading along that one — so a driver never jerks
+        // sideways onto a diagonal. Holds even for the staggered merged crossing.
+        for net in [arterial_intersection(), merged_crossing()] {
+            for m in (0..net.movements.len() as u32).map(MovementId) {
+                let mv = net.movement(m);
+                let arr = net.arrival_dir(net.lane(mv.from_lane).link);
+                let dep = net.departure_dir(net.lane(mv.to_lane).link);
+                let te = tangent_at(&net, m, 0.0);
+                let tx = tangent_at(&net, m, net.interior(m).len);
+                let dot = |a: [f64; 2], b: [f64; 2]| a[0] * b[0] + a[1] * b[1];
+                assert!(dot(te, arr) > 0.9, "entry tangent misaligned with the arrival road (movement {})", m.0);
+                assert!(dot(tx, dep) > 0.9, "exit tangent misaligned with the departure road (movement {})", m.0);
+            }
+        }
     }
 
     #[test]
@@ -197,6 +226,90 @@ mod tests {
         assert!(paved, "the vehicle is on the carriageway");
     }
 
+    fn seg_cross(a0: [f64; 2], a1: [f64; 2], b0: [f64; 2], b1: [f64; 2]) -> bool {
+        let d = |p: [f64; 2], q: [f64; 2], r: [f64; 2]| (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]);
+        let (d1, d2, d3, d4) = (d(b0, b1, a0), d(b0, b1, a1), d(a0, a1, b0), d(a0, a1, b1));
+        (d1 > 0.0) != (d2 > 0.0) && (d3 > 0.0) != (d4 > 0.0)
+    }
+
+    fn interior_pts(net: &Network, m: MovementId) -> Vec<[f64; 2]> {
+        let len = net.interior(m).len;
+        (0..=16).map(|i| { let p = net.interior_point(m, len * i as f64 / 16.0); [p[0], p[1]] }).collect()
+    }
+
+    fn paths_cross(net: &Network, a: MovementId, b: MovementId) -> bool {
+        let (pa, pb) = (interior_pts(net, a), interior_pts(net, b));
+        pa.windows(2).any(|sa| pb.windows(2).any(|sb| seg_cross(sa[0], sa[1], sb[0], sb[1])))
+    }
+
+    #[test]
+    fn crossing_interiors_are_flagged_as_conflicts() {
+        // If two movements' paths physically cross (different approach, different
+        // exit — a genuine crossing, not a merge or diverge) they MUST be recorded
+        // as conflicting, or vehicles would drive through each other unchecked.
+        for net in [arterial_intersection(), merged_crossing()] {
+            let n = net.movements.len() as u32;
+            for a in 0..n {
+                for b in a + 1..n {
+                    let (ma, mb) = (net.movement(MovementId(a)), net.movement(MovementId(b)));
+                    if ma.node != mb.node {
+                        continue;
+                    }
+                    let same_approach = net.lane(ma.from_lane).link == net.lane(mb.from_lane).link;
+                    let same_exit = net.lane(ma.to_lane).link == net.lane(mb.to_lane).link;
+                    if same_approach || same_exit {
+                        continue; // shared approach/exit = follow or merge, not a crossing
+                    }
+                    if paths_cross(&net, MovementId(a), MovementId(b)) {
+                        assert!(
+                            net.movements_conflict(MovementId(a), MovementId(b)),
+                            "movements {a} and {b} cross but are not flagged conflicting",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "import")]
+    #[test]
+    fn real_millbrae_junctions_render_and_stay_sound() {
+        use crate::sim::map::millbrae_junction;
+        for n in 0..3 {
+            let net = millbrae_junction(n);
+            let a = draw(&net, [0.0, 0.0], 60.0);
+            println!("\n===== real Millbrae junction {n} ({} nodes / {} links) =====\n{}", net.nodes.len(), net.links.len(), a.render());
+
+            // Same invariants as the synthetic cases, now on real complexity.
+            for m in (0..net.movements.len() as u32).map(MovementId) {
+                let mv = net.movement(m);
+                let arr = net.arrival_dir(net.lane(mv.from_lane).link);
+                let dep = net.departure_dir(net.lane(mv.to_lane).link);
+                let te = tangent_at(&net, m, 0.0);
+                let tx = tangent_at(&net, m, net.interior(m).len);
+                let dot = |a: [f64; 2], b: [f64; 2]| a[0] * b[0] + a[1] * b[1];
+                assert!(dot(te, arr) > 0.85, "junction {n} movement {} enters misaligned (dot {:.2})", m.0, dot(te, arr));
+                assert!(dot(tx, dep) > 0.85, "junction {n} movement {} exits misaligned (dot {:.2})", m.0, dot(tx, dep));
+            }
+            let nm = net.movements.len() as u32;
+            for a in 0..nm {
+                for b in a + 1..nm {
+                    let (ma, mb) = (net.movement(MovementId(a)), net.movement(MovementId(b)));
+                    if ma.node != mb.node
+                        || net.lane(ma.from_lane).link == net.lane(mb.from_lane).link
+                        || net.lane(ma.to_lane).link == net.lane(mb.to_lane).link
+                    {
+                        continue;
+                    }
+                    if paths_cross(&net, MovementId(a), MovementId(b)) {
+                        assert!(net.movements_conflict(MovementId(a), MovementId(b)),
+                            "junction {n}: movements {a},{b} cross but aren't flagged conflicting");
+                    }
+                }
+            }
+        }
+    }
+
     /// Max perpendicular deviation (m) of a movement's interior Bézier from the
     /// straight line between its entry and exit — 0 means a truly linear path.
     fn interior_bow(net: &Network, m: MovementId) -> f64 {
@@ -206,7 +319,7 @@ mod tests {
         let len = d[0].hypot(d[1]).max(1e-9);
         (0..=20)
             .map(|i| {
-                let p = bezier(a, it.ctrl, b, i as f64 / 20.0);
+                let p = net.interior_point(m, it.len * i as f64 / 20.0);
                 ((p[0] - a[0]) * d[1] - (p[1] - a[1]) * d[0]).abs() / len
             })
             .fold(0.0, f64::max)

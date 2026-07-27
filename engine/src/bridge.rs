@@ -40,6 +40,18 @@ impl Simulation {
         Self::assemble(map::millbrae_sample(), seed)
     }
 
+    /// Build a named built-in test scenario (a clean, isolated network) — the
+    /// browser's scenario selector uses this to swap between hand-built junctions
+    /// and the sample/real map for debugging intersection behaviour in isolation.
+    pub fn scenario(name: &str, seed: u32) -> Simulation {
+        let net = match name {
+            "arterial" => map::arterial_intersection(),
+            "corridor" => map::corridor_with_signal(),
+            _ => map::millbrae_sample(),
+        };
+        Self::assemble(net, seed)
+    }
+
     /// Load a network scraped by `tools/osm-scraper` (its JSON schema) and drive
     /// origin–destination demand across it. Requires the `import` feature.
     #[cfg(feature = "import")]

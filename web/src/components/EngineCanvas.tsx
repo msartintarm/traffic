@@ -75,6 +75,11 @@ export default function EngineCanvas() {
   const [error, setError] = useState<string | null>(null);
   const [backend, setBackend] = useState("");
   const [mapLabel, setMapLabel] = useState("");
+  const [scenario, setScenario] = useState("millbrae");
+
+  useEffect(() => {
+    setScenario(new URLSearchParams(window.location.search).get("scenario") ?? "millbrae");
+  }, []);
 
   useEffect(() => {
     let raf = 0;
@@ -163,17 +168,23 @@ export default function EngineCanvas() {
         await mod.default();
         if (disposed) return;
 
+        const scenario = new URLSearchParams(window.location.search).get("scenario") ?? "millbrae";
         let loaded: Sim | null = null;
         let label = "sample map";
-        try {
-          const res = await fetch(`${basePath()}/map.json`);
-          if (res.ok && mod.Simulation.from_map_json) {
-            const text = await res.text();
-            loaded = mod.Simulation.from_map_json(text, 0xc0ffee);
-            label = "OSM map";
+        if (scenario === "arterial" || scenario === "corridor") {
+          loaded = mod.Simulation.scenario(scenario, 0xc0ffee);
+          label = `${scenario} scenario`;
+        } else {
+          try {
+            const res = await fetch(`${basePath()}/map.json`);
+            if (res.ok && mod.Simulation.from_map_json) {
+              const text = await res.text();
+              loaded = mod.Simulation.from_map_json(text, 0xc0ffee);
+              label = "OSM map";
+            }
+          } catch {
+            loaded = null;
           }
-        } catch {
-          loaded = null;
         }
         const sim: Sim = loaded ?? new mod.Simulation(0xc0ffee);
         simRef.current = sim;
@@ -312,6 +323,19 @@ export default function EngineCanvas() {
         <button className={styles.button} disabled={!ready} onClick={() => simRef.current?.fit()}>
           Fit
         </button>
+        <select
+          className={styles.button}
+          value={scenario}
+          onChange={(e) => {
+            const url = new URL(window.location.href);
+            url.searchParams.set("scenario", e.target.value);
+            window.location.href = url.toString();
+          }}
+        >
+          <option value="millbrae">Millbrae (real map)</option>
+          <option value="arterial">Test: arterial junction</option>
+          <option value="corridor">Test: signal corridor</option>
+        </select>
       </div>
 
       <div className={styles.status}>

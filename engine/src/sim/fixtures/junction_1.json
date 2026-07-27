@@ -1,0 +1,43 @@
+{
+  "nodes": [
+    { "osm_id": 65434978, "x": 0.0, "y": 0.0, "control": "uncontrolled" },
+    { "osm_id": 6321861924, "x": 9.2, "y": -12.5, "control": "signal", "signal": { "green_secs": 25, "yellow_secs": 4, "offset": 0.0 } },
+    { "osm_id": 6321861929, "x": 19.5, "y": -26.4, "control": "uncontrolled" },
+    { "osm_id": 65437962, "x": -72.2, "y": 101.8, "control": "stop" },
+    { "osm_id": 65439966, "x": -70.9, "y": -51.3, "control": "uncontrolled" },
+    { "osm_id": 65434980, "x": 73.0, "y": -81.5, "control": "uncontrolled" },
+    { "osm_id": 276563018, "x": 78.1, "y": 44.7, "control": "uncontrolled" },
+    { "osm_id": 1427535790, "x": -29.5, "y": -21.5, "control": "uncontrolled" },
+    { "osm_id": 4116160019, "x": -19.2, "y": 27.6, "control": "uncontrolled" },
+    { "osm_id": 65439964, "x": 70.2, "y": 54.3, "control": "uncontrolled" },
+    { "osm_id": 6321861925, "x": 9.8, "y": 10.0, "control": "signal", "signal": { "green_secs": 25, "yellow_secs": 4, "offset": 0.0 } },
+    { "osm_id": 4116160018, "x": -5.1, "y": 7.8, "control": "uncontrolled" },
+    { "osm_id": 6321861926, "x": -6.0, "y": 9.0, "control": "signal", "signal": { "green_secs": 25, "yellow_secs": 4, "offset": 0.0 } },
+    { "osm_id": 6321861927, "x": -6.4, "y": -5.4, "control": "signal", "signal": { "green_secs": 25, "yellow_secs": 4, "offset": 0.0 } }
+  ],
+  "links": [
+    { "from_osm": 65434978, "to_osm": 6321861924, "lanes": 1, "speed_limit": 15.65, "layer": 0, "geometry": [[7.6,-10.7]] },
+    { "from_osm": 6321861924, "to_osm": 65434978, "lanes": 1, "speed_limit": 15.65, "layer": 0, "geometry": [[7.6,-10.7]] },
+    { "from_osm": 6321861924, "to_osm": 6321861929, "lanes": 1, "speed_limit": 15.65, "layer": 0, "geometry": [[14.7,-19.5],[15.5,-20.4],[16.4,-21.5]] },
+    { "from_osm": 6321861929, "to_osm": 6321861924, "lanes": 1, "speed_limit": 15.65, "layer": 0, "geometry": [[16.4,-21.5],[15.5,-20.4],[14.7,-19.5]] },
+    { "from_osm": 65434978, "to_osm": 276563018, "lanes": 2, "speed_limit": 13.41, "layer": 0, "geometry": [[8.6,-1.3],[13.5,0.5],[16.1,1.5]] },
+    { "from_osm": 1427535790, "to_osm": 65439966, "lanes": 1, "speed_limit": 13.41, "layer": 0, "geometry": [] },
+    { "from_osm": 65439966, "to_osm": 1427535790, "lanes": 1, "speed_limit": 13.41, "layer": 0, "geometry": [] },
+    { "from_osm": 4116160019, "to_osm": 65437962, "lanes": 1, "speed_limit": 15.65, "layer": 0, "geometry": [[-41.8,59.1],[-67.2,94.5],[-68.1,95.8]] },
+    { "from_osm": 65437962, "to_osm": 4116160019, "lanes": 1, "speed_limit": 15.65, "layer": 0, "geometry": [[-68.1,95.8],[-67.2,94.5],[-41.8,59.1]] },
+    { "from_osm": 65439964, "to_osm": 6321861925, "lanes": 2, "speed_limit": 13.41, "layer": 0, "geometry": [[63.7,49.5]] },
+    { "from_osm": 6321861925, "to_osm": 65434978, "lanes": 2, "speed_limit": 13.41, "layer": 0, "geometry": [[9.1,9.5],[4.2,4.4]] },
+    { "from_osm": 4116160018, "to_osm": 6321861926, "lanes": 1, "speed_limit": 15.65, "layer": 0, "geometry": [] },
+    { "from_osm": 6321861926, "to_osm": 4116160018, "lanes": 1, "speed_limit": 15.65, "layer": 0, "geometry": [] },
+    { "from_osm": 6321861926, "to_osm": 4116160019, "lanes": 1, "speed_limit": 15.65, "layer": 0, "geometry": [] },
+    { "from_osm": 4116160019, "to_osm": 6321861926, "lanes": 1, "speed_limit": 15.65, "layer": 0, "geometry": [] },
+    { "from_osm": 65434978, "to_osm": 4116160018, "lanes": 1, "speed_limit": 15.65, "layer": 0, "geometry": [] },
+    { "from_osm": 4116160018, "to_osm": 65434978, "lanes": 1, "speed_limit": 15.65, "layer": 0, "geometry": [] },
+    { "from_osm": 65434978, "to_osm": 6321861927, "lanes": 1, "speed_limit": 13.41, "layer": 0, "geometry": [[-5.2,-4.6]] },
+    { "from_osm": 6321861927, "to_osm": 65434978, "lanes": 1, "speed_limit": 13.41, "layer": 0, "geometry": [[-5.2,-4.6]] },
+    { "from_osm": 6321861927, "to_osm": 1427535790, "lanes": 1, "speed_limit": 13.41, "layer": 0, "geometry": [] },
+    { "from_osm": 1427535790, "to_osm": 6321861927, "lanes": 1, "speed_limit": 13.41, "layer": 0, "geometry": [] },
+    { "from_osm": 6321861929, "to_osm": 65434980, "lanes": 1, "speed_limit": 15.65, "layer": 0, "geometry": [[22.4,-30.0],[29.5,-38.3]] },
+    { "from_osm": 65434980, "to_osm": 6321861929, "lanes": 1, "speed_limit": 15.65, "layer": 0, "geometry": [[29.5,-38.3],[22.4,-30.0]] }
+  ]
+}

@@ -93,14 +93,18 @@ pub struct SignalGroup {
     pub bit: u8,
 }
 
-/// The path a vehicle drives *inside* a node while executing a movement: a
-/// quadratic Bézier from the arrival lane's stop point (`entry`), bulging through
-/// the node corner (`ctrl`), to the departure lane's start (`exit`). `len` is its
-/// arc length, so crossing a node takes real time instead of teleporting.
+/// The path a vehicle drives *inside* a node while executing a movement: a cubic
+/// Bézier from the arrival lane's stop point (`entry`) to the departure lane's
+/// start (`exit`), with control handles `c1`/`c2` set along the arrival and
+/// departure road directions. That makes the path *leave* aligned with the road
+/// it came from and *arrive* aligned with the road it enters — straight when the
+/// roads are collinear, a smooth arc for a turn, a smooth shift when staggered —
+/// so a vehicle never jerks sideways onto a diagonal. `len` is its arc length.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Interior {
     pub entry: [f64; 2],
-    pub ctrl: [f64; 2],
+    pub c1: [f64; 2],
+    pub c2: [f64; 2],
     pub exit: [f64; 2],
     pub len: f64,
 }
@@ -155,10 +159,14 @@ fn unit(v: [f64; 2]) -> [f64; 2] {
     [v[0] / n, v[1] / n]
 }
 
-/// Quadratic Bézier point at parameter `t` in `[0,1]`.
-fn bezier(a: [f64; 2], c: [f64; 2], b: [f64; 2], t: f64) -> [f64; 2] {
+/// Cubic Bézier point at parameter `t` in `[0,1]`.
+fn bezier3(a: [f64; 2], c1: [f64; 2], c2: [f64; 2], b: [f64; 2], t: f64) -> [f64; 2] {
     let u = 1.0 - t;
-    [u * u * a[0] + 2.0 * u * t * c[0] + t * t * b[0], u * u * a[1] + 2.0 * u * t * c[1] + t * t * b[1]]
+    let (w0, w1, w2, w3) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+    [
+        w0 * a[0] + w1 * c1[0] + w2 * c2[0] + w3 * b[0],
+        w0 * a[1] + w1 * c1[1] + w2 * c2[1] + w3 * b[1],
+    ]
 }
 
 const INTERIOR_SAMPLES: usize = 16;
@@ -170,7 +178,7 @@ fn interior_polyline(it: &Interior) -> Vec<([f64; 2], f64)> {
     let mut prev = it.entry;
     out.push((prev, 0.0));
     for i in 1..=INTERIOR_SAMPLES {
-        let p = bezier(it.entry, it.ctrl, it.exit, i as f64 / INTERIOR_SAMPLES as f64);
+        let p = bezier3(it.entry, it.c1, it.c2, it.exit, i as f64 / INTERIOR_SAMPLES as f64);
         acc += norm(sub(p, prev));
         out.push((p, acc));
         prev = p;
@@ -180,18 +188,6 @@ fn interior_polyline(it: &Interior) -> Vec<([f64; 2], f64)> {
 
 fn point2(p: [f64; 3]) -> [f64; 2] {
     [p[0], p[1]]
-}
-
-/// Intersection of the lines through `p1` (dir `d1`) and `p2` (dir `d2`); `None`
-/// when they're parallel.
-fn line_intersection(p1: [f64; 2], d1: [f64; 2], p2: [f64; 2], d2: [f64; 2]) -> Option<[f64; 2]> {
-    let denom = d1[0] * d2[1] - d1[1] * d2[0];
-    if denom.abs() < 1e-6 {
-        return None;
-    }
-    let dp = sub(p2, p1);
-    let t = (dp[0] * d2[1] - dp[1] * d2[0]) / denom;
-    Some([p1[0] + d1[0] * t, p1[1] + d1[1] * t])
 }
 
 /// The sub-polyline of `poly` between arc-lengths `s0` and `s1`, with the two
@@ -318,10 +314,10 @@ impl Network {
     pub fn interior_point(&self, mid: MovementId, s: f64) -> [f64; 3] {
         let it = self.interior(mid);
         let t = (s / it.len.max(1e-9)).clamp(0.0, 1.0);
-        let p = bezier(it.entry, it.ctrl, it.exit, t);
+        let p = bezier3(it.entry, it.c1, it.c2, it.exit, t);
         // Clamped centred difference, so the tangent is valid at both endpoints.
-        let a = bezier(it.entry, it.ctrl, it.exit, (t - 0.02).max(0.0));
-        let b = bezier(it.entry, it.ctrl, it.exit, (t + 0.02).min(1.0));
+        let a = bezier3(it.entry, it.c1, it.c2, it.exit, (t - 0.02).max(0.0));
+        let b = bezier3(it.entry, it.c1, it.c2, it.exit, (t + 0.02).min(1.0));
         let d = unit(sub(b, a));
         [p[0], p[1], d[1].atan2(d[0])]
     }
@@ -337,30 +333,15 @@ impl Network {
                 let mv = self.movement(MovementId(m));
                 let entry = point2(self.lane_point(mv.from_lane, self.lane(mv.from_lane).length));
                 let exit = point2(self.lane_point(mv.to_lane, 0.0));
-                let mid = [(entry[0] + exit[0]) * 0.5, (entry[1] + exit[1]) * 0.5];
-                // A through goes straight (control = midpoint). A turn curves tangent
-                // to the arrival lane at entry and the departure lane at exit — the
-                // control point is where those tangents meet, giving a real turn
-                // trajectory. Guard it: the apex must sit ahead of entry and within a
-                // sane distance, else fall back to the midpoint so shallow/near-
-                // straight movements never loop out into a circle.
+                // Control handles lie along the arrival and departure road
+                // directions, a third of the chord out, so the path leaves and
+                // arrives tangent to each road (straight when collinear).
                 let arr = self.arrival_dir(self.lane(mv.from_lane).link);
                 let dep = self.departure_dir(self.lane(mv.to_lane).link);
-                let chord = norm(sub(exit, entry));
-                let ctrl = if self.movement_turn(MovementId(m)) == TurnType::Through {
-                    mid
-                } else {
-                    match line_intersection(entry, arr, exit, dep) {
-                        Some(a)
-                            if sub(a, entry)[0] * arr[0] + sub(a, entry)[1] * arr[1] > 0.0
-                                && norm(sub(a, mid)) <= chord.max(1.0) * 1.5 =>
-                        {
-                            a
-                        }
-                        _ => mid,
-                    }
-                };
-                let mut it = Interior { entry, ctrl, exit, len: 0.0 };
+                let k = norm(sub(exit, entry)) / 3.0;
+                let c1 = [entry[0] + arr[0] * k, entry[1] + arr[1] * k];
+                let c2 = [exit[0] - dep[0] * k, exit[1] - dep[1] * k];
+                let mut it = Interior { entry, c1, c2, exit, len: 0.0 };
                 it.len = interior_polyline(&it).last().map_or(0.0, |&(_, s)| s);
                 it
             })
@@ -769,8 +750,9 @@ mod tests {
             let h1 = net.interior_point(mid, it.len)[2];
             assert!((h0 - arr[1].atan2(arr[0])).abs() < 0.25, "leaves along the arrival heading");
             assert!((h1 - dep[1].atan2(dep[0])).abs() < 0.25, "arrives along the departure heading");
-            let node = net.node(net.movement(mid).node).position;
-            assert!((it.ctrl[0] - node[0]).hypot(it.ctrl[1] - node[1]) > 1e-3, "control is the tangent apex, not the node centre");
+            // The first handle leads out of the entry along the arrival direction.
+            let lead = [it.c1[0] - it.entry[0], it.c1[1] - it.entry[1]];
+            assert!(lead[0] * arr[0] + lead[1] * arr[1] > 0.0, "first control handle leads along the arrival road");
         }
     }
 

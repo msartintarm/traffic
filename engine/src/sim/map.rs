@@ -215,6 +215,16 @@ impl OsmMap {
                 if out.from != node || out.to == link.from {
                     continue;
                 }
+                // Skip heading reversals (U-turns) by geometry, not just node
+                // identity: merging a divided road's carriageways gives the two
+                // directions distinct terminus nodes, so the identity test above
+                // misses the U-turn onto the opposing carriageway — which would
+                // otherwise become a movement whose path runs backwards.
+                let arr = net.arrival_dir(lane.link);
+                let dep = net.departure_dir(LinkId(out_li as u32));
+                if arr[0] * dep[0] + arr[1] * dep[1] < -0.85 {
+                    continue; // ~>148°: a near-reversal onto the opposing carriageway
+                }
                 let to_index = lane.index_in_link.min(out.lane_count - 1);
                 let to_lane = LaneId(out.lane_start.0 + to_index);
                 movements.push(Movement { from_lane: LaneId(lane_id as u32), to_lane, node, signal_group: None });
@@ -605,6 +615,68 @@ mod import_tests {
     }
 
     #[test]
+    #[ignore] // dev tool: emits a committable fixture from the local map.json
+    fn extract_complex_junction_fixtures() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        let Ok(text) = std::fs::read_to_string(&path) else { return };
+        let raw = json::parse(&text).expect("map json");
+        let pos: std::collections::HashMap<i64, [f64; 2]> = raw.nodes.iter().map(|n| (n.osm_id, [n.x, n.y])).collect();
+        let mut neigh: std::collections::HashMap<i64, std::collections::BTreeSet<i64>> = Default::default();
+        for l in &raw.links {
+            neigh.entry(l.from_osm).or_default().insert(l.to_osm);
+            neigh.entry(l.to_osm).or_default().insert(l.from_osm);
+        }
+        // Rank nodes by *neighbourhood* link density (links within 40 m) so the
+        // complex clusters — divided carriageways crossing a street as several
+        // nodes — surface, not just single high-degree nodes. Dedupe nearby centres.
+        let density = |cc: [f64; 2]| raw.links.iter().filter(|l| {
+            let (a, b) = (pos[&l.from_osm], pos[&l.to_osm]);
+            (a[0] - cc[0]).hypot(a[1] - cc[1]) < 40.0 || (b[0] - cc[0]).hypot(b[1] - cc[1]) < 40.0
+        }).count();
+        let mut by_links: Vec<(i64, usize)> = raw.nodes.iter().map(|n| (n.osm_id, density([n.x, n.y]))).collect();
+        by_links.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut centers: Vec<i64> = Vec::new();
+        for &(id, _) in &by_links {
+            if centers.iter().all(|&e| (pos[&id][0] - pos[&e][0]).hypot(pos[&id][1] - pos[&e][1]) > 90.0) {
+                centers.push(id);
+            }
+            if centers.len() == 3 {
+                break;
+            }
+        }
+
+        for (rank, &center) in centers.iter().enumerate() {
+            let deg = density(pos[&center]);
+            const R: f64 = 70.0;
+            let c = pos[&center];
+            let dist = |id: i64| (pos[&id][0] - c[0]).hypot(pos[&id][1] - c[1]);
+            let mut keep: std::collections::BTreeSet<i64> = raw.nodes.iter().map(|n| n.osm_id).filter(|&id| dist(id) < R).collect();
+            let links: Vec<&LinkSpec> = raw.links.iter().filter(|l| keep.contains(&l.from_osm) || keep.contains(&l.to_osm)).collect();
+            for l in &links { keep.insert(l.from_osm); keep.insert(l.to_osm); } // arm termini
+            let ctrl = |c: MapControl| match c { MapControl::Signal(_) => "signal", MapControl::Stop => "stop", MapControl::Yield => "yield", _ => "uncontrolled" };
+            let mut out = String::from("{\n  \"nodes\": [\n");
+            let nodes: Vec<&NodeSpec> = raw.nodes.iter().filter(|n| keep.contains(&n.osm_id)).collect();
+            for (i, n) in nodes.iter().enumerate() {
+                out.push_str(&format!("    {{ \"osm_id\": {}, \"x\": {:.1}, \"y\": {:.1}, \"control\": \"{}\"{} }}{}\n",
+                    n.osm_id, n.x - c[0], n.y - c[1], ctrl(n.control),
+                    if let MapControl::Signal(p) = n.control { format!(", \"signal\": {{ \"green_secs\": {}, \"yellow_secs\": {}, \"offset\": 0.0 }}", p.green_secs, p.yellow_secs) } else { String::new() },
+                    if i + 1 < nodes.len() { "," } else { "" }));
+            }
+            out.push_str("  ],\n  \"links\": [\n");
+            for (i, l) in links.iter().enumerate() {
+                let geom: Vec<String> = l.geometry.iter().map(|g| format!("[{:.1},{:.1}]", g[0] - c[0], g[1] - c[1])).collect();
+                out.push_str(&format!("    {{ \"from_osm\": {}, \"to_osm\": {}, \"lanes\": {}, \"speed_limit\": {}, \"layer\": {}, \"geometry\": [{}] }}{}\n",
+                    l.from_osm, l.to_osm, l.lanes, l.speed_limit, l.layer, geom.join(","), if i + 1 < links.len() { "," } else { "" }));
+            }
+            out.push_str("  ]\n}\n");
+            let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/sim/fixtures");
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(format!("{dir}/junction_{rank}.json"), &out).unwrap();
+            println!("\n===== FIXTURE {rank} (center {center}, {deg} nearby links, {} nodes / {} links) written", nodes.len(), links.len());
+        }
+    }
+
+    #[test]
     fn exposed_link_data_stays_aligned_with_the_engines_links() {
         // The browser hit-tests clicks against the engine's exposed link names and
         // polylines and then asks the engine for that link's stats. If the import
@@ -709,6 +781,22 @@ pub fn corridor_with_signal() -> Network {
         ],
     }
     .build()
+}
+
+/// Real complex junctions lifted from the scraped Millbrae map (re-centred to the
+/// origin, names stripped — geometry only), as deterministic test fixtures. #0 is
+/// a divided arterial whose crossing OSM splits across four signal nodes; the
+/// import pipeline (collapse + merge) then reduces it to one junction. Requires
+/// the `import` feature (JSON parse). Regenerate via the `extract_complex_junction
+/// _fixtures` dev test.
+#[cfg(feature = "import")]
+pub fn millbrae_junction(n: usize) -> Network {
+    let json = match n {
+        0 => include_str!("fixtures/junction_0.json"),
+        1 => include_str!("fixtures/junction_1.json"),
+        _ => include_str!("fixtures/junction_2.json"),
+    };
+    OsmMap::from_json(json).expect("fixture json is valid").build()
 }
 
 /// A single Millbrae-complexity intersection: a two-way, two-lanes-each-way
