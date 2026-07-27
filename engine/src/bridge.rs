@@ -292,13 +292,7 @@ impl Simulation {
     }
 
     fn world_mesh(&self) -> StaticMesh {
-        let net = &self.world.network;
-        // At-grade + tunnels first (carriageways run to the nodes and overlap to
-        // pave intersections), then bridges on top.
-        let mut mesh = geometry::road_mesh(net);
-        mesh.extend(&geometry::junction_mesh(net));
-        mesh.extend(&geometry::overpass_mesh(net));
-        mesh
+        geometry::world_mesh(&self.world.network)
     }
 
     /// Column-major 4×4 view-projection for the current camera.

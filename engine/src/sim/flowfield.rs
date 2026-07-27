@@ -172,11 +172,12 @@ mod tests {
 
     #[test]
     fn wgsl_kernel_parses_and_validates() {
-        let src = include_str!("flowfield.wgsl");
-        let module = naga::front::wgsl::parse_str(src).expect("flowfield.wgsl should parse");
-        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
-            .validate(&module)
-            .expect("flowfield.wgsl should type-check");
+        for src in [include_str!("flowfield.wgsl"), include_str!("flowfield_batch.wgsl")] {
+            let module = naga::front::wgsl::parse_str(src).expect("flow-field kernel should parse");
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .expect("flow-field kernel should type-check");
+        }
     }
 
     #[test]

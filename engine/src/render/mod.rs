@@ -6,6 +6,7 @@
 //! pure layer so visual behaviour is verified without a browser, exactly as the
 //! sim is. The shader (`scene.wgsl`) is `naga`-validated under `cargo test`.
 
+pub mod ascii;
 pub mod camera;
 pub mod geometry;
 pub mod mass;
@@ -15,6 +16,32 @@ pub mod scene;
 pub mod gpu;
 
 use bytemuck::{Pod, Zeroable};
+
+use crate::sim::network::Network;
+
+/// A render backend the engine can drive. Both the browser GPU renderer and the
+/// ASCII rasteriser are `RenderTarget`s: [`draw_world`] feeds them identical
+/// geometry from the one [`geometry::world_mesh`] builder, so an ASCII regression
+/// test exercises exactly the scene the browser draws — the parity guarantee.
+pub trait RenderTarget {
+    /// The static world surface (carriageways + junction fills + overpasses).
+    fn world(&mut self, mesh: &StaticMesh);
+    /// A vehicle at world pose `[x, y, heading]`.
+    fn vehicle(&mut self, pose: [f64; 3]);
+    /// Lane markings; ignored by default (the ASCII view omits them for clarity,
+    /// the GPU renderer draws them).
+    fn markings(&mut self, _mesh: &StaticMesh) {}
+}
+
+/// Drive a [`RenderTarget`] with the current world and vehicle poses. The single
+/// path both backends go through, so they can't diverge.
+pub fn draw_world<R: RenderTarget>(net: &Network, vehicle_poses: &[[f64; 3]], target: &mut R) {
+    target.world(&geometry::world_mesh(net));
+    target.markings(&geometry::marking_mesh(net));
+    for &pose in vehicle_poses {
+        target.vehicle(pose);
+    }
+}
 
 /// A mesh vertex. `light` selects emissive behaviour in the shader:
 /// 0 = matte body, 1 = brake/tail lamp, 2 = headlamp.

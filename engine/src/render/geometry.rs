@@ -15,6 +15,17 @@ pub const LANE_LINE_COLOR: [f32; 3] = [0.50, 0.50, 0.46]; // same-direction dash
 pub const EDGE_LINE_COLOR: [f32; 3] = [0.55, 0.55, 0.50]; // outer road edge
 pub const CENTER_LINE_COLOR: [f32; 3] = [0.55, 0.46, 0.13]; // dimmed yellow, luminance like the white lines
 
+/// The complete static world surface — at-grade carriageways, junction fills,
+/// then overpasses on top — as one mesh. The single source of truth every
+/// render backend draws (the browser GPU feed and the ASCII rasteriser both use
+/// this), so what the tests rasterise is exactly what the browser shows.
+pub fn world_mesh(net: &Network) -> StaticMesh {
+    let mut mesh = road_mesh(net);
+    mesh.extend(&junction_mesh(net));
+    mesh.extend(&overpass_mesh(net));
+    mesh
+}
+
 /// Filled carriageway ribbons for at-grade and tunnel links (`layer <= 0`),
 /// drawn low to high so a tunnel sits under the surface.
 pub fn road_mesh(net: &Network) -> StaticMesh {
