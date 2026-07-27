@@ -13,7 +13,7 @@ use crate::render::scene::{brake_intensity, class_color, class_dims, signal_colo
 use crate::render::{geometry, Instance, StaticMesh};
 use crate::sim::clock::SimClock;
 use crate::sim::config::{SimConfig, VehicleClass};
-use crate::sim::demand::{self, DemandGenerator};
+use crate::sim::demand::{self, DemandGenerator, DemandMode};
 use crate::sim::map;
 use crate::sim::net_world::NetWorld;
 use crate::sim::network::{LinkId, Network, LANE_WIDTH};
@@ -24,6 +24,7 @@ pub struct Simulation {
     clock: SimClock,
     seed: u64,
     demand: DemandGenerator,
+    demand_mode: DemandMode,
     camera: Camera,
     /// `[x, y, heading, speed]` of each vehicle one tick ago, keyed by id, so the
     /// render interpolates pose between committed states (smooth at 60fps) and
@@ -64,13 +65,37 @@ impl Simulation {
         let cfg = SimConfig { seed: seed as u64, ..SimConfig::default_config() };
         let camera = Camera::fit_bounds(network.bounds(), [900.0, 600.0], 24.0);
         let mut world = NetWorld::new(network, cfg);
-        let demand = build_demand(&world, cfg.seed);
+        let demand_mode = DemandMode::Balanced;
+        let demand = build_demand(&world, cfg.seed, demand_mode);
         world.install_router(&demand.destinations());
         let mut clock = SimClock::new(&cfg);
         clock.play();
         Simulation {
-            world, clock, seed: cfg.seed, demand, camera,
+            world, clock, seed: cfg.seed, demand, demand_mode, camera,
             prev: HashMap::new(), selected: None,
+        }
+    }
+
+    /// Switch the traffic mode ("balanced" or "highway") and reset the streams:
+    /// clears current vehicles, rebuilds the OD demand, and reinstalls the router
+    /// over the new destinations. Ignored if the mode is unchanged.
+    pub fn set_demand_mode(&mut self, mode: &str) {
+        let mode = DemandMode::from_name(mode);
+        if mode == self.demand_mode {
+            return;
+        }
+        self.demand_mode = mode;
+        self.demand = build_demand(&self.world, self.seed, mode);
+        self.world.clear_vehicles();
+        self.world.install_router(&self.demand.destinations());
+        self.prev.clear();
+    }
+
+    /// The active traffic mode name, for the UI to reflect.
+    pub fn demand_mode(&self) -> String {
+        match self.demand_mode {
+            DemandMode::Balanced => "balanced".into(),
+            DemandMode::HighwayBiased => "highway".into(),
         }
     }
 
@@ -415,11 +440,11 @@ impl Simulation {
     }
 }
 
-/// Boundary-aware origin–destination demand: traffic entering from the map's
-/// gateways heads through or into it, interior traffic heads out or stays
-/// within. Vehicles are then routed live by the world's flow field.
-fn build_demand(world: &NetWorld, seed: u64) -> DemandGenerator {
-    let pairs = demand::boundary_od_pairs(&world.network, seed, 48);
+/// Origin–destination demand for the selected mode: the boundary mix, or (in
+/// highway mode) traffic anchored on the US-101 / I-280 gateways. Vehicles are
+/// then routed live by the world's flow field.
+fn build_demand(world: &NetWorld, seed: u64, mode: DemandMode) -> DemandGenerator {
+    let pairs = demand::od_pairs(&world.network, seed, 48, mode);
     DemandGenerator::new(world, &pairs, seed)
 }
 

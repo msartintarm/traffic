@@ -18,6 +18,37 @@ pub struct OdPair {
     pub rate_per_sec: f64,
 }
 
+/// How origins and destinations are distributed across the map — the "traffic
+/// mode" the UI exposes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DemandMode {
+    /// Boundary-balanced: through / inbound / outbound / internal in fixed shares.
+    Balanced,
+    /// Freeway-dominated: most trips originate at a highway gateway (the US-101 /
+    /// I-280 on-ramps into the map), the rest keep the surface streets alive.
+    HighwayBiased,
+}
+
+impl DemandMode {
+    /// Parse the UI's mode name; unknown names fall back to [`Balanced`].
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "highway" | "highways" | "highway-biased" => DemandMode::HighwayBiased,
+            _ => DemandMode::Balanced,
+        }
+    }
+}
+
+/// OD demand for a mode. [`DemandMode::Balanced`] is the boundary mix;
+/// [`DemandMode::HighwayBiased`] anchors most origins on the freeway gateways.
+/// Both fall back to the balanced mix when the map lacks the gateways a mode needs.
+pub fn od_pairs(net: &Network, seed: u64, target: usize, mode: DemandMode) -> Vec<OdPair> {
+    match mode {
+        DemandMode::Balanced => boundary_od_pairs(net, seed, target),
+        DemandMode::HighwayBiased => highway_biased_od_pairs(net, seed, target),
+    }
+}
+
 pub struct DemandGenerator {
     /// `(rate_per_sec, origin, dest)` for OD pairs with at least one valid route.
     pairs: Vec<(f64, LinkId, LinkId)>,
@@ -58,10 +89,11 @@ impl DemandGenerator {
                 continue;
             }
             let driver = class_of(self.seed, self.next_id).driver().sample(self.seed, self.next_id);
+            let speed = entry_speed(&world.network, origin, &driver);
             let spawned = if world.router_knows(dest) {
-                world.spawn_to(self.next_id, origin, dest, 5.0, driver)
+                world.spawn_to(self.next_id, origin, dest, speed, driver)
             } else if let Some(route) = world.network.route_links_with_costs(origin, dest, &costs) {
-                world.spawn_routed(self.next_id, route, 5.0, driver)
+                world.spawn_routed(self.next_id, route, speed, driver)
             } else {
                 false
             };
@@ -100,6 +132,38 @@ pub fn boundary_od_pairs(net: &Network, seed: u64, target: usize) -> Vec<OdPair>
     if pairs.is_empty() {
         let all: Vec<LinkId> = (0..net.links.len() as u32).map(LinkId).collect();
         sample_pairs(net, seed, 99, &all, &all, target, &mut pairs);
+    }
+    pairs
+}
+
+/// Freeway-dominated OD demand: most trips originate on a highway gateway (off
+/// the freeway into town, or through to another gateway), with a minority leaving
+/// town onto the freeway or staying local, so the surface network still lives.
+/// Falls back to the balanced mix on a map with no highway gateways.
+pub fn highway_biased_od_pairs(net: &Network, seed: u64, target: usize) -> Vec<OdPair> {
+    let hw_in = boundary::highway_entry_links(net);
+    let hw_out = boundary::highway_exit_links(net);
+    let exits = boundary::exit_links(net);
+    let interior = boundary::interior_links(net);
+    if hw_in.is_empty() {
+        return boundary_od_pairs(net, seed, target);
+    }
+    let categories: [(&[LinkId], &[LinkId], f64); 4] = [
+        (&hw_in, &interior, 0.45),    // off the freeway into the city
+        (&hw_in, &exits, 0.30),       // through: freeway → any gateway (incl. the other freeway)
+        (&interior, &hw_out, 0.15),   // city onto the freeway
+        (&interior, &interior, 0.10), // residual local trips
+    ];
+    let mut pairs = Vec::new();
+    for (cat, (origins, dests, share)) in categories.iter().enumerate() {
+        if origins.is_empty() || dests.is_empty() {
+            continue;
+        }
+        let want = ((target as f64 * share).round() as usize).max(1);
+        sample_pairs(net, seed, 50 + cat as u32, origins, dests, want, &mut pairs);
+    }
+    if pairs.is_empty() {
+        return boundary_od_pairs(net, seed, target);
     }
     pairs
 }
@@ -144,6 +208,15 @@ fn capacity_rate(net: &Network, origin: LinkId) -> f64 {
     (BASE * link_capacity(net, origin) / REFERENCE).clamp(0.04, 0.9)
 }
 
+/// The speed a vehicle enters the map at: the free-flow speed of its origin road
+/// (its posted limit, capped by the driver's own desired speed), so a car arriving
+/// on a freeway is already moving at freeway speed instead of crawling up from a
+/// standstill. Off-peak traffic entering from US-101 / I-280 comes in fast.
+fn entry_speed(net: &Network, origin: LinkId, driver: &super::config::DriverConfig) -> f64 {
+    let limit = net.lane(net.link(origin).lane_start).speed_limit;
+    limit.min(driver.desired_speed)
+}
+
 /// Vehicle-class mix: mostly cars, some trucks, a few buses.
 fn class_of(seed: u64, id: u32) -> VehicleClass {
     match rng::uniform01(seed, id, 0, Stream::DriverProfile) {
@@ -155,7 +228,7 @@ fn class_of(seed: u64, id: u32) -> VehicleClass {
 
 #[cfg(test)]
 mod tests {
-    use super::super::config::SimConfig;
+    use super::super::config::{DriverConfig, SimConfig};
     use super::super::map::{LinkSpec, NodeSpec, OsmMap};
     use super::super::network::LinkId;
     use super::*;
@@ -218,6 +291,67 @@ mod tests {
         for p in &boundary_od_pairs(&net, 5, 20) {
             assert_eq!(p.rate_per_sec, capacity_rate(&net, p.origin));
         }
+    }
+
+    /// A cross with two freeway gateways (fast entry/exit) and a slow surface
+    /// street, all meeting a central junction — the shape needed to exercise the
+    /// highway-biased mode's freeway origins.
+    fn freeway_and_street() -> Network {
+        OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, -400.0, 0.0), // freeway gateway (W)
+                NodeSpec::uncontrolled(2, 0.0, 0.0),    // interior junction
+                NodeSpec::uncontrolled(3, 400.0, 0.0),  // freeway gateway (E)
+                NodeSpec::uncontrolled(4, 0.0, 200.0),  // interior junction
+                NodeSpec::uncontrolled(5, 0.0, 300.0),  // surface-street gateway (N)
+            ],
+            links: vec![
+                LinkSpec::oneway(1, 2, 3, 29.0), // 0: freeway W→interior (entry)
+                LinkSpec::oneway(2, 3, 3, 29.0), // 1: freeway interior→E (exit)
+                LinkSpec::oneway(2, 4, 1, 13.0), // 2: interior surface link
+                LinkSpec::oneway(4, 5, 1, 13.0), // 3: surface interior→N (slow exit)
+            ],
+        }
+        .build()
+    }
+
+    #[test]
+    fn highway_mode_originates_traffic_on_the_freeway() {
+        let net = freeway_and_street();
+        // Sanity: link 0 is a freeway entry, link 3 a surface exit.
+        assert!(boundary::is_highway_link(&net, LinkId(0)));
+        assert!(!boundary::is_highway_link(&net, LinkId(3)));
+
+        let pairs = od_pairs(&net, 4, 40, DemandMode::HighwayBiased);
+        assert!(!pairs.is_empty(), "highway mode yields demand");
+        let hw_origin = pairs.iter().filter(|p| boundary::is_highway_link(&net, p.origin)).count();
+        assert!(
+            hw_origin * 2 > pairs.len(),
+            "most trips originate on a freeway: {hw_origin} of {}",
+            pairs.len()
+        );
+    }
+
+    #[test]
+    fn highway_entrants_enter_at_freeway_speed() {
+        // A car entering on the freeway (link 0, 29 m/s) comes in near free-flow;
+        // one entering on the surface street (link 2, 13 m/s) enters far slower —
+        // so off-peak highway traffic streams in fast instead of crawling from 5 m/s.
+        let net = freeway_and_street();
+        let fast = entry_speed(&net, LinkId(0), &DriverConfig::car());
+        let slow = entry_speed(&net, LinkId(2), &DriverConfig::car());
+        assert!(fast > 25.0, "freeway entrants come in fast: {fast}");
+        assert!(slow <= 13.0, "surface entrants enter at street speed: {slow}");
+        assert!(fast > slow * 1.8, "highway traffic enters much faster than surface: {fast} vs {slow}");
+    }
+
+    #[test]
+    fn highway_mode_falls_back_when_there_are_no_freeways() {
+        // The plain corridor has no highway gateway, so highway mode degrades to the
+        // balanced boundary mix rather than producing nothing.
+        let net = corridor().build();
+        let pairs = od_pairs(&net, 3, 10, DemandMode::HighwayBiased);
+        assert!(!pairs.is_empty(), "no freeways → fall back to the balanced mix");
     }
 
     #[test]

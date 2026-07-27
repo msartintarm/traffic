@@ -73,6 +73,28 @@ pub fn interior_links(net: &Network) -> Vec<LinkId> {
         .collect()
 }
 
+/// Speed (m/s) at or above which a road counts as a grade-separated freeway.
+/// Around Millbrae US-101 and I-280 run ~29 m/s (65 mph) while arterials top out
+/// near 18; anything faster than this threshold is one of the freeways.
+pub const HIGHWAY_SPEED: f64 = 22.0;
+
+/// Whether `link` is a freeway/highway (by its posted speed).
+pub fn is_highway_link(net: &Network, link: LinkId) -> bool {
+    net.lane(net.link(link).lane_start).speed_limit >= HIGHWAY_SPEED
+}
+
+/// Entry links (leaving a gateway) that are freeways — where highway traffic
+/// enters the map (the US-101 / I-280 on-ramps at the map edge).
+pub fn highway_entry_links(net: &Network) -> Vec<LinkId> {
+    entry_links(net).into_iter().filter(|&l| is_highway_link(net, l)).collect()
+}
+
+/// Exit links (arriving at a gateway) that are freeways — where traffic leaves
+/// the map onto a highway.
+pub fn highway_exit_links(net: &Network) -> Vec<LinkId> {
+    exit_links(net).into_iter().filter(|&l| is_highway_link(net, l)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +129,27 @@ mod tests {
         assert_eq!(entry_links(&net), vec![LinkId(0)], "link leaving the start gateway is an entry");
         assert_eq!(exit_links(&net), vec![LinkId(1)], "link into the end gateway is an exit");
         assert!(interior_links(&net).is_empty(), "a 2-link corridor has no interior link");
+    }
+
+    #[test]
+    fn freeway_gateways_are_classified_by_speed() {
+        // A fast link into the map (freeway on-ramp) and a slow surface street, both
+        // cut at the edge. Only the fast one is a highway entry.
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, -400.0, 0.0),
+                NodeSpec::uncontrolled(2, 0.0, 0.0),
+                NodeSpec::uncontrolled(3, 0.0, 300.0),
+            ],
+            links: vec![
+                LinkSpec::oneway(1, 2, 3, 29.0), // freeway entry
+                LinkSpec::oneway(2, 3, 1, 13.0), // surface exit
+            ],
+        }
+        .build();
+        assert!(is_highway_link(&net, LinkId(0)) && !is_highway_link(&net, LinkId(1)));
+        assert_eq!(highway_entry_links(&net), vec![LinkId(0)], "only the freeway is a highway entry");
+        assert!(highway_exit_links(&net).is_empty(), "the surface exit is not a highway exit");
     }
 
     #[test]

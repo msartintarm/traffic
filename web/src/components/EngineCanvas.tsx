@@ -40,6 +40,8 @@ type Sim = {
   play(): void;
   pause(): void;
   set_speed(s: number): void;
+  set_demand_mode(mode: string): void;
+  demand_mode(): string;
 };
 
 type Renderer = {
@@ -76,6 +78,7 @@ export default function EngineCanvas() {
   const [backend, setBackend] = useState("");
   const [mapLabel, setMapLabel] = useState("");
   const [scenario, setScenario] = useState("millbrae");
+  const [mode, setMode] = useState("balanced");
 
   useEffect(() => {
     setScenario(new URLSearchParams(window.location.search).get("scenario") ?? "millbrae");
@@ -335,6 +338,19 @@ export default function EngineCanvas() {
           <option value="millbrae">Millbrae (real map)</option>
           <option value="arterial">Test: arterial junction</option>
           <option value="corridor">Test: signal corridor</option>
+        </select>
+        <select
+          className={styles.button}
+          value={mode}
+          disabled={!ready}
+          title="Where traffic originates"
+          onChange={(e) => {
+            simRef.current?.set_demand_mode(e.target.value);
+            setMode(e.target.value);
+          }}
+        >
+          <option value="balanced">Traffic: balanced</option>
+          <option value="highway">Traffic: from highways</option>
         </select>
       </div>
 

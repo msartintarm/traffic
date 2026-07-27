@@ -150,6 +150,12 @@ impl NetWorld {
         self.router.as_ref().is_some_and(|r| r.knows(dest))
     }
 
+    /// Remove all vehicles from the road, leaving the network and counters intact —
+    /// used to reset traffic when the demand mode changes without rebuilding the map.
+    pub fn clear_vehicles(&mut self) {
+        self.vehicles.clear();
+    }
+
     /// Measured flow (vehicles/hour) on each link, from entries so far over
     /// elapsed sim time — the sim's own counts to calibrate against real data.
     pub fn link_flows(&self) -> Vec<f64> {
@@ -1978,6 +1984,33 @@ mod tests {
             assert!(world.exited() > 0, "vehicles complete boundary trips (seed {seed}), got {}", world.exited());
             assert_eq!(world.leaked(), 0, "no car disappears at an intersection (seed {seed}), leaked {}", world.leaked());
         }
+    }
+
+    #[test]
+    fn real_map_highway_mode_originates_traffic_on_the_freeways() {
+        use super::super::demand::{self, DemandGenerator, DemandMode};
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let net = super::super::map::OsmMap::from_json(&text).expect("map json").build();
+        // The expanded Millbrae map includes US-101 and I-280, so it has freeway
+        // gateways for highway mode to anchor on.
+        assert!(!boundary::highway_entry_links(&net).is_empty(), "the map has freeway gateways (101/280)");
+
+        let seed = 2u64;
+        let pairs = demand::od_pairs(&net, seed, 40, DemandMode::HighwayBiased);
+        let hw = pairs.iter().filter(|p| boundary::is_highway_link(&net, p.origin)).count();
+        assert!(hw * 2 > pairs.len(), "most trips originate on a freeway: {hw} of {}", pairs.len());
+
+        let mut world = NetWorld::new(net, cfg());
+        let mut gen = DemandGenerator::new(&world, &pairs, seed);
+        world.install_router(&gen.destinations());
+        for _ in 0..1500 {
+            gen.step(&mut world, cfg().dt);
+            world.step();
+        }
+        assert_eq!(world.crashed(), 0, "highway-mode traffic stays collision-free");
+        assert!(world.exited() > 0, "highway-mode trips complete, got {}", world.exited());
+        assert_eq!(world.leaked(), 0, "no car disappears at an intersection, leaked {}", world.leaked());
     }
 
     #[test]
