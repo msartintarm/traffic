@@ -1,6 +1,5 @@
 //! Pure simulation core: no GPU, no DOM, no browser. Native `cargo test`
-//! exercises every model here, and this CPU path is the reference the future
-//! GPU-compute mass layer is validated against.
+//! exercises every model here.
 
 pub mod boundary;
 pub mod clock;

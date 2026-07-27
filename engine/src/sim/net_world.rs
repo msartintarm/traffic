@@ -1,8 +1,7 @@
 //! Vehicles driving a graph [`Network`]: IDM car-following within a lane, a red
-//! signal (or unsatisfied movement) acting as a stationary virtual leader at
-//! the stop line, and lane hand-off across a node when the movement is served.
-//! Accelerations read committed pre-step state and apply in a second pass, the
-//! same double-buffered shape the GPU mass layer will use.
+//! signal (or unsatisfied movement) as a stationary virtual leader at the stop
+//! line, and lane hand-off across a node when the movement is served.
+//! Accelerations read committed pre-step state and apply in a second pass.
 
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
@@ -119,9 +118,8 @@ pub struct NetWorld {
 /// congestion as it forms, rare enough that the recompute cost is negligible.
 const REROUTE_INTERVAL_SECS: f64 = 3.0;
 
-/// A tiny FxHash-style hasher for the dense integer ids (lane / node / movement)
-/// that key the per-tick working maps. The default SipHash dominated the
-/// neighbour, box-gate and crash passes at scale; this is a couple of ops.
+/// FxHash-style hasher for the dense integer ids that key the per-tick maps —
+/// far cheaper than the default SipHash.
 #[derive(Default)]
 pub struct FxHasher(u64);
 const FX_K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
@@ -674,8 +672,8 @@ impl NetWorld {
             }
         }
 
-        // The intended next movement is a pure function of committed state, but was
-        // recomputed 2-3× per vehicle (accel, box-gate, transition). Compute it once.
+        // Compute each vehicle's intended movement once (used by accel, the box
+        // gate, and the transition).
         let intended_mv: Vec<Option<MovementId>> = self
             .vehicles
             .iter()
@@ -697,12 +695,9 @@ impl NetWorld {
                 let control = self.network.node(node).control;
                 let to_line = (lane.length - veh.position).max(0.05);
 
-                // Reaction delay: perceive the leader's pose/speed as of the
-                // driver's reaction time ago. The perceived gap is capped by the
-                // true current gap (`min`), so IDM can never *under*-brake — it's
-                // collision-free in-lane. The delay instead shows up as realistic
-                // start-up lag: a follower is slow to notice the leader pulling
-                // away, so queues discharge with lost time.
+                // Perceive the leader as of `reaction_time` ago, but cap the gap by
+                // the true current gap so IDM can never under-brake (collision-free
+                // in-lane); the delay only adds start-up lag.
                 let leader = if let Some(li) = nb.leader_of[i] {
                     let lead = &self.vehicles[li];
                     let delay = (driver.reaction_time / dt).round() as usize;
@@ -724,9 +719,8 @@ impl NetWorld {
                     None
                 };
 
-                // Slow for an upcoming curve (lateral-accel limit) and for a turn
-                // through the next intersection; take whichever is more restrictive.
-                // Computed up front because the LOD fast path below needs it too.
+                // Upcoming curve (lateral-accel limit) and turn speed; the LOD path
+                // below needs these, so compute them before it.
                 const A_LAT: f64 = 3.0;
                 const CURVE_LOOKAHEAD: f64 = 45.0;
                 let geom_curve = {
@@ -735,10 +729,8 @@ impl NetWorld {
                 };
                 let turn = intended
                     .and_then(|mid| {
-                        // A freeway diverge/merge is free-flow: let the geometric curve
-                        // limit govern it (the car slows on the ramp, not the gore).
                         if self.network.is_interchange_movement(mid) {
-                            return None;
+                            return None; // free-flow diverge/merge; the ramp curve slows it
                         }
                         match self.network.movement_turn(mid) {
                             TurnType::Left => Some(6.0),
@@ -752,14 +744,9 @@ impl NetWorld {
                     (a, b) => a.or(b),
                 };
 
-                // Level-of-detail: a vehicle far enough from its node that no node
-                // constraint (signal, yield, merge, stop line, turn speed) is within
-                // braking range — and with no slower zone downstream — reacts only to
-                // its leader and the local road curvature. Skip building the whole
-                // node stack, whose neighbour-scanning yield/merge/red-ahead checks
-                // dominate the per-vehicle cost. The result is *identical* (those
-                // constraints are all non-binding here), just far cheaper for the many
-                // cars cruising mid-link — which is what governs FPS at scale.
+                // LOD: beyond the range at which any node constraint can bind (and
+                // with no slower zone downstream), only the leader and local curvature
+                // matter — skip the node stack. Identical result, cheaper.
                 const DECISION_HORIZON: f64 = 180.0;
                 let downstream_slower = intended
                     .is_some_and(|mid| self.network.lane(self.network.movement(mid).to_lane).speed_limit < lane.speed_limit);

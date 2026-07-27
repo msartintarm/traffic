@@ -135,12 +135,10 @@ struct BatchParams {
     _pad1: u32,
 }
 
-/// A persistent GPU solver for many flow fields at once. Holds the device,
-/// pipeline and the *static* graph buffers (CSR adjacency), plus the per-recompute
-/// working buffers (sized to the destination count and reused via `write_buffer`),
-/// so a live recompute only re-uploads the changing costs and dispatches — the
-/// reuse that makes per-frame rerouting on a large graph affordable. One dispatch
-/// relaxes every destination field in parallel (`slot_count × link_count`).
+/// Persistent GPU solver for many flow fields at once. Holds the device, pipeline
+/// and static CSR-adjacency buffers, plus per-recompute working buffers reused via
+/// `write_buffer` (reallocated only when the destination count changes). One
+/// dispatch relaxes every destination field (`slot_count × link_count` threads).
 pub struct GpuFlowField {
     device: wgpu::Device,
     queue: wgpu::Queue,

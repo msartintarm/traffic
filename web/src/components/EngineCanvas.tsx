@@ -58,6 +58,7 @@ type Renderer = {
     densityV: Float32Array,
     densityI: Uint32Array,
   ): void;
+  resize(width: number, height: number): void;
 };
 
 const ZOOM_RANGE = 60; // fit-out … max-in ratio driving the slider
@@ -90,6 +91,7 @@ export default function EngineCanvas() {
     let raf = 0;
     let last = performance.now();
     let disposed = false;
+    let removeResize = () => {};
     const panning = { active: false };
     const canvas = canvasRef.current!;
 
@@ -230,6 +232,26 @@ export default function EngineCanvas() {
         }
         setReady(true);
 
+        // Size the backing store to the displayed CSS size × devicePixelRatio, so
+        // the canvas stays crisp on HiDPI and under browser zoom (which raises the
+        // pixel ratio). Preserve the world span so the view/zoom is unaffected.
+        const resizeCanvas = () => {
+          const dpr = Math.min(window.devicePixelRatio || 1, 2);
+          const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
+          const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+          if (canvas.width === w && canvas.height === h) return;
+          const scale = canvas.width / w;
+          canvas.width = w;
+          canvas.height = h;
+          sim.set_meters_per_pixel(sim.meters_per_pixel() * scale);
+          fitMppRef.current *= scale;
+          sim.set_viewport(w, h);
+          renderer?.resize(w, h);
+        };
+        resizeCanvas();
+        window.addEventListener("resize", resizeCanvas);
+        removeResize = () => window.removeEventListener("resize", resizeCanvas);
+
         canvas.addEventListener("wheel", onWheel, { passive: false });
         canvas.addEventListener("contextmenu", onContext);
         canvas.addEventListener("mousedown", onDown);
@@ -294,6 +316,7 @@ export default function EngineCanvas() {
       canvas.removeEventListener("click", onClick);
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      removeResize();
     };
   }, []);
 

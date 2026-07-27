@@ -2,15 +2,12 @@
 //!
 //! For each destination in use we keep a next-hop field: `next_hop[dest][link]`
 //! is the outgoing link to take from `link` to reach `dest` fastest. A vehicle
-//! then routes by an O(1) lookup per intersection ([`FieldRouter::next_hop`])
-//! instead of a per-vehicle path search — the layout that scales to 1M+.
+//! routes by an O(1) lookup per intersection ([`FieldRouter::next_hop`]) instead
+//! of a per-vehicle path search.
 //!
-//! Because the fields are rebuilt from **live** per-link travel times
-//! ([`FieldRouter::recompute`]), in-flight vehicles pick fresh next-hops as jams
-//! form, so rerouting is automatic and shared across every car heading to the
-//! same place. The fields are computed with [`flowfield`] — the Bellman–Ford
-//! Jacobi reference the GPU `flowfield.wgsl` kernel mirrors — so the recompute is
-//! GPU-swappable wholesale at scale.
+//! Fields are rebuilt from live per-link travel times, so in-flight vehicles pick
+//! fresh next-hops as jams form. Computed by [`flowfield`] (Bellman–Ford Jacobi);
+//! `flowfield_gpu` runs the same relaxation on a GPU device.
 
 use std::collections::HashMap;
 
