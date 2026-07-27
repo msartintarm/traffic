@@ -31,6 +31,13 @@ index_type!(ProgramId);
 
 pub const LANE_WIDTH: f64 = 3.5;
 
+/// Turn-pocket bay geometry: the bay is fully open (turn lane at its own offset)
+/// for [`POCKET_OPEN`] metres before the stop line, having diverged from the
+/// adjacent through lane over the bay taper (a per-lane length) upstream of that.
+pub const POCKET_OPEN: f64 = 12.0;
+/// Default bay-taper length assigned to a qualifying turn lane.
+pub const POCKET_TAPER: f64 = 18.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeControl {
     Uncontrolled,
@@ -68,6 +75,13 @@ pub struct Lane {
     pub speed_limit: f64,
     pub movement_start: MovementId,
     pub movement_count: u32,
+    /// Turn-pocket bay-taper length (m), `0.0` for a normal full-width lane. When
+    /// set, this is a dedicated turn lane whose lateral offset is its neighbour's
+    /// upstream (the bay is "closed", merged into the adjacent through lane) and
+    /// diverges over this taper to its own offset by the stop line (the bay
+    /// "opens"). Makes a left/right-turn pocket a real feature of the geometry, so
+    /// turners queue in the bay instead of the through lane.
+    pub pocket_taper: f64,
 }
 
 /// A movement's turn direction, from the angle between the arriving and
@@ -463,6 +477,37 @@ impl Network {
         Some(path.into_iter().map(LinkId).collect())
     }
 
+    /// Lateral offset (m, right of the centreline) of `lane` at `position`. A
+    /// normal lane sits at a constant `(index + 0.5)·WIDTH`; a turn-pocket lane
+    /// (`pocket_taper > 0`) instead merges into its adjacent through lane far from
+    /// the stop line and diverges to its own offset over the bay taper — so the
+    /// bay opens near the junction and closes upstream.
+    pub fn lane_lateral_offset(&self, l: &Lane, position: f64) -> f64 {
+        self.lane_offset_at(l, l.length - position)
+    }
+
+    /// Lateral offset of `lane` a given `to_line` metres upstream of its stop line
+    /// — the pocket taper expressed in the quantity it actually depends on, so both
+    /// vehicle placement and the divider markings sample the same bay geometry.
+    pub fn lane_offset_at(&self, l: &Lane, to_line: f64) -> f64 {
+        let own = (l.index_in_link as f64 + 0.5) * LANE_WIDTH;
+        if l.pocket_taper <= 0.0 {
+            return own;
+        }
+        // A left pocket (lane 0) opens toward the centreline by merging into the
+        // lane on its right; a right pocket (outermost lane) merges into its left.
+        let blend_right = l.index_in_link == 0;
+        let neighbour = own + if blend_right { LANE_WIDTH } else { -LANE_WIDTH };
+        if to_line <= POCKET_OPEN {
+            own
+        } else if to_line >= POCKET_OPEN + l.pocket_taper {
+            neighbour
+        } else {
+            let t = (POCKET_OPEN + l.pocket_taper - to_line) / l.pocket_taper; // 0 closed → 1 open
+            neighbour + (own - neighbour) * t
+        }
+    }
+
     /// World `[x, y, heading]` of a point `position` metres along `lane`,
     /// laterally offset for the lane's index. Pure geometry the renderer uses to
     /// place vehicle instances.
@@ -470,7 +515,7 @@ impl Network {
         let l = self.lane(lane);
         let poly = &self.polylines[l.link.idx()];
         let (pt, dir) = point_along(poly, l.start_offset + position.clamp(0.0, l.length));
-        let off = (l.index_in_link as f64 + 0.5) * LANE_WIDTH;
+        let off = self.lane_lateral_offset(l, position.clamp(0.0, l.length));
         let n = [dir[1], -dir[0]]; // right-hand normal
         [pt[0] + n[0] * off, pt[1] + n[1] * off, dir[1].atan2(dir[0])]
     }
@@ -565,18 +610,61 @@ impl Network {
         out
     }
 
-    /// Interior lane-divider segments `[x0, y0, x1, y1]`, per polyline segment.
+    /// Interior lane-divider segments `[x0, y0, x1, y1]`, per polyline segment. A
+    /// divider tracks the boundary between its two lanes; where a turn pocket
+    /// widens an approach the adjacent boundary tapers (the bay-taper line),
+    /// sampled finely so the marking follows the opening bay.
     pub fn lane_dividers(&self) -> Vec<[f64; 4]> {
         let mut out = Vec::new();
         for i in 0..self.links.len() {
-            let lanes = self.links[i].lane_count;
-            for seg in self.drivable_polyline(LinkId(i as u32)).windows(2) {
-                let dir = unit(sub(seg[1], seg[0]));
-                let (nx, ny) = (dir[1], -dir[0]);
-                for k in 1..lanes {
-                    let off = k as f64 * LANE_WIDTH;
-                    out.push([seg[0][0] + nx * off, seg[0][1] + ny * off, seg[1][0] + nx * off, seg[1][1] + ny * off]);
+            let link = self.links[i];
+            let lanes = link.lane_count;
+            let taper = |k: u32| self.lane(LaneId(link.lane_start.0 + k)).pocket_taper;
+            let has_pocket = (0..lanes).any(|k| taper(k) > 0.0);
+            let poly = self.drivable_polyline(LinkId(i as u32));
+            if !has_pocket {
+                for seg in poly.windows(2) {
+                    let dir = unit(sub(seg[1], seg[0]));
+                    let (nx, ny) = (dir[1], -dir[0]);
+                    for k in 1..lanes {
+                        let off = k as f64 * LANE_WIDTH;
+                        out.push([seg[0][0] + nx * off, seg[0][1] + ny * off, seg[1][0] + nx * off, seg[1][1] + ny * off]);
+                    }
                 }
+                continue;
+            }
+            // Pocket approach: subdivide so a divider follows the tapering boundary.
+            // `to_line` (distance to the stop line) drives the pocket offset, so
+            // track cumulative distance from the upstream end and subtract from the
+            // total to get each sample's distance to the stop line.
+            let total: f64 = poly.windows(2).map(|w| norm(sub(w[1], w[0]))).sum();
+            let boundary = |k: u32, to_line: f64| -> f64 {
+                let a = self.lane_offset_at(self.lane(LaneId(link.lane_start.0 + k - 1)), to_line);
+                let b = self.lane_offset_at(self.lane(LaneId(link.lane_start.0 + k)), to_line);
+                0.5 * (a + b)
+            };
+            let lat = |p: [f64; 2], dir: [f64; 2], o: f64| [p[0] + dir[1] * o, p[1] - dir[0] * o];
+            const STEP: f64 = 2.0;
+            let mut s0 = 0.0f64; // distance from the upstream end to the segment start
+            for seg in poly.windows(2) {
+                let seg_len = norm(sub(seg[1], seg[0]));
+                if seg_len < 1e-6 {
+                    continue;
+                }
+                let dir = unit(sub(seg[1], seg[0]));
+                let steps = (seg_len / STEP).ceil().max(1.0) as usize;
+                for k in 1..lanes {
+                    for t in 0..steps {
+                        let (f0, f1) = (t as f64 / steps as f64, (t + 1) as f64 / steps as f64);
+                        let a = [seg[0][0] + (seg[1][0] - seg[0][0]) * f0, seg[0][1] + (seg[1][1] - seg[0][1]) * f0];
+                        let b = [seg[0][0] + (seg[1][0] - seg[0][0]) * f1, seg[0][1] + (seg[1][1] - seg[0][1]) * f1];
+                        let oa = boundary(k, total - (s0 + seg_len * f0));
+                        let ob = boundary(k, total - (s0 + seg_len * f1));
+                        let (pa, pb) = (lat(a, dir, oa), lat(b, dir, ob));
+                        out.push([pa[0], pa[1], pb[0], pb[1]]);
+                    }
+                }
+                s0 += seg_len;
             }
         }
         out
@@ -696,9 +784,11 @@ mod tests {
     fn road_geometry_matches_lane_counts() {
         let net = map::corridor_with_signal();
         assert_eq!(net.road_strips().len(), net.links.len());
+        // One divider per interior lane boundary; a turn-pocket approach subdivides
+        // its dividers to follow the tapering bay, so that only adds segments.
         let dividers = net.lane_dividers().len();
         let expected: u32 = net.links.iter().map(|l| l.lane_count.saturating_sub(1)).sum();
-        assert_eq!(dividers, expected as usize);
+        assert!(dividers >= expected as usize, "at least one divider per lane boundary: {dividers} >= {expected}");
         let b = net.bounds();
         assert!(b[0] <= b[2] && b[1] <= b[3]);
     }

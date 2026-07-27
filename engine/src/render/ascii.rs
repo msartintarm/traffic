@@ -173,6 +173,64 @@ mod scenarios {
         assert!(w.link_flows()[3] > 0.0, "the car reached the right-turn exit (changed into its turn lane)");
         assert_eq!(w.crashed(), 0);
     }
+
+    #[test]
+    fn a_car_stuck_in_the_wrong_lane_crosses_instead_of_vanishing() {
+        // Regression for cars disappearing when they enter an intersection: a
+        // dest-routed car that can't reach a lane serving its route must still
+        // traverse the junction (taking an available movement and rerouting), not
+        // be silently deleted at the stop line.
+        //
+        // 2-lane west approach into a 4-way. Channelisation gives lane 0 the left
+        // turn (→N) only, and lane 1 the through (→E) and right (→S). A car bound
+        // for E is spawned in lane 0; a second car pinned alongside in lane 1 blocks
+        // the merge, so the first arrives at the stop line in a lane that can't make
+        // its turn. It must still come out the far side — on the N exit its lane
+        // does serve — rather than vanishing inside the box.
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(0, 0.0, 0.0),
+                NodeSpec::uncontrolled(1, -140.0, 0.0), // W (2-lane approach, +x)
+                NodeSpec::uncontrolled(2, 140.0, 0.0),  // E (through)
+                NodeSpec::uncontrolled(3, 0.0, 140.0),  // N (left)
+                NodeSpec::uncontrolled(4, 0.0, -140.0), // S (right)
+            ],
+            links: vec![
+                LinkSpec::oneway(1, 0, 2, 15.0), // 0: W→junction, two lanes
+                LinkSpec::oneway(0, 2, 1, 15.0), // 1: →E through
+                LinkSpec::oneway(0, 3, 1, 15.0), // 2: →N left
+                LinkSpec::oneway(0, 4, 1, 15.0), // 3: →S right
+            ],
+        }
+        .build();
+        let mut w = NetWorld::new(net, SimConfig::default_config());
+        w.install_router(&[LinkId(1)]); // destination: the through exit (→E), which lane 0 can't serve
+        let lanes: Vec<_> = w.network.lanes_of(LinkId(0)).collect();
+        let stop = w.network.lane(lanes[0]).length;
+        // Place the routed car at the stop line in lane 0 (bound for E, which only
+        // lane 1 serves), with a car pinned in lane 1 at the same line so it cannot
+        // merge before it enters the box.
+        w.spawn_to_in_lane(1, lanes[0], stop, LinkId(1), 6.0, DriverConfig::car());
+        w.spawn(2, lanes[1], stop, 6.0, DriverConfig::car());
+
+        let mut saw_on_approach = w.vehicle(1).is_some();
+        for t in 0..300 {
+            w.step();
+            if t == 0 {
+                saw_on_approach &= w.vehicle(1).is_some();
+                println!("\nstuck in the wrong lane at the line:\n{}", snapshot(&w, [-20.0, 0.0], 70.0).render());
+            }
+            if t == 60 {
+                println!("\nemerged past the junction (not vanished):\n{}", snapshot(&w, [0.0, 45.0], 70.0).render());
+            }
+        }
+        assert!(saw_on_approach, "the routed car exists while approaching");
+        // It came out on the N exit (the movement its lane actually serves) — proof
+        // it crossed the box instead of being deleted at the stop line. Before the
+        // fix `link_flows()[2]` was 0 because the car vanished on entry.
+        assert!(w.link_flows()[2] > 0.0, "the stuck car crossed onto the N exit instead of vanishing");
+        assert_eq!(w.crashed(), 0, "no collision");
+    }
 }
 
 #[cfg(test)]

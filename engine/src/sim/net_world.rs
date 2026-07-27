@@ -52,8 +52,13 @@ enum Fate {
     Alive,
     /// Crossed onto a new link (its id, for entry counting).
     Entered(LinkId),
-    /// Left the network at the end of its route.
+    /// Left the network legitimately — reached its destination, finished its
+    /// route, or ran off a genuine dead end.
     Exited,
+    /// Removed at an interior node despite still having a routable next hop — a
+    /// vehicle that *disappeared* at an intersection. Should never happen; counted
+    /// so a regression in movement resolution is caught rather than silent.
+    Leaked,
 }
 
 /// How many `(position, speed)` samples to retain — enough for the largest
@@ -89,6 +94,7 @@ pub struct NetWorld {
     time: f64,
     tick: u64,
     exited: u32,
+    leaked: u32,
     crashed: u32,
     /// Downstream lanes fed by more than one lane — the merge points; value is
     /// the list of feeding (from) lane ids.
@@ -128,7 +134,7 @@ impl NetWorld {
         let link_entries = vec![0u32; network.links.len()];
         let junctions = Junctions::build(&network);
         Self {
-            network, cfg, vehicles: Vec::new(), time: 0.0, tick: 0, exited: 0, crashed: 0,
+            network, cfg, vehicles: Vec::new(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0,
             merges, signals, link_entries, router: None, junctions,
         }
     }
@@ -208,6 +214,18 @@ impl NetWorld {
         true
     }
 
+    /// Test-only: spawn a destination-routed vehicle in a specific lane at a
+    /// specific position, so a scenario can place a car where it cannot reach a
+    /// lane serving its route.
+    #[cfg(test)]
+    pub fn spawn_to_in_lane(&mut self, id: u32, lane: LaneId, position: f64, dest: LinkId, speed: f64, driver: DriverConfig) {
+        self.link_entries[self.network.lane(lane).link.idx()] += 1;
+        self.vehicles.push(NetVehicle {
+            id, lane, position, speed, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
+            stopped_at: None, history: vec![(position, speed)], wait_ticks: 0, crossing: None,
+        });
+    }
+
     /// Whether a vehicle can be placed at the start of `lane` without overlapping
     /// one already there — measured against each occupant's *rear* (position minus
     /// its own length), so long vehicles are accounted for.
@@ -229,6 +247,12 @@ impl NetWorld {
     /// Vehicles removed from the road after a collision.
     pub fn crashed(&self) -> u32 {
         self.crashed
+    }
+
+    /// Vehicles that disappeared at an interior intersection despite having a
+    /// routable next hop. A correct engine never leaks — this stays zero.
+    pub fn leaked(&self) -> u32 {
+        self.leaked
     }
 
     /// Per-link travel time (ms) inflated by current occupancy — the live edge
@@ -270,20 +294,42 @@ impl NetWorld {
 
     fn intended_movement(&self, veh: &NetVehicle) -> Option<MovementId> {
         let lane = self.network.lane(veh.lane);
-        if lane.movement_count == 0 {
-            return None;
-        }
-        if let (Some(dest), Some(router)) = (veh.dest, self.router.as_ref()) {
-            let next_link = router.next_hop(dest, lane.link)?;
-            return self.movement_to(veh.lane, next_link);
-        }
-        if !veh.route.is_empty() {
-            if veh.route_idx + 1 >= veh.route.len() {
-                return None;
+        // The routed movement — onto the flow-field's (or explicit route's) next
+        // link. `None` here means the car couldn't reach a lane that serves that
+        // link, *not* that it should leave: a car that has arrived (no next hop) or
+        // finished its route returns early below, before this fallback.
+        let preferred = if let (Some(dest), Some(router)) = (veh.dest, self.router.as_ref()) {
+            match router.next_hop(dest, lane.link) {
+                None => return None, // reached the destination → leave the network
+                Some(next_link) => self.movement_to(veh.lane, next_link),
             }
-            return self.movement_to(veh.lane, veh.route[veh.route_idx + 1]);
-        }
-        Some(lane.movement_start)
+        } else if !veh.route.is_empty() {
+            if veh.route_idx + 1 >= veh.route.len() {
+                return None; // explicit route completed → leave
+            }
+            self.movement_to(veh.lane, veh.route[veh.route_idx + 1])
+        } else {
+            None
+        };
+        // Take the routed movement when this lane serves it; otherwise proceed on
+        // whatever this lane offers (reroute from where it lands) — a car in the
+        // wrong lane must never vanish mid-network. If even this lane serves
+        // nothing, borrow a sibling lane's movement rather than dropping the car;
+        // only a genuine dead end (no lane on the link moves on) truly exits.
+        preferred
+            .or_else(|| (lane.movement_count > 0).then_some(lane.movement_start))
+            .or_else(|| self.any_movement_on(lane.link))
+    }
+
+    /// The first available movement from any lane of `link` — a last-resort so a
+    /// vehicle at an interior node whose own lane serves nothing still proceeds
+    /// instead of disappearing. `None` only for a true dead end.
+    fn any_movement_on(&self, link: LinkId) -> Option<MovementId> {
+        self.network
+            .lanes_of(link)
+            .map(|l| self.network.lane(l))
+            .find(|l| l.movement_count > 0)
+            .map(|l| l.movement_start)
     }
 
     /// The movement this vehicle would take if it were on `lane` — its flow-field
@@ -743,6 +789,7 @@ impl NetWorld {
                     survivors.push(veh);
                 }
                 Fate::Exited => exited += 1,
+                Fate::Leaked => self.leaked += 1,
             }
         }
         self.vehicles = survivors;
@@ -821,7 +868,20 @@ impl NetWorld {
                 veh.speed = 0.0;
                 Fate::Alive
             }
+            // No movement resolved. Legitimate when the car has arrived (no next
+            // hop) or run off a genuine dead end; a leak if it still had somewhere
+            // to go — which `intended_movement`'s fallback prevents.
+            None if self.still_has_a_route(veh, lane.link) && self.network.links.iter().any(|l| l.from == node) => Fate::Leaked,
             None => Fate::Exited,
+        }
+    }
+
+    /// Whether the vehicle still has an onward hop it hasn't taken — a routed next
+    /// link or an unfinished explicit route. Used to tell a genuine exit from a leak.
+    fn still_has_a_route(&self, veh: &NetVehicle, from: LinkId) -> bool {
+        match (veh.dest, self.router.as_ref()) {
+            (Some(dest), Some(router)) => router.next_hop(dest, from).is_some(),
+            _ => veh.route_idx + 1 < veh.route.len(),
         }
     }
 
@@ -979,31 +1039,27 @@ impl NetWorld {
     /// Pruned to co-node crossers (collision-imminent only), so cost is the sum
     /// over nodes of k² with k = that node's handful of simultaneous crossers.
     fn remove_overlap_crashes(&mut self) {
-        // Centre distance below which two ~2 m-wide bodies genuinely overlap
-        // (not a legitimate close pass); with vehicle length this is conservative.
-        const OVERLAP: f64 = 2.4;
-        // (index, world position, from-link, to-link)
-        let mut by_node: HashMap<u32, Vec<(usize, [f64; 2], u32, u32)>> = HashMap::new();
+        // (index, world position, heading, from-link, to-link)
+        let mut by_node: HashMap<u32, Vec<(usize, [f64; 2], f64, u32, u32)>> = HashMap::new();
         for (i, v) in self.vehicles.iter().enumerate() {
             if let Some(c) = v.crossing {
                 let mv = self.network.movement(c.movement);
                 let p = self.vehicle_world_pose(v);
                 let (from_link, to_link) = (self.network.lane(mv.from_lane).link.0, self.network.lane(mv.to_lane).link.0);
-                by_node.entry(mv.node.0).or_default().push((i, [p[0], p[1]], from_link, to_link));
+                by_node.entry(mv.node.0).or_default().push((i, [p[0], p[1]], p[2], from_link, to_link));
             }
         }
         let mut crashed = vec![false; self.vehicles.len()];
         for group in by_node.values() {
             for a in 0..group.len() {
                 for b in a + 1..group.len() {
-                    let ((i, pi, fi, ti), (j, pj, fj, tj)) = (group[a], group[b]);
+                    let ((i, pi, hi, fi, ti), (j, pj, hj, fj, tj)) = (group[a], group[b]);
                     // Mirror the conflict builder: same approach fans out and same
-                    // exit merges — both run parallel/zipper, not a crossing. Only a
-                    // genuine cross-approach, cross-exit body overlap is a collision.
+                    // exit merges — both run parallel/zipper, not a crossing.
                     if fi == fj || ti == tj {
                         continue;
                     }
-                    if (pi[0] - pj[0]).hypot(pi[1] - pj[1]) < OVERLAP {
+                    if crossing_overlap(pi, hi, pj, hj) {
                         crashed[i] = true;
                         crashed[j] = true;
                     }
@@ -1147,6 +1203,21 @@ fn should_yield_to(
 /// deceleration — the dilemma-zone test for whether to stop on yellow.
 fn can_stop_before(speed: f64, decel: f64, distance: f64) -> bool {
     speed * speed / (2.0 * decel.max(0.1)) <= distance
+}
+
+/// Whether two crossing vehicles' bodies genuinely collide. A collision is a
+/// *crossing* — near-perpendicular headings within [`OVERLAP`] of each other. Two
+/// vehicles running roughly parallel or anti-parallel (e.g. opposing protected
+/// lefts diverging to opposite corners, or offset oncoming through lanes) are
+/// passing, not colliding, even when their bodies momentarily come close.
+fn crossing_overlap(pi: [f64; 2], hi: f64, pj: [f64; 2], hj: f64) -> bool {
+    // Centre distance below which two ~2 m-wide bodies genuinely overlap;
+    // conservative once vehicle length is accounted for.
+    const OVERLAP: f64 = 2.4;
+    if (hi - hj).cos().abs() > 0.7 {
+        return false;
+    }
+    (pi[0] - pj[0]).hypot(pi[1] - pj[1]) < OVERLAP
 }
 
 /// The gap a driver will accept, shrinking from `base` as `waited` grows
@@ -1747,11 +1818,10 @@ mod tests {
         assert!(next > 100, "the intersection should be busy: {next} spawned");
         assert!(w.exited() > 30, "traffic should keep clearing the intersection: {} exited", w.exited());
         assert!(saw_crossing, "vehicles actually traverse the intersection interior");
-        // Essentially crash-free over 130+ turning vehicles. (Correct lane
-        // channelisation starts opposing lefts from the median lane, whose paths
-        // genuinely cross the box — a small residual the left-turn phasing/yield
-        // model can tighten further; see the intersection notes.)
-        assert!(w.crashed() <= 8, "a signalized arterial stays essentially crash-free, got {}", w.crashed());
+        // Crash-free over 130+ turning vehicles: signal phasing separates the
+        // conflicting movements, and the crossing check distinguishes a genuine
+        // T-bone from opposing lefts that merely pass close (anti-parallel).
+        assert_eq!(w.crashed(), 0, "a signalized arterial stays crash-free, got {}", w.crashed());
     }
 
     #[test]
@@ -1906,6 +1976,7 @@ mod tests {
             }
             assert_eq!(world.crashed(), 0, "flow-field-routed traffic stays collision-free (seed {seed})");
             assert!(world.exited() > 0, "vehicles complete boundary trips (seed {seed}), got {}", world.exited());
+            assert_eq!(world.leaked(), 0, "no car disappears at an intersection (seed {seed}), leaked {}", world.leaked());
         }
     }
 
@@ -1936,6 +2007,7 @@ mod tests {
         assert!(peak > 100, "the map actually loads up under stress, peaked at {peak}");
         // Collisions, if any, are a small fraction of completed trips — no pileup.
         assert!(world.crashed() * 8 < world.exited(), "crashes stay a small fraction of trips: {} crashed vs {} exited", world.crashed(), world.exited());
+        assert_eq!(world.leaked(), 0, "no car disappears at an intersection under saturation, leaked {}", world.leaked());
     }
 
     #[test]
@@ -2124,6 +2196,22 @@ mod tests {
         w.step();
         assert_eq!(w.crashed(), 2);
         assert_eq!(w.vehicles().len(), 0);
+    }
+
+    #[test]
+    fn crossing_overlap_flags_t_bones_not_close_passes() {
+        use std::f64::consts::{FRAC_PI_2, PI};
+        let origin = [0.0, 0.0];
+        let near = [0.5, 0.5]; // well within OVERLAP (2.4 m)
+        // A near-perpendicular meeting is a genuine T-bone.
+        assert!(crossing_overlap(origin, 0.0, near, FRAC_PI_2), "perpendicular crossing collides");
+        // Two anti-parallel bodies (opposing protected lefts passing to opposite
+        // corners) are passing, not colliding, even when they momentarily overlap.
+        assert!(!crossing_overlap(origin, 0.0, near, PI), "anti-parallel pass does not collide");
+        // Same-heading (parallel) bodies are following/side-by-side, not a crossing.
+        assert!(!crossing_overlap(origin, 0.3, near, 0.3), "parallel run is not a crossing");
+        // A true crossing that is still far apart does not collide.
+        assert!(!crossing_overlap(origin, 0.0, [5.0, 5.0], FRAC_PI_2), "distant crossing does not collide");
     }
 
     #[test]

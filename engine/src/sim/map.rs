@@ -198,6 +198,7 @@ impl OsmMap {
                     speed_limit: spec.speed_limit,
                     movement_start: MovementId(0),
                     movement_count: 0,
+                    pocket_taper: 0.0,
                 });
             }
             net.links.push(Link { from, to, lane_start, lane_count: spec.lanes, layer: spec.layer });
@@ -269,6 +270,7 @@ impl OsmMap {
             }
         }
         net.movements = movements;
+        assign_turn_pockets(&mut net);
         net.build_interiors();
 
         let plans = relocate_signals_to_junctions(&net, &self.nodes);
@@ -322,6 +324,43 @@ fn relocate_signals_to_junctions(net: &Network, specs: &[NodeSpec]) -> Vec<Optio
         }
     }
     plans
+}
+
+/// Flag dedicated turn lanes as physical turn pockets. A lane qualifies when it
+/// serves only one turn direction (left on the median-side lane 0, right on the
+/// outermost lane), its neighbour is a through lane it can peel away from, and the
+/// approach is long enough to hold a bay. The lane then gets a bay taper, so
+/// [`Network::lane_lateral_offset`] opens the pocket near the stop line and merges
+/// it into the through lane upstream — turners queue in the bay, not the through
+/// lane, and the widened approach renders like a real intersection.
+fn assign_turn_pockets(net: &mut Network) {
+    const MIN_LEN: f64 = 45.0;
+    let turns = |lane_id: u32| -> Vec<TurnType> {
+        let lane = net.lanes[lane_id as usize];
+        (0..lane.movement_count).map(|k| net.movement_turn(MovementId(lane.movement_start.0 + k))).collect()
+    };
+    let mut pockets: Vec<u32> = Vec::new();
+    for li in 0..net.links.len() {
+        let link = net.links[li];
+        if link.lane_count < 2 {
+            continue;
+        }
+        for (lane_idx, want) in [(0u32, TurnType::Left), (link.lane_count - 1, TurnType::Right)] {
+            let lane_id = link.lane_start.0 + lane_idx;
+            let ts = turns(lane_id);
+            if net.lanes[lane_id as usize].length < MIN_LEN || ts.is_empty() || ts.iter().any(|&t| t != want) {
+                continue;
+            }
+            let nb_idx = if lane_idx == 0 { 1 } else { link.lane_count - 2 };
+            if !turns(link.lane_start.0 + nb_idx).contains(&TurnType::Through) {
+                continue; // the bay must peel off a through lane, not another pocket
+            }
+            pockets.push(lane_id);
+        }
+    }
+    for lane_id in pockets {
+        net.lanes[lane_id as usize].pocket_taper = super::network::POCKET_TAPER;
+    }
 }
 
 /// Build a signalized node's phase program from the conflict graph: each approach
@@ -1092,11 +1131,50 @@ mod tests {
         assert!(max(&throughs) <= min(&rights), "through is left of right: {throughs:?} vs {rights:?}");
 
         // Geometry: lower lane index really is the left lane. Travel is +x, so the
-        // left side is +y — lane 0 must sit farther +y than the last lane.
+        // left side is +y — lane 0 must sit farther +y than the last lane. Sample
+        // at the stop line, where the turn-pocket bays are fully open (upstream the
+        // left/right bays merge into the through lane and coincide).
         let lanes: Vec<LaneId> = net.lanes_of(LinkId(0)).collect();
-        let p0 = net.lane_point(lanes[0], 0.0);
-        let pn = net.lane_point(*lanes.last().unwrap(), 0.0);
+        let stop = net.lane(lanes[0]).length;
+        let p0 = net.lane_point(lanes[0], stop);
+        let pn = net.lane_point(*lanes.last().unwrap(), net.lane(*lanes.last().unwrap()).length);
         assert!(p0[1] > pn[1], "lane 0 sits to the left (toward the centreline)");
+    }
+
+    #[test]
+    fn a_dedicated_turn_lane_becomes_a_pocket_that_opens_at_the_stop_line() {
+        // The same 3-lane approach: its dedicated left lane (0) is a real bay that
+        // merges into the through lane upstream and diverges to its own offset by
+        // the stop line. A single-lane road never gets a pocket.
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(0, 0.0, 0.0),
+                NodeSpec::uncontrolled(1, -200.0, 0.0),
+                NodeSpec::uncontrolled(2, 200.0, 0.0),
+                NodeSpec::uncontrolled(3, 0.0, 200.0),
+                NodeSpec::uncontrolled(4, 0.0, -200.0),
+            ],
+            links: vec![
+                LinkSpec::oneway(1, 0, 3, 15.0),
+                LinkSpec::oneway(0, 2, 1, 15.0),
+                LinkSpec::oneway(0, 3, 1, 15.0),
+                LinkSpec::oneway(0, 4, 1, 15.0),
+            ],
+        }
+        .build();
+        let left = net.lanes_of(LinkId(0)).next().unwrap();
+        let l = net.lane(left);
+        assert!(l.pocket_taper > 0.0, "the dedicated left lane is a pocket");
+        // At the stop line the bay is open (own offset); far upstream it has merged
+        // into the through lane a full lane-width over; the divergence is monotonic.
+        let off = |pos: f64| net.lane_lateral_offset(l, pos);
+        let (open, closed) = (off(l.length), off(0.0));
+        assert!((open - 0.5 * LANE_WIDTH).abs() < 1e-9, "open bay sits at its own offset");
+        assert!((closed - 1.5 * LANE_WIDTH).abs() < 1e-9, "closed bay merges into the through lane");
+        assert!(off(l.length - 6.0) < off(l.length - 24.0), "the bay tapers monotonically");
+
+        // A one-lane approach can't have a bay.
+        assert_eq!(net.lane(net.lanes_of(LinkId(1)).next().unwrap()).pocket_taper, 0.0);
     }
 
     #[test]
