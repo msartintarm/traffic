@@ -22,6 +22,12 @@ import = ["dep:serde", "dep:serde_json"]
 # adapters like Mesa lavapipe) and is tested against the CPU reference:
 # `cargo test --features gpu`.
 gpu = ["dep:wgpu", "dep:pollster"]
+# CPU data-parallelism for the per-vehicle step (rayon). The accel / intended-
+# movement / box-entry passes are order-preserving pure maps over committed state,
+# so this is a drop-in speed-up validated bit-for-bit against the serial result.
+# Native only — browser parallelism needs SharedArrayBuffer workers, a separate
+# effort. Enable with `--features parallel` (e.g. on the `load` bench).
+parallel = ["dep:rayon"]
 
 [dependencies]
 # Plain-data numeric crunching only in the sim core. GPU/DOM bridges are added
@@ -30,6 +36,7 @@ gpu = ["dep:wgpu", "dep:pollster"]
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 bytemuck = { version = "1", features = ["derive"] }
+rayon = { version = "1", optional = true }
 
 # Native GPU compute (the `gpu` feature). Software adapters are fine, so this
 # runs headless in CI without a physical GPU.
@@ -42,7 +49,7 @@ pollster = { version = "0.4", optional = true }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["HtmlCanvasElement"] }
+web-sys = { version = "0.3", features = ["HtmlCanvasElement", "Window", "Performance"] }
 wgpu = { version = "26", default-features = false, features = ["webgpu", "webgl", "wgsl"] }
 
 [dev-dependencies]

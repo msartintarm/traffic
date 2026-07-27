@@ -30,9 +30,6 @@ pub struct NetVehicle {
     /// The stop-controlled node this vehicle has already halted at, so a stop
     /// sign is enforced once rather than forever.
     stopped_at: Option<NodeId>,
-    /// Recent `(position, speed)` samples (newest last) so a follower can react
-    /// to the leader's state as of its reaction time ago.
-    history: Vec<(f64, f64)>,
     /// Consecutive ticks spent essentially stopped — drives yield impatience.
     wait_ticks: u32,
     /// When set, the vehicle is inside a node traversing a movement's interior
@@ -65,21 +62,58 @@ enum Fate {
 /// plausible reaction delay at the fixed timestep.
 const HISTORY_LEN: usize = 8;
 
+type History = [(f64, f64); HISTORY_LEN];
+
+/// Vehicle storage as columns: the rows plus the per-vehicle reaction-delay
+/// history kept out of the row (it is only read for a leader, not while iterating
+/// every row). Columns stay index-aligned; mutations go through here.
+#[derive(Clone, Debug, Default)]
+struct Fleet {
+    rows: Vec<NetVehicle>,
+    hist: Vec<History>,
+    hist_len: Vec<u8>,
+}
+
+impl Fleet {
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn push(&mut self, v: NetVehicle) {
+        let mut h = [(0.0, 0.0); HISTORY_LEN];
+        h[0] = (v.position, v.speed);
+        self.hist.push(h);
+        self.hist_len.push(1);
+        self.rows.push(v);
+    }
+
+    fn clear(&mut self) {
+        self.rows.clear();
+        self.hist.clear();
+        self.hist_len.clear();
+    }
+
+    /// Row `i`'s `(position, speed)` `ticks` steps ago (clamped to the oldest kept).
+    fn delayed(&self, i: usize, ticks: usize) -> (f64, f64) {
+        let n = self.hist_len[i] as usize;
+        self.hist[i][n - 1 - ticks.min(n - 1)]
+    }
+}
+
+/// Append the current `(position, speed)` to a history column entry, dropping the
+/// oldest sample once full.
+fn record_history(hist: &mut History, len: &mut u8, position: f64, speed: f64) {
+    let n = *len as usize;
+    if n < HISTORY_LEN {
+        hist[n] = (position, speed);
+        *len += 1;
+    } else {
+        hist.copy_within(1.., 0);
+        hist[HISTORY_LEN - 1] = (position, speed);
+    }
+}
+
 impl NetVehicle {
-    /// This vehicle's `(position, speed)` `ticks` steps ago (clamped to the
-    /// oldest sample available).
-    fn delayed(&self, ticks: usize) -> (f64, f64) {
-        let n = self.history.len();
-        self.history[n - 1 - ticks.min(n - 1)]
-    }
-
-    fn record(&mut self) {
-        self.history.push((self.position, self.speed));
-        if self.history.len() > HISTORY_LEN {
-            self.history.remove(0);
-        }
-    }
-
     /// Whether the vehicle is currently inside a node traversing a movement's
     /// interior path (its `lane`/`position` are pinned at the stop line).
     pub fn is_crossing(&self) -> bool {
@@ -90,7 +124,7 @@ impl NetVehicle {
 pub struct NetWorld {
     pub network: Network,
     cfg: SimConfig,
-    vehicles: Vec<NetVehicle>,
+    fleet: Fleet,
     time: f64,
     tick: u64,
     exited: u32,
@@ -117,6 +151,79 @@ pub struct NetWorld {
 /// Sim seconds between flow-field rebuilds — often enough that routing tracks
 /// congestion as it forms, rare enough that the recompute cost is negligible.
 const REROUTE_INTERVAL_SECS: f64 = 3.0;
+
+pub const STEP_PHASES: usize = 7;
+pub const PHASE_NAMES: [&str; STEP_PHASES] =
+    ["refresh_routes", "advance_signals", "lane_changes", "neighbors", "accel", "advance", "crashes"];
+thread_local! {
+    static PROF: std::cell::Cell<[f64; STEP_PHASES]> = const { std::cell::Cell::new([0.0; STEP_PHASES]) };
+}
+/// Read and reset the per-phase step timings (ms) accumulated since the last call.
+/// Always zero on wasm (the profiler is a no-op there — no clock).
+pub fn prof_take() -> [f64; STEP_PHASES] {
+    PROF.with(|c| c.replace([0.0; STEP_PHASES]))
+}
+
+/// Per-phase step timer. Real on native (for the load tests); a zero-cost no-op on
+/// wasm, where `Instant::now()` is unavailable.
+#[cfg(not(target_arch = "wasm32"))]
+struct Prof(std::time::Instant);
+#[cfg(not(target_arch = "wasm32"))]
+impl Prof {
+    #[inline]
+    fn new() -> Self {
+        Self(std::time::Instant::now())
+    }
+    #[inline]
+    fn lap(&mut self, phase: usize) {
+        let ms = self.0.elapsed().as_secs_f64() * 1000.0;
+        PROF.with(|c| {
+            let mut a = c.get();
+            a[phase] += ms;
+            c.set(a);
+        });
+        self.0 = std::time::Instant::now();
+    }
+}
+#[cfg(target_arch = "wasm32")]
+struct Prof;
+#[cfg(target_arch = "wasm32")]
+impl Prof {
+    #[inline]
+    fn new() -> Self {
+        Self
+    }
+    #[inline]
+    fn lap(&mut self, _phase: usize) {}
+}
+
+/// Map `0..n` through `f`, in parallel across cores under the `parallel` feature
+/// (rayon), serially otherwise. Order-preserving, so the collected result is
+/// bit-for-bit the serial one — the per-vehicle passes it drives read only
+/// committed pre-step state, so the elements are independent.
+#[cfg(feature = "parallel")]
+fn map_collect<T, F>(n: usize, f: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(usize) -> T + Sync + Send,
+{
+    use rayon::prelude::*;
+    // Below this, rayon's per-task overhead outweighs the win (measured crossover on
+    // the Millbrae step is ~4–5k vehicles), so stay serial — the parallel path is
+    // only for the dense regime that actually saturates a core.
+    const PAR_THRESHOLD: usize = 4000;
+    if n < PAR_THRESHOLD {
+        return (0..n).map(f).collect();
+    }
+    (0..n).into_par_iter().map(f).collect()
+}
+#[cfg(not(feature = "parallel"))]
+fn map_collect<T, F>(n: usize, f: F) -> Vec<T>
+where
+    F: Fn(usize) -> T,
+{
+    (0..n).map(f).collect()
+}
 
 /// FxHash-style hasher for the dense integer ids that key the per-tick maps —
 /// far cheaper than the default SipHash.
@@ -162,7 +269,7 @@ impl NetWorld {
         let link_entries = vec![0u32; network.links.len()];
         let junctions = Junctions::build(&network);
         Self {
-            network, cfg, vehicles: Vec::new(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0,
+            network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0,
             merges, signals, link_entries, router: None, external_reroute: false, junctions,
         }
     }
@@ -202,7 +309,7 @@ impl NetWorld {
     /// Remove all vehicles from the road, leaving the network and counters intact —
     /// used to reset traffic when the demand mode changes without rebuilding the map.
     pub fn clear_vehicles(&mut self) {
-        self.vehicles.clear();
+        self.fleet.clear();
     }
 
     /// Measured flow (vehicles/hour) on each link, from entries so far over
@@ -217,7 +324,7 @@ impl NetWorld {
         let l = self.network.link(link);
         let lane = self.network.lane(l.lane_start);
         let (mut count, mut sum) = (0u32, 0.0);
-        for v in &self.vehicles {
+        for v in &self.fleet.rows {
             if self.network.lane(v.lane).link == link {
                 count += 1;
                 sum += v.speed;
@@ -230,9 +337,9 @@ impl NetWorld {
 
     pub fn spawn(&mut self, id: u32, lane: LaneId, position: f64, speed: f64, driver: DriverConfig) {
         self.link_entries[self.network.lane(lane).link.idx()] += 1;
-        self.vehicles.push(NetVehicle {
+        self.fleet.push(NetVehicle {
             id, lane, position, speed, driver, route: Vec::new(), route_idx: 0, dest: None,
-            stopped_at: None, history: vec![(position, speed)], wait_ticks: 0, crossing: None,
+            stopped_at: None, wait_ticks: 0, crossing: None,
         });
     }
 
@@ -247,9 +354,9 @@ impl NetWorld {
             return false;
         }
         self.link_entries[self.network.lane(lane).link.idx()] += 1;
-        self.vehicles.push(NetVehicle {
+        self.fleet.push(NetVehicle {
             id, lane, position: 0.0, speed, driver, route, route_idx: 0, dest: None,
-            stopped_at: None, history: vec![(0.0, speed)], wait_ticks: 0, crossing: None,
+            stopped_at: None, wait_ticks: 0, crossing: None,
         });
         true
     }
@@ -262,9 +369,9 @@ impl NetWorld {
             return false;
         }
         self.link_entries[entry_link.idx()] += 1;
-        self.vehicles.push(NetVehicle {
+        self.fleet.push(NetVehicle {
             id, lane, position: 0.0, speed, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
-            stopped_at: None, history: vec![(0.0, speed)], wait_ticks: 0, crossing: None,
+            stopped_at: None, wait_ticks: 0, crossing: None,
         });
         true
     }
@@ -275,9 +382,9 @@ impl NetWorld {
     #[cfg(test)]
     pub fn spawn_to_in_lane(&mut self, id: u32, lane: LaneId, position: f64, dest: LinkId, speed: f64, driver: DriverConfig) {
         self.link_entries[self.network.lane(lane).link.idx()] += 1;
-        self.vehicles.push(NetVehicle {
+        self.fleet.push(NetVehicle {
             id, lane, position, speed, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
-            stopped_at: None, history: vec![(position, speed)], wait_ticks: 0, crossing: None,
+            stopped_at: None, wait_ticks: 0, crossing: None,
         });
     }
 
@@ -285,7 +392,7 @@ impl NetWorld {
     /// one already there — measured against each occupant's *rear* (position minus
     /// its own length), so long vehicles are accounted for.
     pub fn entrance_clear(&self, lane: LaneId, min_gap: f64) -> bool {
-        self.vehicles
+        self.fleet.rows
             .iter()
             .filter(|v| v.lane == lane)
             .all(|v| v.position - v.driver.vehicle_length > min_gap)
@@ -315,7 +422,7 @@ impl NetWorld {
     /// times its free-flow time, so routes computed with these steer around it.
     pub fn live_link_costs(&self) -> Vec<u64> {
         let mut count = vec![0u32; self.network.links.len()];
-        for v in &self.vehicles {
+        for v in &self.fleet.rows {
             count[self.network.lane(v.lane).link.idx()] += 1;
         }
         (0..self.network.links.len() as u32)
@@ -331,7 +438,7 @@ impl NetWorld {
     }
 
     pub fn vehicles(&self) -> &[NetVehicle] {
-        &self.vehicles
+        &self.fleet.rows
     }
 
     /// A vehicle's current world pose `[x, y, heading]` — its interior crossing
@@ -344,7 +451,7 @@ impl NetWorld {
     }
 
     pub fn vehicle(&self, id: u32) -> Option<&NetVehicle> {
-        self.vehicles.iter().find(|v| v.id == id)
+        self.fleet.rows.iter().find(|v| v.id == id)
     }
 
     fn intended_movement(&self, veh: &NetVehicle) -> Option<MovementId> {
@@ -440,7 +547,7 @@ impl NetWorld {
         let mut by_lane: IntMap<Vec<usize>> = IntMap::default();
         let mut approaching: IntMap<Vec<usize>> = IntMap::default();
         let mut crossing_at: IntMap<Vec<usize>> = IntMap::default();
-        for (i, v) in self.vehicles.iter().enumerate() {
+        for (i, v) in self.fleet.rows.iter().enumerate() {
             if let Some(c) = v.crossing {
                 crossing_at.entry(self.network.movement(c.movement).node.0).or_default().push(i);
                 continue; // inside a node — not part of any lane's car-following
@@ -448,17 +555,17 @@ impl NetWorld {
             by_lane.entry(v.lane.0).or_default().push(i);
             approaching.entry(self.downstream_node(v.lane).0).or_default().push(i);
         }
-        let mut leader_of = vec![None; self.vehicles.len()];
+        let mut leader_of = vec![None; self.fleet.rows.len()];
         let mut lane_front: IntMap<usize> = IntMap::default();
         for members in by_lane.values_mut() {
             members.sort_by(|&a, &b| {
-                self.vehicles[a].position.total_cmp(&self.vehicles[b].position)
+                self.fleet.rows[a].position.total_cmp(&self.fleet.rows[b].position)
             });
             for w in members.windows(2) {
                 leader_of[w[0]] = Some(w[1]);
             }
             let front = *members.first().unwrap();
-            lane_front.insert(self.vehicles[front].lane.0, front);
+            lane_front.insert(self.fleet.rows[front].lane.0, front);
         }
         Neighbors { leader_of, lane_front, by_lane, approaching, crossing_at }
     }
@@ -481,17 +588,17 @@ impl NetWorld {
     /// lane) and mandatory (move to a lane that serves the route's next link).
     fn lane_changes(&mut self) {
         let mut by_lane: IntMap<Vec<usize>> = IntMap::default();
-        for (i, v) in self.vehicles.iter().enumerate() {
+        for (i, v) in self.fleet.rows.iter().enumerate() {
             if v.crossing.is_some() {
                 continue; // no lane changes mid-intersection
             }
             by_lane.entry(v.lane.0).or_default().push(i);
         }
         for m in by_lane.values_mut() {
-            m.sort_by(|&a, &b| self.vehicles[a].position.total_cmp(&self.vehicles[b].position));
+            m.sort_by(|&a, &b| self.fleet.rows[a].position.total_cmp(&self.fleet.rows[b].position));
         }
         let mut changes: Vec<(usize, LaneId)> = Vec::new();
-        for i in 0..self.vehicles.len() {
+        for i in 0..self.fleet.rows.len() {
             if let Some(t) = self.best_lane_change(i, &by_lane) {
                 changes.push((i, t));
             }
@@ -501,7 +608,7 @@ impl NetWorld {
             // share a start offset (a no-op remap), but a turn-*pocket* lane begins
             // partway down the link, so a car can only move into it once it is
             // within the pocket's span.
-            let veh = &self.vehicles[i];
+            let veh = &self.fleet.rows[i];
             let arc = self.network.lane(veh.lane).start_offset + veh.position;
             let tgt = self.network.lane(target);
             let new_pos = arc - tgt.start_offset;
@@ -510,19 +617,19 @@ impl NetWorld {
             }
             let len = veh.driver.vehicle_length;
             if self.lane_slot_clear(target, new_pos, len, i) {
-                self.vehicles[i].lane = target;
-                self.vehicles[i].position = new_pos;
+                self.fleet.rows[i].lane = target;
+                self.fleet.rows[i].position = new_pos;
             }
         }
     }
 
     fn best_lane_change(&self, i: usize, by_lane: &IntMap<Vec<usize>>) -> Option<LaneId> {
-        let v = &self.vehicles[i];
+        let v = &self.fleet.rows[i];
         let lane = *self.network.lane(v.lane);
         let link = *self.network.link(lane.link);
         let idx = lane.index_in_link as i64;
         let cur_leader = self.nearest_ahead(v.lane, v.position, by_lane, i);
-        let a_self_cur = idm_follow(v, lane.speed_limit, v.position, v.speed, cur_leader.map(|j| &self.vehicles[j]));
+        let a_self_cur = idm_follow(v, lane.speed_limit, v.position, v.speed, cur_leader.map(|j| &self.fleet.rows[j]));
 
         let mut best: Option<(f64, LaneId)> = None;
         for delta in [-1i64, 1] {
@@ -538,13 +645,13 @@ impl NetWorld {
                 limit,
                 v.position,
                 v.speed,
-                self.nearest_ahead(target, v.position, by_lane, i).map(|j| &self.vehicles[j]),
+                self.nearest_ahead(target, v.position, by_lane, i).map(|j| &self.fleet.rows[j]),
             );
 
             let (a_nf_cur, a_nf_new) = match self.nearest_behind(target, v.position, by_lane, i) {
                 Some(fj) => {
-                    let f = &self.vehicles[fj];
-                    let fl = self.nearest_ahead(target, f.position, by_lane, i).map(|j| &self.vehicles[j]);
+                    let f = &self.fleet.rows[fj];
+                    let fl = self.nearest_ahead(target, f.position, by_lane, i).map(|j| &self.fleet.rows[j]);
                     (
                         idm_follow(f, limit, f.position, f.speed, fl),
                         idm_follow(f, limit, f.position, f.speed, Some(v)),
@@ -570,13 +677,13 @@ impl NetWorld {
     // (this ran ~7× per vehicle in `best_lane_change`).
     fn nearest_ahead(&self, lane: LaneId, pos: f64, by_lane: &IntMap<Vec<usize>>, exclude: usize) -> Option<usize> {
         let list = by_lane.get(&lane.0)?;
-        let idx = list.partition_point(|&j| self.vehicles[j].position <= pos);
+        let idx = list.partition_point(|&j| self.fleet.rows[j].position <= pos);
         list[idx..].iter().copied().find(|&j| j != exclude)
     }
 
     fn nearest_behind(&self, lane: LaneId, pos: f64, by_lane: &IntMap<Vec<usize>>, exclude: usize) -> Option<usize> {
         let list = by_lane.get(&lane.0)?;
-        let idx = list.partition_point(|&j| self.vehicles[j].position < pos);
+        let idx = list.partition_point(|&j| self.fleet.rows[j].position < pos);
         list[..idx].iter().rev().copied().find(|&j| j != exclude)
     }
 
@@ -606,7 +713,7 @@ impl NetWorld {
     }
 
     fn lane_slot_clear(&self, target: LaneId, pos: f64, len: f64, exclude: usize) -> bool {
-        self.vehicles
+        self.fleet.rows
             .iter()
             .enumerate()
             .filter(|(j, o)| *j != exclude && o.lane == target)
@@ -634,7 +741,7 @@ impl NetWorld {
     /// the actuated signals.
     fn advance_signals(&mut self, dt: f64) {
         let mut demand: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for v in &self.vehicles {
+        for v in &self.fleet.rows {
             let lane = self.network.lane(v.lane);
             if lane.length - v.position < junction::DETECT {
                 demand.insert(lane.link.0);
@@ -660,13 +767,18 @@ impl NetWorld {
 
     pub fn step(&mut self) {
         let dt = self.cfg.dt;
+        let mut prof = Prof::new();
         self.refresh_routes();
+        prof.lap(0);
         self.advance_signals(dt);
+        prof.lap(1);
         self.lane_changes();
+        prof.lap(2);
         let nb = self.neighbors();
+        prof.lap(3);
 
         let mut cross_by_mv: IntMap<Vec<usize>> = IntMap::default();
-        for (i, v) in self.vehicles.iter().enumerate() {
+        for (i, v) in self.fleet.rows.iter().enumerate() {
             if let Some(c) = v.crossing {
                 cross_by_mv.entry(c.movement.0).or_default().push(i);
             }
@@ -674,17 +786,15 @@ impl NetWorld {
 
         // Compute each vehicle's intended movement once (used by accel, the box
         // gate, and the transition).
-        let intended_mv: Vec<Option<MovementId>> = self
-            .vehicles
-            .iter()
-            .map(|v| if v.crossing.is_some() { None } else { self.intended_movement(v) })
-            .collect();
+        let intended_mv: Vec<Option<MovementId>> = map_collect(self.fleet.rows.len(), |i| {
+            let v = &self.fleet.rows[i];
+            if v.crossing.is_some() { None } else { self.intended_movement(v) }
+        });
 
-        let accels: Vec<f64> = self
-            .vehicles
-            .iter()
-            .enumerate()
-            .map(|(i, veh)| {
+        let accels: Vec<f64> = map_collect(
+            self.fleet.rows.len(),
+            |i| {
+                let veh = &self.fleet.rows[i];
                 if veh.crossing.is_some() {
                     return self.crossing_accel(i, &nb, &cross_by_mv);
                 }
@@ -699,17 +809,17 @@ impl NetWorld {
                 // the true current gap so IDM can never under-brake (collision-free
                 // in-lane); the delay only adds start-up lag.
                 let leader = if let Some(li) = nb.leader_of[i] {
-                    let lead = &self.vehicles[li];
+                    let lead = &self.fleet.rows[li];
                     let delay = (driver.reaction_time / dt).round() as usize;
-                    let (my_p, _) = veh.delayed(delay);
-                    let (lead_p, lead_v) = lead.delayed(delay);
+                    let (my_p, _) = self.fleet.delayed(i, delay);
+                    let (lead_p, lead_v) = self.fleet.delayed(li, delay);
                     let delayed_gap = lead_p - my_p - lead.driver.vehicle_length;
                     let current_gap = lead.position - veh.position - lead.driver.vehicle_length;
                     Some(Obstacle { gap: delayed_gap.min(current_gap), speed: lead_v })
                 } else if let Some(mid) = intended {
                     let to_lane = self.network.movement(mid).to_lane;
                     nb.lane_front.get(&to_lane.0).map(|&front| {
-                        let lead = &self.vehicles[front];
+                        let lead = &self.fleet.rows[front];
                         Obstacle {
                             gap: (lane.length - veh.position) + lead.position - lead.driver.vehicle_length,
                             speed: lead.speed,
@@ -773,7 +883,7 @@ impl NetWorld {
                     let to_lane = self.network.movement(mid).to_lane;
                     nb.lane_front
                         .get(&to_lane.0)
-                        .is_some_and(|&f| self.vehicles[f].position < driver.vehicle_length + driver.min_gap)
+                        .is_some_and(|&f| self.fleet.rows[f].position < driver.vehicle_length + driver.min_gap)
                 });
                 // Signal: red always stops; yellow stops only if the vehicle can
                 // brake comfortably before the line (dilemma zone) — otherwise it
@@ -826,14 +936,15 @@ impl NetWorld {
                 };
                 let binding = constraint::binding_acceleration(&ctx, constraint::DEFAULT);
                 binding + constraint::accel_noise(driver.accel_noise, self.cfg.seed, veh.id, self.tick)
-            })
-            .collect();
+            },
+        );
+        prof.lap(4);
 
         // Destination-lane occupancy (nearest-to-entrance rear), so a crosser
         // finishing its interior path never lands on top of a queued vehicle —
         // instead it holds at the far edge of the node (box-blocking, realistic).
         let mut front: IntMap<f64> = IntMap::default();
-        for v in &self.vehicles {
+        for v in &self.fleet.rows {
             if v.crossing.is_none() && v.position < self.network.lane(v.lane).length {
                 let e = front.entry(v.lane.0).or_insert(f64::MAX);
                 *e = e.min(v.position - v.driver.vehicle_length);
@@ -844,47 +955,65 @@ impl NetWorld {
         // movement still occupies the node (a straggler from the previous phase),
         // which the soft box-yield can't guarantee under momentum. Precomputed here
         // while committed state and `nb` are valid, since the advance pass empties
-        // `self.vehicles`.
-        let block_entry: Vec<bool> = self
-            .vehicles
-            .iter()
-            .enumerate()
-            .map(|(i, veh)| {
-                intended_mv[i]
-                    .is_some_and(|mid| self.box_conflict(mid, self.network.link(self.network.lane(veh.lane).link).to, &nb))
-            })
-            .collect();
+        // `self.fleet.rows`.
+        let block_entry: Vec<bool> = map_collect(self.fleet.rows.len(), |i| {
+            let veh = &self.fleet.rows[i];
+            intended_mv[i]
+                .is_some_and(|mid| self.box_conflict(mid, self.network.link(self.network.lane(veh.lane).link).to, &nb))
+        });
 
-        let mut survivors = Vec::with_capacity(self.vehicles.len());
+        let n = self.fleet.len();
+        let mut rows = Vec::with_capacity(n);
+        let mut hist = Vec::with_capacity(n);
+        let mut hist_len = Vec::with_capacity(n);
         let mut exited = 0u32;
-        for (((mut veh, a), block), intended) in
-            std::mem::take(&mut self.vehicles).into_iter().zip(accels).zip(block_entry).zip(intended_mv)
+        let taken = std::mem::take(&mut self.fleet.rows);
+        let taken_h = std::mem::take(&mut self.fleet.hist);
+        let taken_hl = std::mem::take(&mut self.fleet.hist_len);
+        for (((((mut veh, a), block), intended), mut h), mut hl) in taken
+            .into_iter()
+            .zip(accels)
+            .zip(block_entry)
+            .zip(intended_mv)
+            .zip(taken_h)
+            .zip(taken_hl)
         {
-            match self.advance_vehicle(&mut veh, a, dt, &mut front, block, intended) {
+            let fate = self.advance_vehicle(&mut veh, a, dt, &mut front, block, intended);
+            let keep = match fate {
                 Fate::Alive => {
-                    if veh.speed < 0.5 {
-                        veh.wait_ticks += 1;
-                    } else {
-                        veh.wait_ticks = 0;
-                    }
-                    veh.record();
-                    survivors.push(veh);
+                    veh.wait_ticks = if veh.speed < 0.5 { veh.wait_ticks + 1 } else { 0 };
+                    true
                 }
                 Fate::Entered(link) => {
                     self.link_entries[link.idx()] += 1;
                     veh.wait_ticks = 0;
-                    veh.record();
-                    survivors.push(veh);
+                    true
                 }
-                Fate::Exited => exited += 1,
-                Fate::Leaked => self.leaked += 1,
+                Fate::Exited => {
+                    exited += 1;
+                    false
+                }
+                Fate::Leaked => {
+                    self.leaked += 1;
+                    false
+                }
+            };
+            if keep {
+                record_history(&mut h, &mut hl, veh.position, veh.speed);
+                rows.push(veh);
+                hist.push(h);
+                hist_len.push(hl);
             }
         }
-        self.vehicles = survivors;
+        self.fleet.rows = rows;
+        self.fleet.hist = hist;
+        self.fleet.hist_len = hist_len;
         self.exited += exited;
+        prof.lap(5);
         self.remove_crashes();
         self.remove_conflict_crashes();
         self.remove_overlap_crashes();
+        prof.lap(6);
         self.time += dt;
         self.tick += 1;
     }
@@ -984,7 +1113,7 @@ impl NetWorld {
     /// turn's comfortable speed and following either a crosser ahead on the same
     /// movement or the queue waiting on the destination lane.
     fn crossing_accel(&self, i: usize, nb: &Neighbors, cross_by_mv: &IntMap<Vec<usize>>) -> f64 {
-        let veh = &self.vehicles[i];
+        let veh = &self.fleet.rows[i];
         let c = veh.crossing.unwrap();
         let it = self.network.interior(c.movement);
         let to_lane = self.network.movement(c.movement).to_lane;
@@ -1009,17 +1138,17 @@ impl NetWorld {
             if j == i {
                 continue;
             }
-            let o = self.vehicles[j].crossing.unwrap();
+            let o = self.fleet.rows[j].crossing.unwrap();
             if o.s > c.s {
-                let g = o.s - c.s - self.vehicles[j].driver.vehicle_length;
+                let g = o.s - c.s - self.fleet.rows[j].driver.vehicle_length;
                 if g < gap {
                     gap = g;
-                    lead_speed = self.vehicles[j].speed;
+                    lead_speed = self.fleet.rows[j].speed;
                 }
             }
         }
         if let Some(&f) = nb.lane_front.get(&to_lane.0) {
-            let l = &self.vehicles[f];
+            let l = &self.fleet.rows[f];
             let g = (it.len - c.s) + l.position - l.driver.vehicle_length;
             if g < gap {
                 gap = g;
@@ -1051,7 +1180,7 @@ impl NetWorld {
                 continue; // already through this point
             }
             for &j in cross_by_mv.get(&other_mv.0).into_iter().flatten() {
-                let o = &self.vehicles[j];
+                let o = &self.fleet.rows[j];
                 let their_dist = other_s - o.crossing.unwrap().s;
                 if their_dist < -2.0 {
                     continue; // they have cleared the point
@@ -1073,17 +1202,17 @@ impl NetWorld {
     fn remove_crashes(&mut self) {
         const OVERLAP_TOL: f64 = 0.5;
         let mut by_lane: IntMap<Vec<usize>> = IntMap::default();
-        for (i, v) in self.vehicles.iter().enumerate() {
+        for (i, v) in self.fleet.rows.iter().enumerate() {
             if v.crossing.is_some() {
                 continue; // crossers are pinned at the line; handled by conflict crashes
             }
             by_lane.entry(v.lane.0).or_default().push(i);
         }
-        let mut crashed = vec![false; self.vehicles.len()];
+        let mut crashed = vec![false; self.fleet.rows.len()];
         for members in by_lane.values_mut() {
-            members.sort_by(|&a, &b| self.vehicles[a].position.total_cmp(&self.vehicles[b].position));
+            members.sort_by(|&a, &b| self.fleet.rows[a].position.total_cmp(&self.fleet.rows[b].position));
             for w in members.windows(2) {
-                let (rear, front) = (&self.vehicles[w[0]], &self.vehicles[w[1]]);
+                let (rear, front) = (&self.fleet.rows[w[0]], &self.fleet.rows[w[1]]);
                 let gap = front.position - rear.position - front.driver.vehicle_length;
                 if gap < -OVERLAP_TOL {
                     crashed[w[0]] = true;
@@ -1101,7 +1230,7 @@ impl NetWorld {
     fn remove_conflict_crashes(&mut self) {
         const CROSS_TOL: f64 = 3.0;
         let mut at: IntMap<Vec<(usize, f64)>> = IntMap::default();
-        for (i, v) in self.vehicles.iter().enumerate() {
+        for (i, v) in self.fleet.rows.iter().enumerate() {
             if let Some(c) = v.crossing {
                 at.entry(c.movement.0).or_default().push((i, c.s));
             }
@@ -1109,7 +1238,7 @@ impl NetWorld {
         if at.is_empty() {
             return;
         }
-        let mut crashed = vec![false; self.vehicles.len()];
+        let mut crashed = vec![false; self.fleet.rows.len()];
         for cp in &self.network.conflicts {
             let (Some(a), Some(b)) = (at.get(&cp.a.0), at.get(&cp.b.0)) else { continue };
             for &(i, sa) in a {
@@ -1136,7 +1265,7 @@ impl NetWorld {
     fn remove_overlap_crashes(&mut self) {
         // (index, world position, heading, from-link, to-link)
         let mut by_node: IntMap<Vec<(usize, [f64; 2], f64, u32, u32)>> = IntMap::default();
-        for (i, v) in self.vehicles.iter().enumerate() {
+        for (i, v) in self.fleet.rows.iter().enumerate() {
             if let Some(c) = v.crossing {
                 let mv = self.network.movement(c.movement);
                 let p = self.vehicle_world_pose(v);
@@ -1144,7 +1273,7 @@ impl NetWorld {
                 by_node.entry(mv.node.0).or_default().push((i, [p[0], p[1]], p[2], from_link, to_link));
             }
         }
-        let mut crashed = vec![false; self.vehicles.len()];
+        let mut crashed = vec![false; self.fleet.rows.len()];
         for group in by_node.values() {
             for a in 0..group.len() {
                 for b in a + 1..group.len() {
@@ -1164,26 +1293,25 @@ impl NetWorld {
         self.take_crashed(crashed);
     }
 
-    /// Remove the flagged vehicles and add them to the crash count.
+    /// Remove the flagged vehicles (compacting every column) and count the crashes.
     fn take_crashed(&mut self, crashed: Vec<bool>) {
-        if crashed.iter().any(|&c| c) {
-            let mut i = 0;
-            self.vehicles.retain(|_| {
-                let keep = !crashed[i];
-                i += 1;
-                if !keep {
-                    self.crashed += 1;
-                }
-                keep
-            });
+        if !crashed.iter().any(|&c| c) {
+            return;
         }
+        let mut keep = crashed.iter().map(|&c| !c);
+        self.fleet.rows.retain(|_| keep.next().unwrap());
+        let mut keep = crashed.iter().map(|&c| !c);
+        self.fleet.hist.retain(|_| keep.next().unwrap());
+        let mut keep = crashed.iter().map(|&c| !c);
+        self.fleet.hist_len.retain(|_| keep.next().unwrap());
+        self.crashed += crashed.iter().filter(|&&c| c).count() as u32;
     }
 
     /// Whether `mid`'s interior path conflicts with a vehicle already crossing
     /// `node` — you must not enter an occupied box, whatever the control.
     fn box_conflict(&self, mid: MovementId, node: NodeId, nb: &Neighbors) -> bool {
         nb.crossing_at.get(&node.0).into_iter().flatten().any(|&j| {
-            let o = self.vehicles[j].crossing.unwrap().movement;
+            let o = self.fleet.rows[j].crossing.unwrap().movement;
             self.network.movements_conflict(mid, o)
         })
     }
@@ -1192,7 +1320,7 @@ impl NetWorld {
     /// different link and will arrive within the critical gap — the signal to
     /// give way. `None` means clear to proceed.
     fn conflicting_priority_traffic(&self, i: usize, lane: LaneId, node: NodeId, nb: &Neighbors) -> Option<()> {
-        let me = &self.vehicles[i];
+        let me = &self.fleet.rows[i];
         // Impatience: the longer we've waited, the smaller the gap we'll accept.
         let critical = effective_critical_gap(me.driver.critical_gap, me.wait_ticks as f64 * self.cfg.dt);
         let my_link = self.network.lane(lane).link;
@@ -1203,7 +1331,7 @@ impl NetWorld {
             if j == i {
                 continue;
             }
-            let o = &self.vehicles[j];
+            let o = &self.fleet.rows[j];
             let o_lane = *self.network.lane(o.lane);
             if o_lane.link == my_link || o.speed < 0.5 {
                 continue;
@@ -1232,7 +1360,7 @@ impl NetWorld {
                 continue;
             }
             for &j in nb.by_lane.get(&from).into_iter().flatten() {
-                let o = &self.vehicles[j];
+                let o = &self.fleet.rows[j];
                 if o.speed < 0.5 {
                     continue;
                 }
@@ -1348,6 +1476,17 @@ mod tests {
 
     fn cfg() -> SimConfig {
         SimConfig::default_config()
+    }
+
+    #[test]
+    fn map_collect_preserves_order_and_matches_serial() {
+        // Whichever build (serial or rayon `parallel`), the collected result must
+        // equal the plain serial map element-for-element — the per-vehicle step
+        // passes depend on this order preservation.
+        let n = 5000;
+        let got = map_collect(n, |i| i * i + 7);
+        let serial: Vec<usize> = (0..n).map(|i| i * i + 7).collect();
+        assert_eq!(got, serial);
     }
 
     fn approach_lane(net: &Network) -> LaneId {
@@ -2073,102 +2212,6 @@ mod tests {
             assert!(world.exited() > 0, "vehicles complete boundary trips (seed {seed}), got {}", world.exited());
             assert_eq!(world.leaked(), 0, "no car disappears at an intersection (seed {seed}), leaked {}", world.leaked());
         }
-    }
-
-    #[test]
-    #[ignore] // benchmark: time step() at scale on the real map
-    fn bench_step_at_scale() {
-        use super::super::demand::{self, DemandGenerator, DemandMode};
-        use std::time::Instant;
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
-        let Ok(text) = std::fs::read_to_string(path) else { return };
-        let net = super::super::map::OsmMap::from_json(&text).expect("map json").build();
-        let mut world = NetWorld::new(net, cfg());
-        let pairs = demand::od_pairs(&world.network, 1, 200, DemandMode::HighwayBiased);
-        let mut gen = DemandGenerator::new(&world, &pairs, 1);
-        world.install_router(&gen.destinations());
-        // Fill up to ~5000 cars.
-        while world.vehicles().len() < 5000 {
-            gen.step(&mut world, cfg().dt);
-            world.step();
-        }
-        let n = world.vehicles().len();
-        // Sum the O(approach) work in conflicting_priority_traffic (the suspect).
-        let mut approach_iters = 0u64;
-        {
-            let nb = world.neighbors();
-            for v in world.vehicles() {
-                if v.crossing.is_none() {
-                    let node = world.downstream_node(v.lane);
-                    if matches!(world.network.node(node).control, NodeControl::Uncontrolled | NodeControl::Stop | NodeControl::Yield) {
-                        approach_iters += nb.approaching.get(&node.0).map_or(0, |a| a.len()) as u64;
-                    }
-                }
-            }
-        }
-        let iters = 300;
-        let (mut total, mut max) = (0.0f64, 0.0f64);
-        for _ in 0..iters {
-            let t = Instant::now();
-            world.step();
-            let ms = t.elapsed().as_secs_f64() * 1000.0;
-            total += ms;
-            max = max.max(ms);
-        }
-        eprintln!(
-            "BENCH cars={n} mean={:.2}ms/tick worst-tick={max:.2}ms  approach-iters/tick={approach_iters}",
-            total / iters as f64
-        );
-    }
-
-    #[test]
-    #[ignore] // benchmark: the whole per-frame CPU cost that governs canvas FPS at scale
-    fn bench_frame_at_scale() {
-        // A browser frame is: advance() (one or more sim steps) + render marshaling
-        // (a world pose per vehicle for the instance buffer, plus the prev-pose map
-        // for interpolation). Both are O(vehicles) on the single wasm thread, so
-        // this is what drops the FPS with lots of cars — independent of GPU routing.
-        use super::super::demand::{self, DemandGenerator, DemandMode};
-        use std::time::Instant;
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
-        let Ok(text) = std::fs::read_to_string(path) else { return };
-        let net = super::super::map::OsmMap::from_json(&text).expect("map json").build();
-        let mut world = NetWorld::new(net, cfg());
-        let pairs = demand::od_pairs(&world.network, 1, 200, DemandMode::HighwayBiased);
-        let mut gen = DemandGenerator::new(&world, &pairs, 1);
-        world.install_router(&gen.destinations());
-        world.set_external_reroute(true); // model the browser's GPU-routing case (no CPU recompute)
-        while world.vehicles().len() < 5000 {
-            gen.step(&mut world, cfg().dt);
-            world.step();
-        }
-        let n = world.vehicles().len();
-
-        let iters = 300;
-        let (mut step_ms, mut marshal_ms) = (0.0f64, 0.0f64);
-        for _ in 0..iters {
-            // Render marshaling, exactly as bridge::render_instances + snapshot do:
-            // one world pose per vehicle for the GPU instance buffer, and again into
-            // the id→pose map used to interpolate between frames.
-            let t = Instant::now();
-            let poses: Vec<[f64; 3]> = world.vehicles().iter().map(|v| world.vehicle_world_pose(v)).collect();
-            let mut prev: HashMap<u32, [f32; 4]> = HashMap::with_capacity(n);
-            for v in world.vehicles() {
-                let p = world.vehicle_world_pose(v);
-                prev.insert(v.id, [p[0] as f32, p[1] as f32, p[2] as f32, v.speed as f32]);
-            }
-            std::hint::black_box((&poses, &prev));
-            marshal_ms += t.elapsed().as_secs_f64() * 1000.0;
-
-            let t = Instant::now();
-            world.step();
-            step_ms += t.elapsed().as_secs_f64() * 1000.0;
-        }
-        let (step, marshal) = (step_ms / iters as f64, marshal_ms / iters as f64);
-        eprintln!(
-            "BENCH FRAME cars={n} step={step:.2}ms render-marshal={marshal:.2}ms per-frame-total={:.2}ms (native; ~2-3× in wasm)",
-            step + marshal
-        );
     }
 
     #[test]

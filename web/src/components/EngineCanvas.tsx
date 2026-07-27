@@ -213,9 +213,10 @@ export default function EngineCanvas() {
             sim.marking_mesh_vertices(),
             sim.marking_mesh_indices(),
           );
-          // Opt-in: run route recomputes on the renderer's WebGPU device (`?gpu=1`).
-          // Off by default — the CPU amortized path is the verified-smooth default.
-          if (new URLSearchParams(window.location.search).get("gpu") === "1") {
+          // Route recomputes run on the renderer's WebGPU device by default (it
+          // removes the flow-field recompute from the CPU step). Pass `?gpu=0` to
+          // fall back to the CPU amortized path.
+          if (new URLSearchParams(window.location.search).get("gpu") !== "0") {
             try {
               sim.enable_gpu_routing(renderer!);
               setBackend("WebGPU / WebGL2 · GPU routing");

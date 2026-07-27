@@ -72,6 +72,13 @@ impl SimClock {
         completed
     }
 
+    /// Discard accumulated-but-unrun sim time. Called when a frame's catch-up hits
+    /// its wall-clock budget, so an overloaded frame degrades to slow-motion rather
+    /// than building an unpayable backlog that freezes the main thread.
+    pub fn drop_backlog(&mut self) {
+        self.accumulator = 0.0;
+    }
+
     pub fn advance(&mut self, real_elapsed: f64, max_ticks: u32) -> u32 {
         if self.state == PlayState::Paused || self.speed == 0.0 {
             return 0;
@@ -135,6 +142,17 @@ mod tests {
         let mut c = clock();
         c.play();
         assert_eq!(c.advance(1000.0, 10), 10);
+    }
+
+    #[test]
+    fn drop_backlog_discards_pending_time() {
+        let mut c = clock();
+        c.play();
+        assert_eq!(c.advance(0.5, 1000), 2); // 0.5s / 0.2s = 2 ticks, 0.1s left over
+        assert!(c.alpha() > 0.0, "leftover time should register as sub-tick progress");
+        c.drop_backlog();
+        assert_eq!(c.alpha(), 0.0);
+        assert_eq!(c.advance(0.0, 1000), 0, "nothing carried into the next frame");
     }
 
     #[test]

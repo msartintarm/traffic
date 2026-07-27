@@ -26,6 +26,24 @@ use crate::sim::map;
 use crate::sim::net_world::NetWorld;
 use crate::sim::network::{LinkId, Network, LANE_WIDTH};
 
+/// Soft wall-clock budget (ms) for one frame's catch-up stepping. Past this, the
+/// frame stops advancing the sim and renders, dropping the backlog so a heavy step
+/// degrades to slow-motion instead of locking the main thread.
+const FRAME_BUDGET_MS: f64 = 8.0;
+/// Hard ceiling on catch-up ticks per frame. The wall-clock budget is the real
+/// limiter; this only bounds the loop if no monotonic clock is available.
+const MAX_CATCHUP_TICKS: u32 = 240;
+
+/// Monotonic wall-clock milliseconds from the browser's high-resolution timer.
+/// Returns 0.0 if unavailable, which disables the budget (falling back to the tick
+/// ceiling) rather than erroring.
+fn now_ms() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0)
+}
+
 #[wasm_bindgen]
 pub struct Simulation {
     world: NetWorld,
@@ -193,20 +211,38 @@ impl Simulation {
 
     pub fn advance(&mut self, real_elapsed_secs: f64) -> u32 {
         self.drive_gpu_routing();
-        let ticks = self.clock.advance(real_elapsed_secs, 240);
+        let ticks = self.clock.advance(real_elapsed_secs, MAX_CATCHUP_TICKS);
+        if ticks == 0 {
+            return 0;
+        }
         let dt = self.clock.dt();
-        for t in 0..ticks {
+        let started = now_ms();
+        let mut ran = 0u32;
+        while ran < ticks {
+            // Once catch-up blows the frame budget, treat this tick as the last:
+            // render the result and drop the remaining backlog so a heavy step
+            // degrades to slow-motion instead of freezing the main thread. (Always
+            // run at least one tick, hence `ran > 0`.)
+            let over_budget = ran > 0 && now_ms() - started > FRAME_BUDGET_MS;
+            let last = over_budget || ran + 1 == ticks;
             // The render interpolates between `prev` and the post-step state, so
-            // only the snapshot taken right before the *final* tick is ever used.
-            // Skipping it on the intermediate catch-up ticks avoids rebuilding the
-            // full pose map (over every vehicle) several times per frame.
-            if t + 1 == ticks {
+            // only the snapshot taken right before the *final* committed tick is
+            // used; taking it once (not per catch-up tick) avoids rebuilding the
+            // full pose map several times per frame.
+            if last {
                 self.prev = self.snapshot();
             }
             self.demand.step(&mut self.world, dt); // stream routed vehicles in
             self.world.step();
+            ran += 1;
+            if last {
+                if over_budget {
+                    self.clock.drop_backlog();
+                }
+                break;
+            }
         }
-        ticks
+        ran
     }
 
     pub fn vehicle_count(&self) -> u32 {
