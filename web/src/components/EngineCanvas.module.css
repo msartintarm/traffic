@@ -1,0 +1,145 @@
+/* In-viewport HUD, styled after ../plant's frosted-glass control chips. */
+
+.wrapper {
+  position: relative;
+  width: 100%;
+  max-width: 900px;
+}
+
+.canvas {
+  width: 100%;
+  display: block;
+  border: 1px solid #222;
+  border-radius: 8px;
+  background: #0b0e13;
+  /* Right-drag pan / wheel zoom need raw pointer moves, not the browser's
+     own scroll/pan gesture. */
+  touch-action: none;
+}
+
+/* Top-left control bar: play/pause, speed, zoom, fit. */
+.controls {
+  position: absolute;
+  top: 0.6rem;
+  left: 0.6rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  max-width: calc(100% - 1.2rem);
+  padding: 0.3rem 0.5rem;
+  border-radius: 8px;
+  background: rgba(15, 15, 20, 0.55);
+  backdrop-filter: blur(4px);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: #e2e8f0;
+  font-family: ui-monospace, monospace;
+  font-size: 0.75rem;
+}
+
+.button {
+  font-size: 0.75rem;
+  padding: 0.15rem 0.6rem;
+  border-radius: 6px;
+  border: 1px solid #38bdf8;
+  background: rgba(56, 189, 248, 0.15);
+  color: #7dd3fc;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.button:hover:not(:disabled) {
+  background: rgba(56, 189, 248, 0.3);
+}
+
+.button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.buttonActive {
+  background: rgba(56, 189, 248, 0.35);
+  color: #e0f2fe;
+}
+
+.zoomLabel {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  white-space: nowrap;
+}
+
+.slider {
+  width: 110px;
+}
+
+/* Top-right status: backend, map, live counts. Never swallows canvas input. */
+.status {
+  position: absolute;
+  top: 0.6rem;
+  right: 0.6rem;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.15rem;
+  padding: 0.3rem 0.55rem;
+  border-radius: 8px;
+  background: rgba(15, 15, 20, 0.55);
+  backdrop-filter: blur(4px);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: #cbd5e1;
+  font-family: ui-monospace, monospace;
+  font-size: 0.7rem;
+  text-align: right;
+  pointer-events: none;
+}
+
+/* Bottom-left selected-road panel (shown on click). */
+.panel {
+  position: absolute;
+  bottom: 0.6rem;
+  left: 0.6rem;
+  display: none;
+  padding: 0.35rem 0.6rem;
+  border-radius: 8px;
+  background: rgba(15, 15, 20, 0.6);
+  backdrop-filter: blur(4px);
+  border: 1px solid #2585b4;
+  color: #e6edf3;
+  font-family: ui-monospace, monospace;
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  max-width: calc(100% - 1.2rem);
+  pointer-events: none;
+}
+
+/* Bottom-right usage hint. */
+.hint {
+  position: absolute;
+  bottom: 0.6rem;
+  right: 0.6rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 6px;
+  background: rgba(15, 15, 20, 0.45);
+  backdrop-filter: blur(4px);
+  color: #94a3b8;
+  font-family: ui-monospace, monospace;
+  font-size: 0.62rem;
+  text-align: right;
+  pointer-events: none;
+  max-width: calc(100% - 1.2rem);
+}
+
+.tooltip {
+  position: fixed;
+  display: none;
+  pointer-events: none;
+  padding: 2px 6px;
+  background: rgba(11, 14, 19, 0.9);
+  color: #e6edf3;
+  border: 1px solid #333;
+  border-radius: 4px;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  z-index: 10;
+}

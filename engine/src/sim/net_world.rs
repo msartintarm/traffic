@@ -11,6 +11,7 @@ use super::constraint::{self, LongContext, Obstacle, SpeedTarget};
 use super::idm;
 use super::mobil::{self, MobilParams};
 use super::network::{LaneId, LinkId, MovementId, Network, NodeControl, NodeId, TurnType};
+use super::router::FieldRouter;
 use super::signal::SignalState;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -22,6 +23,9 @@ pub struct NetVehicle {
     pub driver: DriverConfig,
     pub route: Vec<LinkId>,
     pub route_idx: usize,
+    /// Destination link for flow-field routing; when set (with a world router)
+    /// it supersedes `route` and reroutes live around congestion.
+    pub dest: Option<LinkId>,
     /// The stop-controlled node this vehicle has already halted at, so a stop
     /// sign is enforced once rather than forever.
     stopped_at: Option<NodeId>,
@@ -96,7 +100,14 @@ pub struct NetWorld {
     /// Cumulative vehicles that have entered each link (spawned onto it or
     /// crossed onto it) — the raw counts calibration compares to real data.
     link_entries: Vec<u32>,
+    /// Flow-field router for destination-based vehicles, rebuilt periodically
+    /// against live costs so in-flight cars reroute around congestion.
+    router: Option<FieldRouter>,
 }
+
+/// Sim seconds between flow-field rebuilds — often enough that routing tracks
+/// congestion as it forms, rare enough that the recompute cost is negligible.
+const REROUTE_INTERVAL_SECS: f64 = 3.0;
 
 impl NetWorld {
     pub fn new(network: Network, cfg: SimConfig) -> Self {
@@ -132,8 +143,19 @@ impl NetWorld {
         let link_entries = vec![0u32; network.links.len()];
         Self {
             network, cfg, vehicles: Vec::new(), time: 0.0, tick: 0, exited: 0, crashed: 0,
-            merges, signals, approaches, link_entries,
+            merges, signals, approaches, link_entries, router: None,
         }
+    }
+
+    /// Install a flow-field router covering `dests`; vehicles spawned via
+    /// [`NetWorld::spawn_to`] then route by the field and reroute live.
+    pub fn install_router(&mut self, dests: &[LinkId]) {
+        let costs = self.live_link_costs();
+        self.router = Some(FieldRouter::new(&self.network, dests, &costs));
+    }
+
+    pub fn router_knows(&self, dest: LinkId) -> bool {
+        self.router.as_ref().is_some_and(|r| r.knows(dest))
     }
 
     /// Measured flow (vehicles/hour) on each link, from entries so far over
@@ -162,7 +184,7 @@ impl NetWorld {
     pub fn spawn(&mut self, id: u32, lane: LaneId, position: f64, speed: f64, driver: DriverConfig) {
         self.link_entries[self.network.lane(lane).link.idx()] += 1;
         self.vehicles.push(NetVehicle {
-            id, lane, position, speed, driver, route: Vec::new(), route_idx: 0,
+            id, lane, position, speed, driver, route: Vec::new(), route_idx: 0, dest: None,
             stopped_at: None, history: vec![(position, speed)], wait_ticks: 0, crossing: None,
         });
     }
@@ -179,7 +201,22 @@ impl NetWorld {
         }
         self.link_entries[self.network.lane(lane).link.idx()] += 1;
         self.vehicles.push(NetVehicle {
-            id, lane, position: 0.0, speed, driver, route, route_idx: 0,
+            id, lane, position: 0.0, speed, driver, route, route_idx: 0, dest: None,
+            stopped_at: None, history: vec![(0.0, speed)], wait_ticks: 0, crossing: None,
+        });
+        true
+    }
+
+    /// Spawn at the start of `entry_link` bound for `dest`, routed live by the
+    /// world's flow-field. Refused if the entrance is still occupied.
+    pub fn spawn_to(&mut self, id: u32, entry_link: LinkId, dest: LinkId, speed: f64, driver: DriverConfig) -> bool {
+        let Some(lane) = self.network.lanes_of(entry_link).next() else { return false };
+        if !self.entrance_clear(lane, driver.min_gap) {
+            return false;
+        }
+        self.link_entries[entry_link.idx()] += 1;
+        self.vehicles.push(NetVehicle {
+            id, lane, position: 0.0, speed, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
             stopped_at: None, history: vec![(0.0, speed)], wait_ticks: 0, crossing: None,
         });
         true
@@ -250,19 +287,27 @@ impl NetWorld {
         if lane.movement_count == 0 {
             return None;
         }
+        if let (Some(dest), Some(router)) = (veh.dest, self.router.as_ref()) {
+            let next_link = router.next_hop(dest, lane.link)?;
+            return self.movement_to(veh.lane, next_link);
+        }
         if !veh.route.is_empty() {
             if veh.route_idx + 1 >= veh.route.len() {
                 return None;
             }
-            let next_link = veh.route[veh.route_idx + 1];
-            for (k, m) in self.network.movements_of(veh.lane).iter().enumerate() {
-                if self.network.lane(m.to_lane).link == next_link {
-                    return Some(MovementId(lane.movement_start.0 + k as u32));
-                }
-            }
-            return None;
+            return self.movement_to(veh.lane, veh.route[veh.route_idx + 1]);
         }
         Some(lane.movement_start)
+    }
+
+    /// The movement from `from_lane` onto `next_link`, if one exists.
+    fn movement_to(&self, from_lane: LaneId, next_link: LinkId) -> Option<MovementId> {
+        let start = self.network.lane(from_lane).movement_start;
+        self.network
+            .movements_of(from_lane)
+            .iter()
+            .position(|m| self.network.lane(m.to_lane).link == next_link)
+            .map(|k| MovementId(start.0 + k as u32))
     }
 
     fn neighbors(&self) -> Neighbors {
@@ -502,8 +547,23 @@ impl NetWorld {
         }
     }
 
+    fn refresh_routes(&mut self) {
+        if self.router.is_none() {
+            return;
+        }
+        let interval = (REROUTE_INTERVAL_SECS / self.cfg.dt).max(1.0) as u64;
+        if self.tick % interval != 0 {
+            return;
+        }
+        let costs = self.live_link_costs();
+        if let Some(r) = self.router.as_mut() {
+            r.recompute(&costs);
+        }
+    }
+
     pub fn step(&mut self) {
         let dt = self.cfg.dt;
+        self.refresh_routes();
         self.advance_signals(dt);
         self.lane_changes();
         let nb = self.neighbors();
@@ -1077,6 +1137,7 @@ fn integrate(v: &mut NetVehicle, accel: f64, dt: f64) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::boundary;
     use super::super::map::*;
     use super::super::network::{LaneId, LinkId};
     use super::*;
@@ -1301,6 +1362,67 @@ mod tests {
         world.run_ticks(1000); // turns slow vehicles, so allow more time
 
         assert_eq!(world.exited(), 2, "both routed vehicles reach their destination");
+    }
+
+    fn symmetric_diamond() -> Network {
+        OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(0, 0.0, 0.0),
+                NodeSpec::uncontrolled(1, 100.0, 0.0),
+                NodeSpec::uncontrolled(2, 200.0, -80.0),
+                NodeSpec::uncontrolled(3, 200.0, 80.0),
+                NodeSpec::uncontrolled(4, 300.0, 0.0),
+                NodeSpec::uncontrolled(5, 400.0, 0.0),
+            ],
+            links: vec![
+                LinkSpec::oneway(0, 1, 1, 20.0),
+                LinkSpec::oneway(1, 2, 1, 20.0),
+                LinkSpec::oneway(1, 3, 1, 20.0),
+                LinkSpec::oneway(2, 4, 1, 20.0),
+                LinkSpec::oneway(3, 4, 1, 20.0),
+                LinkSpec::oneway(4, 5, 1, 20.0),
+            ],
+        }
+        .build()
+    }
+
+    #[test]
+    fn destination_routed_vehicle_drives_the_field_to_its_exit() {
+        let mut world = NetWorld::new(diamond(), cfg());
+        world.install_router(&[LinkId(5)]);
+        assert!(world.spawn_to(1, LinkId(0), LinkId(5), 12.0, DriverConfig::car()));
+        world.run_ticks(1000);
+        assert_eq!(world.exited(), 1, "a vehicle with only a destination reaches it via the flow field");
+    }
+
+    #[test]
+    fn through_traffic_enters_and_leaves_at_gateways() {
+        let net = diamond();
+        assert_eq!(boundary::entry_links(&net), vec![LinkId(0)]);
+        assert_eq!(boundary::exit_links(&net), vec![LinkId(5)]);
+        let mut world = NetWorld::new(net, cfg());
+        world.install_router(&[LinkId(5)]);
+        assert!(world.spawn_to(1, LinkId(0), LinkId(5), 12.0, DriverConfig::car()));
+        world.run_ticks(1000);
+        assert_eq!(world.exited(), 1, "external traffic crosses from the entry gateway to the exit gateway");
+    }
+
+    #[test]
+    fn in_flight_traffic_spreads_onto_the_second_arm_when_the_first_congests() {
+        let mut world = NetWorld::new(symmetric_diamond(), cfg());
+        world.install_router(&[LinkId(5)]);
+        let mut next = 0u32;
+        for t in 0..3000 {
+            if t % 3 == 0 && world.spawn_to(next, LinkId(0), LinkId(5), 12.0, DriverConfig::car()) {
+                next += 1;
+            }
+            world.step();
+        }
+        let flows = world.link_flows();
+        assert_eq!(world.crashed(), 0, "rerouting stays collision-free");
+        assert!(flows[1] > 0.0, "the tie-preferred arm carries traffic");
+        assert!(flows[2] > 0.0, "as the first arm congests, in-flight cars are steered onto the second");
+        assert!(world.exited() > 20, "traffic keeps flowing through, got {}", world.exited());
     }
 
     #[test]
@@ -1640,6 +1762,28 @@ mod tests {
         // Per-approach OSM signals are relocated onto their junctions, so most
         // real intersections cycle rather than sitting permanently green.
         assert!(multiphase >= 15, "most signalized intersections should cycle, got {multiphase}");
+    }
+
+    #[test]
+    fn real_map_boundary_demand_routes_live_and_stays_safe() {
+        use super::super::demand::{self, DemandGenerator};
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let net = super::super::map::OsmMap::from_json(&text).expect("map json").build();
+        assert!(!boundary::gateways(&net).is_empty(), "a bbox-clipped city map has edge gateways");
+
+        let mut world = NetWorld::new(net, cfg());
+        let pairs = demand::boundary_od_pairs(&world.network, 7, 48);
+        assert!(!pairs.is_empty(), "boundary categories yield demand on the real map");
+        let mut gen = DemandGenerator::new(&world, &pairs, 7);
+        world.install_router(&gen.destinations());
+
+        for _ in 0..1500 {
+            gen.step(&mut world, cfg().dt);
+            world.step();
+        }
+        assert_eq!(world.crashed(), 0, "flow-field-routed traffic stays collision-free");
+        assert!(world.exited() > 0, "vehicles complete boundary trips, got {}", world.exited());
     }
 
     #[test]

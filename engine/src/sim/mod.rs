@@ -2,6 +2,7 @@
 //! exercises every model here, and this CPU path is the reference the future
 //! GPU-compute mass layer is validated against.
 
+pub mod boundary;
 pub mod clock;
 pub mod config;
 pub mod constraint;
@@ -18,6 +19,7 @@ pub mod meso_gpu;
 pub mod net_world;
 pub mod network;
 pub mod rng;
+pub mod router;
 pub mod signal;
 pub mod vehicle;
 pub mod world;

@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { basePath } from "../lib/basePath";
+import styles from "./EngineCanvas.module.css";
 
 type Sim = {
   advance(dtSecs: number): number;
@@ -274,20 +275,23 @@ export default function EngineCanvas() {
   };
 
   return (
-    <div>
-      <div style={{ margin: "8px 0", display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-        <button onClick={toggle} disabled={!ready}>
+    <div className={styles.wrapper}>
+      <canvas ref={canvasRef} width={900} height={600} className={styles.canvas} />
+
+      <div className={styles.controls}>
+        <button className={styles.button} onClick={toggle} disabled={!ready}>
           {playing ? "Pause" : "Play"}
         </button>
         {[1, 2, 8].map((s) => (
-          <button key={s} disabled={!ready} onClick={() => simRef.current?.set_speed(s)}>
+          <button key={s} className={styles.button} disabled={!ready} onClick={() => simRef.current?.set_speed(s)}>
             {s}×
           </button>
         ))}
-        <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 12, opacity: 0.85 }}>
+        <label className={styles.zoomLabel}>
           Zoom
           <input
             ref={sliderRef}
+            className={styles.slider}
             type="range"
             min={0}
             max={1000}
@@ -301,51 +305,25 @@ export default function EngineCanvas() {
             }}
           />
         </label>
-        <button disabled={!ready} onClick={() => simRef.current?.fit()}>
+        <button className={styles.button} disabled={!ready} onClick={() => simRef.current?.fit()}>
           Fit
         </button>
-        {!ready && !error && <span style={{ opacity: 0.6 }}>loading engine…</span>}
-        {ready && <span style={{ opacity: 0.5, fontSize: 12 }}>{backend} · {mapLabel}</span>}
-        {ready && <span ref={statsRef} style={{ opacity: 0.7, fontSize: 12 }} />}
+      </div>
+
+      <div className={styles.status}>
+        {!ready && !error && <span>loading engine…</span>}
+        {ready && <span>{backend} · {mapLabel}</span>}
+        {ready && <span ref={statsRef} />}
         {error && <span style={{ color: "#ff7b72" }}>engine failed: {error}</span>}
       </div>
-      <p style={{ margin: "0 0 8px", opacity: 0.5, fontSize: 12 }}>
-        Wheel to zoom · right-drag to pan · hover a road for its name · click to select · Fit to reset
+
+      <div ref={panelRef} className={styles.panel} />
+
+      <p className={styles.hint}>
+        Wheel to zoom · right-drag to pan · hover a road for its name · click to select
       </p>
-      <div
-        ref={panelRef}
-        style={{
-          display: "none",
-          margin: "0 0 8px",
-          padding: "4px 10px",
-          background: "rgba(37,133,180,0.15)",
-          border: "1px solid #2585b4",
-          borderRadius: 6,
-          fontSize: 13,
-          fontVariantNumeric: "tabular-nums",
-        }}
-      />
-      <canvas
-        ref={canvasRef}
-        width={900}
-        height={600}
-        style={{ width: "100%", maxWidth: 900, border: "1px solid #222", borderRadius: 8, display: "block" }}
-      />
-      <div
-        ref={tipRef}
-        style={{
-          position: "fixed",
-          display: "none",
-          pointerEvents: "none",
-          padding: "2px 6px",
-          background: "rgba(11,14,19,0.9)",
-          color: "#e6edf3",
-          border: "1px solid #333",
-          borderRadius: 4,
-          fontSize: 12,
-          zIndex: 10,
-        }}
-      />
+
+      <div ref={tipRef} className={styles.tooltip} />
     </div>
   );
 }

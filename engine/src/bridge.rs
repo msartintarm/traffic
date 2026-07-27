@@ -13,11 +13,10 @@ use crate::render::scene::{brake_intensity, class_color, class_dims, signal_colo
 use crate::render::{geometry, Instance, StaticMesh};
 use crate::sim::clock::SimClock;
 use crate::sim::config::{SimConfig, VehicleClass};
-use crate::sim::demand::{DemandGenerator, OdPair};
+use crate::sim::demand::{self, DemandGenerator};
 use crate::sim::map;
 use crate::sim::net_world::NetWorld;
 use crate::sim::network::{LinkId, Network, LANE_WIDTH};
-use crate::sim::rng::{hash, Stream};
 
 #[wasm_bindgen]
 pub struct Simulation {
@@ -52,8 +51,9 @@ impl Simulation {
     fn assemble(network: Network, seed: u32) -> Simulation {
         let cfg = SimConfig { seed: seed as u64, ..SimConfig::default_config() };
         let camera = Camera::fit_bounds(network.bounds(), [900.0, 600.0], 24.0);
-        let world = NetWorld::new(network, cfg);
+        let mut world = NetWorld::new(network, cfg);
         let demand = build_demand(&world, cfg.seed);
+        world.install_router(&demand.destinations());
         let mut clock = SimClock::new(&cfg);
         clock.play();
         Simulation {
@@ -385,25 +385,11 @@ impl Simulation {
     }
 }
 
-/// Sample origin–destination pairs whose routes cross at least one intersection,
-/// so the scenario shows continuous traffic flowing through the network.
+/// Boundary-aware origin–destination demand: traffic entering from the map's
+/// gateways heads through or into it, interior traffic heads out or stays
+/// within. Vehicles are then routed live by the world's flow field.
 fn build_demand(world: &NetWorld, seed: u64) -> DemandGenerator {
-    let net: &Network = &world.network;
-    let link_count = net.links.len().max(1) as u64;
-    let pick = |salt: u32, attempt: u64| LinkId((hash(seed, salt, attempt, Stream::RouteChoice) % link_count) as u32);
-
-    let mut pairs = Vec::new();
-    let mut attempt = 0u64;
-    while pairs.len() < 32 && attempt < 2000 {
-        let (o, d) = (pick(1, attempt), pick(2, attempt));
-        attempt += 1;
-        if o == d {
-            continue;
-        }
-        if net.route_links(o, d).is_some_and(|r| r.len() >= 3) {
-            pairs.push(OdPair { origin: o, dest: d, rate_per_sec: 0.2 });
-        }
-    }
+    let pairs = demand::boundary_od_pairs(&world.network, seed, 48);
     DemandGenerator::new(world, &pairs, seed)
 }
 
