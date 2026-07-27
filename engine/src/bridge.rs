@@ -9,14 +9,14 @@ use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 
 use crate::render::camera::Camera;
-use crate::render::scene::{brake_intensity, class_color, class_dims, signal_color, signal_instance};
+use crate::render::scene::{brake_intensity, class_color, class_dims, signal_color, signal_head_instances};
 use crate::render::{geometry, Instance, StaticMesh};
 use crate::sim::clock::SimClock;
 use crate::sim::config::{SimConfig, VehicleClass};
 use crate::sim::demand::{DemandGenerator, OdPair};
 use crate::sim::map;
 use crate::sim::net_world::NetWorld;
-use crate::sim::network::{LaneId, LinkId, Network, NodeControl, LANE_WIDTH};
+use crate::sim::network::{LinkId, Network, LANE_WIDTH};
 use crate::sim::rng::{hash, Stream};
 
 #[wasm_bindgen]
@@ -30,8 +30,6 @@ pub struct Simulation {
     /// render interpolates pose between committed states (smooth at 60fps) and
     /// derives brake lights from the speed delta.
     prev: HashMap<u32, [f32; 4]>,
-    /// Each vehicle's lane one tick ago, to detect node crossings (for turn arcs).
-    prev_lane: HashMap<u32, u32>,
     /// The link the user has selected (clicked), highlighted in the density pass.
     selected: Option<usize>,
 }
@@ -60,7 +58,7 @@ impl Simulation {
         clock.play();
         Simulation {
             world, clock, seed: cfg.seed, demand, camera,
-            prev: HashMap::new(), prev_lane: HashMap::new(), selected: None,
+            prev: HashMap::new(), selected: None,
         }
     }
 
@@ -124,7 +122,6 @@ impl Simulation {
         self.demand.step(&mut self.world, dt);
         self.world.step();
         self.prev = self.snapshot(); // discrete step: show the new state directly
-        self.prev_lane = self.snapshot_lanes();
     }
 
     pub fn advance(&mut self, real_elapsed_secs: f64) -> u32 {
@@ -132,7 +129,6 @@ impl Simulation {
         let dt = self.clock.dt();
         for _ in 0..ticks {
             self.prev = self.snapshot(); // state before this tick
-            self.prev_lane = self.snapshot_lanes();
             self.demand.step(&mut self.world, dt); // stream routed vehicles in
             self.world.step();
         }
@@ -178,20 +174,17 @@ impl Simulation {
         let dt = self.clock.dt() as f32;
         let mut out = Vec::with_capacity(self.world.vehicles().len() * 4);
         for v in self.world.vehicles() {
-            let c = self.world.network.lane_point(v.lane, v.position);
+            let c = self.world.vehicle_world_pose(v);
             let (cx, cy, ch, cs) = (c[0] as f32, c[1] as f32, c[2] as f32, v.speed as f32);
+            // The sim samples the interior curve per tick, so a straight lerp
+            // between consecutive poses already traces the turn.
             let (x, y, h, brake) = match self.prev.get(&v.id) {
-                Some(&[px, py, ph, ps]) => {
-                    // Quadratic Bézier through the turn control (straight when it's the midpoint).
-                    let [kx, ky] = self.control_point(v.lane.0, self.prev_lane.get(&v.id).copied(), [px, py], [cx, cy]);
-                    let u = 1.0 - alpha;
-                    (
-                        u * u * px + 2.0 * u * alpha * kx + alpha * alpha * cx,
-                        u * u * py + 2.0 * u * alpha * ky + alpha * alpha * cy,
-                        ph + shortest_angle(ph, ch) * alpha,
-                        brake_intensity((cs - ps) / dt),
-                    )
-                }
+                Some(&[px, py, ph, ps]) => (
+                    px + (cx - px) * alpha,
+                    py + (cy - py) * alpha,
+                    ph + shortest_angle(ph, ch) * alpha,
+                    brake_intensity((cs - ps) / dt),
+                ),
                 None => (cx, cy, ch, 0.0),
             };
             out.extend_from_slice(&[x, y, h, brake]);
@@ -199,25 +192,37 @@ impl Simulation {
         out
     }
 
-    /// Signal heads as `[x, y, r, g, b]`, one per signal group at each signalized
-    /// node, positioned around the junction and coloured by current state.
+    /// Signal heads as `[x, y, r, g, b]`, one per signal group, placed at the
+    /// stop line of the approach the group controls and coloured by its state.
     pub fn signal_heads(&self) -> Vec<f32> {
+        let mut out = Vec::new();
+        for (pos, _heading, state) in self.signal_head_slots() {
+            let col = signal_color(state);
+            out.extend_from_slice(&[pos[0], pos[1], col[0], col[1], col[2]]);
+        }
+        out
+    }
+
+    /// Each signal group's head as `(position, approach heading, state)`. The
+    /// head sits at the stop line of one of the group's approach lanes, nudged
+    /// laterally by group bit so several heads on one approach don't overlap.
+    fn signal_head_slots(&self) -> Vec<([f32; 2], f32, crate::sim::signal::SignalState)> {
         let net = &self.world.network;
         let states = self.world.signal_states();
-        let mut out = Vec::new();
-        for node in &net.nodes {
-            let NodeControl::Signalized(program) = node.control else { continue };
-            let mut k = 0usize;
-            for (gi, g) in net.groups.iter().enumerate() {
-                if g.program != program {
-                    continue;
-                }
-                let ang = std::f32::consts::TAU * k as f32 / 4.0;
-                let (px, py) = (node.position[0] as f32 + 6.0 * ang.cos(), node.position[1] as f32 + 6.0 * ang.sin());
-                let col = signal_color(states[gi]);
-                out.extend_from_slice(&[px, py, col[0], col[1], col[2]]);
-                k += 1;
+        let mut rep = vec![None; net.groups.len()];
+        for mv in &net.movements {
+            if let Some(g) = mv.signal_group {
+                rep[g.idx()].get_or_insert(mv.from_lane);
             }
+        }
+        let mut out = Vec::new();
+        for (gi, lane) in rep.into_iter().enumerate() {
+            let Some(lane) = lane else { continue };
+            let bit = net.groups[gi].bit as f64;
+            let p = net.lane_point(lane, net.lane(lane).length);
+            let dir = net.arrival_dir(net.lane(lane).link);
+            let (px, py) = (p[0] + dir[1] * bit * 2.0, p[1] - dir[0] * bit * 2.0);
+            out.push(([px as f32, py as f32], dir[1].atan2(dir[0]) as f32, states[gi]));
         }
         out
     }
@@ -237,7 +242,7 @@ impl Simulation {
         let mut out = Vec::new();
         for (i, node) in net.nodes.iter().enumerate() {
             if degree[i] >= 2 {
-                out.extend_from_slice(&[node.position[0] as f32, node.position[1] as f32, (widest[i] * 0.75 + 1.0) as f32]);
+                out.extend_from_slice(&[node.position[0] as f32, node.position[1] as f32, (widest[i] * 0.55 + 0.5) as f32]);
             }
         }
         out
@@ -265,8 +270,10 @@ impl Simulation {
 
     fn world_mesh(&self) -> StaticMesh {
         let net = &self.world.network;
+        // At-grade + tunnels first (carriageways run to the nodes and overlap to
+        // pave intersections), then bridges on top.
         let mut mesh = geometry::road_mesh(net);
-        mesh.extend(&geometry::junction_mesh(net));
+        mesh.extend(&geometry::overpass_mesh(net));
         mesh
     }
 
@@ -289,14 +296,13 @@ impl Simulation {
             .iter()
             .map(|v| {
                 let class = VehicleClass::from_length(v.driver.vehicle_length);
-                let c = self.world.network.lane_point(v.lane, v.position);
+                let c = self.world.vehicle_world_pose(v);
                 let (cx, cy, ch, cs) = (c[0] as f32, c[1] as f32, c[2] as f32, v.speed as f32);
                 let [px, py, ph, ps] = self.prev.get(&v.id).copied().unwrap_or([cx, cy, ch, cs]);
-                let control = self.control_point(v.lane.0, self.prev_lane.get(&v.id).copied(), [px, py], [cx, cy]);
                 Instance {
                     pos: [cx, cy],
                     prev_pos: [px, py],
-                    control,
+                    control: [(px + cx) * 0.5, (py + cy) * 0.5],
                     scale: class_dims(class),
                     color: class_color(class),
                     heading: ch,
@@ -342,23 +348,10 @@ impl Simulation {
     }
 
     fn signal_instance_vec(&self) -> Vec<Instance> {
-        let net = &self.world.network;
-        let states = self.world.signal_states();
-        let mut out = Vec::new();
-        for node in &net.nodes {
-            let NodeControl::Signalized(program) = node.control else { continue };
-            let mut k = 0usize;
-            for (gi, g) in net.groups.iter().enumerate() {
-                if g.program != program {
-                    continue;
-                }
-                let ang = std::f32::consts::TAU * k as f32 / 4.0;
-                let pos = [node.position[0] as f32 + 6.0 * ang.cos(), node.position[1] as f32 + 6.0 * ang.sin()];
-                out.push(signal_instance(pos, 1.6, states[gi]));
-                k += 1;
-            }
-        }
-        out
+        self.signal_head_slots()
+            .into_iter()
+            .flat_map(|(pos, heading, state)| signal_head_instances(pos, heading, state))
+            .collect()
     }
 
     fn snapshot(&self) -> HashMap<u32, [f32; 4]> {
@@ -366,34 +359,10 @@ impl Simulation {
             .vehicles()
             .iter()
             .map(|v| {
-                let p = self.world.network.lane_point(v.lane, v.position);
+                let p = self.world.vehicle_world_pose(v);
                 (v.id, [p[0] as f32, p[1] as f32, p[2] as f32, v.speed as f32])
             })
             .collect()
-    }
-
-    fn snapshot_lanes(&self) -> HashMap<u32, u32> {
-        self.world.vehicles().iter().map(|v| (v.id, v.lane.0)).collect()
-    }
-
-    /// Bézier control point for a vehicle's prev→current motion: the node it just
-    /// crossed (so the path curves through the corner), else the segment midpoint
-    /// (straight). `pl` is the previous-tick lane if known.
-    fn control_point(&self, cur_lane: u32, pl: Option<u32>, prev: [f32; 2], cur: [f32; 2]) -> [f32; 2] {
-        let mid = [(prev[0] + cur[0]) * 0.5, (prev[1] + cur[1]) * 0.5];
-        let Some(pl) = pl else { return mid };
-        if pl == cur_lane {
-            return mid;
-        }
-        let net = &self.world.network;
-        let prev_link = net.lane(LaneId(pl)).link;
-        let cur_link = net.lane(LaneId(cur_lane)).link;
-        if prev_link != cur_link && net.link(prev_link).to == net.link(cur_link).from {
-            let np = net.node(net.link(cur_link).from).position; // crossed this node
-            [np[0] as f32, np[1] as f32]
-        } else {
-            mid // lane change on the same road → straight
-        }
     }
 
     /// Static carriageway quads `[cx0, cy0, cx1, cy1, width]` per link.

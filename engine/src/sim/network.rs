@@ -51,13 +51,20 @@ pub struct Link {
     pub to: NodeId,
     pub lane_start: LaneId,
     pub lane_count: u32,
+    /// Grade-separation level for render z-order (see `LinkSpec::layer`).
+    pub layer: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Lane {
     pub link: LinkId,
     pub index_in_link: u32,
+    /// Drivable length, i.e. the link centreline between the two junction
+    /// boundaries — the polyline shortened by each end node's setback.
     pub length: f64,
+    /// Arc-length along the link polyline where this lane's usable span begins
+    /// (the upstream junction boundary); `position` is measured from here.
+    pub start_offset: f64,
     pub speed_limit: f64,
     pub movement_start: MovementId,
     pub movement_count: u32,
@@ -86,6 +93,30 @@ pub struct SignalGroup {
     pub bit: u8,
 }
 
+/// The path a vehicle drives *inside* a node while executing a movement: a
+/// quadratic Bézier from the arrival lane's stop point (`entry`), bulging through
+/// the node corner (`ctrl`), to the departure lane's start (`exit`). `len` is its
+/// arc length, so crossing a node takes real time instead of teleporting.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Interior {
+    pub entry: [f64; 2],
+    pub ctrl: [f64; 2],
+    pub exit: [f64; 2],
+    pub len: f64,
+}
+
+/// Where two movements' interior paths cross at a node, as the arc-length along
+/// each path (`sa` on `a`, `sb` on `b`). Precomputed once; at runtime a vehicle
+/// near `sa` on `a` and another near `sb` on `b` are occupying the same spot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ConflictPoint {
+    pub node: NodeId,
+    pub a: MovementId,
+    pub sa: f64,
+    pub b: MovementId,
+    pub sb: f64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Network {
     pub nodes: Vec<Node>,
@@ -98,6 +129,15 @@ pub struct Network {
     /// a straight link is just its two endpoints. Vehicle placement and road
     /// geometry follow this, so real OSM curves render and drive as curves.
     pub polylines: Vec<Vec<[f64; 2]>>,
+    /// Interior crossing path per movement (index-aligned with `movements`).
+    pub interiors: Vec<Interior>,
+    /// Crossing points between conflicting movements, over the whole network.
+    pub conflicts: Vec<ConflictPoint>,
+    /// Per-node render setback (metres): how far short of the node the drawn
+    /// carriageway/markings stop — the junction-box edge. Smaller than a lane's
+    /// stop-line setback (which adds a crosswalk margin), so lines run up to the
+    /// box instead of breaking off early.
+    pub render_setback: Vec<f64>,
 }
 
 fn sub(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
@@ -111,6 +151,113 @@ fn norm(v: [f64; 2]) -> f64 {
 fn unit(v: [f64; 2]) -> [f64; 2] {
     let n = norm(v).max(1e-9);
     [v[0] / n, v[1] / n]
+}
+
+/// Quadratic Bézier point at parameter `t` in `[0,1]`.
+fn bezier(a: [f64; 2], c: [f64; 2], b: [f64; 2], t: f64) -> [f64; 2] {
+    let u = 1.0 - t;
+    [u * u * a[0] + 2.0 * u * t * c[0] + t * t * b[0], u * u * a[1] + 2.0 * u * t * c[1] + t * t * b[1]]
+}
+
+const INTERIOR_SAMPLES: usize = 16;
+
+/// Sampled polyline of an interior Bézier and its cumulative arc length.
+fn interior_polyline(it: &Interior) -> Vec<([f64; 2], f64)> {
+    let mut out = Vec::with_capacity(INTERIOR_SAMPLES + 1);
+    let mut acc = 0.0;
+    let mut prev = it.entry;
+    out.push((prev, 0.0));
+    for i in 1..=INTERIOR_SAMPLES {
+        let p = bezier(it.entry, it.ctrl, it.exit, i as f64 / INTERIOR_SAMPLES as f64);
+        acc += norm(sub(p, prev));
+        out.push((p, acc));
+        prev = p;
+    }
+    out
+}
+
+fn point2(p: [f64; 3]) -> [f64; 2] {
+    [p[0], p[1]]
+}
+
+/// Intersection of the lines through `p1` (dir `d1`) and `p2` (dir `d2`); `None`
+/// when they're parallel.
+fn line_intersection(p1: [f64; 2], d1: [f64; 2], p2: [f64; 2], d2: [f64; 2]) -> Option<[f64; 2]> {
+    let denom = d1[0] * d2[1] - d1[1] * d2[0];
+    if denom.abs() < 1e-6 {
+        return None;
+    }
+    let dp = sub(p2, p1);
+    let t = (dp[0] * d2[1] - dp[1] * d2[0]) / denom;
+    Some([p1[0] + d1[0] * t, p1[1] + d1[1] * t])
+}
+
+/// The sub-polyline of `poly` between arc-lengths `s0` and `s1`, with the two
+/// endpoints interpolated exactly onto those cuts.
+fn clip_polyline(poly: &[[f64; 2]], s0: f64, s1: f64) -> Vec<[f64; 2]> {
+    let lerp = |a: [f64; 2], b: [f64; 2], t: f64| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+    let mut out = Vec::new();
+    let mut acc = 0.0;
+    for w in poly.windows(2) {
+        let seg = norm(sub(w[1], w[0])).max(1e-9);
+        let (a, b) = (acc, acc + seg);
+        if b >= s0 && a <= s1 {
+            if a <= s0 {
+                out.push(lerp(w[0], w[1], (s0 - a) / seg));
+            } else {
+                out.push(w[0]);
+            }
+            if b >= s1 {
+                out.push(lerp(w[0], w[1], (s1 - a) / seg));
+            }
+        }
+        acc = b;
+    }
+    if out.len() < 2 {
+        let (p0, _) = point_along(poly, s0);
+        let (p1, _) = point_along(poly, s1);
+        return vec![p0, p1];
+    }
+    out
+}
+
+/// Whether two segments cross, as parametric `(t, u)` along each; `None` if
+/// parallel or non-overlapping.
+fn segment_intersection(p1: [f64; 2], p2: [f64; 2], p3: [f64; 2], p4: [f64; 2]) -> Option<(f64, f64)> {
+    let r = sub(p2, p1);
+    let s = sub(p4, p3);
+    let denom = r[0] * s[1] - r[1] * s[0];
+    if denom.abs() < 1e-12 {
+        return None;
+    }
+    let qp = sub(p3, p1);
+    let t = (qp[0] * s[1] - qp[1] * s[0]) / denom;
+    let u = (qp[0] * r[1] - qp[1] * r[0]) / denom;
+    ((0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u)).then_some((t, u))
+}
+
+/// The arc-lengths where two interior paths conflict: an exact segment crossing
+/// if one exists (their paths truly intersect, whatever the sampling), otherwise
+/// the closest approach if it's within `clearance` (a near-miss like two
+/// same-direction curves). Segment-exact so long interiors at big intersections
+/// can't slip a real crossing between samples.
+fn nearest_crossing(a: &[([f64; 2], f64)], b: &[([f64; 2], f64)], clearance: f64) -> Option<(f64, f64)> {
+    let lerp = |x: f64, y: f64, k: f64| x + (y - x) * k;
+    let mut best = f64::MAX;
+    let mut at = (0.0, 0.0);
+    for wa in a.windows(2) {
+        for wb in b.windows(2) {
+            if let Some((t, u)) = segment_intersection(wa[0].0, wa[1].0, wb[0].0, wb[1].0) {
+                return Some((lerp(wa[0].1, wa[1].1, t), lerp(wb[0].1, wb[1].1, u)));
+            }
+            let d = norm(sub(wa[0].0, wb[0].0));
+            if d < best {
+                best = d;
+                at = (wa[0].1, wb[0].1);
+            }
+        }
+    }
+    (best < clearance).then_some(at)
 }
 
 /// The point and unit direction at arc-length `s` along a polyline (clamped).
@@ -153,6 +300,93 @@ impl Network {
         let l = self.lane(lane);
         let start = l.movement_start.idx();
         &self.movements[start..start + l.movement_count as usize]
+    }
+
+    pub fn interior(&self, mid: MovementId) -> &Interior {
+        &self.interiors[mid.idx()]
+    }
+
+    /// Whether two movements have a crossing conflict point.
+    pub fn movements_conflict(&self, a: MovementId, b: MovementId) -> bool {
+        self.conflicts.iter().any(|c| (c.a == a && c.b == b) || (c.a == b && c.b == a))
+    }
+
+    /// World `[x, y, heading]` of a point `s` metres along a movement's interior
+    /// crossing path (clamped to its length).
+    pub fn interior_point(&self, mid: MovementId, s: f64) -> [f64; 3] {
+        let it = self.interior(mid);
+        let t = (s / it.len.max(1e-9)).clamp(0.0, 1.0);
+        let p = bezier(it.entry, it.ctrl, it.exit, t);
+        // Clamped centred difference, so the tangent is valid at both endpoints.
+        let a = bezier(it.entry, it.ctrl, it.exit, (t - 0.02).max(0.0));
+        let b = bezier(it.entry, it.ctrl, it.exit, (t + 0.02).min(1.0));
+        let d = unit(sub(b, a));
+        [p[0], p[1], d[1].atan2(d[0])]
+    }
+
+    /// Compute each movement's interior path and all cross-movement conflict
+    /// points. Called once at build time; `interiors` is index-aligned with
+    /// `movements`. Two movements conflict when they arrive from different links,
+    /// depart to different links, and their interior paths pass within a lane
+    /// width of each other — a genuine crossing, not a merge or a diverge.
+    pub fn build_interiors(&mut self) {
+        self.interiors = (0..self.movements.len() as u32)
+            .map(|m| {
+                let mv = self.movement(MovementId(m));
+                let entry = point2(self.lane_point(mv.from_lane, self.lane(mv.from_lane).length));
+                let exit = point2(self.lane_point(mv.to_lane, 0.0));
+                let mid = [(entry[0] + exit[0]) * 0.5, (entry[1] + exit[1]) * 0.5];
+                // A through goes straight (control = midpoint). A turn curves tangent
+                // to the arrival lane at entry and the departure lane at exit — the
+                // control point is where those tangents meet, giving a real turn
+                // trajectory. Guard it: the apex must sit ahead of entry and within a
+                // sane distance, else fall back to the midpoint so shallow/near-
+                // straight movements never loop out into a circle.
+                let arr = self.arrival_dir(self.lane(mv.from_lane).link);
+                let dep = self.departure_dir(self.lane(mv.to_lane).link);
+                let chord = norm(sub(exit, entry));
+                let ctrl = if self.movement_turn(MovementId(m)) == TurnType::Through {
+                    mid
+                } else {
+                    match line_intersection(entry, arr, exit, dep) {
+                        Some(a)
+                            if sub(a, entry)[0] * arr[0] + sub(a, entry)[1] * arr[1] > 0.0
+                                && norm(sub(a, mid)) <= chord.max(1.0) * 1.5 =>
+                        {
+                            a
+                        }
+                        _ => mid,
+                    }
+                };
+                let mut it = Interior { entry, ctrl, exit, len: 0.0 };
+                it.len = interior_polyline(&it).last().map_or(0.0, |&(_, s)| s);
+                it
+            })
+            .collect();
+
+        // ~ a vehicle width: paths that pass farther apart than this share the box
+        // safely (e.g. opposing protected lefts), so they neither collide nor force
+        // separate signal phases; only genuine crossings (near-zero separation) do.
+        const CLEARANCE: f64 = 2.0;
+        let polys: Vec<Vec<([f64; 2], f64)>> = self.interiors.iter().map(interior_polyline).collect();
+        let mut conflicts = Vec::new();
+        for i in 0..self.movements.len() {
+            for j in (i + 1)..self.movements.len() {
+                let (a, b) = (self.movements[i], self.movements[j]);
+                if a.node != b.node {
+                    continue;
+                }
+                if self.lane(a.from_lane).link == self.lane(b.from_lane).link
+                    || self.lane(a.to_lane).link == self.lane(b.to_lane).link
+                {
+                    continue;
+                }
+                if let Some((sa, sb)) = nearest_crossing(&polys[i], &polys[j], CLEARANCE) {
+                    conflicts.push(ConflictPoint { node: a.node, a: MovementId(i as u32), sa, b: MovementId(j as u32), sb });
+                }
+            }
+        }
+        self.conflicts = conflicts;
     }
 
     pub fn lanes_of(&self, link: LinkId) -> impl Iterator<Item = LaneId> {
@@ -252,7 +486,7 @@ impl Network {
     pub fn lane_point(&self, lane: LaneId, position: f64) -> [f64; 3] {
         let l = self.lane(lane);
         let poly = &self.polylines[l.link.idx()];
-        let (pt, dir) = point_along(poly, position.clamp(0.0, l.length));
+        let (pt, dir) = point_along(poly, l.start_offset + position.clamp(0.0, l.length));
         let off = (l.index_in_link as f64 + 0.5) * LANE_WIDTH;
         let n = [dir[1], -dir[0]]; // right-hand normal
         [pt[0] + n[0] * off, pt[1] + n[1] * off, dir[1].atan2(dir[0])]
@@ -295,15 +529,16 @@ impl Network {
         if poly.len() < 3 {
             return f64::INFINITY;
         }
+        let from = self.lane(lane).start_offset + position;
         let mut acc = 0.0;
         let mut best = f64::INFINITY;
         for i in 1..poly.len() - 1 {
             let seg_in = norm(sub(poly[i], poly[i - 1]));
             acc += seg_in;
-            if acc < position {
+            if acc < from {
                 continue;
             }
-            if acc > position + lookahead {
+            if acc > from + lookahead {
                 break;
             }
             let a = unit(sub(poly[i], poly[i - 1]));
@@ -319,6 +554,18 @@ impl Network {
         best
     }
 
+    /// The link centreline clipped to its lanes' drivable span (between the two
+    /// junction boundaries), so carriageways and markings stop at the
+    /// intersection rather than crossing into it.
+    pub fn drivable_polyline(&self, link: LinkId) -> Vec<[f64; 2]> {
+        let l = self.link(link);
+        let poly = &self.polylines[link.idx()];
+        let full: f64 = poly.windows(2).map(|w| norm(sub(w[1], w[0]))).sum();
+        let s0 = self.render_setback.get(l.from.idx()).copied().unwrap_or(0.0);
+        let s1 = full - self.render_setback.get(l.to.idx()).copied().unwrap_or(0.0);
+        clip_polyline(poly, s0, s1.max(s0 + 0.5))
+    }
+
     /// Filled carriageway quads `[cx0, cy0, cx1, cy1, width]`, one per polyline
     /// segment of each link (curved roads become several quads).
     pub fn road_strips(&self) -> Vec<[f64; 5]> {
@@ -326,7 +573,7 @@ impl Network {
         for i in 0..self.links.len() {
             let w = self.links[i].lane_count as f64 * LANE_WIDTH;
             let c = w / 2.0;
-            for seg in self.polylines[i].windows(2) {
+            for seg in self.drivable_polyline(LinkId(i as u32)).windows(2) {
                 let dir = unit(sub(seg[1], seg[0]));
                 let n = [dir[1] * c, -dir[0] * c];
                 out.push([seg[0][0] + n[0], seg[0][1] + n[1], seg[1][0] + n[0], seg[1][1] + n[1], w]);
@@ -340,7 +587,7 @@ impl Network {
         let mut out = Vec::new();
         for i in 0..self.links.len() {
             let lanes = self.links[i].lane_count;
-            for seg in self.polylines[i].windows(2) {
+            for seg in self.drivable_polyline(LinkId(i as u32)).windows(2) {
                 let dir = unit(sub(seg[1], seg[0]));
                 let (nx, ny) = (dir[1], -dir[0]);
                 for k in 1..lanes {
@@ -408,9 +655,14 @@ mod tests {
         };
         let net = map.build();
         let lane = LaneId(0);
+        let l = *net.lane(lane);
         let start = net.lane_point(lane, 0.0);
-        let end = net.lane_point(lane, net.lane(lane).length);
-        assert!((start[0] - 0.0).abs() < 1e-9 && (end[0] - 100.0).abs() < 1e-9);
+        let end = net.lane_point(lane, l.length);
+        // Lanes are pulled back to the junction boundaries, so the span sits
+        // inside the node endpoints by each node's setback.
+        assert!((start[0] - l.start_offset).abs() < 1e-9);
+        assert!((end[0] - (l.start_offset + l.length)).abs() < 1e-9);
+        assert!(l.start_offset > 0.0 && l.length < 100.0, "setback shortens the drivable span");
         assert!((start[2]).abs() < 1e-9, "eastbound heading is 0 rad");
         assert!(start[1] < 0.0, "right-hand lane offset is negative-y for +x travel");
     }
@@ -420,13 +672,14 @@ mod tests {
         // L-shaped link (0,0) → bend (100,0) → (100,100).
         let net = OsmMap {
             nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 100.0, 100.0)],
-            links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 1, speed_limit: 20.0, geometry: vec![[100.0, 0.0]] }],
+            links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 1, speed_limit: 20.0, geometry: vec![[100.0, 0.0]], layer: 0 }],
         }
         .build();
         let lane = LaneId(0);
-        let len = net.lane(lane).length;
-        assert!((len - 200.0).abs() < 1.0, "arc length ~200, got {len}");
-        let mid = net.lane_point(lane, 100.0);
+        let l = *net.lane(lane);
+        // Full arc is ~200; the drivable span is that minus the two setbacks.
+        assert!((l.start_offset + l.length - (200.0 - l.start_offset)).abs() < 1.0, "span ends a setback short of the far node");
+        let mid = net.lane_point(lane, 100.0 - l.start_offset);
         assert!((mid[0] - 100.0).abs() < 5.0 && mid[1].abs() < 5.0, "midpoint near the bend: {mid:?}");
         assert!(net.min_radius_ahead(lane, 0.0, 200.0).is_finite(), "a bend has finite radius");
     }
@@ -461,6 +714,86 @@ mod tests {
         assert_eq!(dividers, expected as usize);
         let b = net.bounds();
         assert!(b[0] <= b[2] && b[1] <= b[3]);
+    }
+
+    #[test]
+    fn drivable_polyline_stops_at_the_junction_boundaries() {
+        // The trimmed centreline must sit inside the node endpoints by the
+        // setback, so road fill and markings never cross into the intersection.
+        let net = map::corridor_with_signal();
+        for i in 0..net.links.len() {
+            let link = net.link(LinkId(i as u32));
+            let poly = net.drivable_polyline(LinkId(i as u32));
+            let from = net.node(link.from).position;
+            let to = net.node(link.to).position;
+            let d0 = (poly[0][0] - from[0]).hypot(poly[0][1] - from[1]);
+            let d1 = (poly[poly.len() - 1][0] - to[0]).hypot(poly[poly.len() - 1][1] - to[1]);
+            // The drawn carriageway stops at the junction-box edge (render setback),
+            // which is inside the stop line (that adds a crosswalk margin).
+            assert!((d0 - net.render_setback[link.from.idx()]).abs() < 1e-6, "starts at the box edge");
+            assert!(d1 > 0.5, "ends short of the downstream node: {d1}");
+            assert!(net.render_setback[link.from.idx()] < net.lane(link.lane_start).start_offset, "box edge is inside the stop line");
+        }
+    }
+
+    #[test]
+    fn every_movement_has_a_nonzero_interior_path() {
+        let net = map::corridor_with_signal();
+        assert_eq!(net.interiors.len(), net.movements.len());
+        for m in 0..net.movements.len() as u32 {
+            let it = net.interior(MovementId(m));
+            assert!(it.len > 0.0, "movement {m} interior has length");
+            let start = net.interior_point(MovementId(m), 0.0);
+            let end = net.interior_point(MovementId(m), it.len);
+            assert!((start[0] - it.entry[0]).abs() < 1e-6 && (end[0] - it.exit[0]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn turn_interior_is_tangent_to_the_lanes_it_joins() {
+        // The crossing path should leave along the arrival heading and arrive along
+        // the departure heading (a real turn trajectory), not pivot on the centre.
+        let net = map::corridor_with_signal();
+        let through_lane = net.lanes_of(LinkId(0)).next().unwrap(); // link 1->2 heading +x
+        for k in 0..net.lane(through_lane).movement_count {
+            let mid = MovementId(net.lane(through_lane).movement_start.0 + k);
+            if net.movement_turn(mid) == TurnType::Through {
+                continue;
+            }
+            let it = net.interior(mid);
+            let arr = net.arrival_dir(net.lane(net.movement(mid).from_lane).link);
+            let dep = net.departure_dir(net.lane(net.movement(mid).to_lane).link);
+            let h0 = net.interior_point(mid, 0.0)[2];
+            let h1 = net.interior_point(mid, it.len)[2];
+            assert!((h0 - arr[1].atan2(arr[0])).abs() < 0.25, "leaves along the arrival heading");
+            assert!((h1 - dep[1].atan2(dep[0])).abs() < 0.25, "arrives along the departure heading");
+            let node = net.node(net.movement(mid).node).position;
+            assert!((it.ctrl[0] - node[0]).hypot(it.ctrl[1] - node[1]) > 1e-3, "control is the tangent apex, not the node centre");
+        }
+    }
+
+    #[test]
+    fn crossing_movements_produce_a_conflict_point() {
+        // A four-way: west→east through vs south→north through must cross.
+        let net = map::corridor_with_signal();
+        assert!(!net.conflicts.is_empty(), "the crossing corridor has conflicts");
+        for c in &net.conflicts {
+            let (a, b) = (net.movement(c.a), net.movement(c.b));
+            assert_ne!(net.lane(a.from_lane).link, net.lane(b.from_lane).link, "conflicts are between different approaches");
+            let pa = net.interior_point(c.a, c.sa);
+            let pb = net.interior_point(c.b, c.sb);
+            assert!((pa[0] - pb[0]).hypot(pa[1] - pb[1]) < LANE_WIDTH, "the recorded points coincide");
+        }
+    }
+
+    #[test]
+    fn same_approach_movements_do_not_conflict() {
+        // Two movements from the same approach (through vs left off the same link)
+        // diverge — they must not be flagged as a crossing conflict.
+        let net = map::corridor_with_signal();
+        for c in &net.conflicts {
+            assert_ne!(net.lane(net.movement(c.a).from_lane).link, net.lane(net.movement(c.b).from_lane).link);
+        }
     }
 
     #[test]

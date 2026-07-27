@@ -30,6 +30,25 @@ pub struct NetVehicle {
     history: Vec<(f64, f64)>,
     /// Consecutive ticks spent essentially stopped — drives yield impatience.
     wait_ticks: u32,
+    /// When set, the vehicle is inside a node traversing a movement's interior
+    /// path (`lane`/`position` pinned at the stop line); `s` is its arc-length
+    /// progress. Cleared when it lands on the destination lane.
+    crossing: Option<Crossing>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Crossing {
+    movement: MovementId,
+    s: f64,
+}
+
+/// Outcome of advancing a vehicle one tick.
+enum Fate {
+    Alive,
+    /// Crossed onto a new link (its id, for entry counting).
+    Entered(LinkId),
+    /// Left the network at the end of its route.
+    Exited,
 }
 
 /// How many `(position, speed)` samples to retain — enough for the largest
@@ -50,6 +69,12 @@ impl NetVehicle {
             self.history.remove(0);
         }
     }
+
+    /// Whether the vehicle is currently inside a node traversing a movement's
+    /// interior path (its `lane`/`position` are pinned at the stop line).
+    pub fn is_crossing(&self) -> bool {
+        self.crossing.is_some()
+    }
 }
 
 pub struct NetWorld {
@@ -65,9 +90,9 @@ pub struct NetWorld {
     merges: HashMap<u32, Vec<u32>>,
     /// Per-program actuated-signal state, indexed by `ProgramId`.
     signals: Vec<SignalRuntime>,
-    /// Per-program approach links, indexed by signal-group bit — for demand
-    /// detection at each phase.
-    approaches: Vec<Vec<LinkId>>,
+    /// Per-program, per-group-bit approach links (the links feeding each signal
+    /// group) — for actuated demand detection at each phase.
+    approaches: Vec<Vec<Vec<LinkId>>>,
     /// Cumulative vehicles that have entered each link (spawned onto it or
     /// crossed onto it) — the raw counts calibration compares to real data.
     link_entries: Vec<u32>,
@@ -84,14 +109,23 @@ impl NetWorld {
         }
         merges.retain(|_, froms| froms.len() > 1);
 
-        let signals = vec![SignalRuntime { phase: 0, elapsed: 0.0, yellow: false }; network.programs.len()];
-        let mut approaches = vec![Vec::new(); network.programs.len()];
-        for (i, node) in network.nodes.iter().enumerate() {
-            if let NodeControl::Signalized(pid) = node.control {
-                approaches[pid.idx()] = (0..network.links.len() as u32)
-                    .filter(|&li| network.links[li as usize].to == NodeId(i as u32))
-                    .map(LinkId)
-                    .collect();
+        let signals = vec![SignalRuntime { phase: 0, elapsed: 0.0, yellow: false, all_red: 0.0 }; network.programs.len()];
+        // The links feeding each signal group, indexed by program then group bit.
+        let mut approaches: Vec<Vec<Vec<LinkId>>> = vec![Vec::new(); network.programs.len()];
+        for g in &network.groups {
+            let bits = &mut approaches[g.program.idx()];
+            if bits.len() <= g.bit as usize {
+                bits.resize(g.bit as usize + 1, Vec::new());
+            }
+        }
+        for mv in &network.movements {
+            if let Some(gid) = mv.signal_group {
+                let g = network.groups[gid.idx()];
+                let link = network.lane(mv.from_lane).link;
+                let feeders = &mut approaches[g.program.idx()][g.bit as usize];
+                if !feeders.contains(&link) {
+                    feeders.push(link);
+                }
             }
         }
 
@@ -129,7 +163,7 @@ impl NetWorld {
         self.link_entries[self.network.lane(lane).link.idx()] += 1;
         self.vehicles.push(NetVehicle {
             id, lane, position, speed, driver, route: Vec::new(), route_idx: 0,
-            stopped_at: None, history: vec![(position, speed)], wait_ticks: 0,
+            stopped_at: None, history: vec![(position, speed)], wait_ticks: 0, crossing: None,
         });
     }
 
@@ -146,7 +180,7 @@ impl NetWorld {
         self.link_entries[self.network.lane(lane).link.idx()] += 1;
         self.vehicles.push(NetVehicle {
             id, lane, position: 0.0, speed, driver, route, route_idx: 0,
-            stopped_at: None, history: vec![(0.0, speed)], wait_ticks: 0,
+            stopped_at: None, history: vec![(0.0, speed)], wait_ticks: 0, crossing: None,
         });
         true
     }
@@ -198,6 +232,15 @@ impl NetWorld {
         &self.vehicles
     }
 
+    /// A vehicle's current world pose `[x, y, heading]` — its interior crossing
+    /// path when inside a node, otherwise its lane position.
+    pub fn vehicle_world_pose(&self, v: &NetVehicle) -> [f64; 3] {
+        match v.crossing {
+            Some(c) => self.network.interior_point(c.movement, c.s),
+            None => self.network.lane_point(v.lane, v.position),
+        }
+    }
+
     pub fn vehicle(&self, id: u32) -> Option<&NetVehicle> {
         self.vehicles.iter().find(|v| v.id == id)
     }
@@ -225,7 +268,12 @@ impl NetWorld {
     fn neighbors(&self) -> Neighbors {
         let mut by_lane: HashMap<u32, Vec<usize>> = HashMap::new();
         let mut approaching: HashMap<u32, Vec<usize>> = HashMap::new();
+        let mut crossing_at: HashMap<u32, Vec<usize>> = HashMap::new();
         for (i, v) in self.vehicles.iter().enumerate() {
+            if let Some(c) = v.crossing {
+                crossing_at.entry(self.network.movement(c.movement).node.0).or_default().push(i);
+                continue; // inside a node — not part of any lane's car-following
+            }
             by_lane.entry(v.lane.0).or_default().push(i);
             approaching.entry(self.downstream_node(v.lane).0).or_default().push(i);
         }
@@ -241,7 +289,7 @@ impl NetWorld {
             let front = *members.first().unwrap();
             lane_front.insert(self.vehicles[front].lane.0, front);
         }
-        Neighbors { leader_of, lane_front, by_lane, approaching }
+        Neighbors { leader_of, lane_front, by_lane, approaching, crossing_at }
     }
 
     fn downstream_node(&self, lane: LaneId) -> NodeId {
@@ -263,6 +311,9 @@ impl NetWorld {
     fn lane_changes(&mut self) {
         let mut by_lane: HashMap<u32, Vec<usize>> = HashMap::new();
         for (i, v) in self.vehicles.iter().enumerate() {
+            if v.crossing.is_some() {
+                continue; // no lane changes mid-intersection
+            }
             by_lane.entry(v.lane.0).or_default().push(i);
         }
         for m in by_lane.values_mut() {
@@ -420,17 +471,24 @@ impl NetWorld {
                 (program.phases.len(), ph.green_mask, ph.yellow_secs)
             };
             let bit_has_demand = |served: bool| {
-                self.approaches[pid].iter().enumerate().any(|(bit, link)| {
-                    (green_mask & (1u64 << bit) != 0) == served && demand.contains(&link.0)
+                self.approaches[pid].iter().enumerate().any(|(bit, links)| {
+                    (green_mask & (1u64 << bit) != 0) == served && links.iter().any(|l| demand.contains(&l.0))
                 })
             };
             let mut rt = self.signals[pid];
             rt.elapsed += dt;
-            if rt.yellow {
-                if rt.elapsed >= yellow_dur {
+            if rt.all_red > 0.0 {
+                rt.all_red -= dt;
+                if rt.all_red <= 0.0 {
+                    rt.all_red = 0.0;
                     rt.phase = (rt.phase + 1) % n_phases;
                     rt.elapsed = 0.0;
+                }
+            } else if rt.yellow {
+                if rt.elapsed >= yellow_dur {
                     rt.yellow = false;
+                    rt.all_red = ALL_RED;
+                    rt.elapsed = 0.0;
                 }
             } else if n_phases > 1
                 && rt.elapsed >= MIN_GREEN
@@ -450,11 +508,21 @@ impl NetWorld {
         self.lane_changes();
         let nb = self.neighbors();
 
+        let mut cross_by_mv: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (i, v) in self.vehicles.iter().enumerate() {
+            if let Some(c) = v.crossing {
+                cross_by_mv.entry(c.movement.0).or_default().push(i);
+            }
+        }
+
         let accels: Vec<f64> = self
             .vehicles
             .iter()
             .enumerate()
             .map(|(i, veh)| {
+                if veh.crossing.is_some() {
+                    return self.crossing_accel(i, &nb, &cross_by_mv);
+                }
                 let lane = *self.network.lane(veh.lane);
                 let driver = veh.driver.capped_to(lane.speed_limit);
                 let intended = self.intended_movement(veh);
@@ -517,10 +585,13 @@ impl NetWorld {
                 let stop_sign = (matches!(control, NodeControl::Stop) && veh.stopped_at != Some(node))
                     .then_some(to_line);
 
-                let yield_line = matches!(control, NodeControl::Stop | NodeControl::Yield)
-                    .then(|| self.conflicting_priority_traffic(i, veh.lane, node, &nb))
-                    .flatten()
-                    .map(|()| to_line);
+                // Never enter a box occupied by conflicting crossing traffic (any
+                // node type); additionally, at unsignalized nodes defer to
+                // higher-priority approaching traffic by right-of-way.
+                let box_yield = intended.is_some_and(|mid| self.box_conflict(mid, node, &nb));
+                let prio_yield = matches!(control, NodeControl::Uncontrolled | NodeControl::Stop | NodeControl::Yield)
+                    && self.conflicting_priority_traffic(i, veh.lane, node, &nb).is_some();
+                let yield_line = (box_yield || prio_yield).then_some(to_line);
 
                 let merge = self.merge_conflict(veh, lane.length, intended, &nb);
 
@@ -532,11 +603,15 @@ impl NetWorld {
                     let r = self.network.min_radius_ahead(veh.lane, veh.position, CURVE_LOOKAHEAD);
                     r.is_finite().then(|| SpeedTarget { speed: (A_LAT * r).sqrt(), distance: CURVE_LOOKAHEAD })
                 };
+                // Ease down to a turn speed approaching the line; the floor on the
+                // distance keeps the deceleration comfortable instead of slamming to
+                // a stop right at the bar (the car finishes slowing through the turn
+                // interior, where `crossing_accel` caps its speed).
                 let turn = intended.and_then(|mid| match self.network.movement_turn(mid) {
                     TurnType::Left => Some(6.0),
                     TurnType::Right => Some(5.0),
                     TurnType::Through => None,
-                }).map(|speed| SpeedTarget { speed, distance: to_line });
+                }).map(|speed| SpeedTarget { speed, distance: to_line.max(12.0) });
                 let curve = match (geom_curve, turn) {
                     (Some(a), Some(b)) => Some(if a.speed <= b.speed { a } else { b }),
                     (a, b) => a.or(b),
@@ -558,66 +633,187 @@ impl NetWorld {
             })
             .collect();
 
-        // Integrate every vehicle in place (no crossing yet).
-        let mut moved: Vec<NetVehicle> = std::mem::take(&mut self.vehicles)
-            .into_iter()
-            .zip(accels)
-            .map(|(mut veh, a)| {
-                integrate(&mut veh, a, dt);
-                let lane = *self.network.lane(veh.lane);
-                let node = self.network.link(lane.link).to;
-                if matches!(self.network.node(node).control, NodeControl::Stop)
-                    && veh.speed < 0.3
-                    && (lane.length - veh.position) < veh.driver.vehicle_length + veh.driver.min_gap + 1.0
-                {
-                    veh.stopped_at = Some(node);
-                }
-                veh
-            })
-            .collect();
-
-        // Occupancy-aware crossing: process in id order, tracking each lane's
-        // frontmost (entrance-nearest) position, so a vehicle never crosses a
-        // node onto a spot another vehicle already holds. This makes
-        // intersection/merge overlaps impossible rather than after-the-fact.
-        // `front[lane]` = the nearest occupied point to the lane entrance (the
-        // rear = position − length of the closest-in vehicle), so a crosser never
-        // lands on top of a long vehicle already there.
-        moved.sort_by_key(|v| v.id);
+        // Destination-lane occupancy (nearest-to-entrance rear), so a crosser
+        // finishing its interior path never lands on top of a queued vehicle —
+        // instead it holds at the far edge of the node (box-blocking, realistic).
         let mut front: HashMap<u32, f64> = HashMap::new();
-        for v in &moved {
-            if v.position < self.network.lane(v.lane).length {
+        for v in &self.vehicles {
+            if v.crossing.is_none() && v.position < self.network.lane(v.lane).length {
                 let e = front.entry(v.lane.0).or_insert(f64::MAX);
                 *e = e.min(v.position - v.driver.vehicle_length);
             }
         }
 
-        let mut survivors = Vec::with_capacity(moved.len());
-        for mut veh in moved {
-            let pre_link = self.network.lane(veh.lane).link;
-            let alive = self.advance_across_nodes(&mut veh, &mut front);
-            if alive {
-                let post_link = self.network.lane(veh.lane).link;
-                if post_link != pre_link {
-                    self.link_entries[post_link.idx()] += 1;
+        let mut survivors = Vec::with_capacity(self.vehicles.len());
+        let mut exited = 0u32;
+        for (mut veh, a) in std::mem::take(&mut self.vehicles).into_iter().zip(accels) {
+            match self.advance_vehicle(&mut veh, a, dt, &mut front) {
+                Fate::Alive => {
+                    if veh.speed < 0.5 {
+                        veh.wait_ticks += 1;
+                    } else {
+                        veh.wait_ticks = 0;
+                    }
+                    veh.record();
+                    survivors.push(veh);
                 }
-                if veh.speed < 0.5 {
-                    veh.wait_ticks += 1;
-                } else {
+                Fate::Entered(link) => {
+                    self.link_entries[link.idx()] += 1;
                     veh.wait_ticks = 0;
+                    veh.record();
+                    survivors.push(veh);
                 }
-                veh.record();
-                let e = front.entry(veh.lane.0).or_insert(f64::MAX);
-                *e = e.min(veh.position - veh.driver.vehicle_length);
-                survivors.push(veh);
-            } else {
-                self.exited += 1;
+                Fate::Exited => exited += 1,
             }
         }
         self.vehicles = survivors;
+        self.exited += exited;
         self.remove_crashes();
+        self.remove_conflict_crashes();
         self.time += dt;
         self.tick += 1;
+    }
+
+    /// Advance one vehicle: integrate its longitudinal state, drive the
+    /// lane→interior→lane transitions, and report whether it stayed on the road,
+    /// entered a new link, or left the network.
+    fn advance_vehicle(&self, veh: &mut NetVehicle, accel: f64, dt: f64, front: &mut HashMap<u32, f64>) -> Fate {
+        if let Some(mut c) = veh.crossing {
+            let it = *self.network.interior(c.movement);
+            veh.speed = (veh.speed + accel * dt).max(0.0);
+            c.s += veh.speed * dt;
+            if c.s < it.len {
+                veh.crossing = Some(c);
+                return Fate::Alive;
+            }
+            // Reached the far edge: land on the destination lane unless its
+            // entrance is occupied, in which case wait inside the node.
+            let to_lane = self.network.movement(c.movement).to_lane;
+            let clear = front.get(&to_lane.0).is_none_or(|&rear| rear >= veh.driver.min_gap);
+            if !clear {
+                c.s = it.len;
+                veh.speed = 0.0;
+                veh.crossing = Some(c);
+                return Fate::Alive;
+            }
+            veh.crossing = None;
+            veh.lane = to_lane;
+            veh.position = c.s - it.len;
+            veh.stopped_at = None;
+            let e = front.entry(to_lane.0).or_insert(f64::MAX);
+            *e = e.min(veh.position - veh.driver.vehicle_length);
+            let to_link = self.network.lane(to_lane).link;
+            if veh.route_idx + 1 < veh.route.len() && veh.route[veh.route_idx + 1] == to_link {
+                veh.route_idx += 1;
+            }
+            return Fate::Entered(to_link);
+        }
+
+        integrate(veh, accel, dt);
+        let lane = *self.network.lane(veh.lane);
+        let node = self.network.link(lane.link).to;
+        if matches!(self.network.node(node).control, NodeControl::Stop)
+            && veh.speed < 0.3
+            && (lane.length - veh.position) < veh.driver.vehicle_length + veh.driver.min_gap + 1.0
+        {
+            veh.stopped_at = Some(node);
+        }
+        if veh.position < lane.length {
+            return Fate::Alive;
+        }
+        // Reached the stop line. Enter the intersection interior when the
+        // movement is served (green/yellow) — otherwise hold at the line.
+        match self.intended_movement(veh) {
+            Some(mid) if self.movement_state(mid) != SignalState::Red => {
+                let overflow = veh.position - lane.length;
+                veh.position = lane.length;
+                veh.crossing = Some(Crossing { movement: mid, s: overflow.min(self.network.interior(mid).len) });
+                Fate::Alive
+            }
+            Some(_) => {
+                veh.position = lane.length;
+                veh.speed = 0.0;
+                Fate::Alive
+            }
+            None => Fate::Exited,
+        }
+    }
+
+    /// IDM acceleration for a vehicle traversing a node interior: capped to the
+    /// turn's comfortable speed and following either a crosser ahead on the same
+    /// movement or the queue waiting on the destination lane.
+    fn crossing_accel(&self, i: usize, nb: &Neighbors, cross_by_mv: &HashMap<u32, Vec<usize>>) -> f64 {
+        let veh = &self.vehicles[i];
+        let c = veh.crossing.unwrap();
+        let it = self.network.interior(c.movement);
+        let to_lane = self.network.movement(c.movement).to_lane;
+        let cap = match self.network.movement_turn(c.movement) {
+            TurnType::Left => 6.0,
+            TurnType::Right => 5.0,
+            TurnType::Through => f64::INFINITY,
+        };
+        let mut d = veh.driver.capped_to(self.network.lane(to_lane).speed_limit);
+        d.desired_speed = d.desired_speed.min(cap);
+
+        let mut gap = f64::INFINITY;
+        let mut lead_speed = veh.speed;
+        for &j in cross_by_mv.get(&c.movement.0).into_iter().flatten() {
+            if j == i {
+                continue;
+            }
+            let o = self.vehicles[j].crossing.unwrap();
+            if o.s > c.s {
+                let g = o.s - c.s - self.vehicles[j].driver.vehicle_length;
+                if g < gap {
+                    gap = g;
+                    lead_speed = self.vehicles[j].speed;
+                }
+            }
+        }
+        if let Some(&f) = nb.lane_front.get(&to_lane.0) {
+            let l = &self.vehicles[f];
+            let g = (it.len - c.s) + l.position - l.driver.vehicle_length;
+            if g < gap {
+                gap = g;
+                lead_speed = l.speed;
+            }
+        }
+        let mut accel = if gap.is_finite() {
+            idm::acceleration(&d, veh.speed, veh.speed - lead_speed, gap.max(0.05))
+        } else {
+            idm::free_acceleration(&d, veh.speed)
+        };
+
+        // In-intersection avoidance: if a vehicle on a conflicting movement will
+        // reach a shared conflict point first, brake to stop short of it. This is
+        // the crash-avoidant behaviour; a collision only occurs when a driver is
+        // already too close/fast to stop (then the conflict-point check crashes it).
+        for cp in &self.network.conflicts {
+            let (my_s, other_mv, other_s) = if cp.a == c.movement {
+                (cp.sa, cp.b, cp.sb)
+            } else if cp.b == c.movement {
+                (cp.sb, cp.a, cp.sa)
+            } else {
+                continue;
+            };
+            let my_dist = my_s - c.s;
+            if my_dist <= 0.0 {
+                continue; // already through this point
+            }
+            for &j in cross_by_mv.get(&other_mv.0).into_iter().flatten() {
+                let o = &self.vehicles[j];
+                let their_dist = other_s - o.crossing.unwrap().s;
+                if their_dist < -2.0 {
+                    continue; // they have cleared the point
+                }
+                let they_go_first = their_dist < my_dist || (their_dist == my_dist && o.id < veh.id);
+                if they_go_first {
+                    let stop_gap = (my_dist - 1.0).max(0.05); // hold ~1 m short of the point
+                    accel = accel.min(idm::acceleration(&d, veh.speed, veh.speed, stop_gap));
+                }
+            }
+        }
+        accel
     }
 
     /// Detect rear-end overlaps within a lane (a follower's front past the
@@ -628,6 +824,9 @@ impl NetWorld {
         const OVERLAP_TOL: f64 = 0.5;
         let mut by_lane: HashMap<u32, Vec<usize>> = HashMap::new();
         for (i, v) in self.vehicles.iter().enumerate() {
+            if v.crossing.is_some() {
+                continue; // crossers are pinned at the line; handled by conflict crashes
+            }
             by_lane.entry(v.lane.0).or_default().push(i);
         }
         let mut crashed = vec![false; self.vehicles.len()];
@@ -642,6 +841,44 @@ impl NetWorld {
                 }
             }
         }
+        self.take_crashed(crashed);
+    }
+
+    /// Detect collisions inside intersections: two vehicles traversing different
+    /// movements that both occupy a precomputed conflict point this tick. This is
+    /// what makes running a red/misjudging a gap actually crash. Cost is linear —
+    /// only vehicles currently crossing are indexed, against static conflicts.
+    fn remove_conflict_crashes(&mut self) {
+        const CROSS_TOL: f64 = 3.0;
+        let mut at: HashMap<u32, Vec<(usize, f64)>> = HashMap::new();
+        for (i, v) in self.vehicles.iter().enumerate() {
+            if let Some(c) = v.crossing {
+                at.entry(c.movement.0).or_default().push((i, c.s));
+            }
+        }
+        if at.is_empty() {
+            return;
+        }
+        let mut crashed = vec![false; self.vehicles.len()];
+        for cp in &self.network.conflicts {
+            let (Some(a), Some(b)) = (at.get(&cp.a.0), at.get(&cp.b.0)) else { continue };
+            for &(i, sa) in a {
+                if (sa - cp.sa).abs() >= CROSS_TOL {
+                    continue;
+                }
+                for &(j, sb) in b {
+                    if (sb - cp.sb).abs() < CROSS_TOL {
+                        crashed[i] = true;
+                        crashed[j] = true;
+                    }
+                }
+            }
+        }
+        self.take_crashed(crashed);
+    }
+
+    /// Remove the flagged vehicles and add them to the crash count.
+    fn take_crashed(&mut self, crashed: Vec<bool>) {
         if crashed.iter().any(|&c| c) {
             let mut i = 0;
             self.vehicles.retain(|_| {
@@ -653,6 +890,15 @@ impl NetWorld {
                 keep
             });
         }
+    }
+
+    /// Whether `mid`'s interior path conflicts with a vehicle already crossing
+    /// `node` — you must not enter an occupied box, whatever the control.
+    fn box_conflict(&self, mid: MovementId, node: NodeId, nb: &Neighbors) -> bool {
+        nb.crossing_at.get(&node.0).into_iter().flatten().any(|&j| {
+            let o = self.vehicles[j].crossing.unwrap().movement;
+            self.network.movements_conflict(mid, o)
+        })
     }
 
     /// `Some(())` when a higher-priority vehicle is approaching `node` from a
@@ -715,44 +961,6 @@ impl NetWorld {
         best
     }
 
-    fn advance_across_nodes(&self, veh: &mut NetVehicle, front: &mut HashMap<u32, f64>) -> bool {
-        for _ in 0..8 {
-            let lane = *self.network.lane(veh.lane);
-            if veh.position < lane.length {
-                return true;
-            }
-            match self.intended_movement(veh) {
-                // Cross on green or yellow; hold only on red.
-                Some(mid) if self.movement_state(mid) != SignalState::Red => {
-                    let to_lane = self.network.movement(mid).to_lane;
-                    // `front` holds the nearest occupied rear; the crosser lands at
-                    // ~0, so require that rear to be at least min_gap ahead.
-                    if front.get(&to_lane.0).is_some_and(|&rear| rear < veh.driver.min_gap) {
-                        veh.position = lane.length; // entrance occupied — hold at the line
-                        veh.speed = 0.0;
-                        return true;
-                    }
-                    veh.position -= lane.length;
-                    veh.lane = to_lane;
-                    veh.stopped_at = None;
-                    let to_link = self.network.lane(to_lane).link;
-                    if veh.route_idx + 1 < veh.route.len()
-                        && veh.route[veh.route_idx + 1] == to_link
-                    {
-                        veh.route_idx += 1;
-                    }
-                }
-                Some(_) => {
-                    veh.position = lane.length;
-                    veh.speed = 0.0;
-                    return true;
-                }
-                None => return false,
-            }
-        }
-        true
-    }
-
     pub fn run_ticks(&mut self, ticks: u32) {
         for _ in 0..ticks {
             self.step();
@@ -765,6 +973,8 @@ struct Neighbors {
     lane_front: HashMap<u32, usize>,
     by_lane: HashMap<u32, Vec<usize>>,
     approaching: HashMap<u32, Vec<usize>>,
+    /// Vehicles currently inside each node (traversing an interior), by node id.
+    crossing_at: HashMap<u32, Vec<usize>>,
 }
 
 /// Live state of one actuated signal program: which phase is running, how long
@@ -774,11 +984,14 @@ struct SignalRuntime {
     phase: usize,
     elapsed: f64,
     yellow: bool,
+    /// Seconds of all-red clearance remaining after a phase's yellow — everyone
+    /// gets red so the intersection empties before the next phase turns green.
+    all_red: f64,
 }
 
 impl SignalRuntime {
     fn state_of(&self, bit: u8, program: &super::signal::SignalProgram) -> SignalState {
-        if program.phases.is_empty() {
+        if program.phases.is_empty() || self.all_red > 0.0 {
             return SignalState::Red;
         }
         let served = program.phases[self.phase].green_mask & (1u64 << bit) != 0;
@@ -798,6 +1011,9 @@ impl SignalRuntime {
 const MIN_GREEN: f64 = 6.0;
 const MAX_GREEN: f64 = 45.0;
 const DETECT: f64 = 35.0;
+/// All-red clearance after each phase's yellow, so a vehicle that entered late
+/// can clear the interior before a conflicting phase turns green.
+const ALL_RED: f64 = 2.5;
 
 /// IDM acceleration for a vehicle placed at `pos`/`speed` on a lane with the
 /// given speed limit, following `leader` (or free road if none). Used to score
@@ -1172,28 +1388,24 @@ mod tests {
             ],
         }
         .build();
-        let major_app = net.lanes_of(LinkId(0)).next().unwrap();
-        let minor_app = net.lanes_of(LinkId(2)).next().unwrap();
         let mut world = NetWorld::new(net, cfg());
         world.spawn_routed(10, vec![LinkId(0), LinkId(1)], 20.0, DriverConfig::car()); // major through
         world.spawn_routed(20, vec![LinkId(2), LinkId(3)], 9.0, DriverConfig::car()); // minor straight across
 
-        let (mut major_cross, mut minor_cross) = (None, None);
+        // Record the tick each vehicle first enters the intersection interior.
+        let (mut major_enter, mut minor_enter) = (None, None);
         for t in 0..400 {
-            let mj_before = world.vehicle(10).map(|v| v.lane);
-            let mn_before = world.vehicle(20).map(|v| v.lane);
             world.step();
-            let mj_after = world.vehicle(10).map(|v| v.lane);
-            let mn_after = world.vehicle(20).map(|v| v.lane);
-            if major_cross.is_none() && mj_before == Some(major_app) && mj_after != Some(major_app) {
-                major_cross = Some(t);
+            if major_enter.is_none() && world.vehicle(10).is_some_and(|v| v.is_crossing()) {
+                major_enter = Some(t);
             }
-            if minor_cross.is_none() && mn_before == Some(minor_app) && mn_after != Some(minor_app) {
-                minor_cross = Some(t);
+            if minor_enter.is_none() && world.vehicle(20).is_some_and(|v| v.is_crossing()) {
+                minor_enter = Some(t);
             }
         }
-        let (mj, mn) = (major_cross.expect("major crosses"), minor_cross.expect("minor crosses"));
+        let (mj, mn) = (major_enter.expect("major crosses"), minor_enter.expect("minor crosses"));
         assert!(mn > mj, "minor arrived first but must yield: minor@{mn} major@{mj}");
+        assert_eq!(world.crashed(), 0, "yielding avoids a collision");
     }
 
     #[test]
@@ -1242,6 +1454,272 @@ mod tests {
             links: vec![LinkSpec::oneway(1, 2, 1, 40.0)],
         }
         .build()
+    }
+
+    /// A full uncontrolled four-way with every in/out leg, each `arm` metres.
+    /// No signal or priority control, so conflicting movements are only kept
+    /// apart by timing — the setup for the collision-model tests. Link ids:
+    /// 0:W→C 1:E→C 2:S→C 3:N→C 4:C→W 5:C→E 6:C→S 7:C→N.
+    fn uncontrolled_cross(arm: f64) -> Network {
+        OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(0, 0.0, 0.0),  // C
+                NodeSpec::uncontrolled(1, -arm, 0.0), // W
+                NodeSpec::uncontrolled(2, arm, 0.0),  // E
+                NodeSpec::uncontrolled(3, 0.0, -arm), // S
+                NodeSpec::uncontrolled(4, 0.0, arm),  // N
+            ],
+            links: vec![
+                LinkSpec::oneway(1, 0, 1, 15.0), // 0: W→C
+                LinkSpec::oneway(2, 0, 1, 15.0), // 1: E→C
+                LinkSpec::oneway(3, 0, 1, 15.0), // 2: S→C
+                LinkSpec::oneway(4, 0, 1, 15.0), // 3: N→C
+                LinkSpec::oneway(0, 1, 1, 15.0), // 4: C→W
+                LinkSpec::oneway(0, 2, 1, 15.0), // 5: C→E
+                LinkSpec::oneway(0, 3, 1, 15.0), // 6: C→S
+                LinkSpec::oneway(0, 4, 1, 15.0), // 7: C→N
+            ],
+        }
+        .build()
+    }
+
+    // Opposing left turns (W→N and E→S) share the intersection's diagonal, so
+    // vehicles entering together meet head-on at the centre.
+    const LEFT_W_TO_N: [LinkId; 2] = [LinkId(0), LinkId(7)];
+    const LEFT_E_TO_S: [LinkId; 2] = [LinkId(1), LinkId(6)];
+
+    #[test]
+    fn conflicting_crossers_yield_to_avoid_a_collision() {
+        // Two conflicting movements arriving together at an uncontrolled node: the
+        // crash-avoidant behaviour makes one yield inside the box, so both clear
+        // without colliding.
+        let mut w = NetWorld::new(uncontrolled_cross(120.0), cfg());
+        let d = DriverConfig { accel_noise: 0.0, ..DriverConfig::car() };
+        assert!(w.spawn_routed(1, LEFT_W_TO_N.to_vec(), 12.0, d.clone()));
+        assert!(w.spawn_routed(2, LEFT_E_TO_S.to_vec(), 12.0, d));
+        for _ in 0..300 {
+            w.step();
+        }
+        assert_eq!(w.crashed(), 0, "avoidance prevents the collision");
+        assert_eq!(w.exited(), 2, "and both vehicles clear the intersection");
+    }
+
+    #[test]
+    fn staggered_crossings_do_not_collide() {
+        // The same conflict, but the second vehicle arrives after the first has
+        // cleared the intersection — no collision.
+        let mut w = NetWorld::new(uncontrolled_cross(100.0), cfg());
+        let d = DriverConfig { accel_noise: 0.0, ..DriverConfig::car() };
+        assert!(w.spawn_routed(1, LEFT_W_TO_N.to_vec(), 12.0, d.clone()));
+        for _ in 0..40 {
+            w.step();
+        }
+        assert!(w.spawn_routed(2, LEFT_E_TO_S.to_vec(), 12.0, d));
+        for _ in 0..200 {
+            w.step();
+        }
+        assert_eq!(w.crashed(), 0, "cleanly separated crossings never collide");
+    }
+
+    #[test]
+    fn crossing_a_node_takes_several_ticks() {
+        // A vehicle is inside the intersection (is_crossing) for more than one
+        // tick — the interior is traversed over time, not teleported.
+        let mut w = NetWorld::new(uncontrolled_cross(60.0), cfg());
+        let d = DriverConfig { accel_noise: 0.0, ..DriverConfig::car() };
+        w.spawn_routed(1, LEFT_W_TO_N.to_vec(), 12.0, d);
+        let mut crossing_ticks = 0;
+        let mut reached_exit = false;
+        for _ in 0..200 {
+            w.step();
+            if w.vehicle(1).is_some_and(|v| v.is_crossing()) {
+                crossing_ticks += 1;
+            }
+            if on_link(&w, 1, LinkId(7)) {
+                reached_exit = true;
+            }
+        }
+        assert!(crossing_ticks > 1, "spent multiple ticks inside the node: {crossing_ticks}");
+        assert!(reached_exit, "and completed onto the departure link");
+    }
+
+    fn on_link(w: &NetWorld, id: u32, link: LinkId) -> bool {
+        w.vehicle(id).is_some_and(|v| !v.is_crossing() && w.network.lane(v.lane).link == link)
+    }
+
+    #[test]
+    fn arterial_intersection_flows_and_stays_safe_under_mixed_turning_demand() {
+        // Millbrae-complexity: a two-way multi-lane signalized crossing carrying
+        // through traffic on every approach plus left turns. It must keep flowing
+        // (throughput scales with time) and stay collision-free.
+        let mut w = NetWorld::new(super::super::map::arterial_intersection(), cfg());
+        // link ids (see arterial_intersection): approaches W=0, E=3, S=4, N=7.
+        let throughs = [
+            [LinkId(0), LinkId(2)], // W→E
+            [LinkId(3), LinkId(1)], // E→W
+            [LinkId(4), LinkId(6)], // S→N
+            [LinkId(7), LinkId(5)], // N→S
+        ];
+        let lefts = [
+            [LinkId(0), LinkId(6)], // W→N
+            [LinkId(3), LinkId(5)], // E→S
+        ];
+        let mut next = 0u32;
+        let mut saw_crossing = false;
+        for t in 0..2500u32 {
+            if t % 22 == 0 {
+                for r in &throughs {
+                    if w.spawn_routed(next, r.to_vec(), 12.0, DriverConfig::car()) {
+                        next += 1;
+                    }
+                }
+            }
+            if t % 55 == 0 {
+                for r in &lefts {
+                    if w.spawn_routed(next, r.to_vec(), 12.0, DriverConfig::car()) {
+                        next += 1;
+                    }
+                }
+            }
+            w.step();
+            saw_crossing |= w.vehicles().iter().any(|v| v.is_crossing());
+        }
+        assert!(next > 100, "the intersection should be busy: {next} spawned");
+        assert!(w.exited() > 30, "traffic should keep clearing the intersection: {} exited", w.exited());
+        assert!(saw_crossing, "vehicles actually traverse the intersection interior");
+        assert!(w.crashed() <= 3, "a signalized arterial stays essentially crash-free, got {}", w.crashed());
+    }
+
+    #[test]
+    fn real_map_render_signals_show_red_and_green() {
+        // The renderer reads NetWorld::signal_states() (the actuated runtime, not
+        // the pure program). Under real traffic those must include reds, or every
+        // head would look green.
+        use super::super::demand::{DemandGenerator, OdPair};
+        use super::super::signal::SignalState;
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let net = super::super::map::OsmMap::from_json(&text).expect("map json").build();
+        if net.programs.is_empty() {
+            return;
+        }
+        let mut w = NetWorld::new(net, cfg());
+        // A small fixed set of long routes through the network (capped, so the
+        // test doesn't route every O/D pair on a 400-link map).
+        let n = w.network.links.len() as u32;
+        let mut pairs = Vec::new();
+        for o in (0..n).step_by(7) {
+            for d in (0..n).step_by(11) {
+                if o != d && w.network.route_links(LinkId(o), LinkId(d)).is_some_and(|r| r.len() >= 5) {
+                    pairs.push(OdPair { origin: LinkId(o), dest: LinkId(d), rate_per_sec: 0.3 });
+                    if pairs.len() >= 20 {
+                        break;
+                    }
+                }
+            }
+            if pairs.len() >= 20 {
+                break;
+            }
+        }
+        let mut d = DemandGenerator::new(&w, &pairs, 1);
+        let (mut reds, mut greens) = (0u64, 0u64);
+        for _ in 0..800 {
+            d.step(&mut w, cfg().dt);
+            w.step();
+            for s in w.signal_states() {
+                match s {
+                    SignalState::Red => reds += 1,
+                    SignalState::Green => greens += 1,
+                    _ => {}
+                }
+            }
+        }
+        let multiphase = w.network.programs.iter().filter(|p| p.phases.len() > 1).count();
+        assert!(greens > 0, "some signals go green");
+        assert!(reds > 0, "some signals go red (rendered heads aren't all green)");
+        // Per-approach OSM signals are relocated onto their junctions, so most
+        // real intersections cycle rather than sitting permanently green.
+        assert!(multiphase >= 15, "most signalized intersections should cycle, got {multiphase}");
+    }
+
+    #[test]
+    fn a_signalized_crossing_stays_collision_free_under_demand() {
+        // Two conflicting through streams under sustained demand through a
+        // signalized four-way: conflict-derived phasing plus all-red clearance
+        // must keep it crash-free while traffic flows.
+        let plan = SignalPlan { green_secs: 12.0, yellow_secs: 3.0, offset: 0.0 };
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::signalized(0, 0.0, 0.0, plan),
+                NodeSpec::uncontrolled(1, -250.0, 0.0),
+                NodeSpec::uncontrolled(2, 250.0, 0.0),
+                NodeSpec::uncontrolled(3, 0.0, -250.0),
+                NodeSpec::uncontrolled(4, 0.0, 250.0),
+            ],
+            links: vec![
+                LinkSpec::oneway(1, 0, 1, 15.0), // 0: W→C
+                LinkSpec::oneway(3, 0, 1, 15.0), // 1: S→C
+                LinkSpec::oneway(0, 2, 1, 15.0), // 2: C→E
+                LinkSpec::oneway(0, 4, 1, 15.0), // 3: C→N
+            ],
+        }
+        .build();
+        let mut w = NetWorld::new(net, cfg());
+        let mut next = 0u32;
+        for t in 0..1500u32 {
+            if t % 10 == 0 {
+                let d = DriverConfig::car();
+                if w.spawn_routed(next, vec![LinkId(0), LinkId(2)], 13.0, d.clone()) {
+                    next += 1;
+                }
+                if w.spawn_routed(next, vec![LinkId(1), LinkId(3)], 13.0, d) {
+                    next += 1;
+                }
+            }
+            w.step();
+        }
+        assert!(w.exited() > 20, "traffic should flow through the signal: {} exited", w.exited());
+        assert_eq!(w.crashed(), 0, "signal phasing + all-red keep it crash-free, got {}", w.crashed());
+    }
+
+    #[test]
+    fn priority_yielding_keeps_an_uncontrolled_crossing_mostly_safe() {
+        // A major E–W road (faster, priority) crosses a minor N–S road at an
+        // uncontrolled node, both under sustained demand. Right-of-way yielding
+        // should keep collisions rare, not constant — the fix for pervasive
+        // intersection crashing on the real map.
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(0, 0.0, 0.0),
+                NodeSpec::uncontrolled(1, -250.0, 0.0),
+                NodeSpec::uncontrolled(2, 250.0, 0.0),
+                NodeSpec::uncontrolled(3, 0.0, -250.0),
+                NodeSpec::uncontrolled(4, 0.0, 250.0),
+            ],
+            links: vec![
+                LinkSpec::oneway(1, 0, 1, 22.0), // 0: major W→C
+                LinkSpec::oneway(0, 2, 1, 22.0), // 1: major C→E
+                LinkSpec::oneway(3, 0, 1, 10.0), // 2: minor S→C
+                LinkSpec::oneway(0, 4, 1, 10.0), // 3: minor C→N
+            ],
+        }
+        .build();
+        let mut w = NetWorld::new(net, cfg());
+        let mut next = 0u32;
+        for t in 0..1200u32 {
+            if t % 12 == 0 {
+                let d = DriverConfig::car();
+                if w.spawn_routed(next, vec![LinkId(0), LinkId(1)], 20.0, d.clone()) {
+                    next += 1;
+                }
+                if w.spawn_routed(next, vec![LinkId(2), LinkId(3)], 9.0, d) {
+                    next += 1;
+                }
+            }
+            w.step();
+        }
+        assert!(w.exited() > 20, "traffic should be flowing: {} exited", w.exited());
+        assert!(w.crashed() <= 2, "priority yielding should make crashes rare, got {}", w.crashed());
     }
 
     #[test]
@@ -1354,6 +1832,7 @@ mod tests {
                 lanes: 1,
                 speed_limit: 30.0,
                 geometry: vec![[200.0, 0.0], [202.68, 10.0], [210.0, 17.32]],
+                layer: 0,
             }],
         }
         .build();
@@ -1433,6 +1912,9 @@ mod tests {
             for v in w.vehicles() {
                 assert!(v.speed >= -1e-6, "no reversing: {}", v.speed);
                 assert!(v.speed <= max_limit + 1.5, "no gross speeding: {} > {}", v.speed, max_limit);
+                if v.is_crossing() {
+                    continue; // inside a node, not occupying the lane
+                }
                 by_lane.entry(v.lane.0).or_default().push((v.position, v.driver.vehicle_length));
             }
             for cars in by_lane.values_mut() {
@@ -1457,10 +1939,15 @@ mod tests {
                 d.step(&mut w, cfg().dt);
                 w.step();
             }
-            (w.vehicles().len(), w.exited(), w.crashed())
+            // A fingerprint of the whole live state — far more seed-sensitive than
+            // the saturated vehicle count alone.
+            let fp = w.vehicles().iter().fold(0u64, |h, v| {
+                h.wrapping_mul(1000003).wrapping_add(v.id as u64).wrapping_add((v.position * 100.0) as u64)
+            });
+            (w.vehicles().len(), w.exited(), w.crashed(), fp)
         };
         assert_eq!(run(7), run(7), "identical seeds must reproduce");
-        assert_ne!(run(7).0, run(8).0, "different seeds should differ");
+        assert_ne!(run(7), run(8), "different seeds should differ");
     }
 
     #[test]

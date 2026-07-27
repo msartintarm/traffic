@@ -103,6 +103,20 @@ def parse_speed_mps(tags, highway):
     return round(mph * 0.44704, 2)
 
 
+def parse_layer(tags):
+    raw = tags.get("layer")
+    if raw is not None:
+        try:
+            return int(float(raw))
+        except ValueError:
+            pass
+    if tags.get("bridge") in ("yes", "viaduct", "true", "1"):
+        return 1
+    if tags.get("tunnel") in ("yes", "true", "1"):
+        return -1
+    return 0
+
+
 def parse_lanes(tags, oneway):
     try:
         lanes = int(tags.get("lanes", ""))
@@ -163,7 +177,7 @@ def build(raw, bbox):
     def geom_of(node_ids):
         return [list(project(nodes[nid]["lat"], nodes[nid]["lon"], lat0, lon0)) for nid in node_ids]
 
-    def emit_link(a, b, lanes, speed, geometry, name, ref):
+    def emit_link(a, b, lanes, speed, geometry, name, ref, layer):
         if (a, b) in emitted:
             return
         emitted.add((a, b))
@@ -172,6 +186,8 @@ def build(raw, bbox):
             link["name"] = name  # road name, e.g. "El Camino Real"
         if ref:
             link["ref"] = ref  # route ref, e.g. "CA 82" — used to match real counts
+        if layer:
+            link["layer"] = layer  # grade separation for render z-order
         out_links.append(link)
 
     for way in ways:
@@ -182,6 +198,7 @@ def build(raw, bbox):
         speed = parse_speed_mps(tags, highway)
         name = tags.get("name")
         ref = tags.get("ref")
+        layer = parse_layer(tags)
 
         seq = way["nodes"]
         block_start = 0
@@ -193,9 +210,9 @@ def build(raw, bbox):
                 emit_node(a)
                 emit_node(b)
                 mid = geom_of(seq[block_start + 1 : i])  # intermediate bend points
-                emit_link(a, b, lanes, speed, mid, name, ref)
+                emit_link(a, b, lanes, speed, mid, name, ref, layer)
                 if not oneway:
-                    emit_link(b, a, lanes, speed, list(reversed(mid)), name, ref)
+                    emit_link(b, a, lanes, speed, list(reversed(mid)), name, ref, layer)
             block_start = i
 
     return {

@@ -91,18 +91,31 @@ pub fn signal_color(state: SignalState) -> [f32; 3] {
     }
 }
 
-/// A signal head as an emissive instance at `pos`, sized `radius`.
-pub fn signal_instance(pos: [f32; 2], radius: f32, state: SignalState) -> Instance {
-    Instance {
-        pos,
-        prev_pos: pos,
-        control: pos, // static
-        scale: [radius, radius],
-        color: signal_color(state),
-        heading: 0.0,
-        prev_heading: 0.0,
-        brake: 1.0, // fully emissive
-    }
+/// Dark housing colour of a signal head.
+pub const SIGNAL_HOUSING: [f32; 3] = [0.05, 0.05, 0.06];
+
+fn emissive(pos: [f32; 2], scale: [f32; 2], color: [f32; 3], heading: f32) -> Instance {
+    Instance { pos, prev_pos: pos, control: pos, scale, color, heading, prev_heading: heading, brake: 1.0 }
+}
+
+/// A miniature three-lamp signal head (a dark housing with red/yellow/green
+/// lamps, the current state's lamp lit and the others dimmed) at `pos`, aligned
+/// to the approach `heading` — the on-street look of a real Bay Area signal.
+pub fn signal_head_instances(pos: [f32; 2], heading: f32, state: SignalState) -> [Instance; 4] {
+    // Only the active lamp shows colour; the other two are dark (unlit) lenses,
+    // so a red head reads clearly as red and a green as green — no phantom colour.
+    const UNLIT: [f32; 3] = [0.03, 0.03, 0.035];
+    let fwd = [heading.cos(), heading.sin()];
+    let lamp = |slot: f32, on: bool, base: [f32; 3]| {
+        let p = [pos[0] + fwd[0] * slot, pos[1] + fwd[1] * slot];
+        emissive(p, [0.9, 0.9], if on { base } else { UNLIT }, heading)
+    };
+    [
+        emissive(pos, [5.6, 2.3], SIGNAL_HOUSING, heading), // housing
+        lamp(-1.6, state == SignalState::Red, signal_color(SignalState::Red)),
+        lamp(0.0, state == SignalState::Yellow, signal_color(SignalState::Yellow)),
+        lamp(1.6, state == SignalState::Green, signal_color(SignalState::Green)),
+    ]
 }
 
 #[cfg(test)]
