@@ -138,6 +138,8 @@ pub struct Network {
     /// stop-line setback (which adds a crosswalk margin), so lines run up to the
     /// box instead of breaking off early.
     pub render_setback: Vec<f64>,
+    /// OSM road name per link (index-aligned with `links`), for browser labelling.
+    pub link_names: Vec<String>,
 }
 
 fn sub(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
@@ -672,7 +674,7 @@ mod tests {
         // L-shaped link (0,0) → bend (100,0) → (100,100).
         let net = OsmMap {
             nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 100.0, 100.0)],
-            links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 1, speed_limit: 20.0, geometry: vec![[100.0, 0.0]], layer: 0 }],
+            links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 1, speed_limit: 20.0, geometry: vec![[100.0, 0.0]], layer: 0, name: String::new() }],
         }
         .build();
         let lane = LaneId(0);

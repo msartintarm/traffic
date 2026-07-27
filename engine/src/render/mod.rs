@@ -134,6 +134,21 @@ impl StaticMesh {
         self.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
     }
 
+    /// Fill a convex polygon (vertices in order) as a triangle fan. Vertices
+    /// carry zero offset — a real paved area, not a min-width line.
+    pub fn push_polygon(&mut self, points: &[[f64; 2]], color: [f32; 3]) {
+        if points.len() < 3 {
+            return;
+        }
+        let base = self.vertices.len() as u32;
+        for p in points {
+            self.vertices.push(StaticVertex { center: [p[0] as f32, p[1] as f32], offset: [0.0, 0.0], color, light: 0.0 });
+        }
+        for k in 1..points.len() as u32 - 1 {
+            self.indices.extend([base, base + k, base + k + 1]);
+        }
+    }
+
     pub fn push_disc(&mut self, center: [f64; 2], radius: f64, color: [f32; 3]) {
         const SIDES: u32 = 12;
         let c = [center[0] as f32, center[1] as f32];

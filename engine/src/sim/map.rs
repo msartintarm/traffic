@@ -9,7 +9,7 @@
 //! at its downstream node, skipping U-turns. Turn restrictions and lane-level
 //! `turn:lanes` from OSM prune these movements in a later pass.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use super::network::*;
 use super::signal::{Phase, SignalProgram};
@@ -60,11 +60,14 @@ pub struct LinkSpec {
     /// <0 a tunnel. Used only for render z-order — crossings at different layers
     /// share no node, so they already form no intersection.
     pub layer: i32,
+    /// OSM road name, carried through the topology transforms so the browser can
+    /// label the engine's own links (which no longer match the raw import).
+    pub name: String,
 }
 
 impl LinkSpec {
     pub fn oneway(from_osm: i64, to_osm: i64, lanes: u32, speed_limit: f64) -> Self {
-        Self { from_osm, to_osm, lanes, speed_limit, geometry: Vec::new(), layer: 0 }
+        Self { from_osm, to_osm, lanes, speed_limit, geometry: Vec::new(), layer: 0, name: String::new() }
     }
 
     pub fn twoway(a: i64, b: i64, lanes: u32, speed_limit: f64) -> [Self; 2] {
@@ -79,6 +82,89 @@ pub struct OsmMap {
 }
 
 impl OsmMap {
+    /// Dissolve uncontrolled degree-2 pass-through nodes (where one road simply
+    /// continues) into the adjacent link's polyline, so a road between two real
+    /// junctions is a single link with bends rather than a chain of stub links and
+    /// spurious junction boxes. Only merges segments sharing lanes, speed and
+    /// layer; controlled nodes and attribute changes are left intact.
+    pub fn collapse_pass_through_nodes(&self) -> OsmMap {
+        let pos: HashMap<i64, [f64; 2]> = self.nodes.iter().map(|n| (n.osm_id, [n.x, n.y])).collect();
+        let mut nodes = self.nodes.clone();
+        let mut links = self.links.clone();
+        while let Some((node, mut remove, add)) = next_collapse(&nodes, &links, &pos) {
+            remove.sort_unstable();
+            for &i in remove.iter().rev() {
+                links.remove(i);
+            }
+            links.extend(add);
+            nodes.retain(|n| n.osm_id != node);
+        }
+        OsmMap { nodes, links }
+    }
+
+    /// Merge intersections that OSM splits across several nodes a few metres apart
+    /// (divided roads, staggered crossings) into one logical junction: cluster
+    /// junction nodes joined by a short stub, collapse each cluster to its centroid,
+    /// drop the now-internal stubs, and re-point the external approaches. `build`
+    /// then forms a single box with one coordinated signal instead of two.
+    pub fn merge_split_intersections(&self) -> OsmMap {
+        const STUB_MAX: f64 = 25.0;
+        let pos: HashMap<i64, [f64; 2]> = self.nodes.iter().map(|n| (n.osm_id, [n.x, n.y])).collect();
+        let mut neigh: HashMap<i64, BTreeSet<i64>> = HashMap::new();
+        for l in &self.links {
+            neigh.entry(l.from_osm).or_default().insert(l.to_osm);
+            neigh.entry(l.to_osm).or_default().insert(l.from_osm);
+        }
+        let degree = |id: i64| neigh.get(&id).map_or(0, BTreeSet::len);
+
+        let mut parent: HashMap<i64, i64> = self.nodes.iter().map(|n| (n.osm_id, n.osm_id)).collect();
+        for l in &self.links {
+            if distance(pos[&l.from_osm], pos[&l.to_osm]) < STUB_MAX
+                && degree(l.from_osm) >= 3
+                && degree(l.to_osm) >= 3
+            {
+                let (ra, rb) = (uf_find(&mut parent, l.from_osm), uf_find(&mut parent, l.to_osm));
+                if ra != rb {
+                    parent.insert(ra, rb);
+                }
+            }
+        }
+
+        let mut clusters: HashMap<i64, Vec<i64>> = HashMap::new();
+        for n in &self.nodes {
+            let r = uf_find(&mut parent, n.osm_id);
+            clusters.entry(r).or_default().push(n.osm_id);
+        }
+
+        let mut rep_of: HashMap<i64, i64> = HashMap::new();
+        let mut nodes: Vec<NodeSpec> = Vec::new();
+        for members in clusters.values() {
+            let rep_id = *members.iter().min().unwrap();
+            let (mut cx, mut cy) = (0.0, 0.0);
+            let mut control = MapControl::Uncontrolled;
+            for &m in members {
+                rep_of.insert(m, rep_id);
+                cx += pos[&m][0];
+                cy += pos[&m][1];
+                let c = self.nodes.iter().find(|n| n.osm_id == m).unwrap().control;
+                if control_rank(c) > control_rank(control) {
+                    control = c;
+                }
+            }
+            let k = members.len() as f64;
+            nodes.push(NodeSpec { osm_id: rep_id, x: cx / k, y: cy / k, control });
+        }
+
+        let mut links = Vec::new();
+        for l in &self.links {
+            let (from_osm, to_osm) = (rep_of[&l.from_osm], rep_of[&l.to_osm]);
+            if from_osm != to_osm {
+                links.push(LinkSpec { from_osm, to_osm, ..l.clone() });
+            }
+        }
+        OsmMap { nodes, links }
+    }
+
     pub fn build(&self) -> Network {
         let mut net = Network::default();
         let mut id_of: HashMap<i64, NodeId> = HashMap::new();
@@ -113,6 +199,7 @@ impl OsmMap {
             }
             net.links.push(Link { from, to, lane_start, lane_count: spec.lanes, layer: spec.layer });
             net.polylines.push(polyline);
+            net.link_names.push(spec.name.clone());
         }
 
         set_junction_setbacks(&mut net);
@@ -275,6 +362,90 @@ fn distance(a: [f64; 2], b: [f64; 2]) -> f64 {
     (a[0] - b[0]).hypot(a[1] - b[1])
 }
 
+fn uf_find(parent: &mut HashMap<i64, i64>, x: i64) -> i64 {
+    let p = parent[&x];
+    if p == x {
+        return x;
+    }
+    let root = uf_find(parent, p);
+    parent.insert(x, root);
+    root
+}
+
+/// Control precedence when merging nodes: a signal outranks a stop, a stop a
+/// yield, so a merged junction keeps its strongest control.
+fn control_rank(c: MapControl) -> u8 {
+    match c {
+        MapControl::Signal(_) => 3,
+        MapControl::Stop => 2,
+        MapControl::Yield => 1,
+        MapControl::Uncontrolled => 0,
+    }
+}
+
+/// Find one uncontrolled pass-through node to dissolve: returns its osm id, the
+/// indices of the links to remove, and the merged link(s) to add. `None` when no
+/// node is collapsible (the fixpoint).
+fn next_collapse(
+    nodes: &[NodeSpec],
+    links: &[LinkSpec],
+    pos: &HashMap<i64, [f64; 2]>,
+) -> Option<(i64, Vec<usize>, Vec<LinkSpec>)> {
+    for node in nodes.iter().filter(|n| n.control == MapControl::Uncontrolled) {
+        let n = node.osm_id;
+        let incident: Vec<usize> = links
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.from_osm == n || l.to_osm == n)
+            .map(|(i, _)| i)
+            .collect();
+        let neigh: BTreeSet<i64> = incident
+            .iter()
+            .map(|&i| if links[i].from_osm == n { links[i].to_osm } else { links[i].from_osm })
+            .collect();
+        if neigh.len() != 2 {
+            continue;
+        }
+        let mut nb = neigh.iter().copied();
+        let (a, b) = (nb.next().unwrap(), nb.next().unwrap());
+        let find = |from: i64, to: i64| links.iter().position(|l| l.from_osm == from && l.to_osm == to);
+        let (a_in, a_out, b_in, b_out) = (find(a, n), find(n, a), find(b, n), find(n, b));
+
+        let joined = |s1: usize, s2: usize, from: i64, to: i64| -> Option<LinkSpec> {
+            let (l1, l2) = (&links[s1], &links[s2]);
+            if l1.lanes != l2.lanes || l1.speed_limit != l2.speed_limit || l1.layer != l2.layer {
+                return None;
+            }
+            let mut geometry = l1.geometry.clone();
+            geometry.push(pos[&n]);
+            geometry.extend(l2.geometry.iter().copied());
+            let name = if l1.name.is_empty() { l2.name.clone() } else { l1.name.clone() };
+            Some(LinkSpec { from_osm: from, to_osm: to, lanes: l1.lanes, speed_limit: l1.speed_limit, geometry, layer: l1.layer, name })
+        };
+
+        if incident.len() == 4 {
+            if let (Some(ai), Some(ao), Some(bi), Some(bo)) = (a_in, a_out, b_in, b_out) {
+                if let (Some(fwd), Some(rev)) = (joined(ai, bo, a, b), joined(bi, ao, b, a)) {
+                    return Some((n, vec![ai, ao, bi, bo], vec![fwd, rev]));
+                }
+            }
+        }
+        if incident.len() == 2 {
+            if let (Some(ai), None, None, Some(bo)) = (a_in, a_out, b_in, b_out) {
+                if let Some(fwd) = joined(ai, bo, a, b) {
+                    return Some((n, vec![ai, bo], vec![fwd]));
+                }
+            }
+            if let (None, Some(ao), Some(bi), None) = (a_in, a_out, b_in, b_out) {
+                if let Some(rev) = joined(bi, ao, b, a) {
+                    return Some((n, vec![bi, ao], vec![rev]));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Pull every lane back from its end nodes to the junction boundary so vehicles
 /// stop and start at the edge of the intersection, leaving the interior (the box)
 /// to the movements' crossing paths. A node's setback is half the widest
@@ -342,6 +513,8 @@ mod json {
         geometry: Vec<[f64; 2]>,
         #[serde(default)]
         layer: i32,
+        #[serde(default)]
+        name: String,
     }
 
     #[derive(Deserialize)]
@@ -386,6 +559,7 @@ mod json {
                 speed_limit: l.speed_limit,
                 geometry: l.geometry,
                 layer: l.layer,
+                name: l.name,
             })
             .collect();
         Ok(OsmMap { nodes, links })
@@ -393,11 +567,11 @@ mod json {
 }
 
 impl OsmMap {
-    /// Parse the OSM scraper's JSON (`tools/osm-scraper`) into an `OsmMap`.
-    /// Requires the `import` feature.
+    /// Parse the OSM scraper's JSON (`tools/osm-scraper`) into an `OsmMap`,
+    /// simplifying spurious pass-through nodes. Requires the `import` feature.
     #[cfg(feature = "import")]
     pub fn from_json(s: &str) -> Result<OsmMap, String> {
-        json::parse(s)
+        Ok(json::parse(s)?.collapse_pass_through_nodes().merge_split_intersections())
     }
 }
 
@@ -428,6 +602,54 @@ mod import_tests {
         assert_eq!(net.lanes.len(), 5);
         assert_eq!(net.programs.len(), 1, "node 2 is signalized");
         assert!(net.groups.len() >= 2);
+    }
+
+    #[test]
+    fn exposed_link_data_stays_aligned_with_the_engines_links() {
+        // The browser hit-tests clicks against the engine's exposed link names and
+        // polylines and then asks the engine for that link's stats. If the import
+        // transforms (collapse + merge) left names/geometry misaligned with the
+        // link set, a click would select the wrong road — the glitch this guards.
+        // A named road with a pass-through node (collapses) and a split junction
+        // 20 m wide (merges) exercises both transforms.
+        let doc = r#"{
+            "nodes": [
+                { "osm_id": 1, "x": -100.0, "y": 0.0, "control": "uncontrolled" },
+                { "osm_id": 2, "x": 0.0, "y": 0.0, "control": "uncontrolled" },
+                { "osm_id": 3, "x": 100.0, "y": 0.0, "control": "uncontrolled" },
+                { "osm_id": 4, "x": 120.0, "y": 0.0, "control": "uncontrolled" },
+                { "osm_id": 5, "x": 220.0, "y": 0.0, "control": "uncontrolled" },
+                { "osm_id": 6, "x": 100.0, "y": -100.0, "control": "uncontrolled" },
+                { "osm_id": 7, "x": 120.0, "y": 100.0, "control": "uncontrolled" }
+            ],
+            "links": [
+                { "from_osm": 1, "to_osm": 2, "lanes": 1, "speed_limit": 15.0, "name": "Broadway" },
+                { "from_osm": 2, "to_osm": 3, "lanes": 1, "speed_limit": 15.0, "name": "Broadway" },
+                { "from_osm": 4, "to_osm": 5, "lanes": 1, "speed_limit": 15.0, "name": "Broadway" },
+                { "from_osm": 3, "to_osm": 4, "lanes": 1, "speed_limit": 15.0, "name": "" },
+                { "from_osm": 3, "to_osm": 6, "lanes": 1, "speed_limit": 15.0, "name": "Oak Street" },
+                { "from_osm": 4, "to_osm": 7, "lanes": 1, "speed_limit": 15.0, "name": "Oak Street" }
+            ]
+        }"#;
+        let net = OsmMap::from_json(doc).expect("valid json").build();
+
+        assert_eq!(net.link_names.len(), net.links.len(), "one name per link");
+        assert_eq!(net.polylines.len(), net.links.len(), "one polyline per link");
+        assert!(net.links.len() < 6, "collapse + merge reduced the link count, got {}", net.links.len());
+
+        for i in 0..net.links.len() {
+            let link = net.link(LinkId(i as u32));
+            let poly = &net.polylines[i];
+            assert_eq!(poly[0], net.node(link.from).position, "polyline starts at its link's from-node");
+            assert_eq!(*poly.last().unwrap(), net.node(link.to).position, "polyline ends at its link's to-node");
+        }
+
+        // Names survive the transforms and land on the right links.
+        let broadway = (0..net.links.len())
+            .find(|&i| net.node(net.link(LinkId(i as u32)).from).position == [-100.0, 0.0])
+            .expect("the west Broadway approach exists");
+        assert_eq!(net.link_names[broadway], "Broadway", "the collapsed+merged road keeps its name");
+        assert!(net.link_names.iter().any(|n| n == "Oak Street"), "the cross street name is preserved too");
     }
 
     #[test]
@@ -652,7 +874,7 @@ mod tests {
             ],
             links: vec![
                 LinkSpec::oneway(1, 2, 1, 20.0), // surface road, crosses origin
-                LinkSpec { from_osm: 3, to_osm: 4, lanes: 1, speed_limit: 25.0, geometry: Vec::new(), layer: 1 }, // bridge over it
+                LinkSpec { from_osm: 3, to_osm: 4, lanes: 1, speed_limit: 25.0, geometry: Vec::new(), layer: 1, name: String::new() }, // bridge over it
             ],
         }
         .build();
@@ -703,6 +925,164 @@ mod tests {
                 net.link(to_link).to,
                 "movement reverses down the arrival link"
             );
+        }
+    }
+
+    #[test]
+    fn collapse_dissolves_a_oneway_pass_through_into_one_link() {
+        let map = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, 0.0, 0.0),
+                NodeSpec::uncontrolled(2, 100.0, 0.0),
+                NodeSpec::uncontrolled(3, 200.0, 0.0),
+            ],
+            links: vec![LinkSpec::oneway(1, 2, 1, 20.0), LinkSpec::oneway(2, 3, 1, 20.0)],
+        }
+        .collapse_pass_through_nodes();
+        assert_eq!(map.nodes.len(), 2, "the middle pass-through node is dissolved");
+        assert_eq!(map.links.len(), 1);
+        let l = &map.links[0];
+        assert_eq!((l.from_osm, l.to_osm), (1, 3));
+        assert_eq!(l.geometry, vec![[100.0, 0.0]], "the dissolved node becomes a bend point");
+    }
+
+    #[test]
+    fn collapse_dissolves_a_twoway_pass_through_both_directions() {
+        let mut links = LinkSpec::twoway(1, 2, 2, 18.0).to_vec();
+        links.extend(LinkSpec::twoway(2, 3, 2, 18.0));
+        let map = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, 0.0, 0.0),
+                NodeSpec::uncontrolled(2, 100.0, 0.0),
+                NodeSpec::uncontrolled(3, 200.0, 0.0),
+            ],
+            links,
+        }
+        .collapse_pass_through_nodes();
+        assert_eq!(map.nodes.len(), 2);
+        assert_eq!(map.links.len(), 2, "one link each way remains");
+        assert!(map.links.iter().any(|l| (l.from_osm, l.to_osm) == (1, 3)));
+        assert!(map.links.iter().any(|l| (l.from_osm, l.to_osm) == (3, 1)));
+    }
+
+    #[test]
+    fn collapse_chains_multiple_pass_through_nodes() {
+        let map = OsmMap {
+            nodes: (1..=4).map(|i| NodeSpec::uncontrolled(i, (i - 1) as f64 * 100.0, 0.0)).collect(),
+            links: vec![
+                LinkSpec::oneway(1, 2, 1, 20.0),
+                LinkSpec::oneway(2, 3, 1, 20.0),
+                LinkSpec::oneway(3, 4, 1, 20.0),
+            ],
+        }
+        .collapse_pass_through_nodes();
+        assert_eq!(map.nodes.len(), 2);
+        assert_eq!(map.links.len(), 1);
+        assert_eq!(map.links[0].geometry, vec![[100.0, 0.0], [200.0, 0.0]]);
+    }
+
+    #[test]
+    fn collapse_preserves_real_junctions_signals_and_attribute_changes() {
+        let plan = SignalPlan { green_secs: 15.0, yellow_secs: 3.0, offset: 0.0 };
+        let signal_node = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, 0.0, 0.0),
+                NodeSpec::signalized(2, 100.0, 0.0, plan),
+                NodeSpec::uncontrolled(3, 200.0, 0.0),
+            ],
+            links: vec![LinkSpec::oneway(1, 2, 1, 20.0), LinkSpec::oneway(2, 3, 1, 20.0)],
+        }
+        .collapse_pass_through_nodes();
+        assert_eq!(signal_node.nodes.len(), 3, "a signalized pass-through is kept");
+
+        let lane_drop = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, 0.0, 0.0),
+                NodeSpec::uncontrolled(2, 100.0, 0.0),
+                NodeSpec::uncontrolled(3, 200.0, 0.0),
+            ],
+            links: vec![LinkSpec::oneway(1, 2, 2, 20.0), LinkSpec::oneway(2, 3, 1, 20.0)],
+        }
+        .collapse_pass_through_nodes();
+        assert_eq!(lane_drop.nodes.len(), 3, "a lane-count change is a real transition, kept");
+
+        let cross = signalized_cross_map();
+        let collapsed = cross.collapse_pass_through_nodes();
+        assert_eq!(collapsed.nodes.len(), cross.nodes.len(), "a real 4-way is untouched");
+    }
+
+    /// A divided-road crossing OSM splits into two junctions 20 m apart (west
+    /// half `1`, east half `2`, joined by a stub), each carrying a cross arm.
+    fn split_crossing() -> OsmMap {
+        let mut links = LinkSpec::twoway(1, 2, 2, 20.0).to_vec(); // the stub between halves
+        links.extend(LinkSpec::twoway(10, 1, 2, 20.0)); // west arm at half 1
+        links.extend(LinkSpec::twoway(1, 11, 1, 13.0)); // south arm at half 1
+        links.extend(LinkSpec::twoway(2, 12, 2, 20.0)); // east arm at half 2
+        links.extend(LinkSpec::twoway(2, 13, 1, 13.0)); // north arm at half 2
+        OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, 0.0, 0.0),
+                NodeSpec::uncontrolled(2, 20.0, 0.0),
+                NodeSpec::uncontrolled(10, -120.0, 0.0),
+                NodeSpec::uncontrolled(11, 0.0, -120.0),
+                NodeSpec::uncontrolled(12, 140.0, 0.0),
+                NodeSpec::uncontrolled(13, 20.0, 120.0),
+            ],
+            links,
+        }
+    }
+
+    #[test]
+    fn merge_collapses_a_split_crossing_into_one_junction() {
+        let merged = split_crossing().merge_split_intersections();
+        assert_eq!(merged.nodes.len(), 5, "the two halves become one node (plus the four arm ends)");
+        assert!(!merged.links.iter().any(|l| (l.from_osm, l.to_osm) == (1, 2) || (l.from_osm, l.to_osm) == (2, 1)),
+            "the internal stub is dropped");
+        let rep = merged.nodes.iter().find(|n| ![10, 11, 12, 13].contains(&n.osm_id)).unwrap();
+        assert!((rep.x - 10.0).abs() < 1e-6 && rep.y.abs() < 1e-6, "merged node sits at the cluster centroid");
+        for arm in [10, 11, 12, 13] {
+            assert!(merged.links.iter().any(|l| l.from_osm == arm && l.to_osm == rep.osm_id),
+                "arm {arm} now approaches the merged junction");
+        }
+    }
+
+    #[test]
+    fn merged_split_crossing_is_one_signalized_intersection() {
+        let plan = SignalPlan { green_secs: 20.0, yellow_secs: 4.0, offset: 0.0 };
+        let mut map = split_crossing();
+        map.nodes[1].control = MapControl::Signal(plan); // signalize the east half only
+        let net = map.merge_split_intersections().build();
+        assert_eq!(net.programs.len(), 1, "the merged junction has a single coordinated signal program");
+        assert!(!net.conflicts.is_empty(), "the merged 4-way has crossing conflict points");
+    }
+
+    #[test]
+    fn merge_leaves_ordinary_blocks_untouched() {
+        // Nodes a normal block apart (>STUB_MAX) are not merged.
+        let net_nodes = signalized_cross_map().merge_split_intersections();
+        assert_eq!(net_nodes.nodes.len(), 5, "a real 100 m four-way is left alone");
+    }
+
+    fn signalized_cross_map() -> OsmMap {
+        let plan = SignalPlan { green_secs: 15.0, yellow_secs: 3.0, offset: 0.0 };
+        OsmMap {
+            nodes: vec![
+                NodeSpec::signalized(0, 0.0, 0.0, plan),
+                NodeSpec::uncontrolled(1, -100.0, 0.0),
+                NodeSpec::uncontrolled(2, 100.0, 0.0),
+                NodeSpec::uncontrolled(3, 0.0, -100.0),
+                NodeSpec::uncontrolled(4, 0.0, 100.0),
+            ],
+            links: vec![
+                LinkSpec::oneway(1, 0, 1, 15.0),
+                LinkSpec::oneway(2, 0, 1, 15.0),
+                LinkSpec::oneway(3, 0, 1, 15.0),
+                LinkSpec::oneway(4, 0, 1, 15.0),
+                LinkSpec::oneway(0, 1, 1, 15.0),
+                LinkSpec::oneway(0, 2, 1, 15.0),
+                LinkSpec::oneway(0, 3, 1, 15.0),
+                LinkSpec::oneway(0, 4, 1, 15.0),
+            ],
         }
     }
 

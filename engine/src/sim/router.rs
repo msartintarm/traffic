@@ -63,6 +63,28 @@ impl FieldRouter {
         }
     }
 
+    /// The destinations in slot order — the order [`recompute_from_distances`]
+    /// expects its `dist_per_slot` in.
+    pub fn dests_in_slot_order(&self) -> &[LinkId] {
+        &self.dests
+    }
+
+    /// Adjacency (CSR-flattenable) for an external solver (e.g. the GPU backend)
+    /// to run the same relaxation the pure [`recompute`] does.
+    pub fn adjacency(&self) -> &[Vec<u32>] {
+        &self.adj
+    }
+
+    /// Rebuild the next-hop fields from reverse distances computed elsewhere
+    /// (the GPU backend), `dist_per_slot[s]` being the distances to
+    /// `dests_in_slot_order()[s]`. Equivalent to [`recompute`] but with the
+    /// expensive Bellman–Ford done off-core.
+    pub fn recompute_from_distances(&mut self, cost: &[u64], dist_per_slot: &[Vec<u64>]) {
+        for (s, dist) in dist_per_slot.iter().enumerate() {
+            self.next_hop[s] = flowfield::next_hops(&self.adj, dist, cost);
+        }
+    }
+
     /// The next link to take from `from` toward `dest`: `None` if `from` already
     /// is the destination, the destination is unreachable, or it is not one this
     /// router tracks.
@@ -142,6 +164,34 @@ mod tests {
         assert_eq!(router.next_hop(dest, dest), None, "already at the destination");
         assert_eq!(router.next_hop(LinkId(3), LinkId(0)), None, "no field for an untracked destination");
         assert!(router.knows(dest) && !router.knows(LinkId(3)));
+    }
+
+    #[test]
+    fn recompute_from_distances_matches_the_builtin_recompute() {
+        // Feeding externally-computed reverse distances (the GPU backend's job)
+        // must produce the same next-hop field as the pure CPU recompute.
+        let net = diamond();
+        let cost = free_costs(&net);
+        let reference = FieldRouter::new(&net, &[LinkId(5), LinkId(4)], &cost);
+
+        let mut fed = FieldRouter::new(&net, &[LinkId(5), LinkId(4)], &cost);
+        let dists: Vec<Vec<u64>> = fed
+            .dests_in_slot_order()
+            .to_vec()
+            .iter()
+            .map(|&d| flowfield::distances_to(fed.adjacency(), d, &cost))
+            .collect();
+        fed.recompute_from_distances(&cost, &dists);
+
+        for &dest in &[LinkId(5), LinkId(4)] {
+            for from in 0..net.links.len() as u32 {
+                assert_eq!(
+                    fed.next_hop(dest, LinkId(from)),
+                    reference.next_hop(dest, LinkId(from)),
+                    "next hop to {dest:?} from {from} must match the builtin recompute"
+                );
+            }
+        }
     }
 
     #[test]

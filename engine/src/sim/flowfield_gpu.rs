@@ -125,6 +125,35 @@ pub fn distances_to_gpu(offsets: &[u32], targets: &[u32], cost: &[u32], dest: u3
     Some(out)
 }
 
+/// Recompute a [`FieldRouter`]'s next-hop fields on the GPU: run the same
+/// `flowfield.wgsl` relaxation once per destination and feed the reverse
+/// distances back into the router. Returns `false` if no adapter is available
+/// (caller falls back to the CPU [`FieldRouter::recompute`]). This is the scale
+/// path — the relaxation is parallel over links, so a large graph with many
+/// destinations that would stall a CPU core runs on the GPU.
+pub fn recompute_router_gpu(
+    router: &mut super::router::FieldRouter,
+    net: &super::network::Network,
+    cost: &[u64],
+) -> bool {
+    let adj = super::flowfield::adjacency(net);
+    let (offsets, targets) = super::flowfield::csr(&adj);
+    let cost32: Vec<u32> = cost.iter().map(|&c| c.min(u32::MAX as u64) as u32).collect();
+    let dests: Vec<u32> = router.dests_in_slot_order().iter().map(|d| d.0).collect();
+
+    let mut dist_per_slot = Vec::with_capacity(dests.len());
+    for &dest in &dests {
+        let Some(gpu) = distances_to_gpu(&offsets, &targets, &cost32, dest) else { return false };
+        dist_per_slot.push(
+            gpu.into_iter()
+                .map(|d| if d == u32::MAX { super::flowfield::UNREACHABLE } else { d as u64 })
+                .collect(),
+        );
+    }
+    router.recompute_from_distances(cost, &dist_per_slot);
+    true
+}
+
 fn entry(binding: u32, ty: wgpu::BufferBindingType) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -190,6 +219,48 @@ mod tests {
         for (i, (&g, &c)) in gpu.iter().zip(&cpu).enumerate() {
             let c32 = if c == UNREACHABLE { u32::MAX } else { c as u32 };
             assert_eq!(g, c32, "link {i}: gpu {g} != cpu {c32}");
+        }
+    }
+
+    #[test]
+    fn gpu_backed_router_matches_the_cpu_router() {
+        use super::super::router::FieldRouter;
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(0, 0.0, 0.0),
+                NodeSpec::uncontrolled(1, 100.0, 0.0),
+                NodeSpec::uncontrolled(2, 200.0, -10.0),
+                NodeSpec::uncontrolled(3, 200.0, 300.0),
+                NodeSpec::uncontrolled(4, 300.0, 0.0),
+                NodeSpec::uncontrolled(5, 400.0, 0.0),
+            ],
+            links: vec![
+                LinkSpec::oneway(0, 1, 1, 20.0),
+                LinkSpec::oneway(1, 2, 1, 20.0),
+                LinkSpec::oneway(1, 3, 1, 20.0),
+                LinkSpec::oneway(2, 4, 1, 20.0),
+                LinkSpec::oneway(3, 4, 1, 20.0),
+                LinkSpec::oneway(4, 5, 1, 20.0),
+            ],
+        }
+        .build();
+        let cost: Vec<u64> = (0..net.links.len() as u32).map(|i| net.link_travel_time_ms(LinkId(i))).collect();
+        let dests = [LinkId(5), LinkId(4)];
+        let cpu = FieldRouter::new(&net, &dests, &cost);
+
+        let mut gpu = FieldRouter::new(&net, &dests, &cost);
+        if !recompute_router_gpu(&mut gpu, &net, &cost) {
+            eprintln!("no GPU adapter; skipping GPU-backed router equivalence test");
+            return;
+        }
+        for &dest in &dests {
+            for from in 0..net.links.len() as u32 {
+                assert_eq!(
+                    gpu.next_hop(dest, LinkId(from)),
+                    cpu.next_hop(dest, LinkId(from)),
+                    "GPU router next hop to {dest:?} from {from} must match the CPU router"
+                );
+            }
         }
     }
 }

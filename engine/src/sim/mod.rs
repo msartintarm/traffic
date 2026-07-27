@@ -11,6 +11,7 @@ pub mod flowfield;
 #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 pub mod flowfield_gpu;
 pub mod idm;
+pub mod junction;
 pub mod map;
 pub mod meso;
 pub mod mobil;

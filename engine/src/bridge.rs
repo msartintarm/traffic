@@ -248,6 +248,29 @@ impl Simulation {
         out
     }
 
+    /// OSM road names for the engine's *own* links (post collapse/merge),
+    /// index-aligned with link ids — so the browser labels the same links the
+    /// engine selects and reports stats for, and click never deviates.
+    pub fn link_names(&self) -> Vec<String> {
+        self.world.network.link_names.clone()
+    }
+
+    /// Each engine link's centreline polyline, index-aligned with link ids, as a
+    /// self-describing flat buffer: per link `[point_count, x0, y0, x1, y1, …]`.
+    /// The browser hit-tests clicks against these (the engine's real geometry),
+    /// not the raw import, so selection stays in sync.
+    pub fn link_polylines(&self) -> Vec<f32> {
+        let mut out = Vec::new();
+        for poly in &self.world.network.polylines {
+            out.push(poly.len() as f32);
+            for p in poly {
+                out.push(p[0] as f32);
+                out.push(p[1] as f32);
+            }
+        }
+        out
+    }
+
     // --- WebGPU renderer feed -------------------------------------------------
 
     /// Roads + junctions as flat `StaticVertex` floats (drawn at all zooms).
@@ -273,6 +296,7 @@ impl Simulation {
         // At-grade + tunnels first (carriageways run to the nodes and overlap to
         // pave intersections), then bridges on top.
         let mut mesh = geometry::road_mesh(net);
+        mesh.extend(&geometry::junction_mesh(net));
         mesh.extend(&geometry::overpass_mesh(net));
         mesh
     }

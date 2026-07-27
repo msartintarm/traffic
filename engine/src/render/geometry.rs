@@ -3,7 +3,7 @@
 //! [`StaticMesh`] (`center + offset` vertices) so the shader can hold every
 //! road/line to a minimum on-screen width at any zoom.
 
-use crate::sim::network::{LaneId, LinkId, MovementId, Network, TurnType, LANE_WIDTH};
+use crate::sim::network::{LaneId, LinkId, MovementId, Network, NodeId, TurnType, LANE_WIDTH};
 
 use super::{mass, StaticMesh};
 
@@ -56,6 +56,79 @@ fn road_ribbons(net: &Network, layer_min: i32, layer_max: i32) -> StaticMesh {
         }
     }
     mesh
+}
+
+/// Filled junction polygons: for every node where roads meet, the convex hull of
+/// the incident carriageways' end corners, paved in road colour. Narrow ribbons
+/// radiating from a node leave dark gaps between the arms at anything larger than
+/// a tight crossing (and at merged junctions); this fills the whole box so the
+/// intersection reads as one paved area and vehicles crossing it aren't drawn over
+/// bare background.
+pub fn junction_mesh(net: &Network) -> StaticMesh {
+    let mut mesh = StaticMesh::default();
+    for n in 0..net.nodes.len() as u32 {
+        let node = NodeId(n);
+        let mut pts: Vec<[f64; 2]> = Vec::new();
+        for link in 0..net.links.len() as u32 {
+            let l = net.link(LinkId(link));
+            if l.layer != 0 {
+                continue; // grade-separated crossings aren't one junction
+            }
+            let poly = &net.polylines[link as usize];
+            let (seg_a, seg_b) = if l.to == node {
+                (poly[poly.len() - 2], poly[poly.len() - 1])
+            } else if l.from == node {
+                (poly[0], poly[1])
+            } else {
+                continue;
+            };
+            let half = l.lane_count as f64 * LANE_WIDTH / 2.0;
+            let (a, b) = offset_right(seg_a, seg_b, half);
+            let center = if l.to == node { b } else { a };
+            let (dx, dy) = (seg_b[0] - seg_a[0], seg_b[1] - seg_a[1]);
+            let len = dx.hypot(dy).max(1e-9);
+            let perp = [dy / len * half, -dx / len * half];
+            pts.push([center[0] + perp[0], center[1] + perp[1]]);
+            pts.push([center[0] - perp[0], center[1] - perp[1]]);
+        }
+        let hull = convex_hull(pts);
+        if hull.len() >= 3 {
+            mesh.push_polygon(&hull, ROAD_COLOR);
+        }
+    }
+    mesh
+}
+
+/// Andrew's monotone chain convex hull (counter-clockwise). Few points per node,
+/// so the O(n log n) sort is negligible.
+fn convex_hull(mut pts: Vec<[f64; 2]>) -> Vec<[f64; 2]> {
+    if pts.len() < 3 {
+        return pts;
+    }
+    pts.sort_by(|p, q| p[0].total_cmp(&q[0]).then(p[1].total_cmp(&q[1])));
+    pts.dedup_by(|p, q| (p[0] - q[0]).abs() < 1e-9 && (p[1] - q[1]).abs() < 1e-9);
+    if pts.len() < 3 {
+        return pts;
+    }
+    let cross = |o: [f64; 2], a: [f64; 2], b: [f64; 2]| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    let mut lower: Vec<[f64; 2]> = Vec::new();
+    for &p in &pts {
+        while lower.len() >= 2 && cross(lower[lower.len() - 2], lower[lower.len() - 1], p) <= 0.0 {
+            lower.pop();
+        }
+        lower.push(p);
+    }
+    let mut upper: Vec<[f64; 2]> = Vec::new();
+    for &p in pts.iter().rev() {
+        while upper.len() >= 2 && cross(upper[upper.len() - 2], upper[upper.len() - 1], p) <= 0.0 {
+            upper.pop();
+        }
+        upper.push(p);
+    }
+    lower.pop();
+    upper.pop();
+    lower.extend(upper);
+    lower
 }
 
 /// Lane dividers (dashed) plus solid carriageway edge lines. Drawn only when
@@ -213,13 +286,28 @@ mod tests {
                 NodeSpec::uncontrolled(4, 0.0, 100.0),
             ],
             links: vec![
-                LinkSpec { from_osm: 1, to_osm: 2, lanes: 1, speed_limit: 20.0, geometry: Vec::new(), layer: 0 },
-                LinkSpec { from_osm: 3, to_osm: 4, lanes: 1, speed_limit: 25.0, geometry: Vec::new(), layer: 1 },
+                LinkSpec { from_osm: 1, to_osm: 2, lanes: 1, speed_limit: 20.0, geometry: Vec::new(), layer: 0, name: String::new() },
+                LinkSpec { from_osm: 3, to_osm: 4, lanes: 1, speed_limit: 25.0, geometry: Vec::new(), layer: 1, name: String::new() },
             ],
         }
         .build();
         assert_eq!(road_mesh(&net).vertices.len(), 4, "only the surface link is at grade");
         assert_eq!(overpass_mesh(&net).vertices.len(), 4, "the bridge draws on top");
+    }
+
+    #[test]
+    fn junction_mesh_fills_the_box_covering_the_node() {
+        // A four-way's junction polygon should be a real filled area that contains
+        // the node centre, so the crossing is paved rather than a gap between arms.
+        let net = map::arterial_intersection();
+        let mesh = junction_mesh(&net);
+        assert!(!mesh.is_empty(), "a junction is filled");
+        assert!(mesh.vertices.iter().all(|v| v.offset == [0.0, 0.0]), "fill vertices are a real area, not min-width");
+        // The hull around the centre node spans both axes (it's a box, not a sliver).
+        let cxs: Vec<f32> = mesh.vertices.iter().map(|v| v.center[0]).collect();
+        let cys: Vec<f32> = mesh.vertices.iter().map(|v| v.center[1]).collect();
+        let span = |v: &[f32]| v.iter().cloned().fold(f32::MIN, f32::max) - v.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(span(&cxs) > LANE_WIDTH as f32 && span(&cys) > LANE_WIDTH as f32, "the box has width on both axes");
     }
 
     #[test]
@@ -244,7 +332,7 @@ mod tests {
         // not strips. A curved (multi-segment) link must produce in-range indices.
         let net = OsmMap {
             nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 200.0, 100.0)],
-            links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 2, speed_limit: 20.0, geometry: vec![[100.0, 0.0], [150.0, 50.0]], layer: 0 }],
+            links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 2, speed_limit: 20.0, geometry: vec![[100.0, 0.0], [150.0, 50.0]], layer: 0, name: String::new() }],
         }
         .build();
         let mesh = congestion_mesh(&net, &[999], None); // link 0 heavily congested

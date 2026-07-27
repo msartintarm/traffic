@@ -12,6 +12,8 @@ type Sim = {
   road_strips(): Float32Array;
   lane_dividers(): Float32Array;
   world_bounds(): Float32Array;
+  link_names(): string[];
+  link_polylines(): Float32Array;
   world_mesh_vertices(): Float32Array;
   world_mesh_indices(): Uint32Array;
   marking_mesh_vertices(): Float32Array;
@@ -169,7 +171,6 @@ export default function EngineCanvas() {
             const text = await res.text();
             loaded = mod.Simulation.from_map_json(text, 0xc0ffee);
             label = "OSM map";
-            roadsRef.current = buildLinks(text); // all links (index-aligned) for hover + click
           }
         } catch {
           loaded = null;
@@ -177,6 +178,9 @@ export default function EngineCanvas() {
         const sim: Sim = loaded ?? new mod.Simulation(0xc0ffee);
         simRef.current = sim;
         setMapLabel(label);
+        // Hover/click hit-test against the engine's own links (post collapse/merge),
+        // index-aligned with link ids, so selection can't deviate from the engine.
+        roadsRef.current = linksFromSim(sim);
 
         sim.set_viewport(canvas.width, canvas.height);
         sim.fit();
@@ -330,16 +334,22 @@ export default function EngineCanvas() {
 
 // ---- road-name hover --------------------------------------------------------
 
-/** All links as polylines (world coords), index-aligned with the engine's links,
- * so a click maps to a link index. `name` may be empty. */
-function buildLinks(mapJson: string): { name: string; pts: number[][] }[] {
-  const m = JSON.parse(mapJson);
-  const node = new Map<number, number[]>(m.nodes.map((n: { osm_id: number; x: number; y: number }) => [n.osm_id, [n.x, n.y]]));
-  return m.links.map((l: { from_osm: number; to_osm: number; name?: string; geometry?: number[][] }) => {
-    const from = node.get(l.from_osm);
-    const to = node.get(l.to_osm);
-    return { name: l.name ?? "", pts: from && to ? [from, ...(l.geometry ?? []), to] : [] };
-  });
+/** The engine's own links as polylines (world coords), index-aligned with link
+ * ids, so a click maps to the exact link the engine selects. Built from the
+ * engine's post-transform geometry — never the raw import — so they can't drift.
+ * `link_polylines` is a self-describing flat buffer: per link `[n, x0,y0,…]`. */
+function linksFromSim(sim: Sim): { name: string; pts: number[][] }[] {
+  const names = sim.link_names();
+  const flat = sim.link_polylines();
+  const out: { name: string; pts: number[][] }[] = [];
+  let i = 0;
+  for (let link = 0; link < names.length; link++) {
+    const n = flat[i++];
+    const pts: number[][] = [];
+    for (let k = 0; k < n; k++) pts.push([flat[i++], flat[i++]]);
+    out.push({ name: names[link], pts });
+  }
+  return out;
 }
 
 /** Nearest link index to a world point within `maxD` metres, or -1. */
