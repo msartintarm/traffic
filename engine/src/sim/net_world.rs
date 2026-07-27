@@ -681,6 +681,7 @@ impl NetWorld {
         self.exited += exited;
         self.remove_crashes();
         self.remove_conflict_crashes();
+        self.remove_overlap_crashes();
         self.time += dt;
         self.tick += 1;
     }
@@ -894,6 +895,47 @@ impl NetWorld {
                 }
                 for &(j, sb) in b {
                     if (sb - cp.sb).abs() < CROSS_TOL {
+                        crashed[i] = true;
+                        crashed[j] = true;
+                    }
+                }
+            }
+        }
+        self.take_crashed(crashed);
+    }
+
+    /// General in-box collision detection: any two vehicles traversing the *same
+    /// node* on *different* movements whose actual bodies overlap have collided —
+    /// a real-time check on true positions, catching overlaps the precomputed
+    /// conflict points miss (e.g. where merged geometry runs two paths together).
+    /// Pruned to co-node crossers (collision-imminent only), so cost is the sum
+    /// over nodes of k² with k = that node's handful of simultaneous crossers.
+    fn remove_overlap_crashes(&mut self) {
+        // Centre distance below which two ~2 m-wide bodies genuinely overlap
+        // (not a legitimate close pass); with vehicle length this is conservative.
+        const OVERLAP: f64 = 2.4;
+        // (index, world position, from-link, to-link)
+        let mut by_node: HashMap<u32, Vec<(usize, [f64; 2], u32, u32)>> = HashMap::new();
+        for (i, v) in self.vehicles.iter().enumerate() {
+            if let Some(c) = v.crossing {
+                let mv = self.network.movement(c.movement);
+                let p = self.vehicle_world_pose(v);
+                let (from_link, to_link) = (self.network.lane(mv.from_lane).link.0, self.network.lane(mv.to_lane).link.0);
+                by_node.entry(mv.node.0).or_default().push((i, [p[0], p[1]], from_link, to_link));
+            }
+        }
+        let mut crashed = vec![false; self.vehicles.len()];
+        for group in by_node.values() {
+            for a in 0..group.len() {
+                for b in a + 1..group.len() {
+                    let ((i, pi, fi, ti), (j, pj, fj, tj)) = (group[a], group[b]);
+                    // Mirror the conflict builder: same approach fans out and same
+                    // exit merges — both run parallel/zipper, not a crossing. Only a
+                    // genuine cross-approach, cross-exit body overlap is a collision.
+                    if fi == fj || ti == tj {
+                        continue;
+                    }
+                    if (pi[0] - pj[0]).hypot(pi[1] - pj[1]) < OVERLAP {
                         crashed[i] = true;
                         crashed[j] = true;
                     }

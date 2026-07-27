@@ -50,6 +50,9 @@ wgpu = { version = "26", default-features = false, features = ["webgpu", "webgl"
 # WGSL typo fails CI instead of silently producing a blank GPU pass in a browser
 # (the discipline ../plant uses for scene.wgsl).
 naga = { version = "26", features = ["wgsl-in"] }
+# Golden-image visual regression: encode/decode PNGs of the software-rasterised
+# world so intersection rendering is regression-tested browser-free.
+png = "0.17"
 
 [profile.release]
 opt-level = 3

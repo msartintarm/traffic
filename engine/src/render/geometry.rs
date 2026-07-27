@@ -3,7 +3,7 @@
 //! [`StaticMesh`] (`center + offset` vertices) so the shader can hold every
 //! road/line to a minimum on-screen width at any zoom.
 
-use crate::sim::network::{LaneId, LinkId, MovementId, Network, NodeId, TurnType, LANE_WIDTH};
+use crate::sim::network::{LaneId, LinkId, MovementId, Network, NodeControl, NodeId, TurnType, LANE_WIDTH};
 
 use super::{mass, StaticMesh};
 
@@ -69,17 +69,19 @@ fn road_ribbons(net: &Network, layer_min: i32, layer_max: i32) -> StaticMesh {
     mesh
 }
 
-/// Filled junction polygons: for every node where roads meet, the convex hull of
-/// the incident carriageways' end corners, paved in road colour. Narrow ribbons
-/// radiating from a node leave dark gaps between the arms at anything larger than
-/// a tight crossing (and at merged junctions); this fills the whole box so the
-/// intersection reads as one paved area and vehicles crossing it aren't drawn over
-/// bare background.
+/// Filled junction pavement. A real intersection is a *solid* paved surface
+/// spanning where the approaches meet, so for every node we fan-fill the region
+/// bounded by its incident carriageways' edge corners as seen from the node —
+/// including the node itself as a corner — giving gap-free pavement that reaches
+/// each approach mouth. Done per node (not a global hull) so it stays bounded to
+/// that junction's own arms. `road_mesh` already paves the approaches; this fills
+/// the box and the re-entrant corners between them.
 pub fn junction_mesh(net: &Network) -> StaticMesh {
     let mut mesh = StaticMesh::default();
     for n in 0..net.nodes.len() as u32 {
         let node = NodeId(n);
-        let mut pts: Vec<[f64; 2]> = Vec::new();
+        let node_pos = net.node(node).position;
+        let mut corners: Vec<[f64; 2]> = vec![node_pos];
         for link in 0..net.links.len() as u32 {
             let l = net.link(LinkId(link));
             if l.layer != 0 {
@@ -99,23 +101,60 @@ pub fn junction_mesh(net: &Network) -> StaticMesh {
             let (dx, dy) = (seg_b[0] - seg_a[0], seg_b[1] - seg_a[1]);
             let len = dx.hypot(dy).max(1e-9);
             let perp = [dy / len * half, -dx / len * half];
-            pts.push([center[0] + perp[0], center[1] + perp[1]]);
-            pts.push([center[0] - perp[0], center[1] - perp[1]]);
+            corners.push([center[0] + perp[0], center[1] + perp[1]]);
+            corners.push([center[0] - perp[0], center[1] - perp[1]]);
         }
-        let hull = convex_hull(pts);
+        let hull = convex_hull(corners);
         if hull.len() >= 3 {
-            mesh.push_polygon(&hull, ROAD_COLOR);
+            mesh.push_polygon(&round_corners(&hull, CURB_RADIUS), ROAD_COLOR);
         }
     }
     mesh
 }
 
-/// Andrew's monotone chain convex hull (counter-clockwise). Few points per node,
-/// so the O(n log n) sort is negligible.
-fn convex_hull(mut pts: Vec<[f64; 2]>) -> Vec<[f64; 2]> {
-    if pts.len() < 3 {
-        return pts;
+/// Curb-return radius (m): California curb returns run ~5–10 m; 5 keeps corners
+/// crisp without eating into small junctions.
+const CURB_RADIUS: f64 = 5.0;
+
+/// Round each convex-polygon corner with a quadratic fillet, so the junction
+/// pavement reads with curb returns instead of sharp points. The fillet radius is
+/// clamped to a fraction of the adjacent edges so short edges don't over-round.
+fn round_corners(poly: &[[f64; 2]], radius: f64) -> Vec<[f64; 2]> {
+    let n = poly.len();
+    if n < 3 {
+        return poly.to_vec();
     }
+    let mut out = Vec::with_capacity(n * 4);
+    for i in 0..n {
+        let (p, v, q) = (poly[(i + n - 1) % n], poly[i], poly[(i + 1) % n]);
+        let (in_len, out_len) = (norm(sub(v, p)), norm(sub(q, v)));
+        let r = radius.min(in_len * 0.4).min(out_len * 0.4);
+        let din = norm2(sub(v, p));
+        let dout = norm2(sub(q, v));
+        let t1 = [v[0] - din[0] * r, v[1] - din[1] * r];
+        let t2 = [v[0] + dout[0] * r, v[1] + dout[1] * r];
+        for s in 0..=3 {
+            out.push(bezier(t1, v, t2, s as f64 / 3.0));
+        }
+    }
+    out
+}
+
+fn sub(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
+    [a[0] - b[0], a[1] - b[1]]
+}
+
+fn norm(v: [f64; 2]) -> f64 {
+    v[0].hypot(v[1])
+}
+
+fn norm2(v: [f64; 2]) -> [f64; 2] {
+    let n = v[0].hypot(v[1]).max(1e-9);
+    [v[0] / n, v[1] / n]
+}
+
+/// Andrew's monotone chain convex hull (counter-clockwise); few points per node.
+fn convex_hull(mut pts: Vec<[f64; 2]>) -> Vec<[f64; 2]> {
     pts.sort_by(|p, q| p[0].total_cmp(&q[0]).then(p[1].total_cmp(&q[1])));
     pts.dedup_by(|p, q| (p[0] - q[0]).abs() < 1e-9 && (p[1] - q[1]).abs() < 1e-9);
     if pts.len() < 3 {
@@ -163,34 +202,88 @@ pub fn marking_mesh(net: &Network) -> StaticMesh {
     }
     // A left-turn arrow painted on any lane that carries a protected (signalized)
     // left, near its stop line — the on-road cue a real turn lane shows.
-    for lane_id in 0..net.lanes.len() as u32 {
-        let lane = LaneId(lane_id);
-        let has_protected_left = net.movements_of(lane).iter().enumerate().any(|(k, m)| {
-            let mid = MovementId(net.lane(lane).movement_start.0 + k as u32);
-            m.signal_group.is_some() && net.movement_turn(mid) == TurnType::Left
-        });
-        if has_protected_left {
-            let len = net.lane(lane).length;
-            let p = net.lane_point(lane, (len - 8.0).max(len * 0.5));
-            left_turn_arrow(&mut mesh, [p[0], p[1]], p[2]);
-        }
-    }
+    lane_use_arrows(net, &mut mesh);
+    crosswalks(net, &mut mesh);
     mesh
 }
 
 pub const ARROW_COLOR: [f32; 3] = [0.88, 0.88, 0.82];
+pub const CROSSWALK_COLOR: [f32; 3] = [0.82, 0.82, 0.78];
 
-/// Paint a left-turn arrow (forward shaft that bends left into an arrowhead)
-/// centred at `p`, aligned to lane heading `h`.
-fn left_turn_arrow(mesh: &mut StaticMesh, p: [f64; 2], h: f64) {
+/// California lane-use pavement arrows: on each signalized-approach lane, paint an
+/// arrow for every turn its movements allow (left / through / right), so the
+/// permitted turns per lane read the way they do on a real approach.
+fn lane_use_arrows(net: &Network, mesh: &mut StaticMesh) {
+    for lane_id in 0..net.lanes.len() as u32 {
+        let lane = LaneId(lane_id);
+        let node = net.link(net.lane(lane).link).to;
+        if !matches!(net.node(node).control, NodeControl::Signalized(_)) {
+            continue;
+        }
+        let start = net.lane(lane).movement_start.0;
+        let mut turns: Vec<TurnType> = (0..net.lane(lane).movement_count)
+            .map(|k| net.movement_turn(MovementId(start + k)))
+            .collect();
+        turns.dedup();
+        if turns.is_empty() {
+            continue;
+        }
+        let len = net.lane(lane).length;
+        let p = net.lane_point(lane, (len - 8.0).max(len * 0.5));
+        for turn in turns {
+            lane_arrow(mesh, [p[0], p[1]], p[2], turn);
+        }
+    }
+}
+
+/// Paint a lane-use arrow for `turn`, centred at `p`, aligned to lane heading `h`.
+fn lane_arrow(mesh: &mut StaticMesh, p: [f64; 2], h: f64, turn: TurnType) {
     let fwd = [h.cos(), h.sin()];
-    let left = [-fwd[1], fwd[0]];
+    let side = match turn {
+        TurnType::Left => 1.0,
+        TurnType::Right => -1.0,
+        TurnType::Through => 0.0,
+    };
+    let left = [-fwd[1] * side, fwd[0] * side];
     let at = |fx: f64, fy: f64| [p[0] + fwd[0] * fx + left[0] * fy, p[1] + fwd[1] * fx + left[1] * fy];
     let bar = |mesh: &mut StaticMesh, a: [f64; 2], b: [f64; 2]| mesh.push_ribbon(a, b, 0.18, ARROW_COLOR, 0.0);
-    bar(mesh, at(-2.5, 0.0), at(1.0, 0.0)); // shaft
-    bar(mesh, at(1.0, 0.0), at(1.0, 1.5)); // bend to the left
-    bar(mesh, at(1.0, 1.5), at(0.45, 1.0)); // arrowhead barbs
-    bar(mesh, at(1.0, 1.5), at(1.55, 1.0));
+    if turn == TurnType::Through {
+        bar(mesh, at(-2.5, 0.0), at(1.6, 0.0)); // shaft
+        bar(mesh, at(1.6, 0.0), at(0.9, 0.55)); // arrowhead
+        bar(mesh, at(1.6, 0.0), at(0.9, -0.55));
+    } else {
+        bar(mesh, at(-2.5, 0.0), at(1.0, 0.0)); // shaft
+        bar(mesh, at(1.0, 0.0), at(1.0, 1.5)); // bend toward the turn
+        bar(mesh, at(1.0, 1.5), at(0.45, 1.0)); // arrowhead barbs
+        bar(mesh, at(1.0, 1.5), at(1.55, 1.0));
+    }
+}
+
+/// California-style continental crosswalks across every approach to a signalized
+/// junction: bars parallel to travel, filling the stop-line-to-box margin. (The
+/// convention is isolated here so other regions' markings can slot in later.)
+fn crosswalks(net: &Network, mesh: &mut StaticMesh) {
+    const DEPTH: f64 = 2.4; // crosswalk depth (m), ~ the stop-bar/box margin
+    for n in 0..net.nodes.len() as u32 {
+        if !matches!(net.node(NodeId(n)).control, NodeControl::Signalized(_)) {
+            continue;
+        }
+        for link in 0..net.links.len() as u32 {
+            if net.link(LinkId(link)).to != NodeId(n) {
+                continue;
+            }
+            for lane in net.lanes_of(LinkId(link)) {
+                let p = net.lane_point(lane, net.lane(lane).length); // stop-line point
+                let (d, perp) = ([p[2].cos(), p[2].sin()], [p[2].sin(), -p[2].cos()]);
+                for k in [-1.0, 1.0] {
+                    let off = k * LANE_WIDTH * 0.28;
+                    let a = [p[0] + perp[0] * off, p[1] + perp[1] * off];
+                    let b = [a[0] + d[0] * DEPTH, a[1] + d[1] * DEPTH];
+                    mesh.push_ribbon(a, b, 0.28, CROSSWALK_COLOR, 0.0);
+                }
+            }
+        }
+    }
 }
 
 /// Translucent congestion overlay: shade every polyline segment of a link busy
@@ -324,6 +417,23 @@ mod tests {
     #[test]
     fn markings_are_produced_for_a_multi_lane_road() {
         assert!(!marking_mesh(&map::corridor_with_signal()).is_empty());
+    }
+
+    #[test]
+    fn signalized_approaches_get_crosswalks() {
+        let signal = marking_mesh(&map::arterial_intersection()).vertices.iter().filter(|v| v.color == CROSSWALK_COLOR).count();
+        assert!(signal > 0, "a signalized junction paints crosswalks");
+        // The unsignalized bridge map has no signal, so no crosswalks.
+        let none = marking_mesh(&OsmMap {
+            nodes: vec![NodeSpec::uncontrolled(1, -100.0, 0.0), NodeSpec::uncontrolled(2, 100.0, 0.0)],
+            links: vec![LinkSpec::oneway(1, 2, 1, 20.0)],
+        }
+        .build())
+        .vertices
+        .iter()
+        .filter(|v| v.color == CROSSWALK_COLOR)
+        .count();
+        assert_eq!(none, 0, "an uncontrolled road has no crosswalks");
     }
 
     #[test]

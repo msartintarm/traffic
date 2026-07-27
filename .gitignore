@@ -6,3 +6,5 @@ web/public/wasm-pkg/
 web/*.tsbuildinfo
 __pycache__/
 *.pyc
+# Golden-image regression writes this only on a mismatch, for inspection.
+*.actual.png

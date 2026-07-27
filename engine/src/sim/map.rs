@@ -109,6 +109,10 @@ impl OsmMap {
     /// then forms a single box with one coordinated signal instead of two.
     pub fn merge_split_intersections(&self) -> OsmMap {
         const STUB_MAX: f64 = 25.0;
+        // A link this short is junction interior (a turn slot, median crossing or
+        // lane-change fragment), so merge it into the junction whatever its
+        // endpoints' degree or lane count — otherwise it renders as a stray nub.
+        const INTERIOR_MAX: f64 = 12.0;
         let pos: HashMap<i64, [f64; 2]> = self.nodes.iter().map(|n| (n.osm_id, [n.x, n.y])).collect();
         let mut neigh: HashMap<i64, BTreeSet<i64>> = HashMap::new();
         for l in &self.links {
@@ -119,10 +123,9 @@ impl OsmMap {
 
         let mut parent: HashMap<i64, i64> = self.nodes.iter().map(|n| (n.osm_id, n.osm_id)).collect();
         for l in &self.links {
-            if distance(pos[&l.from_osm], pos[&l.to_osm]) < STUB_MAX
-                && degree(l.from_osm) >= 3
-                && degree(l.to_osm) >= 3
-            {
+            let d = distance(pos[&l.from_osm], pos[&l.to_osm]);
+            let junctions = degree(l.from_osm) >= 3 && degree(l.to_osm) >= 3;
+            if d < INTERIOR_MAX || (d < STUB_MAX && junctions) {
                 let (ra, rb) = (uf_find(&mut parent, l.from_osm), uf_find(&mut parent, l.to_osm));
                 if ra != rb {
                     parent.insert(ra, rb);

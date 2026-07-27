@@ -10,6 +10,7 @@ pub mod ascii;
 pub mod camera;
 pub mod geometry;
 pub mod mass;
+pub mod raster;
 pub mod scene;
 
 #[cfg(target_arch = "wasm32")]
