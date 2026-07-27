@@ -42,6 +42,7 @@ type Sim = {
   set_speed(s: number): void;
   set_demand_mode(mode: string): void;
   demand_mode(): string;
+  enable_gpu_routing(renderer: Renderer): void;
 };
 
 type Renderer = {
@@ -79,6 +80,7 @@ export default function EngineCanvas() {
   const [mapLabel, setMapLabel] = useState("");
   const [scenario, setScenario] = useState("millbrae");
   const [mode, setMode] = useState("balanced");
+  const [showSettings, setShowSettings] = useState(false);
 
   useEffect(() => {
     setScenario(new URLSearchParams(window.location.search).get("scenario") ?? "millbrae");
@@ -209,7 +211,18 @@ export default function EngineCanvas() {
             sim.marking_mesh_vertices(),
             sim.marking_mesh_indices(),
           );
-          setBackend("WebGPU / WebGL2");
+          // Opt-in: run route recomputes on the renderer's WebGPU device (`?gpu=1`).
+          // Off by default — the CPU amortized path is the verified-smooth default.
+          if (new URLSearchParams(window.location.search).get("gpu") === "1") {
+            try {
+              sim.enable_gpu_routing(renderer!);
+              setBackend("WebGPU / WebGL2 · GPU routing");
+            } catch {
+              setBackend("WebGPU / WebGL2");
+            }
+          } else {
+            setBackend("WebGPU / WebGL2");
+          }
         } catch {
           renderer = null;
           sceneRef.current = buildScene(sim);
@@ -300,58 +313,70 @@ export default function EngineCanvas() {
         <button className={styles.button} onClick={toggle} disabled={!ready}>
           {playing ? "Pause" : "Play"}
         </button>
-        {[1, 2, 8].map((s) => (
+        {[1, 2, 8, 16, 32].map((s) => (
           <button key={s} className={styles.button} disabled={!ready} onClick={() => simRef.current?.set_speed(s)}>
             {s}×
           </button>
         ))}
-        <label className={styles.zoomLabel}>
-          Zoom
-          <input
-            ref={sliderRef}
-            className={styles.slider}
-            type="range"
-            min={0}
-            max={1000}
-            defaultValue={0}
-            disabled={!ready}
-            onInput={() => {
-              const sim = simRef.current;
-              const slider = sliderRef.current;
-              if (!sim || !slider) return;
-              sim.set_meters_per_pixel(fitMppRef.current * Math.pow(1 / ZOOM_RANGE, Number(slider.value) / 1000));
-            }}
-          />
-        </label>
-        <button className={styles.button} disabled={!ready} onClick={() => simRef.current?.fit()}>
-          Fit
+        <button
+          className={styles.button}
+          onClick={() => setShowSettings((v) => !v)}
+          aria-expanded={showSettings}
+          title="Show or hide settings"
+        >
+          {showSettings ? "Settings ▾" : "Settings ▸"}
         </button>
-        <select
-          className={styles.button}
-          value={scenario}
-          onChange={(e) => {
-            const url = new URL(window.location.href);
-            url.searchParams.set("scenario", e.target.value);
-            window.location.href = url.toString();
-          }}
-        >
-          <option value="millbrae">Millbrae (real map)</option>
-          <option value="arterial">Test: arterial junction</option>
-          <option value="corridor">Test: signal corridor</option>
-        </select>
-        <select
-          className={styles.button}
-          value={mode}
-          disabled={!ready}
-          title="Where traffic originates"
-          onChange={(e) => {
-            simRef.current?.set_demand_mode(e.target.value);
-            setMode(e.target.value);
-          }}
-        >
-          <option value="balanced">Traffic: balanced</option>
-          <option value="highway">Traffic: from highways</option>
-        </select>
+        {showSettings && (
+          <>
+            <label className={styles.zoomLabel}>
+              Zoom
+              <input
+                ref={sliderRef}
+                className={styles.slider}
+                type="range"
+                min={0}
+                max={1000}
+                defaultValue={0}
+                disabled={!ready}
+                onInput={() => {
+                  const sim = simRef.current;
+                  const slider = sliderRef.current;
+                  if (!sim || !slider) return;
+                  sim.set_meters_per_pixel(fitMppRef.current * Math.pow(1 / ZOOM_RANGE, Number(slider.value) / 1000));
+                }}
+              />
+            </label>
+            <button className={styles.button} disabled={!ready} onClick={() => simRef.current?.fit()}>
+              Fit
+            </button>
+            <select
+              className={styles.button}
+              value={scenario}
+              onChange={(e) => {
+                const url = new URL(window.location.href);
+                url.searchParams.set("scenario", e.target.value);
+                window.location.href = url.toString();
+              }}
+            >
+              <option value="millbrae">Millbrae (real map)</option>
+              <option value="arterial">Test: arterial junction</option>
+              <option value="corridor">Test: signal corridor</option>
+            </select>
+            <select
+              className={styles.button}
+              value={mode}
+              disabled={!ready}
+              title="Where traffic originates"
+              onChange={(e) => {
+                simRef.current?.set_demand_mode(e.target.value);
+                setMode(e.target.value);
+              }}
+            >
+              <option value="balanced">Traffic: balanced</option>
+              <option value="highway">Traffic: from highways</option>
+            </select>
+          </>
+        )}
       </div>
 
       <div className={styles.status}>

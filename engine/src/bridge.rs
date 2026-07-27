@@ -5,13 +5,21 @@
 //! tested natively; this layer is only marshalling.
 
 use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
+
+use crate::sim::net_world::FxHasher;
+/// Pose map keyed by (sparse) vehicle id, hashed cheaply for the per-frame rebuild.
+type PoseMap = HashMap<u32, [f32; 4], BuildHasherDefault<FxHasher>>;
 
 use wasm_bindgen::prelude::*;
 
 use crate::render::camera::Camera;
 use crate::render::scene::{brake_intensity, class_color, class_dims, signal_color, signal_head_instances};
+use crate::render::gpu::Renderer;
 use crate::render::{geometry, Instance, StaticMesh};
 use crate::sim::clock::SimClock;
+use crate::sim::flowfield;
+use crate::sim::flowfield_gpu::{GpuFlowField, PendingReadback};
 use crate::sim::config::{SimConfig, VehicleClass};
 use crate::sim::demand::{self, DemandGenerator, DemandMode};
 use crate::sim::map;
@@ -29,9 +37,15 @@ pub struct Simulation {
     /// `[x, y, heading, speed]` of each vehicle one tick ago, keyed by id, so the
     /// render interpolates pose between committed states (smooth at 60fps) and
     /// derives brake lights from the speed delta.
-    prev: HashMap<u32, [f32; 4]>,
+    prev: PoseMap,
     /// The link the user has selected (clicked), highlighted in the density pass.
     selected: Option<usize>,
+    /// Optional GPU flow-field solver on the renderer's WebGPU device, plus the
+    /// in-flight async readback and the cost snapshot it was dispatched with.
+    gpu: Option<GpuFlowField>,
+    gpu_pending: Option<PendingReadback>,
+    gpu_cost: Vec<u64>,
+    gpu_last: f64,
 }
 
 #[wasm_bindgen]
@@ -72,8 +86,23 @@ impl Simulation {
         clock.play();
         Simulation {
             world, clock, seed: cfg.seed, demand, demand_mode, camera,
-            prev: HashMap::new(), selected: None,
+            prev: PoseMap::default(), selected: None,
+            gpu: None, gpu_pending: None, gpu_cost: Vec::new(), gpu_last: 0.0,
         }
+    }
+
+    /// Move route recomputes onto the browser's WebGPU device — the *same* device
+    /// the `renderer` already owns (no second adapter, no headers). Call once after
+    /// the renderer is created. Routing then rebuilds on the GPU; if a result isn't
+    /// ready yet the previous field is used (never a stall). Idempotent.
+    pub fn enable_gpu_routing(&mut self, renderer: &Renderer) {
+        let adj = flowfield::adjacency(&self.world.network);
+        let (offsets, targets) = flowfield::csr(&adj);
+        let (device, queue) = renderer.device_queue();
+        self.gpu = Some(GpuFlowField::from_device(device, queue, &offsets, &targets));
+        self.gpu_pending = None;
+        self.world.set_external_reroute(true);
+        self.gpu_last = f64::NEG_INFINITY; // recompute on the next frame
     }
 
     /// Switch the traffic mode ("balanced" or "highway") and reset the streams:
@@ -156,16 +185,24 @@ impl Simulation {
     pub fn single_step(&mut self) {
         let dt = self.clock.dt();
         self.clock.single_step();
+        self.drive_gpu_routing();
         self.demand.step(&mut self.world, dt);
         self.world.step();
         self.prev = self.snapshot(); // discrete step: show the new state directly
     }
 
     pub fn advance(&mut self, real_elapsed_secs: f64) -> u32 {
+        self.drive_gpu_routing();
         let ticks = self.clock.advance(real_elapsed_secs, 240);
         let dt = self.clock.dt();
-        for _ in 0..ticks {
-            self.prev = self.snapshot(); // state before this tick
+        for t in 0..ticks {
+            // The render interpolates between `prev` and the post-step state, so
+            // only the snapshot taken right before the *final* tick is ever used.
+            // Skipping it on the intermediate catch-up ticks avoids rebuilding the
+            // full pose map (over every vehicle) several times per frame.
+            if t + 1 == ticks {
+                self.prev = self.snapshot();
+            }
             self.demand.step(&mut self.world, dt); // stream routed vehicles in
             self.world.step();
         }
@@ -409,7 +446,7 @@ impl Simulation {
             .collect()
     }
 
-    fn snapshot(&self) -> HashMap<u32, [f32; 4]> {
+    fn snapshot(&self) -> PoseMap {
         self.world
             .vehicles()
             .iter()
@@ -443,6 +480,47 @@ impl Simulation {
 /// Origin–destination demand for the selected mode: the boundary mix, or (in
 /// highway mode) traffic anchored on the US-101 / I-280 gateways. Vehicles are
 /// then routed live by the world's flow field.
+/// How often (sim seconds) to kick off a GPU flow-field rebuild — matches the CPU
+/// path's reroute cadence.
+const GPU_REROUTE_SECS: f64 = 3.0;
+
+impl Simulation {
+    /// Pump the async GPU routing recompute once per frame: collect a finished
+    /// readback into the router, else (when idle and due) dispatch a fresh one.
+    /// Non-blocking — the browser can't wait on the GPU, so a rebuild spans frames.
+    fn drive_gpu_routing(&mut self) {
+        if self.gpu.is_none() {
+            return;
+        }
+        // Collect an in-flight readback, if the GPU has finished it.
+        if let Some(pending) = self.gpu_pending.take() {
+            match self.gpu.as_ref().unwrap().try_take(&pending) {
+                Some(fields) => {
+                    let dist: Vec<Vec<u64>> = fields
+                        .into_iter()
+                        .map(|f| f.into_iter().map(|d| if d == u32::MAX { flowfield::UNREACHABLE } else { d as u64 }).collect())
+                        .collect();
+                    self.world.feed_router_distances(&self.gpu_cost, &dist);
+                    self.gpu_last = self.world.time();
+                }
+                None => self.gpu_pending = Some(pending), // still mapping
+            }
+            return; // one GPU action per frame
+        }
+        // Idle: dispatch a rebuild when the field is due for a refresh.
+        if self.world.time() - self.gpu_last < GPU_REROUTE_SECS {
+            return;
+        }
+        let dests: Vec<u32> = self.world.router_dest_links().iter().map(|d| d.0).collect();
+        if dests.is_empty() {
+            return;
+        }
+        self.gpu_cost = self.world.live_link_costs();
+        let cost32: Vec<u32> = self.gpu_cost.iter().map(|&c| c.min(u32::MAX as u64) as u32).collect();
+        self.gpu_pending = Some(self.gpu.as_mut().unwrap().begin_readback(&cost32, &dests));
+    }
+}
+
 fn build_demand(world: &NetWorld, seed: u64, mode: DemandMode) -> DemandGenerator {
     let pairs = demand::od_pairs(&world.network, seed, 48, mode);
     DemandGenerator::new(world, &pairs, seed)

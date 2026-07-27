@@ -23,6 +23,8 @@ pub struct FieldRouter {
     slot: HashMap<u32, usize>,
     /// `next_hop[slot][from_link]` toward `dests[slot]` (`None` = unreachable).
     next_hop: Vec<Vec<Option<LinkId>>>,
+    /// Next slot for [`recompute_incremental`] to refresh — spreads the rebuild.
+    cursor: usize,
 }
 
 impl FieldRouter {
@@ -39,9 +41,31 @@ impl FieldRouter {
             });
         }
         let next_hop = vec![Vec::new(); unique.len()];
-        let mut router = Self { adj, dests: unique, slot, next_hop };
+        let mut router = Self { adj, dests: unique, slot, next_hop, cursor: 0 };
         router.recompute(cost);
         router
+    }
+
+    /// Number of distinct destination fields maintained.
+    pub fn destination_count(&self) -> usize {
+        self.dests.len()
+    }
+
+    /// Refresh only `count` destination fields this call, cycling through them, so
+    /// the full rebuild is spread across many ticks instead of a single spike (a
+    /// ~half-second freeze at city scale). Over `dests.len()/count` calls every
+    /// field is refreshed against the latest `cost`.
+    pub fn recompute_incremental(&mut self, cost: &[u64], count: usize) {
+        let total = self.dests.len();
+        if total == 0 {
+            return;
+        }
+        for _ in 0..count.min(total) {
+            let s = self.cursor % total;
+            let dist = flowfield::distances_to(&self.adj, self.dests[s], cost);
+            self.next_hop[s] = flowfield::next_hops(&self.adj, &dist, cost);
+            self.cursor = (self.cursor + 1) % total;
+        }
     }
 
     /// The destinations this router routes to.

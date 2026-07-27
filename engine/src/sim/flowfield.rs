@@ -43,11 +43,12 @@ pub fn distances_to(adj: &[Vec<u32>], dest: LinkId, cost: &[u64]) -> Vec<u64> {
     let n = adj.len();
     let mut dist = vec![UNREACHABLE; n];
     dist[dest.idx()] = 0;
+    let mut next = dist.clone();
     for _ in 0..=n {
         let mut changed = false;
-        let mut next = dist.clone();
         for (a, outs) in adj.iter().enumerate() {
             if a == dest.idx() {
+                next[a] = 0;
                 continue;
             }
             let mut best = UNREACHABLE;
@@ -57,12 +58,12 @@ pub fn distances_to(adj: &[Vec<u32>], dest: LinkId, cost: &[u64]) -> Vec<u64> {
                     best = best.min(cost[b as usize].saturating_add(db));
                 }
             }
-            if best < next[a] {
-                next[a] = best;
+            next[a] = best.min(dist[a]);
+            if best < dist[a] {
                 changed = true;
             }
         }
-        dist = next;
+        std::mem::swap(&mut dist, &mut next);
         if !changed {
             break;
         }

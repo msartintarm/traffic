@@ -368,6 +368,15 @@ impl Renderer {
     }
 }
 
+// Not `#[wasm_bindgen]`: a Rust-only accessor so the sim can build a GPU compute
+// context on the *same* WebGPU device the renderer already owns (device/queue are
+// cheap Arc handles), sharing one context between rendering and flow-field compute.
+impl Renderer {
+    pub(crate) fn device_queue(&self) -> (wgpu::Device, wgpu::Queue) {
+        (self.device.clone(), self.queue.clone())
+    }
+}
+
 fn buffer_init(device: &wgpu::Device, label: &str, contents: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
     use wgpu::util::DeviceExt;
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents, usage })

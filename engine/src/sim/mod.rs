@@ -8,7 +8,10 @@ pub mod config;
 pub mod constraint;
 pub mod demand;
 pub mod flowfield;
-#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+// Compiled whenever a wgpu device is available: natively under the `gpu` feature
+// (Vulkan/GL), and always in the browser (WebGPU) so routing can run on the
+// renderer's device. Device-creating helpers inside are further gated to native.
+#[cfg(any(feature = "gpu", target_arch = "wasm32"))]
 pub mod flowfield_gpu;
 pub mod idm;
 pub mod junction;

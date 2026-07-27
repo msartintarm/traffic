@@ -17,6 +17,7 @@ struct Params {
 
 /// Reverse shortest-path distances (ms, `u32::MAX` = unreachable) from every
 /// link to `dest`, computed on the GPU. `None` if no adapter is available.
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 pub fn distances_to_gpu(offsets: &[u32], targets: &[u32], cost: &[u32], dest: u32) -> Option<Vec<u32>> {
     let n = cost.len();
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -135,10 +136,11 @@ struct BatchParams {
 }
 
 /// A persistent GPU solver for many flow fields at once. Holds the device,
-/// pipeline and the *static* graph buffers (CSR adjacency) so repeated live
-/// recomputes only re-upload the changing costs and dispatch — the reuse that
-/// makes per-frame rerouting on a large graph affordable. One dispatch relaxes
-/// every destination field in parallel (`slot_count × link_count` invocations).
+/// pipeline and the *static* graph buffers (CSR adjacency), plus the per-recompute
+/// working buffers (sized to the destination count and reused via `write_buffer`),
+/// so a live recompute only re-uploads the changing costs and dispatches — the
+/// reuse that makes per-frame rerouting on a large graph affordable. One dispatch
+/// relaxes every destination field in parallel (`slot_count × link_count`).
 pub struct GpuFlowField {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -147,13 +149,29 @@ pub struct GpuFlowField {
     offsets_buf: wgpu::Buffer,
     targets_buf: wgpu::Buffer,
     link_count: usize,
+    /// Working buffers, (re)allocated only when the destination count changes.
+    work: Option<Work>,
+}
+
+/// The per-recompute buffers, sized for `slot_count` destinations. Persisted so a
+/// recompute writes into them (`queue.write_buffer`) rather than allocating anew.
+struct Work {
+    slot_count: usize,
+    params: wgpu::Buffer,
+    cost_buf: wgpu::Buffer,
+    dests_buf: wgpu::Buffer,
+    buf_a: wgpu::Buffer,
+    buf_b: wgpu::Buffer,
+    staging: wgpu::Buffer,
+    bind: [wgpu::BindGroup; 2],
 }
 
 impl GpuFlowField {
-    /// Build a solver for a fixed graph (`offsets`/`targets` = CSR of the link
-    /// adjacency). `None` if no adapter is available.
+    /// Build a solver on a freshly-acquired native device (Vulkan/GL, software
+    /// adapters included). `None` if no adapter is available. The browser instead
+    /// injects its render device with [`from_device`](Self::from_device).
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
     pub fn new(offsets: &[u32], targets: &[u32]) -> Option<Self> {
-        let link_count = offsets.len().saturating_sub(1);
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
             ..Default::default()
@@ -167,9 +185,17 @@ impl GpuFlowField {
             trace: wgpu::Trace::Off,
         }))
         .ok()?;
+        Some(Self::from_device(device, queue, offsets, targets))
+    }
+
+    /// Build a solver on an existing device/queue — the browser shares the
+    /// renderer's WebGPU device this way, so compute and rendering run on one
+    /// context (no second adapter, no headers).
+    pub fn from_device(device: wgpu::Device, queue: wgpu::Queue, offsets: &[u32], targets: &[u32]) -> Self {
         use wgpu::util::DeviceExt;
+        let link_count = offsets.len().saturating_sub(1);
         let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
-        let offsets_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: cast_slice(offsets), usage: storage });
+        let offsets_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: cast_slice(if offsets.is_empty() { &[0u32] } else { offsets }), usage: storage });
         let targets_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: cast_slice(if targets.is_empty() { &[0u32] } else { targets }), usage: storage });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -201,37 +227,24 @@ impl GpuFlowField {
             compilation_options: Default::default(),
             cache: None,
         });
-        Some(Self { device, queue, pipeline, layout, offsets_buf, targets_buf, link_count })
+        Self { device, queue, pipeline, layout, offsets_buf, targets_buf, link_count, work: None }
     }
 
-    /// Reverse distances for every destination in `dests`, as one `Vec` per
-    /// destination (`u32::MAX` = unreachable). Reuses the device/pipeline/graph.
-    pub fn distances(&self, cost: &[u32], dests: &[u32]) -> Vec<Vec<u32>> {
-        use wgpu::util::DeviceExt;
-        let (l, k) = (self.link_count, dests.len());
-        let total = l * k;
-        if total == 0 {
-            return vec![Vec::new(); k];
+    /// (Re)allocate the working buffers when the destination count changes.
+    fn ensure_work(&mut self, slot_count: usize) {
+        if self.work.as_ref().is_some_and(|w| w.slot_count == slot_count) {
+            return;
         }
-        let init: Vec<u32> = (0..total)
-            .map(|g| if (g % l) as u32 == dests[g / l] { 0 } else { u32::MAX })
-            .collect();
+        let l = self.link_count;
+        let total = (l * slot_count).max(1);
         let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
-        let params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("batch-params"),
-            contents: bytemuck::bytes_of(&BatchParams { link_count: l as u32, slot_count: k as u32, _pad0: 0, _pad1: 0 }),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let cost_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: cast_slice(cost), usage: storage });
-        let dests_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: cast_slice(dests), usage: storage });
-        let buf_a = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: cast_slice(&init), usage: storage });
-        let buf_b = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: cast_slice(&init), usage: storage });
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("batch-staging"),
-            size: (total * 4) as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let buf = |size: usize, usage| self.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (size * 4).max(4) as u64, usage, mapped_at_creation: false });
+        let params = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("batch-params"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let cost_buf = buf(l.max(1), storage);
+        let dests_buf = buf(slot_count.max(1), storage);
+        let buf_a = buf(total, storage);
+        let buf_b = buf(total, storage);
+        let staging = buf(total, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
         let bind = |din: &wgpu::Buffer, dout: &wgpu::Buffer| {
             self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
@@ -247,26 +260,58 @@ impl GpuFlowField {
                 ],
             })
         };
-        let bind_groups = [bind(&buf_a, &buf_b), bind(&buf_b, &buf_a)];
+        let bind = [bind(&buf_a, &buf_b), bind(&buf_b, &buf_a)];
+        self.work = Some(Work { slot_count, params, cost_buf, dests_buf, buf_a, buf_b, staging, bind });
+    }
+
+    /// Encode and submit the relaxation for `cost`/`dests` into the working
+    /// buffers, returning the parity of the buffer holding the result. Shared by
+    /// the blocking and (future) async readback paths.
+    fn dispatch(&mut self, cost: &[u32], dests: &[u32]) -> usize {
+        let (l, k) = (self.link_count, dests.len());
+        self.ensure_work(k);
+        let w = self.work.as_ref().unwrap();
+        let total = l * k;
+        let init: Vec<u32> = (0..total).map(|g| if (g % l) as u32 == dests[g / l] { 0 } else { u32::MAX }).collect();
+        self.queue.write_buffer(&w.params, 0, bytemuck::bytes_of(&BatchParams { link_count: l as u32, slot_count: k as u32, _pad0: 0, _pad1: 0 }));
+        self.queue.write_buffer(&w.cost_buf, 0, cast_slice(cost));
+        self.queue.write_buffer(&w.dests_buf, 0, cast_slice(dests));
+        self.queue.write_buffer(&w.buf_a, 0, cast_slice(&init));
+        self.queue.write_buffer(&w.buf_b, 0, cast_slice(&init));
+
         let groups = (total as u32).div_ceil(64).max(1);
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         let mut parity = 0usize;
-        // Path length is at most `link_count` edges, so that many relaxations
-        // converge every field (a convergence check would cut this, later).
+        // At most `link_count` edge relaxations converge every field (a GPU-side
+        // convergence flag would cut this — a follow-up once the path is on real
+        // hardware).
         for _ in 0..l {
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
                 pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &bind_groups[parity], &[]);
+                pass.set_bind_group(0, &w.bind[parity], &[]);
                 pass.dispatch_workgroups(groups, 1, 1);
             }
             parity ^= 1;
         }
-        let latest = if parity == 0 { &buf_a } else { &buf_b };
-        encoder.copy_buffer_to_buffer(latest, 0, &staging, 0, (total * 4) as u64);
+        let latest = if parity == 0 { &w.buf_a } else { &w.buf_b };
+        encoder.copy_buffer_to_buffer(latest, 0, &w.staging, 0, (total * 4) as u64);
         self.queue.submit([encoder.finish()]);
+        parity
+    }
 
-        let slice = staging.slice(..);
+    /// Reverse distances for every destination in `dests`, one `Vec` per
+    /// destination (`u32::MAX` = unreachable). **Blocking** readback — native only
+    /// (the browser cannot block; it drives the async path instead).
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    pub fn distances(&mut self, cost: &[u32], dests: &[u32]) -> Vec<Vec<u32>> {
+        let (l, k) = (self.link_count, dests.len());
+        if l == 0 || k == 0 {
+            return vec![Vec::new(); k];
+        }
+        self.dispatch(cost, dests);
+        let staging = &self.work.as_ref().unwrap().staging;
+        let slice = staging.slice(..(l * k * 4) as u64);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         let _ = self.device.poll(wgpu::PollType::Wait);
         let all: Vec<u32> = cast_slice(&slice.get_mapped_range()).to_vec();
@@ -275,20 +320,58 @@ impl GpuFlowField {
     }
 }
 
+/// An in-flight async readback: the GPU work is submitted and the staging buffer
+/// is being mapped; `ready` flips when the browser reports the map complete.
+#[cfg(target_arch = "wasm32")]
+pub struct PendingReadback {
+    ready: std::rc::Rc<std::cell::Cell<bool>>,
+    slot_count: usize,
+}
+
+/// Browser (async) readback: the GPU cannot be blocked on, so a recompute is
+/// *dispatched* on one frame and *collected* on a later one.
+#[cfg(target_arch = "wasm32")]
+impl GpuFlowField {
+    /// Dispatch a recompute and begin mapping the result. Poll [`try_take`](Self::try_take)
+    /// on later frames. Non-blocking.
+    pub fn begin_readback(&mut self, cost: &[u32], dests: &[u32]) -> PendingReadback {
+        let k = dests.len();
+        self.dispatch(cost, dests);
+        let ready = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = ready.clone();
+        let bytes = (self.link_count * k * 4) as u64;
+        let staging = &self.work.as_ref().unwrap().staging;
+        staging.slice(..bytes.max(4)).map_async(wgpu::MapMode::Read, move |res| {
+            if res.is_ok() {
+                flag.set(true);
+            }
+        });
+        PendingReadback { ready, slot_count: k }
+    }
+
+    /// If the pending map has completed, read the distance fields and unmap the
+    /// staging buffer (freeing it for the next dispatch); else `None`.
+    pub fn try_take(&self, pending: &PendingReadback) -> Option<Vec<Vec<u32>>> {
+        let _ = self.device.poll(wgpu::PollType::Poll); // pump; a no-op driver on the web
+        if !pending.ready.get() {
+            return None;
+        }
+        let l = self.link_count;
+        let bytes = (l * pending.slot_count * 4) as u64;
+        let staging = &self.work.as_ref().unwrap().staging;
+        let all: Vec<u32> = cast_slice(&staging.slice(..bytes.max(4)).get_mapped_range()).to_vec();
+        staging.unmap();
+        Some(all.chunks(l.max(1)).map(<[u32]>::to_vec).collect())
+    }
+}
+
 /// Recompute a [`FieldRouter`]'s next-hop fields on the GPU in one batched
-/// dispatch and feed the reverse distances back. Returns `false` if no adapter
-/// is available (caller falls back to the CPU [`FieldRouter::recompute`]). The
-/// scale path — the relaxation is parallel over every (destination, link).
-pub fn recompute_router_gpu(
-    router: &mut super::router::FieldRouter,
-    net: &super::network::Network,
-    cost: &[u64],
-) -> bool {
-    let adj = super::flowfield::adjacency(net);
-    let (offsets, targets) = super::flowfield::csr(&adj);
+/// dispatch and feed the reverse distances back, **reusing** a persistent
+/// `solver` (built once over the network's adjacency). Blocking — native path.
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+pub fn recompute_router_gpu(solver: &mut GpuFlowField, router: &mut super::router::FieldRouter, cost: &[u64]) -> bool {
     let cost32: Vec<u32> = cost.iter().map(|&c| c.min(u32::MAX as u64) as u32).collect();
     let dests: Vec<u32> = router.dests_in_slot_order().iter().map(|d| d.0).collect();
-    let Some(solver) = GpuFlowField::new(&offsets, &targets) else { return false };
     let dist_per_slot: Vec<Vec<u64>> = solver
         .distances(&cost32, &dests)
         .into_iter()
@@ -307,6 +390,7 @@ fn entry(binding: u32, ty: wgpu::BufferBindingType) -> wgpu::BindGroupLayoutEntr
     }
 }
 
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 async fn request_adapter(instance: &wgpu::Instance) -> Option<wgpu::Adapter> {
     for force in [true, false] {
         let opts = wgpu::RequestAdapterOptions {
@@ -393,7 +477,7 @@ mod tests {
         let cost32: Vec<u32> = cost64.iter().map(|&c| c as u32).collect();
         let dests = [4u32, 5u32];
 
-        let Some(solver) = GpuFlowField::new(&offsets, &targets) else {
+        let Some(mut solver) = GpuFlowField::new(&offsets, &targets) else {
             eprintln!("no GPU adapter; skipping batched flow-field test");
             return;
         };
@@ -433,11 +517,16 @@ mod tests {
         let dests = [LinkId(5), LinkId(4)];
         let cpu = FieldRouter::new(&net, &dests, &cost);
 
-        let mut gpu = FieldRouter::new(&net, &dests, &cost);
-        if !recompute_router_gpu(&mut gpu, &net, &cost) {
+        let adj = adjacency(&net);
+        let (offsets, targets) = csr(&adj);
+        let Some(mut solver) = GpuFlowField::new(&offsets, &targets) else {
             eprintln!("no GPU adapter; skipping GPU-backed router equivalence test");
             return;
-        }
+        };
+        let mut gpu = FieldRouter::new(&net, &dests, &cost);
+        // Recompute twice to exercise the persistent working-buffer reuse path.
+        recompute_router_gpu(&mut solver, &mut gpu, &cost);
+        recompute_router_gpu(&mut solver, &mut gpu, &cost);
         for &dest in &dests {
             for from in 0..net.links.len() as u32 {
                 assert_eq!(
