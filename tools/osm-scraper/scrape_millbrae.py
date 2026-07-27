@@ -7,7 +7,7 @@ The output schema is the contract between this tool and the Rust engine:
     {
       "meta":  {"place", "bbox", "origin"},
       "nodes": [{"osm_id", "x", "y", "control", "signal"?}],
-      "links": [{"from_osm", "to_osm", "lanes", "speed_limit"}]
+      "links": [{"from_osm", "to_osm", "lanes", "speed_limit", "road_class"}]
     }
 
 `x`/`y` are metres in a local equirectangular projection about the bbox centre
@@ -177,7 +177,7 @@ def build(raw, bbox):
     def geom_of(node_ids):
         return [list(project(nodes[nid]["lat"], nodes[nid]["lon"], lat0, lon0)) for nid in node_ids]
 
-    def emit_link(a, b, lanes, speed, geometry, name, ref, layer):
+    def emit_link(a, b, lanes, speed, geometry, name, ref, layer, road_class):
         if (a, b) in emitted:
             return
         emitted.add((a, b))
@@ -188,6 +188,10 @@ def build(raw, bbox):
             link["ref"] = ref  # route ref, e.g. "CA 82" — used to match real counts
         if layer:
             link["layer"] = layer  # grade separation for render z-order
+        # OSM highway class (motorway, motorway_link, primary, residential, …) — lets
+        # the engine model freeway↔ramp interchanges as free-flow diverges/merges
+        # instead of stop-controlled intersections.
+        link["road_class"] = road_class
         out_links.append(link)
 
     for way in ways:
@@ -210,9 +214,9 @@ def build(raw, bbox):
                 emit_node(a)
                 emit_node(b)
                 mid = geom_of(seq[block_start + 1 : i])  # intermediate bend points
-                emit_link(a, b, lanes, speed, mid, name, ref, layer)
+                emit_link(a, b, lanes, speed, mid, name, ref, layer, highway)
                 if not oneway:
-                    emit_link(b, a, lanes, speed, list(reversed(mid)), name, ref, layer)
+                    emit_link(b, a, lanes, speed, list(reversed(mid)), name, ref, layer, highway)
             block_start = i
 
     return {

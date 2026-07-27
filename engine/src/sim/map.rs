@@ -63,11 +63,14 @@ pub struct LinkSpec {
     /// OSM road name, carried through the topology transforms so the browser can
     /// label the engine's own links (which no longer match the raw import).
     pub name: String,
+    /// OSM `highway` class (e.g. "motorway", "motorway_link", "residential"),
+    /// distilled into [`RoadKind`] at build; drives free-flow ramp interchanges.
+    pub road_class: String,
 }
 
 impl LinkSpec {
     pub fn oneway(from_osm: i64, to_osm: i64, lanes: u32, speed_limit: f64) -> Self {
-        Self { from_osm, to_osm, lanes, speed_limit, geometry: Vec::new(), layer: 0, name: String::new() }
+        Self { from_osm, to_osm, lanes, speed_limit, geometry: Vec::new(), layer: 0, name: String::new(), road_class: String::new() }
     }
 
     pub fn twoway(a: i64, b: i64, lanes: u32, speed_limit: f64) -> [Self; 2] {
@@ -201,11 +204,19 @@ impl OsmMap {
                     pocket_taper: 0.0,
                 });
             }
-            net.links.push(Link { from, to, lane_start, lane_count: spec.lanes, layer: spec.layer });
+            net.links.push(Link {
+                from,
+                to,
+                lane_start,
+                lane_count: spec.lanes,
+                layer: spec.layer,
+                kind: RoadKind::from_osm(&spec.road_class),
+            });
             net.polylines.push(polyline);
             net.link_names.push(spec.name.clone());
         }
 
+        offset_ramps_to_curb(&mut net);
         set_junction_setbacks(&mut net);
 
         // Lane-channelised movements (California lane-use convention): rather than
@@ -243,8 +254,34 @@ impl OsmMap {
             let nearest = |x: usize, from: usize, to: usize| -> usize {
                 if from == 0 { 0 } else { ((x as f64) * (to as f64) / (from as f64)).round() as usize }
             };
+            // A freeway interchange (this approach is grade-separated and at least
+            // one exit is a ramp) wires by side, not by angular slice: US ramps are
+            // on the right (the highest lane index). The mainline keeps every lane;
+            // an off-ramp hangs off the *curb* lane, which can still continue (a car
+            // in it merges left rather than being forced to exit), so a car never
+            // has to divert across the mainline to reach a ramp on the far side.
+            let ramp_exit = |i: usize| net.links[onward[i].0].kind == RoadKind::Ramp;
+            let is_interchange = link.kind.is_grade_separated() && (0..m).any(ramp_exit);
+            let has_mainline = (0..m).any(|i| !ramp_exit(i));
             let mut lane_exits: Vec<std::collections::BTreeSet<usize>> = vec![Default::default(); n];
-            if m > 0 {
+            if is_interchange && has_mainline {
+                let mains: Vec<usize> = (0..m).filter(|&i| !ramp_exit(i)).collect();
+                let mm = mains.len();
+                // Mainline continuation(s) keep every lane (a freeway split still
+                // fans left→right among the continuations).
+                for (j, &i) in mains.iter().enumerate() {
+                    lane_exits[nearest(j, mm - 1, n - 1)].insert(i);
+                }
+                for (k, exits) in lane_exits.iter_mut().enumerate() {
+                    exits.insert(mains[nearest(k, n - 1, mm - 1)]);
+                }
+                // Off-ramps hang off the curb lane only (shared with the mainline).
+                for i in 0..m {
+                    if ramp_exit(i) {
+                        lane_exits[n - 1].insert(i);
+                    }
+                }
+            } else if m > 0 {
                 for i in 0..m {
                     lane_exits[nearest(i, m - 1, n - 1)].insert(i); // every exit served
                 }
@@ -257,7 +294,13 @@ impl OsmMap {
                 let start = MovementId(movements.len() as u32);
                 for &exit_i in exits {
                     let out = net.links[onward[exit_i].0];
-                    let to_index = (k as u32).min(out.lane_count - 1);
+                    // An on-ramp merges onto the freeway's curb (rightmost) lane, not
+                    // the same index it left (which would land it on the median).
+                    let to_index = if link.kind == RoadKind::Ramp && out.kind == RoadKind::Freeway {
+                        out.lane_count - 1
+                    } else {
+                        (k as u32).min(out.lane_count - 1)
+                    };
                     movements.push(Movement {
                         from_lane: LaneId(lane_id),
                         to_lane: LaneId(out.lane_start.0 + to_index),
@@ -505,7 +548,8 @@ fn next_collapse(
             geometry.push(pos[&n]);
             geometry.extend(l2.geometry.iter().copied());
             let name = if l1.name.is_empty() { l2.name.clone() } else { l1.name.clone() };
-            Some(LinkSpec { from_osm: from, to_osm: to, lanes: l1.lanes, speed_limit: l1.speed_limit, geometry, layer: l1.layer, name })
+            let road_class = if l1.road_class.is_empty() { l2.road_class.clone() } else { l1.road_class.clone() };
+            Some(LinkSpec { from_osm: from, to_osm: to, lanes: l1.lanes, speed_limit: l1.speed_limit, geometry, layer: l1.layer, name, road_class })
         };
 
         if incident.len() == 4 {
@@ -535,6 +579,57 @@ fn next_collapse(
 /// stop and start at the edge of the intersection, leaving the interior (the box)
 /// to the movements' crossing paths. A node's setback is half the widest
 /// carriageway meeting it; clamped so short links keep a positive drivable span.
+/// Slide each ramp's freeway end out to the curb. OSM attaches a ramp at the
+/// freeway *centreline* node, but the renderer treats a carriageway's polyline as
+/// its left (median) edge and offsets lanes rightward — so a narrow ramp sharing
+/// that node is drawn on the freeway's inner lanes instead of peeling off the
+/// outside. Shifting the ramp end laterally by the freeway's remaining width
+/// (tapered back to its own alignment over `TRANSITION` m) makes the ramp diverge
+/// from / merge onto the curb edge, matching how the lanes are wired.
+fn offset_ramps_to_curb(net: &mut Network) {
+    const TRANSITION: f64 = 45.0;
+    // Freeway travel direction and width at each node it touches (through-direction).
+    let mut freeway_at: HashMap<u32, ([f64; 2], f64)> = HashMap::new();
+    for fi in 0..net.links.len() {
+        let f = net.links[fi];
+        if f.kind != RoadKind::Freeway {
+            continue;
+        }
+        freeway_at.entry(f.to.0).or_insert((net.arrival_dir(LinkId(fi as u32)), f.lane_count as f64));
+        freeway_at.entry(f.from.0).or_insert((net.departure_dir(LinkId(fi as u32)), f.lane_count as f64));
+    }
+    for li in 0..net.links.len() {
+        if net.links[li].kind != RoadKind::Ramp {
+            continue;
+        }
+        let ramp_lanes = net.links[li].lane_count as f64;
+        for at_start in [true, false] {
+            let node = if at_start { net.links[li].from } else { net.links[li].to };
+            let Some(&(fdir, flanes)) = freeway_at.get(&node.0) else { continue };
+            if flanes <= ramp_lanes {
+                continue; // nothing wider to peel off from
+            }
+            let right = [fdir[1], -fdir[0]]; // curb side of the freeway
+            let mag = (flanes - ramp_lanes) * LANE_WIDTH;
+            let shift = [right[0] * mag, right[1] * mag];
+            // Cumulative arc distance of each point from this (freeway-connected) end.
+            let poly = net.polylines[li].clone();
+            let count = poly.len();
+            let order: Vec<usize> = if at_start { (0..count).collect() } else { (0..count).rev().collect() };
+            let mut dist = vec![0.0f64; count];
+            for w in 1..count {
+                let (a, b) = (poly[order[w - 1]], poly[order[w]]);
+                dist[order[w]] = dist[order[w - 1]] + (b[0] - a[0]).hypot(b[1] - a[1]);
+            }
+            for i in 0..count {
+                let t = (1.0 - dist[i] / TRANSITION).max(0.0); // full at the end, 0 by TRANSITION
+                net.polylines[li][i][0] += shift[0] * t;
+                net.polylines[li][i][1] += shift[1] * t;
+            }
+        }
+    }
+}
+
 fn set_junction_setbacks(net: &mut Network) {
     // A crosswalk/stop-bar margin so vehicles halt just behind the box, as at a
     // real signalized intersection, rather than nosing into the crossing.
@@ -547,8 +642,22 @@ fn set_junction_setbacks(net: &mut Network) {
         box_r[link.from.idx()] = box_r[link.from.idx()].max(half);
         box_r[link.to.idx()] = box_r[link.to.idx()].max(half);
     }
+    // A pure freeway interchange (diverge/merge/connector) has no cross traffic and
+    // no stop bar: the ramp peels off the mainline edge. Collapse its box so the
+    // carriageways run together instead of pulling back into an intersection-like
+    // gap, keeping only a hairline setback for numerical safety.
+    let interchange: Vec<bool> = (0..net.nodes.len()).map(|n| net.is_interchange_node(NodeId(n as u32))).collect();
+    for n in 0..net.nodes.len() {
+        if interchange[n] {
+            box_r[n] = box_r[n].min(0.5);
+        }
+    }
     net.render_setback = box_r.clone();
-    let radius: Vec<f64> = box_r.iter().map(|&r| if r > 0.0 { r + STOP_MARGIN } else { 0.0 }).collect();
+    let radius: Vec<f64> = box_r
+        .iter()
+        .enumerate()
+        .map(|(n, &r)| if r <= 0.0 { 0.0 } else if interchange[n] { r } else { r + STOP_MARGIN })
+        .collect();
     for i in 0..net.links.len() {
         let link = net.links[i];
         let full = net.polylines[i].windows(2).map(|w| distance(w[0], w[1])).sum::<f64>();
@@ -600,6 +709,8 @@ mod json {
         layer: i32,
         #[serde(default)]
         name: String,
+        #[serde(default)]
+        road_class: String,
     }
 
     #[derive(Deserialize)]
@@ -645,6 +756,7 @@ mod json {
                 geometry: l.geometry,
                 layer: l.layer,
                 name: l.name,
+                road_class: l.road_class,
             })
             .collect();
         Ok(OsmMap { nodes, links })
@@ -1037,7 +1149,7 @@ mod tests {
             ],
             links: vec![
                 LinkSpec::oneway(1, 2, 1, 20.0), // surface road, crosses origin
-                LinkSpec { from_osm: 3, to_osm: 4, lanes: 1, speed_limit: 25.0, geometry: Vec::new(), layer: 1, name: String::new() }, // bridge over it
+                LinkSpec { from_osm: 3, to_osm: 4, lanes: 1, speed_limit: 25.0, geometry: Vec::new(), layer: 1, name: String::new(), road_class: String::new() }, // bridge over it
             ],
         }
         .build();
@@ -1175,6 +1287,89 @@ mod tests {
 
         // A one-lane approach can't have a bay.
         assert_eq!(net.lane(net.lanes_of(LinkId(1)).next().unwrap()).pocket_taper, 0.0);
+    }
+
+    #[test]
+    fn freeway_ramps_wire_to_the_curb_lane() {
+        // A lane-drop off-ramp like US-101's: a 6-lane freeway drops to a 5-lane
+        // mainline plus a 1-lane off-ramp. The dropped 6th (curb) lane is consumed
+        // by the ramp — exit-only — the mainline keeps lanes 0-4, and a downstream
+        // on-ramp merges back onto the curb lane, not the median.
+        let hw = |a, b, lanes, sp| LinkSpec { road_class: "motorway".into(), ..LinkSpec::oneway(a, b, lanes, sp) };
+        let ramp = |a, b, lanes, sp| LinkSpec { road_class: "motorway_link".into(), ..LinkSpec::oneway(a, b, lanes, sp) };
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, -600.0, 0.0),    // freeway in
+                NodeSpec::uncontrolled(2, -200.0, 0.0),    // diverge
+                NodeSpec::uncontrolled(3, 200.0, 0.0),     // merge
+                NodeSpec::uncontrolled(6, 600.0, 0.0),     // freeway out
+                NodeSpec::uncontrolled(4, 100.0, -260.0),  // off-ramp exit
+                NodeSpec::uncontrolled(5, -100.0, -260.0), // on-ramp origin
+            ],
+            links: vec![
+                hw(1, 2, 6, 29.0),   // 0: 6-lane freeway → diverge
+                hw(2, 3, 5, 29.0),   // 1: 5-lane mainline (a lane drops to the ramp)
+                ramp(2, 4, 1, 25.0), // 2: off-ramp (diverge from link 0)
+                hw(3, 6, 6, 29.0),   // 3: 6-lane freeway out (a lane merges in)
+                ramp(5, 3, 1, 25.0), // 4: on-ramp (merge into link 3)
+            ],
+        }
+        .build();
+
+        // Off-ramp: fed only by the curb lane (index 5) of the 6-lane approach.
+        let ramp_froms: Vec<u32> = (0..net.movements.len() as u32)
+            .map(MovementId)
+            .filter(|&m| net.lane(net.movement(m).to_lane).link == LinkId(2))
+            .map(|m| net.lane(net.movement(m).from_lane).index_in_link)
+            .collect();
+        assert_eq!(ramp_froms, vec![5], "the off-ramp diverges from the curb lane only, got {ramp_froms:?}");
+
+        // The curb lane can continue OR exit (it is not forced onto the ramp), so a
+        // through car merges left instead of stopping; the inner lanes only continue.
+        let curb_lane = net.lanes_of(LinkId(0)).last().unwrap();
+        let mut curb_dests: Vec<u32> = (0..net.lane(curb_lane).movement_count)
+            .map(|j| net.lane(net.movement(MovementId(net.lane(curb_lane).movement_start.0 + j)).to_lane).link.0)
+            .collect();
+        curb_dests.sort();
+        assert_eq!(curb_dests, vec![1, 2], "the curb lane continues on the freeway and feeds the ramp, got {curb_dests:?}");
+        for k in 0..5u32 {
+            let lane = net.lanes_of(LinkId(0)).nth(k as usize).unwrap();
+            let dests: Vec<u32> = (0..net.lane(lane).movement_count)
+                .map(|j| net.lane(net.movement(MovementId(net.lane(lane).movement_start.0 + j)).to_lane).link.0)
+                .collect();
+            assert_eq!(dests, vec![1], "inner lane {k} continues on the freeway only, got {dests:?}");
+        }
+
+        // On-ramp: the ramp (link 4) merges onto the curb lane (index 5) of link 3.
+        let merge_tos: Vec<u32> = (0..net.movements.len() as u32)
+            .map(MovementId)
+            .filter(|&m| net.lane(net.movement(m).from_lane).link == LinkId(4))
+            .map(|m| net.lane(net.movement(m).to_lane).index_in_link)
+            .collect();
+        assert_eq!(merge_tos, vec![5], "the on-ramp merges onto the curb lane, got {merge_tos:?}");
+    }
+
+    #[test]
+    fn an_off_ramp_peels_off_the_freeway_curb_edge() {
+        // A 6-lane freeway heading +x; its curb (right) side is -y. A diverging
+        // off-ramp's start must be slid out toward that curb edge, not left sitting
+        // on the median-side node where it would overlap the inner lanes.
+        let hw = |a, b, lanes, sp| LinkSpec { road_class: "motorway".into(), ..LinkSpec::oneway(a, b, lanes, sp) };
+        let ramp = |a, b, lanes, sp| LinkSpec { road_class: "motorway_link".into(), ..LinkSpec::oneway(a, b, lanes, sp) };
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, -200.0, 0.0),
+                NodeSpec::uncontrolled(2, 0.0, 0.0),      // diverge (freeway centreline node)
+                NodeSpec::uncontrolled(3, 200.0, 0.0),
+                NodeSpec::uncontrolled(4, 160.0, -200.0), // off-ramp exit
+            ],
+            links: vec![hw(1, 2, 6, 29.0), hw(2, 3, 5, 29.0), ramp(2, 4, 1, 25.0)],
+        }
+        .build();
+        // The freeway carriageway spans y ∈ [-6·W, 0] (median at 0, curb at -21).
+        // The ramp start began at the node (y=0) and must be pushed toward the curb.
+        let ramp_start = net.polylines[2][0];
+        assert!(ramp_start[1] < -10.0, "the off-ramp peels off the curb edge, start y = {}", ramp_start[1]);
     }
 
     #[test]

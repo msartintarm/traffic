@@ -721,10 +721,18 @@ impl NetWorld {
                 // distance keeps the deceleration comfortable instead of slamming to
                 // a stop right at the bar (the car finishes slowing through the turn
                 // interior, where `crossing_accel` caps its speed).
-                let turn = intended.and_then(|mid| match self.network.movement_turn(mid) {
-                    TurnType::Left => Some(6.0),
-                    TurnType::Right => Some(5.0),
-                    TurnType::Through => None,
+                let turn = intended.and_then(|mid| {
+                    // A freeway diverge/merge is free-flow: don't ease down to a turn
+                    // speed, let the geometric curve limit (above) govern it — a car
+                    // takes the gore at highway speed and slows on the ramp itself.
+                    if self.network.is_interchange_movement(mid) {
+                        return None;
+                    }
+                    match self.network.movement_turn(mid) {
+                        TurnType::Left => Some(6.0),
+                        TurnType::Right => Some(5.0),
+                        TurnType::Through => None,
+                    }
                 }).map(|speed| SpeedTarget { speed, distance: to_line.max(12.0) });
                 let curve = match (geom_curve, turn) {
                     (Some(a), Some(b)) => Some(if a.speed <= b.speed { a } else { b }),
@@ -906,10 +914,17 @@ impl NetWorld {
         let c = veh.crossing.unwrap();
         let it = self.network.interior(c.movement);
         let to_lane = self.network.movement(c.movement).to_lane;
-        let cap = match self.network.movement_turn(c.movement) {
-            TurnType::Left => 6.0,
-            TurnType::Right => 5.0,
-            TurnType::Through => f64::INFINITY,
+        // A freeway diverge/merge is free-flow — no at-grade turn throttle; the
+        // ramp's own speed limit and curvature (curve-speed limiting on the ramp
+        // link) are what slow a car down, not a hard 5 m/s crawl through the gore.
+        let cap = if self.network.is_interchange_movement(c.movement) {
+            f64::INFINITY
+        } else {
+            match self.network.movement_turn(c.movement) {
+                TurnType::Left => 6.0,
+                TurnType::Right => 5.0,
+                TurnType::Through => f64::INFINITY,
+            }
         };
         let mut d = veh.driver.capped_to(self.network.lane(to_lane).speed_limit);
         d.desired_speed = d.desired_speed.min(cap);
@@ -2014,6 +2029,110 @@ mod tests {
     }
 
     #[test]
+    fn real_map_freeway_interchanges_are_free_flowing() {
+        // The scraped Millbrae map carries OSM road classes, so US-101 / I-280
+        // ramps form free-flow interchange nodes (no stop box). Under highway
+        // demand, cars crossing those interchange movements keep real speed instead
+        // of crawling as if through an intersection.
+        use super::super::demand::{self, DemandGenerator, DemandMode};
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let net = super::super::map::OsmMap::from_json(&text).expect("map json").build();
+
+        let interchange_nodes = (0..net.nodes.len() as u32).filter(|&n| net.is_interchange_node(NodeId(n))).count();
+        let interchange_movs = (0..net.movements.len() as u32).filter(|&m| net.is_interchange_movement(MovementId(m))).count();
+        assert!(interchange_nodes > 0, "the map has freeway interchange nodes from OSM road classes");
+        assert!(interchange_movs > 0, "and free-flow interchange movements");
+        // Interchange nodes shed the intersection stop box.
+        assert!(
+            (0..net.nodes.len() as u32).all(|n| !net.is_interchange_node(NodeId(n)) || net.render_setback[n as usize] <= 0.5),
+            "interchange nodes carry no stop box"
+        );
+
+        let seed = 7u64;
+        let pairs = demand::od_pairs(&net, seed, 48, DemandMode::HighwayBiased);
+        let mut world = NetWorld::new(net, cfg());
+        let mut gen = DemandGenerator::new(&world, &pairs, seed);
+        world.install_router(&gen.destinations());
+        // Count interchange crossings that clear the old 5 m/s turn cap — under the
+        // previous model *no* interchange crossing could, since a ramp diverge was
+        // throttled like a right turn. (Mean speed is confounded by realistic queues
+        // at the ramp termini, so we assert the free-flow crossings now exist.)
+        let (mut fast, mut total, mut peak) = (0u32, 0u32, 0.0f64);
+        for _ in 0..2000 {
+            gen.step(&mut world, cfg().dt);
+            world.step();
+            for v in world.vehicles() {
+                if let Some(c) = v.crossing {
+                    if world.network.is_interchange_movement(c.movement) {
+                        total += 1;
+                        peak = peak.max(v.speed);
+                        if v.speed > 8.0 {
+                            fast += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(total > 0, "cars actually traverse freeway interchanges");
+        assert!(fast > 0, "interchange crossings now exceed the old 5 m/s turn crawl (peak {peak:.1} m/s)");
+        assert!(peak > 12.0, "freeway diverges run at highway speed, peak {peak:.1} m/s");
+        assert_eq!(world.crashed(), 0, "freeway interchanges stay collision-free");
+        assert_eq!(world.leaked(), 0, "no car disappears at an interchange, leaked {}", world.leaked());
+    }
+
+    #[test]
+    fn a_car_diverging_onto_a_ramp_keeps_highway_speed() {
+        // A freeway (29 m/s) that continues straight and sheds a right-diverging
+        // off-ramp. Because both sides are grade-separated, the diverge is a
+        // free-flow interchange, not an at-grade turn: a car peeling onto the ramp
+        // holds highway speed instead of crawling through a 5 m/s "intersection".
+        let hw = |a, b, lanes, sp| LinkSpec { road_class: "motorway".into(), ..LinkSpec::oneway(a, b, lanes, sp) };
+        let ramp = |a, b, lanes, sp| LinkSpec { road_class: "motorway_link".into(), ..LinkSpec::oneway(a, b, lanes, sp) };
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, -400.0, 0.0),   // freeway in
+                NodeSpec::uncontrolled(2, 0.0, 0.0),      // diverge point
+                NodeSpec::uncontrolled(3, 400.0, 0.0),    // freeway continues
+                NodeSpec::uncontrolled(4, 300.0, -260.0), // off-ramp (a real right turn angle)
+            ],
+            links: vec![hw(1, 2, 3, 29.0), hw(2, 3, 3, 29.0), ramp(2, 4, 1, 25.0)],
+        }
+        .build();
+        // The diverge point carries no cross traffic and no stop box.
+        assert!(net.is_interchange_node(NodeId(1)), "the diverge is a pure interchange node");
+        assert!(net.render_setback[1] <= 0.5, "no intersection-like box at the diverge");
+        // The off-ramp is a genuine right turn (would otherwise be capped to 5 m/s).
+        let ramp_mv = (0..net.movements.len() as u32)
+            .map(MovementId)
+            .find(|&m| net.lane(net.movement(m).to_lane).link == LinkId(2))
+            .expect("a freeway→ramp movement exists");
+        assert_eq!(net.movement_turn(ramp_mv), TurnType::Right, "the ramp is a right diverge");
+        assert!(net.is_interchange_movement(ramp_mv), "and it is a free-flow interchange");
+
+        let mut w = NetWorld::new(net, cfg());
+        w.install_router(&[LinkId(2)]); // destination: the off-ramp
+        // Place the exiting car in the curb lane (the off-ramp is curb-side only),
+        // as a driver bound for the exit would already have merged right.
+        let curb = w.network.lanes_of(LinkId(0)).last().unwrap();
+        w.spawn_to_in_lane(1, curb, 5.0, LinkId(2), 26.0, DriverConfig::car());
+        let mut max_speed_crossing: f64 = 0.0;
+        let mut reached_ramp = false;
+        for _ in 0..400 {
+            w.step();
+            if let Some(v) = w.vehicle(1) {
+                if v.is_crossing() {
+                    max_speed_crossing = max_speed_crossing.max(v.speed);
+                }
+            }
+            reached_ramp |= w.link_flows()[2] > 0.0;
+        }
+        assert!(reached_ramp, "the car takes the off-ramp");
+        assert!(max_speed_crossing > 15.0, "it keeps highway speed through the diverge, got {max_speed_crossing:.1} m/s");
+        assert_eq!(w.crashed(), 0);
+    }
+
+    #[test]
     fn high_load_real_map_stays_bounded_and_flowing() {
         // Browser-scale stress: the scraped map under saturating demand must stay
         // *stable* — vehicle count bounded (self-limiting spawns, no runaway),
@@ -2303,6 +2422,7 @@ mod tests {
                 geometry: vec![[200.0, 0.0], [202.68, 10.0], [210.0, 17.32]],
                 layer: 0,
                 name: String::new(),
+                road_class: String::new(),
             }],
         }
         .build();

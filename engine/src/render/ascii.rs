@@ -240,7 +240,7 @@ mod tests {
     use crate::sim::config::{DriverConfig, SimConfig};
     use crate::sim::map::{arterial_intersection, LinkSpec, NodeSpec, OsmMap};
     use crate::sim::net_world::NetWorld;
-    use crate::sim::network::{LinkId, MovementId, Network, TurnType};
+    use crate::sim::network::{LinkId, MovementId, Network, NodeId, TurnType};
 
     /// Render a network (no vehicles) through the shared `draw_world` path — the
     /// same geometry the browser GPU renderer receives.
@@ -248,6 +248,45 @@ mod tests {
         let mut a = Ascii::centered(center, r, 30);
         draw_world(net, &[], &mut a);
         a
+    }
+
+    #[test]
+    fn ascii_shows_a_freeway_diverge_as_a_ramp_not_an_intersection() {
+        // A freeway that continues straight (+x) and sheds an off-ramp. Because both
+        // sides are grade-separated, the diverge has no stop box: the pavement runs
+        // continuously through it and the ramp peels off the side, rather than the
+        // arms pulling back into an intersection gap.
+        let hw = |a, b, lanes, sp| LinkSpec { road_class: "motorway".into(), ..LinkSpec::oneway(a, b, lanes, sp) };
+        let ramp = |a, b, lanes, sp| LinkSpec { road_class: "motorway_link".into(), ..LinkSpec::oneway(a, b, lanes, sp) };
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, -160.0, 0.0),
+                NodeSpec::uncontrolled(2, 0.0, 0.0),     // diverge
+                NodeSpec::uncontrolled(3, 160.0, 0.0),
+                NodeSpec::uncontrolled(4, 120.0, -120.0), // off-ramp
+            ],
+            links: vec![hw(1, 2, 3, 29.0), hw(2, 3, 3, 29.0), ramp(2, 4, 1, 25.0)],
+        }
+        .build();
+        assert!(net.is_interchange_node(NodeId(1)), "the diverge is a pure interchange node");
+        let a = draw(&net, [0.0, -20.0], 60.0);
+        println!("\nfreeway diverge (ramp peels off, no intersection box):\n{}", a.render());
+        // Pavement is continuous along the mainline through the diverge point…
+        assert_eq!(a.cell_at_world([0.0, 0.0]), Some('#'), "the diverge point is paved");
+        assert_eq!(a.cell_at_world([-40.0, 0.0]), Some('#'), "mainline in");
+        assert_eq!(a.cell_at_world([40.0, 0.0]), Some('#'), "mainline continues");
+        // …and the ramp peels off the curb side: the 3-lane mainline spans y∈[-10.5,0],
+        // so any pavement well below that in the exit quadrant is the ramp.
+        let mut ramp_pavement = 0;
+        for xi in 0..12 {
+            for yi in 0..12 {
+                let p = [xi as f64 * 5.0, -15.0 - yi as f64 * 5.0];
+                if a.cell_at_world(p) == Some('#') {
+                    ramp_pavement += 1;
+                }
+            }
+        }
+        assert!(ramp_pavement >= 4, "the off-ramp peels off the curb side ({ramp_pavement} cells)");
     }
 
     #[test]

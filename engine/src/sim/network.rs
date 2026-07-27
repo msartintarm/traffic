@@ -52,6 +52,36 @@ pub struct Node {
     pub control: NodeControl,
 }
 
+/// Road class, distilled from the OSM `highway` tag. Distinguishes the
+/// grade-separated freeway system (mainline + ramps), whose junctions are
+/// free-flow diverges/merges, from ordinary at-grade `Surface` streets whose
+/// junctions are stop/signal/turn intersections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoadKind {
+    Surface,
+    /// A freeway/expressway mainline (`motorway`/`trunk`).
+    Freeway,
+    /// A freeway on/off ramp or interchange connector (`*_link`).
+    Ramp,
+}
+
+impl RoadKind {
+    /// From an OSM `highway` class string.
+    pub fn from_osm(class: &str) -> Self {
+        match class {
+            "motorway" | "trunk" => RoadKind::Freeway,
+            c if c.ends_with("_link") => RoadKind::Ramp,
+            _ => RoadKind::Surface,
+        }
+    }
+
+    /// Whether this is part of the grade-separated freeway system (mainline or
+    /// ramp) — where junctions are free-flow rather than at-grade crossings.
+    pub fn is_grade_separated(self) -> bool {
+        matches!(self, RoadKind::Freeway | RoadKind::Ramp)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Link {
     pub from: NodeId,
@@ -60,6 +90,8 @@ pub struct Link {
     pub lane_count: u32,
     /// Grade-separation level for render z-order (see `LinkSpec::layer`).
     pub layer: i32,
+    /// Road class from OSM, so freeway ramps read as free-flow interchanges.
+    pub kind: RoadKind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -534,6 +566,31 @@ impl Network {
         unit(sub(poly[1], poly[0]))
     }
 
+    /// A movement is a *free-flow interchange* when both the road it leaves and the
+    /// road it joins are grade-separated (freeway mainline or ramp) — a highway
+    /// diverge, merge, or ramp-to-ramp connector. These carry no cross traffic, so
+    /// they run at road speed rather than being throttled like an at-grade turn.
+    pub fn is_interchange_movement(&self, mid: MovementId) -> bool {
+        let mv = self.movement(mid);
+        self.link(self.lane(mv.from_lane).link).kind.is_grade_separated()
+            && self.link(self.lane(mv.to_lane).link).kind.is_grade_separated()
+    }
+
+    /// Whether every carriageway meeting `node` is grade-separated — a pure highway
+    /// interchange point (diverge/merge/connector), with no at-grade cross street.
+    pub fn is_interchange_node(&self, node: NodeId) -> bool {
+        let mut any = false;
+        for l in &self.links {
+            if l.from == node || l.to == node {
+                any = true;
+                if !l.kind.is_grade_separated() {
+                    return false;
+                }
+            }
+        }
+        any
+    }
+
     /// Whether a movement goes straight, left, or right, from the signed angle
     /// between the arriving and departing directions.
     pub fn movement_turn(&self, mid: MovementId) -> TurnType {
@@ -743,7 +800,7 @@ mod tests {
         // L-shaped link (0,0) → bend (100,0) → (100,100).
         let net = OsmMap {
             nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 100.0, 100.0)],
-            links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 1, speed_limit: 20.0, geometry: vec![[100.0, 0.0]], layer: 0, name: String::new() }],
+            links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 1, speed_limit: 20.0, geometry: vec![[100.0, 0.0]], layer: 0, name: String::new(), road_class: String::new() }],
         }
         .build();
         let lane = LaneId(0);
