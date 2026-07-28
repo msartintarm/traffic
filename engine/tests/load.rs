@@ -12,7 +12,7 @@ use std::time::Instant;
 use engine::sim::config::SimConfig;
 use engine::sim::demand::{self, DemandGenerator, DemandMode};
 use engine::sim::map::OsmMap;
-use engine::sim::net_world::{prof_take, NetWorld, PHASE_NAMES, STEP_PHASES};
+use engine::sim::net_world::{prof_take, AccelBackend, NetWorld, PHASE_NAMES, STEP_PHASES};
 use engine::sim::network::Network;
 
 fn real_map() -> Option<Network> {
@@ -67,6 +67,9 @@ fn scaling_curve(mode: DemandMode, target: usize, external_reroute: bool, label:
     let Some(net) = real_map() else { return };
     let cfg = SimConfig::default_config();
     let mut world = NetWorld::new(net, cfg);
+    // Request CPU threads: engages rayon under `--features parallel`, and cleanly
+    // falls back to serial otherwise (so this line is a no-op without the feature).
+    world.set_accel_backend(AccelBackend::Threads);
     let pairs = demand::od_pairs(&world.network, 1, target, mode);
     let mut gen = DemandGenerator::new(&world, &pairs, 1);
     world.install_router(&gen.destinations());

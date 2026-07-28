@@ -146,6 +146,8 @@ pub struct NetWorld {
     external_reroute: bool,
     /// Per-node index of movements and conflict points.
     junctions: Junctions,
+    /// Executor requested for the per-vehicle accel passes (see [`AccelBackend`]).
+    accel_backend: AccelBackend,
 }
 
 /// Sim seconds between flow-field rebuilds — often enough that routing tracks
@@ -197,32 +199,198 @@ impl Prof {
     fn lap(&mut self, _phase: usize) {}
 }
 
-/// Map `0..n` through `f`, in parallel across cores under the `parallel` feature
-/// (rayon), serially otherwise. Order-preserving, so the collected result is
-/// bit-for-bit the serial one — the per-vehicle passes it drives read only
-/// committed pre-step state, so the elements are independent.
+/// Which executor runs the per-vehicle accel passes. Selected at runtime so a
+/// device without a good GPU (or without cross-origin isolation for CPU threads)
+/// can fall back; [`NetWorld::active_backend`] resolves the request against what's
+/// actually available. Each backend is validated to match [`AccelBackend::Serial`]
+/// bit-for-bit — the passes read only committed pre-step state, so order-preserving
+/// parallelism is exact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccelBackend {
+    /// Single-threaded — always available, and the correctness reference.
+    Serial,
+    /// Data-parallel across CPU cores (rayon). Native under `--features parallel`;
+    /// the browser additionally needs a SharedArrayBuffer worker pool (a follow-up).
+    Threads,
+    /// GPU compute kernel for the evaluate pass (a follow-up); the gather stays on
+    /// CPU. Until wired, [`NetWorld::active_backend`] falls it back to `Serial`.
+    Gpu,
+}
+
+impl AccelBackend {
+    pub fn from_name(s: &str) -> Self {
+        match s {
+            "threads" => Self::Threads,
+            "gpu" => Self::Gpu,
+            _ => Self::Serial,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Serial => "serial",
+            Self::Threads => "threads",
+            Self::Gpu => "gpu",
+        }
+    }
+}
+
+/// Whether the CPU worker pool is actually linked and usable. Native: the `parallel`
+/// feature. Browser: this will additionally require the initialised SharedArrayBuffer
+/// pool once that path lands.
+fn threads_available() -> bool {
+    cfg!(feature = "parallel")
+}
+
+/// Below this vehicle count, rayon's per-task overhead outweighs the win (measured
+/// crossover on the Millbrae step is ~4–5k vehicles), so [`map_collect`] stays serial
+/// even on the `Threads` backend. Only referenced on the parallel path.
 #[cfg(feature = "parallel")]
-fn map_collect<T, F>(n: usize, f: F) -> Vec<T>
+const PAR_THRESHOLD: usize = 4000;
+
+/// Map `0..n` through `f` on the given `backend`. Order-preserving on every backend,
+/// so the collected result is bit-for-bit the serial one — the per-vehicle passes it
+/// drives read only committed pre-step state, so the elements are independent.
+fn map_collect<T, F>(backend: AccelBackend, n: usize, f: F) -> Vec<T>
 where
     T: Send,
     F: Fn(usize) -> T + Sync + Send,
 {
-    use rayon::prelude::*;
-    // Below this, rayon's per-task overhead outweighs the win (measured crossover on
-    // the Millbrae step is ~4–5k vehicles), so stay serial — the parallel path is
-    // only for the dense regime that actually saturates a core.
-    const PAR_THRESHOLD: usize = 4000;
-    if n < PAR_THRESHOLD {
-        return (0..n).map(f).collect();
+    match backend {
+        #[cfg(feature = "parallel")]
+        AccelBackend::Threads if n >= PAR_THRESHOLD => {
+            use rayon::prelude::*;
+            (0..n).into_par_iter().map(f).collect()
+        }
+        _ => (0..n).map(f).collect(),
     }
-    (0..n).into_par_iter().map(f).collect()
 }
-#[cfg(not(feature = "parallel"))]
-fn map_collect<T, F>(n: usize, f: F) -> Vec<T>
-where
-    F: Fn(usize) -> T,
-{
-    (0..n).map(f).collect()
+
+/// A rolling vehicle's flattened accel-decision inputs — the output of the gather
+/// pass ([`NetWorld::gather_context`]) and the sole input to the pure evaluate
+/// kernel ([`VehicleContext::evaluate`]). `#[repr(C)]`/`Pod` so a slice of these
+/// uploads to a GPU storage buffer verbatim; an absent optional constraint is
+/// encoded as `+∞` (the constraints' own non-binding value), keeping the struct a
+/// flat, branch-free bag of scalars that a WGSL kernel can consume directly.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct VehicleContext {
+    /// Driver params, capped to the current lane's speed limit.
+    driver: DriverConfig,
+    speed: f64,
+    stop_line: f64,
+    speed_target_speed: f64,
+    speed_target_dist: f64,
+    stop_sign: f64,
+    yield_line: f64,
+    curve_speed: f64,
+    curve_dist: f64,
+    leader_gap: f64,
+    leader_speed: f64,
+    merge_gap: f64,
+    merge_speed: f64,
+    agent_id: u32,
+    _pad: u32,
+}
+
+impl VehicleContext {
+    fn new(driver: DriverConfig, speed: f64, agent_id: u32) -> Self {
+        Self {
+            driver,
+            speed,
+            stop_line: f64::INFINITY,
+            speed_target_speed: f64::INFINITY,
+            speed_target_dist: f64::INFINITY,
+            stop_sign: f64::INFINITY,
+            yield_line: f64::INFINITY,
+            curve_speed: f64::INFINITY,
+            curve_dist: f64::INFINITY,
+            leader_gap: f64::INFINITY,
+            leader_speed: 0.0,
+            merge_gap: f64::INFINITY,
+            merge_speed: 0.0,
+            agent_id,
+            _pad: 0,
+        }
+    }
+
+    fn set_leader(&mut self, o: Option<Obstacle>) {
+        if let Some(o) = o {
+            self.leader_gap = o.gap;
+            self.leader_speed = o.speed;
+        }
+    }
+    fn set_merge(&mut self, o: Option<Obstacle>) {
+        if let Some(o) = o {
+            self.merge_gap = o.gap;
+            self.merge_speed = o.speed;
+        }
+    }
+    fn set_curve(&mut self, t: Option<SpeedTarget>) {
+        if let Some(t) = t {
+            self.curve_speed = t.speed;
+            self.curve_dist = t.distance;
+        }
+    }
+    fn set_speed_target(&mut self, t: Option<SpeedTarget>) {
+        if let Some(t) = t {
+            self.speed_target_speed = t.speed;
+            self.speed_target_dist = t.distance;
+        }
+    }
+    fn set_stop_line(&mut self, d: Option<f64>) {
+        if let Some(d) = d {
+            self.stop_line = d;
+        }
+    }
+    fn set_stop_sign(&mut self, d: Option<f64>) {
+        if let Some(d) = d {
+            self.stop_sign = d;
+        }
+    }
+    fn set_yield_line(&mut self, d: Option<f64>) {
+        if let Some(d) = d {
+            self.yield_line = d;
+        }
+    }
+
+    /// The pure evaluate kernel: rebuild the constraint context from the flat fields
+    /// (`+∞` → `None`), fold the constraints, add the reproducible per-tick noise.
+    /// Reads only `self` — no graph access — so this is exactly what a WGSL kernel
+    /// mirrors when the accel math moves onto the GPU.
+    fn evaluate(&self, seed: u64, tick: u64) -> f64 {
+        let opt = |x: f64| x.is_finite().then_some(x);
+        let ctx = LongContext {
+            driver: &self.driver,
+            speed: self.speed,
+            leader: opt(self.leader_gap).map(|gap| Obstacle { gap, speed: self.leader_speed }),
+            stop_line: opt(self.stop_line),
+            speed_target: opt(self.speed_target_dist)
+                .map(|distance| SpeedTarget { speed: self.speed_target_speed, distance }),
+            stop_sign: opt(self.stop_sign),
+            yield_line: opt(self.yield_line),
+            merge: opt(self.merge_gap).map(|gap| Obstacle { gap, speed: self.merge_speed }),
+            curve: opt(self.curve_dist).map(|distance| SpeedTarget { speed: self.curve_speed, distance }),
+        };
+        constraint::binding_acceleration(&ctx, constraint::DEFAULT)
+            + constraint::accel_noise(self.driver.accel_noise, seed, self.agent_id, tick)
+    }
+}
+
+/// Per-vehicle input to the accel evaluate pass. A rolling vehicle carries its full
+/// [`VehicleContext`]; an in-node crosser carries the acceleration its bespoke
+/// [`NetWorld::crossing_accel`] already produced (a separate kernel, and noiseless).
+enum AccelInput {
+    Rolling(VehicleContext),
+    Crossing(f64),
+}
+
+impl AccelInput {
+    fn evaluate(&self, seed: u64, tick: u64) -> f64 {
+        match self {
+            AccelInput::Rolling(cx) => cx.evaluate(seed, tick),
+            AccelInput::Crossing(a) => *a,
+        }
+    }
 }
 
 /// FxHash-style hasher for the dense integer ids that key the per-tick maps —
@@ -271,6 +439,25 @@ impl NetWorld {
         Self {
             network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0,
             merges, signals, link_entries, router: None, external_reroute: false, junctions,
+            accel_backend: AccelBackend::Serial,
+        }
+    }
+
+    /// Request an executor for the per-vehicle accel passes. Resolved against
+    /// availability each step by [`active_backend`](Self::active_backend), so asking
+    /// for `Threads`/`Gpu` where they aren't available cleanly falls back to serial.
+    pub fn set_accel_backend(&mut self, backend: AccelBackend) {
+        self.accel_backend = backend;
+    }
+
+    /// The backend actually used this step: the request, downgraded to `Serial` when
+    /// it isn't available (no worker pool, or the GPU evaluate kernel isn't wired yet).
+    pub fn active_backend(&self) -> AccelBackend {
+        match self.accel_backend {
+            AccelBackend::Threads if threads_available() => AccelBackend::Threads,
+            // The GPU evaluate kernel is a follow-up; until then it runs serially
+            // (the gather is CPU-side regardless).
+            _ => AccelBackend::Serial,
         }
     }
 
@@ -784,160 +971,32 @@ impl NetWorld {
             }
         }
 
+        // Executor for the per-vehicle passes below (serial / CPU threads / GPU),
+        // resolved against what's available on this device.
+        let backend = self.active_backend();
+
         // Compute each vehicle's intended movement once (used by accel, the box
         // gate, and the transition).
-        let intended_mv: Vec<Option<MovementId>> = map_collect(self.fleet.rows.len(), |i| {
+        let intended_mv: Vec<Option<MovementId>> = map_collect(backend, self.fleet.rows.len(), |i| {
             let v = &self.fleet.rows[i];
             if v.crossing.is_some() { None } else { self.intended_movement(v) }
         });
 
-        let accels: Vec<f64> = map_collect(
-            self.fleet.rows.len(),
-            |i| {
-                let veh = &self.fleet.rows[i];
-                if veh.crossing.is_some() {
-                    return self.crossing_accel(i, &nb, &cross_by_mv);
-                }
-                let lane = *self.network.lane(veh.lane);
-                let driver = veh.driver.capped_to(lane.speed_limit);
-                let intended = intended_mv[i];
-                let node = self.downstream_node(veh.lane);
-                let control = self.network.node(node).control;
-                let to_line = (lane.length - veh.position).max(0.05);
-
-                // Perceive the leader as of `reaction_time` ago, but cap the gap by
-                // the true current gap so IDM can never under-brake (collision-free
-                // in-lane); the delay only adds start-up lag.
-                let leader = if let Some(li) = nb.leader_of[i] {
-                    let lead = &self.fleet.rows[li];
-                    let delay = (driver.reaction_time / dt).round() as usize;
-                    let (my_p, _) = self.fleet.delayed(i, delay);
-                    let (lead_p, lead_v) = self.fleet.delayed(li, delay);
-                    let delayed_gap = lead_p - my_p - lead.driver.vehicle_length;
-                    let current_gap = lead.position - veh.position - lead.driver.vehicle_length;
-                    Some(Obstacle { gap: delayed_gap.min(current_gap), speed: lead_v })
-                } else if let Some(mid) = intended {
-                    let to_lane = self.network.movement(mid).to_lane;
-                    nb.lane_front.get(&to_lane.0).map(|&front| {
-                        let lead = &self.fleet.rows[front];
-                        Obstacle {
-                            gap: (lane.length - veh.position) + lead.position - lead.driver.vehicle_length,
-                            speed: lead.speed,
-                        }
-                    })
-                } else {
-                    None
-                };
-
-                // Upcoming curve (lateral-accel limit) and turn speed; the LOD path
-                // below needs these, so compute them before it.
-                const A_LAT: f64 = 3.0;
-                const CURVE_LOOKAHEAD: f64 = 45.0;
-                let geom_curve = {
-                    let r = self.network.min_radius_ahead(veh.lane, veh.position, CURVE_LOOKAHEAD);
-                    r.is_finite().then(|| SpeedTarget { speed: (A_LAT * r).sqrt(), distance: CURVE_LOOKAHEAD })
-                };
-                let turn = intended
-                    .and_then(|mid| {
-                        if self.network.is_interchange_movement(mid) {
-                            return None; // free-flow diverge/merge; the ramp curve slows it
-                        }
-                        match self.network.movement_turn(mid) {
-                            TurnType::Left => Some(6.0),
-                            TurnType::Right => Some(5.0),
-                            TurnType::Through => None,
-                        }
-                    })
-                    .map(|speed| SpeedTarget { speed, distance: to_line.max(12.0) });
-                let curve = match (geom_curve, turn) {
-                    (Some(a), Some(b)) => Some(if a.speed <= b.speed { a } else { b }),
-                    (a, b) => a.or(b),
-                };
-
-                // LOD: beyond the range at which any node constraint can bind (and
-                // with no slower zone downstream), only the leader and local curvature
-                // matter — skip the node stack. Identical result, cheaper.
-                const DECISION_HORIZON: f64 = 180.0;
-                let downstream_slower = intended
-                    .is_some_and(|mid| self.network.lane(self.network.movement(mid).to_lane).speed_limit < lane.speed_limit);
-                if to_line > DECISION_HORIZON && !downstream_slower {
-                    let ctx = LongContext {
-                        driver: &driver,
-                        speed: veh.speed,
-                        leader,
-                        stop_line: None,
-                        speed_target: None,
-                        stop_sign: None,
-                        yield_line: None,
-                        merge: None,
-                        curve,
-                    };
-                    return constraint::binding_acceleration(&ctx, constraint::DEFAULT)
-                        + constraint::accel_noise(driver.accel_noise, self.cfg.seed, veh.id, self.tick);
-                }
-
-                // Don't-block-the-box: about to cross, but the downstream lane's
-                // entrance is occupied — hold at the line rather than land on top
-                // of a stopped vehicle (the main source of intersection crashes).
-                let downstream_blocked = intended.is_some_and(|mid| {
-                    let to_lane = self.network.movement(mid).to_lane;
-                    nb.lane_front
-                        .get(&to_lane.0)
-                        .is_some_and(|&f| self.fleet.rows[f].position < driver.vehicle_length + driver.min_gap)
-                });
-                // Signal: red always stops; yellow stops only if the vehicle can
-                // brake comfortably before the line (dilemma zone) — otherwise it
-                // proceeds and clears on yellow.
-                let signal_stop = intended.is_some_and(|mid| match self.movement_state(mid) {
-                    SignalState::Green => false,
-                    SignalState::Red => true,
-                    SignalState::Yellow => can_stop_before(veh.speed, driver.comfort_decel, to_line),
-                });
-                // Stop at the immediate line (red / blocked box), or ease toward a
-                // red one intersection ahead so the slowdown starts an earlier link.
-                let stop_line = (signal_stop || downstream_blocked)
-                    .then_some(to_line)
-                    .or_else(|| self.red_ahead(veh, intended, to_line));
-
-                let speed_target = intended.and_then(|mid| {
-                    let to = self.network.lane(self.network.movement(mid).to_lane);
-                    let target = veh.driver.desired_speed.min(to.speed_limit);
-                    (target < driver.desired_speed).then_some(SpeedTarget { speed: target, distance: to_line })
-                });
-
-                let stop_sign = (matches!(control, NodeControl::Stop) && veh.stopped_at != Some(node))
-                    .then_some(to_line);
-
-                // Never enter a box occupied by conflicting crossing traffic (any
-                // node type); additionally, at unsignalized nodes defer to
-                // higher-priority approaching traffic by right-of-way.
-                let box_yield = intended.is_some_and(|mid| self.box_conflict(mid, node, &nb));
-                // A freeway diverge/merge is free-flow — no cross traffic to yield to,
-                // so skip the right-of-way scan (which otherwise walks the whole dense
-                // freeway approach for every car on it).
-                let free_flow = intended.is_some_and(|mid| self.network.is_interchange_movement(mid));
-                let prio_yield = !free_flow
-                    && matches!(control, NodeControl::Uncontrolled | NodeControl::Stop | NodeControl::Yield)
-                    && self.conflicting_priority_traffic(i, veh.lane, node, &nb).is_some();
-                let yield_line = (box_yield || prio_yield).then_some(to_line);
-
-                let merge = self.merge_conflict(veh, lane.length, intended, &nb);
-
-                let ctx = LongContext {
-                    driver: &driver,
-                    speed: veh.speed,
-                    leader,
-                    stop_line,
-                    speed_target,
-                    stop_sign,
-                    yield_line,
-                    merge,
-                    curve,
-                };
-                let binding = constraint::binding_acceleration(&ctx, constraint::DEFAULT);
-                binding + constraint::accel_noise(driver.accel_noise, self.cfg.seed, veh.id, self.tick)
-            },
-        );
+        // Phase 4a — gather each vehicle's accel-decision inputs. Every graph,
+        // neighbor, signal and router lookup lives here (CPU-only; a GPU kernel can't
+        // chase these pointers). Rolling vehicles get a flat `VehicleContext`; in-node
+        // crossers carry their bespoke `crossing_accel` through unchanged.
+        let inputs: Vec<AccelInput> = map_collect(backend, self.fleet.rows.len(), |i| {
+            if self.fleet.rows[i].crossing.is_some() {
+                AccelInput::Crossing(self.crossing_accel(i, &nb, &cross_by_mv))
+            } else {
+                AccelInput::Rolling(self.gather_context(i, &nb, &intended_mv))
+            }
+        });
+        // Phase 4b — evaluate: the pure constraint fold + reproducible noise over the
+        // flat context. No graph access — this half transliterates to a WGSL kernel.
+        let (seed, tick) = (self.cfg.seed, self.tick);
+        let accels: Vec<f64> = map_collect(backend, inputs.len(), |i| inputs[i].evaluate(seed, tick));
         prof.lap(4);
 
         // Destination-lane occupancy (nearest-to-entrance rear), so a crosser
@@ -956,7 +1015,7 @@ impl NetWorld {
         // which the soft box-yield can't guarantee under momentum. Precomputed here
         // while committed state and `nb` are valid, since the advance pass empties
         // `self.fleet.rows`.
-        let block_entry: Vec<bool> = map_collect(self.fleet.rows.len(), |i| {
+        let block_entry: Vec<bool> = map_collect(backend, self.fleet.rows.len(), |i| {
             let veh = &self.fleet.rows[i];
             intended_mv[i]
                 .is_some_and(|mid| self.box_conflict(mid, self.network.link(self.network.lane(veh.lane).link).to, &nb))
@@ -1112,6 +1171,139 @@ impl NetWorld {
     /// IDM acceleration for a vehicle traversing a node interior: capped to the
     /// turn's comfortable speed and following either a crosser ahead on the same
     /// movement or the queue waiting on the destination lane.
+    /// Gather a rolling vehicle's accel-decision context — the graph, neighbor,
+    /// signal and router lookups a GPU evaluate kernel can't do. Returns a flat,
+    /// owned [`VehicleContext`]; [`VehicleContext::evaluate`] turns it into an
+    /// acceleration with no further graph access. Behaviour is identical to the old
+    /// fused accel loop; this is purely the gather/evaluate split.
+    fn gather_context(&self, i: usize, nb: &Neighbors, intended_mv: &[Option<MovementId>]) -> VehicleContext {
+        let dt = self.cfg.dt;
+        let veh = &self.fleet.rows[i];
+        let lane = *self.network.lane(veh.lane);
+        let driver = veh.driver.capped_to(lane.speed_limit);
+        let intended = intended_mv[i];
+        let node = self.downstream_node(veh.lane);
+        let control = self.network.node(node).control;
+        let to_line = (lane.length - veh.position).max(0.05);
+
+        // Perceive the leader as of `reaction_time` ago, but cap the gap by the true
+        // current gap so IDM can never under-brake (collision-free in-lane); the
+        // delay only adds start-up lag.
+        let leader = if let Some(li) = nb.leader_of[i] {
+            let lead = &self.fleet.rows[li];
+            let delay = (driver.reaction_time / dt).round() as usize;
+            let (my_p, _) = self.fleet.delayed(i, delay);
+            let (lead_p, lead_v) = self.fleet.delayed(li, delay);
+            let delayed_gap = lead_p - my_p - lead.driver.vehicle_length;
+            let current_gap = lead.position - veh.position - lead.driver.vehicle_length;
+            Some(Obstacle { gap: delayed_gap.min(current_gap), speed: lead_v })
+        } else if let Some(mid) = intended {
+            let to_lane = self.network.movement(mid).to_lane;
+            nb.lane_front.get(&to_lane.0).map(|&front| {
+                let lead = &self.fleet.rows[front];
+                Obstacle {
+                    gap: (lane.length - veh.position) + lead.position - lead.driver.vehicle_length,
+                    speed: lead.speed,
+                }
+            })
+        } else {
+            None
+        };
+
+        // Upcoming curve (lateral-accel limit) and turn speed; the LOD path below
+        // needs these, so compute them before it.
+        const A_LAT: f64 = 3.0;
+        const CURVE_LOOKAHEAD: f64 = 45.0;
+        let geom_curve = {
+            let r = self.network.min_radius_ahead(veh.lane, veh.position, CURVE_LOOKAHEAD);
+            r.is_finite().then(|| SpeedTarget { speed: (A_LAT * r).sqrt(), distance: CURVE_LOOKAHEAD })
+        };
+        let turn = intended
+            .and_then(|mid| {
+                if self.network.is_interchange_movement(mid) {
+                    return None; // free-flow diverge/merge; the ramp curve slows it
+                }
+                match self.network.movement_turn(mid) {
+                    TurnType::Left => Some(6.0),
+                    TurnType::Right => Some(5.0),
+                    TurnType::Through => None,
+                }
+            })
+            .map(|speed| SpeedTarget { speed, distance: to_line.max(12.0) });
+        let curve = match (geom_curve, turn) {
+            (Some(a), Some(b)) => Some(if a.speed <= b.speed { a } else { b }),
+            (a, b) => a.or(b),
+        };
+
+        let mut cx = VehicleContext::new(driver, veh.speed, veh.id);
+        cx.set_leader(leader);
+        cx.set_curve(curve);
+
+        // LOD: beyond the range at which any node constraint can bind (and with no
+        // slower zone downstream), only the leader and local curvature matter — skip
+        // the node stack. Identical result, cheaper.
+        const DECISION_HORIZON: f64 = 180.0;
+        let downstream_slower = intended
+            .is_some_and(|mid| self.network.lane(self.network.movement(mid).to_lane).speed_limit < lane.speed_limit);
+        if to_line > DECISION_HORIZON && !downstream_slower {
+            return cx;
+        }
+
+        // Don't-block-the-box: about to cross, but the downstream lane's entrance is
+        // occupied — hold at the line rather than land on top of a stopped vehicle
+        // (the main source of intersection crashes).
+        let downstream_blocked = intended.is_some_and(|mid| {
+            let to_lane = self.network.movement(mid).to_lane;
+            nb.lane_front
+                .get(&to_lane.0)
+                .is_some_and(|&f| self.fleet.rows[f].position < driver.vehicle_length + driver.min_gap)
+        });
+        // Signal: red always stops; yellow stops only if the vehicle can brake
+        // comfortably before the line (dilemma zone) — otherwise it proceeds and
+        // clears on yellow.
+        let signal_stop = intended.is_some_and(|mid| match self.movement_state(mid) {
+            SignalState::Green => false,
+            SignalState::Red => true,
+            SignalState::Yellow => can_stop_before(veh.speed, driver.comfort_decel, to_line),
+        });
+        // Stop at the immediate line (red / blocked box), or ease toward a red one
+        // intersection ahead so the slowdown starts an earlier link.
+        let stop_line = (signal_stop || downstream_blocked)
+            .then_some(to_line)
+            .or_else(|| self.red_ahead(veh, intended, to_line));
+
+        let speed_target = intended.and_then(|mid| {
+            let to = self.network.lane(self.network.movement(mid).to_lane);
+            let target = veh.driver.desired_speed.min(to.speed_limit);
+            (target < driver.desired_speed).then_some(SpeedTarget { speed: target, distance: to_line })
+        });
+
+        let stop_sign = (matches!(control, NodeControl::Stop) && veh.stopped_at != Some(node))
+            .then_some(to_line);
+
+        // Never enter a box occupied by conflicting crossing traffic (any node type);
+        // additionally, at unsignalized nodes defer to higher-priority approaching
+        // traffic by right-of-way.
+        let box_yield = intended.is_some_and(|mid| self.box_conflict(mid, node, nb));
+        // A freeway diverge/merge is free-flow — no cross traffic to yield to, so skip
+        // the right-of-way scan (which otherwise walks the whole dense freeway approach
+        // for every car on it).
+        let free_flow = intended.is_some_and(|mid| self.network.is_interchange_movement(mid));
+        let prio_yield = !free_flow
+            && matches!(control, NodeControl::Uncontrolled | NodeControl::Stop | NodeControl::Yield)
+            && self.conflicting_priority_traffic(i, veh.lane, node, nb).is_some();
+        let yield_line = (box_yield || prio_yield).then_some(to_line);
+
+        let merge = self.merge_conflict(veh, lane.length, intended, nb);
+
+        cx.set_stop_line(stop_line);
+        cx.set_speed_target(speed_target);
+        cx.set_stop_sign(stop_sign);
+        cx.set_yield_line(yield_line);
+        cx.set_merge(merge);
+        cx
+    }
+
     fn crossing_accel(&self, i: usize, nb: &Neighbors, cross_by_mv: &IntMap<Vec<usize>>) -> f64 {
         let veh = &self.fleet.rows[i];
         let c = veh.crossing.unwrap();
@@ -1479,14 +1671,32 @@ mod tests {
     }
 
     #[test]
-    fn map_collect_preserves_order_and_matches_serial() {
-        // Whichever build (serial or rayon `parallel`), the collected result must
-        // equal the plain serial map element-for-element — the per-vehicle step
-        // passes depend on this order preservation.
+    fn map_collect_matches_serial_on_every_backend() {
+        // Every backend must collect element-for-element what the plain serial map
+        // does — the per-vehicle step passes depend on this order preservation. 5000 is
+        // above the ~4k rayon crossover, so `Threads` actually engages rayon (under
+        // `--features parallel`); Gpu falls back but must still agree.
         let n = 5000;
-        let got = map_collect(n, |i| i * i + 7);
         let serial: Vec<usize> = (0..n).map(|i| i * i + 7).collect();
-        assert_eq!(got, serial);
+        for backend in [AccelBackend::Serial, AccelBackend::Threads, AccelBackend::Gpu] {
+            assert_eq!(map_collect(backend, n, |i| i * i + 7), serial, "backend {backend:?}");
+        }
+    }
+
+    #[test]
+    fn active_backend_falls_back_when_a_backend_is_unavailable() {
+        let mut w = NetWorld::new(millbrae_sample(), cfg());
+        assert_eq!(w.active_backend(), AccelBackend::Serial, "default is serial");
+        // The GPU evaluate kernel isn't wired yet, so requesting it runs serially.
+        w.set_accel_backend(AccelBackend::Gpu);
+        assert_eq!(w.active_backend(), AccelBackend::Serial);
+        // Threads resolves to itself only when the CPU pool is linked (the `parallel`
+        // feature natively); otherwise it too falls back.
+        w.set_accel_backend(AccelBackend::Threads);
+        let expected = if cfg!(feature = "parallel") { AccelBackend::Threads } else { AccelBackend::Serial };
+        assert_eq!(w.active_backend(), expected);
+        assert_eq!(AccelBackend::from_name("threads"), AccelBackend::Threads);
+        assert_eq!(AccelBackend::from_name("nonsense"), AccelBackend::Serial);
     }
 
     fn approach_lane(net: &Network) -> LaneId {

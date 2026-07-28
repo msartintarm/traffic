@@ -40,6 +40,9 @@ type Sim = {
   play(): void;
   pause(): void;
   set_speed(s: number): void;
+  effective_speed(): number;
+  selected_speed(): number;
+  is_throttled(): boolean;
   set_demand_mode(mode: string): void;
   demand_mode(): string;
   enable_gpu_routing(renderer: Renderer): void;
@@ -285,7 +288,13 @@ export default function EngineCanvas() {
             sliderRef.current.value = String(Math.round(Math.min(1, Math.max(0, t)) * 1000));
           }
           if (statsRef.current) {
-            statsRef.current.textContent = `${sim.vehicle_count()} vehicles · ${sim.crashed()} crashed`;
+            const sel = sim.selected_speed();
+            // Show the selected multiplier while the sim keeps up; only when the frame
+            // budget is actually dropping ticks show the achieved speed alongside it.
+            const speedStr = sim.is_throttled()
+              ? `${sim.effective_speed().toFixed(1)}×/${sel}× (throttled)`
+              : `${sel}×`;
+            statsRef.current.textContent = `${sim.vehicle_count()} vehicles · ${sim.crashed()} crashed · ${speedStr}`;
           }
           if (panelRef.current) {
             const i = selectedRef.current;

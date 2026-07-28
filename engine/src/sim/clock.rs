@@ -53,6 +53,12 @@ impl SimClock {
         self.speed
     }
 
+    /// Whether time is actually advancing (playing and speed > 0) — the guard for
+    /// the achieved-speed meter, which should read zero when paused.
+    pub fn is_running(&self) -> bool {
+        self.state == PlayState::Playing && self.speed > 0.0
+    }
+
     pub fn play(&mut self) {
         self.state = PlayState::Playing;
     }

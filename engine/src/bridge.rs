@@ -23,7 +23,7 @@ use crate::sim::flowfield_gpu::{GpuFlowField, PendingReadback};
 use crate::sim::config::{SimConfig, VehicleClass};
 use crate::sim::demand::{self, DemandGenerator, DemandMode};
 use crate::sim::map;
-use crate::sim::net_world::NetWorld;
+use crate::sim::net_world::{AccelBackend, NetWorld};
 use crate::sim::network::{LinkId, Network, LANE_WIDTH};
 
 /// Soft wall-clock budget (ms) for one frame's catch-up stepping. Past this, the
@@ -33,6 +33,9 @@ const FRAME_BUDGET_MS: f64 = 8.0;
 /// Hard ceiling on catch-up ticks per frame. The wall-clock budget is the real
 /// limiter; this only bounds the loop if no monotonic clock is available.
 const MAX_CATCHUP_TICKS: u32 = 240;
+/// Window over which the achieved-speed meter averages, long enough to smooth the
+/// sub-tick-per-frame quantization at low speeds.
+const SPEED_WINDOW_SECS: f64 = 0.5;
 
 /// Monotonic wall-clock milliseconds from the browser's high-resolution timer.
 /// Returns 0.0 if unavailable, which disables the budget (falling back to the tick
@@ -64,6 +67,19 @@ pub struct Simulation {
     gpu_pending: Option<PendingReadback>,
     gpu_cost: Vec<u64>,
     gpu_last: f64,
+    /// Achieved sim-time / wall-time over the last window — the speed the sim is
+    /// *actually* running at (see [`Simulation::meter_speed`]).
+    effective_speed: f64,
+    /// True when the frame budget is dropping catch-up ticks (can't hold the selected
+    /// speed). Surfaced instead of a noisy per-frame ratio.
+    throttled: bool,
+    /// `now_ms()` at the previous `advance`, for the inter-frame wall delta.
+    last_advance_ms: f64,
+    /// Rolling accumulators for the speed meter: sim- and wall-seconds since the last
+    /// window flush, plus whether any backlog was dropped within it.
+    speed_sim_accum: f64,
+    speed_wall_accum: f64,
+    speed_dropped: bool,
 }
 
 #[wasm_bindgen]
@@ -106,6 +122,8 @@ impl Simulation {
             world, clock, seed: cfg.seed, demand, demand_mode, camera,
             prev: PoseMap::default(), selected: None,
             gpu: None, gpu_pending: None, gpu_cost: Vec::new(), gpu_last: 0.0,
+            effective_speed: 0.0, throttled: false, last_advance_ms: 0.0,
+            speed_sim_accum: 0.0, speed_wall_accum: 0.0, speed_dropped: false,
         }
     }
 
@@ -210,39 +228,111 @@ impl Simulation {
     }
 
     pub fn advance(&mut self, real_elapsed_secs: f64) -> u32 {
+        // Wall-clock delta since the previous frame (uncapped, unlike the JS-capped
+        // `real_elapsed_secs`), clamped so a backgrounded tab's huge gap can't skew
+        // the speed meter.
+        let frame_ms = now_ms();
+        let wall = if self.last_advance_ms > 0.0 {
+            ((frame_ms - self.last_advance_ms) / 1000.0).clamp(0.0, 0.25)
+        } else {
+            0.0
+        };
+        self.last_advance_ms = frame_ms;
+
         self.drive_gpu_routing();
         let ticks = self.clock.advance(real_elapsed_secs, MAX_CATCHUP_TICKS);
-        if ticks == 0 {
-            return 0;
-        }
         let dt = self.clock.dt();
-        let started = now_ms();
+
         let mut ran = 0u32;
-        while ran < ticks {
-            // Once catch-up blows the frame budget, treat this tick as the last:
-            // render the result and drop the remaining backlog so a heavy step
-            // degrades to slow-motion instead of freezing the main thread. (Always
-            // run at least one tick, hence `ran > 0`.)
-            let over_budget = ran > 0 && now_ms() - started > FRAME_BUDGET_MS;
-            let last = over_budget || ran + 1 == ticks;
-            // The render interpolates between `prev` and the post-step state, so
-            // only the snapshot taken right before the *final* committed tick is
-            // used; taking it once (not per catch-up tick) avoids rebuilding the
-            // full pose map several times per frame.
-            if last {
-                self.prev = self.snapshot();
-            }
-            self.demand.step(&mut self.world, dt); // stream routed vehicles in
-            self.world.step();
-            ran += 1;
-            if last {
-                if over_budget {
-                    self.clock.drop_backlog();
+        if ticks > 0 {
+            let loop_start = now_ms();
+            while ran < ticks {
+                // Once catch-up blows the frame budget, treat this tick as the last:
+                // render the result and drop the remaining backlog so a heavy step
+                // degrades to slow-motion instead of freezing the main thread. (Always
+                // run at least one tick, hence `ran > 0`.)
+                let over_budget = ran > 0 && now_ms() - loop_start > FRAME_BUDGET_MS;
+                let last = over_budget || ran + 1 == ticks;
+                // The render interpolates between `prev` and the post-step state, so
+                // only the snapshot taken right before the *final* committed tick is
+                // used; taking it once (not per catch-up tick) avoids rebuilding the
+                // full pose map several times per frame.
+                if last {
+                    self.prev = self.snapshot();
                 }
-                break;
+                self.demand.step(&mut self.world, dt); // stream routed vehicles in
+                self.world.step();
+                ran += 1;
+                if last {
+                    if over_budget {
+                        self.clock.drop_backlog();
+                    }
+                    break;
+                }
             }
         }
+
+        self.meter_speed(ran, dt, wall, ran < ticks);
         ran
+    }
+
+    /// Roll the achieved-speed / throttled readout over a wall-clock window. Averaged
+    /// over the window (not per frame) because at low speeds most frames legitimately
+    /// run zero ticks — a per-frame ratio would read ~0 while perfectly keeping up.
+    /// "Throttled" is defined by the budget dropping catch-up ticks (`ran < ticks`),
+    /// the true can't-keep-up signal, rather than the noisy ratio.
+    fn meter_speed(&mut self, ran: u32, dt: f64, wall: f64, dropped_backlog: bool) {
+        if !self.clock.is_running() {
+            self.effective_speed = 0.0;
+            self.throttled = false;
+            self.speed_sim_accum = 0.0;
+            self.speed_wall_accum = 0.0;
+            self.speed_dropped = false;
+            return;
+        }
+        if wall <= 0.0 {
+            return; // first frame / no clock — nothing to attribute
+        }
+        self.speed_sim_accum += ran as f64 * dt;
+        self.speed_wall_accum += wall;
+        self.speed_dropped |= dropped_backlog;
+        if self.speed_wall_accum >= SPEED_WINDOW_SECS {
+            self.effective_speed = self.speed_sim_accum / self.speed_wall_accum;
+            self.throttled = self.speed_dropped;
+            self.speed_sim_accum = 0.0;
+            self.speed_wall_accum = 0.0;
+            self.speed_dropped = false;
+        }
+    }
+
+    /// Sim-seconds advanced per wall-second, actually achieved over the last window.
+    pub fn effective_speed(&self) -> f64 {
+        self.effective_speed
+    }
+
+    /// The speed multiplier the user selected (last `set_speed`).
+    pub fn selected_speed(&self) -> f64 {
+        self.clock.speed()
+    }
+
+    /// Whether the sim is failing to hold the selected speed — the frame budget is
+    /// dropping catch-up ticks. False while it keeps up (including at 1×, where most
+    /// frames legitimately run no tick at all).
+    pub fn is_throttled(&self) -> bool {
+        self.throttled
+    }
+
+    /// Choose the accel executor: `"serial"`, `"threads"`, or `"gpu"`. The sim falls
+    /// back automatically when the request isn't available on this device (no CPU
+    /// worker pool, or the GPU kernel not yet wired), so the UI can offer all three.
+    pub fn set_accel_backend(&mut self, name: &str) {
+        self.world.set_accel_backend(AccelBackend::from_name(name));
+    }
+
+    /// The backend actually running after availability fallback — for the UI to show
+    /// what the device settled on (may differ from the requested one).
+    pub fn accel_backend(&self) -> String {
+        self.world.active_backend().name().to_string()
     }
 
     pub fn vehicle_count(&self) -> u32 {

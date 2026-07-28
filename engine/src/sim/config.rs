@@ -7,7 +7,10 @@ use super::rng::{self, Stream};
 /// IDM car-following parameters. Fields carry SI units: speeds m/s,
 /// accelerations m/s², headway s, gaps/length m. Defaults are Treiber's
 /// passenger-car values.
-#[derive(Clone, Copy, Debug, PartialEq)]
+// `#[repr(C)]` + `Pod` so it can be embedded in the flat, GPU-uploadable
+// per-vehicle accel context (`net_world::VehicleContext`); all fields are `f64`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DriverConfig {
     pub desired_speed: f64,
     pub time_headway: f64,
