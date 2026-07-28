@@ -74,6 +74,14 @@
   width: 110px;
 }
 
+/* Live rush-hour clock + per-lane freeway volumes, beside the toggle. */
+.rushClock {
+  font-family: ui-monospace, monospace;
+  font-size: 0.7rem;
+  color: #93c5fd;
+  font-variant-numeric: tabular-nums;
+}
+
 /* Top-right status: backend, map, live counts. Never swallows canvas input. */
 .status {
   position: absolute;

@@ -52,26 +52,38 @@ pub struct Node {
     pub control: NodeControl,
 }
 
-/// Road class, distilled from the OSM `highway` tag. Distinguishes the
-/// grade-separated freeway system (mainline + ramps), whose junctions are
-/// free-flow diverges/merges, from ordinary at-grade `Surface` streets whose
-/// junctions are stop/signal/turn intersections.
+/// Road class, distilled from the OSM `highway` tag. The grade-separated freeway
+/// system (mainline + ramps) has free-flow diverge/merge junctions; the at-grade
+/// street classes (arterial / collector / local) are stop/signal/turn intersections,
+/// and are graded by function so demand and junction defaults can differ by type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoadKind {
-    Surface,
-    /// A freeway/expressway mainline (`motorway`/`trunk`).
+    /// Freeway/expressway mainline (`motorway`/`trunk`) — grade-separated, free-flow.
     Freeway,
-    /// A freeway on/off ramp or interchange connector (`*_link`).
+    /// Freeway on/off ramp or interchange connector (`motorway_link`/`trunk_link`).
     Ramp,
+    /// Major surface arterial (`primary`/`secondary`) — high-capacity signalized
+    /// street (e.g. El Camino Real / a main avenue), a through-corridor, not a
+    /// typical trip endpoint.
+    Arterial,
+    /// Collector (`tertiary`) — feeds local streets to the arterials.
+    Collector,
+    /// Local / residential street (`residential`, `unclassified`, service, …) — the
+    /// streets where trips actually start and end.
+    Local,
 }
 
 impl RoadKind {
-    /// From an OSM `highway` class string.
+    /// From an OSM `highway` class string. Ramp is *only* the freeway system's links
+    /// (`motorway_link`/`trunk_link`); an arterial/collector `*_link` is an at-grade
+    /// slip lane of that class, not a grade-separated ramp.
     pub fn from_osm(class: &str) -> Self {
         match class {
             "motorway" | "trunk" => RoadKind::Freeway,
-            c if c.ends_with("_link") => RoadKind::Ramp,
-            _ => RoadKind::Surface,
+            "motorway_link" | "trunk_link" => RoadKind::Ramp,
+            "primary" | "primary_link" | "secondary" | "secondary_link" => RoadKind::Arterial,
+            "tertiary" | "tertiary_link" => RoadKind::Collector,
+            _ => RoadKind::Local,
         }
     }
 
@@ -79,6 +91,17 @@ impl RoadKind {
     /// ramp) — where junctions are free-flow rather than at-grade crossings.
     pub fn is_grade_separated(self) -> bool {
         matches!(self, RoadKind::Freeway | RoadKind::Ramp)
+    }
+
+    /// An ordinary at-grade street (arterial, collector, or local).
+    pub fn is_surface(self) -> bool {
+        !self.is_grade_separated()
+    }
+
+    /// A major road — the freeway system or an arterial. Its trips are through-
+    /// movements; local trips start/end off it. (Collector/Local are "minor".)
+    pub fn is_major(self) -> bool {
+        matches!(self, RoadKind::Freeway | RoadKind::Ramp | RoadKind::Arterial)
     }
 }
 
@@ -190,6 +213,9 @@ pub struct Network {
     pub render_setback: Vec<f64>,
     /// OSM road name per link (index-aligned with `links`), for browser labelling.
     pub link_names: Vec<String>,
+    /// OSM route ref per link (index-aligned with `links`), e.g. "US 101"; empty for
+    /// unnumbered roads. Lets demand route freeway through-traffic along one highway.
+    pub link_refs: Vec<String>,
 }
 
 fn sub(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
@@ -330,6 +356,11 @@ impl Network {
 
     pub fn link(&self, id: LinkId) -> &Link {
         &self.links[id.idx()]
+    }
+
+    /// OSM route ref of a link (e.g. "US 101"), or "" for an unnumbered road.
+    pub fn link_ref(&self, id: LinkId) -> &str {
+        self.link_refs.get(id.idx()).map_or("", String::as_str)
     }
 
     pub fn lane(&self, id: LaneId) -> &Lane {
@@ -800,7 +831,7 @@ mod tests {
         // L-shaped link (0,0) → bend (100,0) → (100,100).
         let net = OsmMap {
             nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 100.0, 100.0)],
-            links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 1, speed_limit: 20.0, geometry: vec![[100.0, 0.0]], layer: 0, name: String::new(), road_class: String::new() }],
+            links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 1, speed_limit: 20.0, geometry: vec![[100.0, 0.0]], layer: 0, name: String::new(), road_class: String::new(), highway_ref: String::new() }],
         }
         .build();
         let lane = LaneId(0);

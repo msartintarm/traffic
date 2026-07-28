@@ -21,7 +21,7 @@ use crate::sim::clock::SimClock;
 use crate::sim::flowfield;
 use crate::sim::flowfield_gpu::{GpuFlowField, PendingReadback};
 use crate::sim::config::{SimConfig, VehicleClass};
-use crate::sim::demand::{self, DemandGenerator, DemandMode};
+use crate::sim::demand::{self, DemandGenerator, DemandSources};
 use crate::sim::map;
 use crate::sim::net_world::{AccelBackend, NetWorld};
 use crate::sim::network::{LinkId, Network, LANE_WIDTH};
@@ -53,7 +53,11 @@ pub struct Simulation {
     clock: SimClock,
     seed: u64,
     demand: DemandGenerator,
-    demand_mode: DemandMode,
+    demand_sources: DemandSources,
+    /// Spawn-rate multiplier and entry-speed cap (m/s), carried across demand rebuilds
+    /// so the UI's frequency / start-speed controls persist when sources are toggled.
+    demand_rate: f64,
+    entry_speed_cap: f64,
     camera: Camera,
     /// `[x, y, heading, speed]` of each vehicle one tick ago, keyed by id, so the
     /// render interpolates pose between committed states (smooth at 60fps) and
@@ -113,13 +117,14 @@ impl Simulation {
         let cfg = SimConfig { seed: seed as u64, ..SimConfig::default_config() };
         let camera = Camera::fit_bounds(network.bounds(), [900.0, 600.0], 24.0);
         let mut world = NetWorld::new(network, cfg);
-        let demand_mode = DemandMode::Balanced;
-        let demand = build_demand(&world, cfg.seed, demand_mode);
+        let demand_sources = DemandSources::new(true, true); // freeway + surface by default
+        let (demand_rate, entry_speed_cap) = (1.0, f64::INFINITY);
+        let demand = build_demand(&world, cfg.seed, demand_sources, demand_rate, entry_speed_cap);
         world.install_router(&demand.destinations());
         let mut clock = SimClock::new(&cfg);
         clock.play();
         Simulation {
-            world, clock, seed: cfg.seed, demand, demand_mode, camera,
+            world, clock, seed: cfg.seed, demand, demand_sources, demand_rate, entry_speed_cap, camera,
             prev: PoseMap::default(), selected: None,
             gpu: None, gpu_pending: None, gpu_cost: Vec::new(), gpu_last: 0.0,
             effective_speed: 0.0, throttled: false, last_advance_ms: 0.0,
@@ -141,27 +146,95 @@ impl Simulation {
         self.gpu_last = f64::NEG_INFINITY; // recompute on the next frame
     }
 
-    /// Switch the traffic mode ("balanced" or "highway") and reset the streams:
-    /// clears current vehicles, rebuilds the OD demand, and reinstalls the router
-    /// over the new destinations. Ignored if the mode is unchanged.
-    pub fn set_demand_mode(&mut self, mode: &str) {
-        let mode = DemandMode::from_name(mode);
-        if mode == self.demand_mode {
-            return;
-        }
-        self.demand_mode = mode;
-        self.demand = build_demand(&self.world, self.seed, mode);
-        self.world.clear_vehicles();
-        self.world.install_router(&self.demand.destinations());
-        self.prev.clear();
+    /// Set which traffic streams spawn (freeway and/or surface). Affects *new* spawns
+    /// only — existing vehicles keep driving to their destinations (the router is kept
+    /// over the union of the new demand's and the in-flight cars' destinations).
+    pub fn set_demand_sources(&mut self, highway: bool, surface: bool) {
+        self.apply_demand_sources(DemandSources { highway, surface, ..self.demand_sources });
     }
 
-    /// The active traffic mode name, for the UI to reflect.
-    pub fn demand_mode(&self) -> String {
-        match self.demand_mode {
-            DemandMode::Balanced => "balanced".into(),
-            DemandMode::HighwayBiased => "highway".into(),
+    /// Drive the freeway stream at real rush-hour peak volumes (each US-101 / I-280
+    /// gateway pushes its lane count × the per-lane peak flow). Affects new spawns
+    /// only; live and non-destructive like the other demand toggles.
+    pub fn set_highway_rush_hour(&mut self, enabled: bool) {
+        self.apply_demand_sources(DemandSources { rush_hour: enabled, ..self.demand_sources });
+    }
+
+    /// Rebuild the demand generator for a new source mix and reinstall the router over
+    /// its destinations plus those of cars already on the road, so in-flight trips
+    /// aren't stranded. No-op if the mix is unchanged.
+    fn apply_demand_sources(&mut self, sources: DemandSources) {
+        if sources == self.demand_sources {
+            return;
         }
+        self.demand_sources = sources;
+        self.demand = build_demand(&self.world, self.seed, sources, self.demand_rate, self.entry_speed_cap);
+        let mut dests = self.demand.destinations();
+        for v in self.world.vehicles() {
+            if let Some(d) = v.dest {
+                dests.push(d);
+            }
+        }
+        dests.sort_by_key(|l| l.0);
+        dests.dedup();
+        self.world.install_router(&dests);
+        // A GPU readback dispatched for the previous destination set is now stale —
+        // its slot layout no longer matches the reinstalled router. Drop it and force
+        // a fresh dispatch so we never feed mismatched distances into the new fields.
+        self.gpu_pending = None;
+        self.gpu_last = f64::NEG_INFINITY;
+    }
+
+    /// Whether freeway traffic is currently spawning, for the UI to reflect.
+    pub fn demand_highway(&self) -> bool {
+        self.demand_sources.highway
+    }
+
+    /// Whether surface traffic is currently spawning.
+    pub fn demand_surface(&self) -> bool {
+        self.demand_sources.surface
+    }
+
+    /// Whether the freeway stream is running on the real rush-hour profile.
+    pub fn demand_rush_hour(&self) -> bool {
+        self.demand_sources.rush_hour
+    }
+
+    /// The simulated rush-hour time of day (hours, 0–24) the profile clock is at, for
+    /// the UI to display the peak building and fading. 0 when the mode is off.
+    pub fn rush_hour_time(&self) -> f64 {
+        self.demand.rush_hour_day_secs() / 3600.0
+    }
+
+    /// Live per-lane freeway volumes (veh/h/lane) read off the real diurnal profile at
+    /// the current simulated time of day, as `[US-101, I-280]`.
+    pub fn rush_hour_flows(&self) -> Vec<f32> {
+        let t = self.demand.rush_hour_day_secs();
+        vec![
+            crate::sim::rush_hour::per_lane("US 101", t) as f32,
+            crate::sim::rush_hour::per_lane("I 280", t) as f32,
+        ]
+    }
+
+    /// Scale the spawn rate of every stream (1.0 = default). Live, non-destructive.
+    pub fn set_demand_rate(&mut self, scale: f64) {
+        self.demand_rate = scale.max(0.0);
+        self.demand.set_rate_scale(self.demand_rate);
+    }
+
+    pub fn demand_rate(&self) -> f64 {
+        self.demand_rate
+    }
+
+    /// Cap the speed vehicles enter the map at (m/s); still never above the origin
+    /// road's limit. A very large value means "enter at the road's limit".
+    pub fn set_entry_speed_cap(&mut self, mps: f64) {
+        self.entry_speed_cap = mps.max(0.0);
+        self.demand.set_entry_speed_cap(self.entry_speed_cap);
+    }
+
+    pub fn entry_speed_cap(&self) -> f64 {
+        self.entry_speed_cap
     }
 
     // --- camera control -------------------------------------------------------
@@ -663,9 +736,13 @@ impl Simulation {
     }
 }
 
-fn build_demand(world: &NetWorld, seed: u64, mode: DemandMode) -> DemandGenerator {
-    let pairs = demand::od_pairs(&world.network, seed, 48, mode);
-    DemandGenerator::new(world, &pairs, seed)
+fn build_demand(world: &NetWorld, seed: u64, sources: DemandSources, rate: f64, entry_cap: f64) -> DemandGenerator {
+    let pairs = demand::od_pairs(&world.network, seed, 48, sources);
+    let mut gen = DemandGenerator::new(world, &pairs, seed);
+    gen.set_rate_scale(rate);
+    gen.set_entry_speed_cap(entry_cap);
+    gen.set_rush_hour(&world.network, sources.rush_hour);
+    gen
 }
 
 /// Shortest signed angular difference `a → b`, so heading interpolation takes

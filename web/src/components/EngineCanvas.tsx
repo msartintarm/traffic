@@ -48,8 +48,15 @@ type Sim = {
   set_threads_ready(ready: boolean): void;
   set_par_threshold(n: number): void;
   par_threshold(): number;
-  set_demand_mode(mode: string): void;
-  demand_mode(): string;
+  set_demand_sources(highway: boolean, surface: boolean): void;
+  demand_highway(): boolean;
+  demand_surface(): boolean;
+  set_highway_rush_hour(enabled: boolean): void;
+  demand_rush_hour(): boolean;
+  rush_hour_time(): number;
+  rush_hour_flows(): Float32Array;
+  set_demand_rate(scale: number): void;
+  set_entry_speed_cap(mps: number): void;
   enable_gpu_routing(renderer: Renderer): void;
 };
 
@@ -84,6 +91,10 @@ type ThreadedEngineModule = EngineModule & { initThreadPool(numThreads: number):
 
 const ZOOM_RANGE = 60; // fit-out … max-in ratio driving the slider
 
+// Speed unit display: m/s → the shown unit, and its label.
+const MPS_TO = { mi: 2.23694, km: 3.6 } as const;
+const UNIT_LABEL = { mi: "mph", km: "km/h" } as const;
+
 export default function EngineCanvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const simRef = useRef<Sim | null>(null);
@@ -101,9 +112,16 @@ export default function EngineCanvas() {
   const [backend, setBackend] = useState("");
   const [mapLabel, setMapLabel] = useState("");
   const [scenario, setScenario] = useState("millbrae");
-  const [mode, setMode] = useState("balanced");
+  const [highwayTraffic, setHighwayTraffic] = useState(true);
+  const [surfaceTraffic, setSurfaceTraffic] = useState(true);
+  const [rushHour, setRushHour] = useState(false);
+  const rushClockRef = useRef<HTMLSpanElement>(null);
   const [accelBackend, setAccelBackend] = useState("serial");
-  const [parThreshold, setParThreshold] = useState(4000);
+  const [parThreshold, setParThreshold] = useState(2000);
+  const [demandRate, setDemandRate] = useState(1);
+  const [startSpeedMps, setStartSpeedMps] = useState(36); // ≥ every road limit ⇒ "enter at limit"
+  const [units, setUnits] = useState<"mi" | "km">("mi");
+  const unitsRef = useRef<"mi" | "km">("mi"); // read inside the rAF draw loop (avoids stale closure)
   const [showSettings, setShowSettings] = useState(false);
 
   useEffect(() => {
@@ -347,10 +365,27 @@ export default function EngineCanvas() {
             const speedStr = sim.is_throttled()
               ? `${sim.effective_speed().toFixed(1)}×/${sel}× (throttled)`
               : `${sel}×`;
-            // The *active* backend (after availability fallback), so a request that
-            // isn't available on this device is visible rather than silently ignored.
+            const count = sim.vehicle_count();
+            // Effective per-frame executor. `accel_backend()` is the active backend after
+            // availability fallback, but the Threads backend only parallelizes at/above
+            // the crossover — below it the step still runs serial — so surface which is
+            // actually in use right now, and the count where threads kick in.
+            const backendName = sim.accel_backend();
+            let execStr = backendName;
+            if (backendName === "threads") {
+              const thr = sim.par_threshold();
+              execStr = count >= thr ? `threads ▸ parallel (≥${thr})` : `threads ▸ serial (<${thr})`;
+            }
             statsRef.current.textContent =
-              `${sim.vehicle_count()} vehicles · ${sim.crashed()} crashed · ${speedStr} · ${sim.accel_backend()}`;
+              `${count} vehicles · ${sim.crashed()} crashed · ${speedStr} · ${execStr}`;
+          }
+          if (rushClockRef.current && sim.demand_rush_hour()) {
+            const h = sim.rush_hour_time();
+            const hh = Math.floor(h);
+            const mm = Math.floor((h - hh) * 60);
+            const [f101, f280] = sim.rush_hour_flows();
+            rushClockRef.current.textContent =
+              ` ${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")} · US-101 ${Math.round(f101)} · I-280 ${Math.round(f280)} veh/h/ln`;
           }
           if (panelRef.current) {
             const i = selectedRef.current;
@@ -358,7 +393,7 @@ export default function EngineCanvas() {
               const st = sim.link_stats(i);
               const name = roadsRef.current[i]?.name || `link ${i}`;
               panelRef.current.textContent =
-                `${name} — ${st[0] | 0} veh · ${Math.round(st[1] * 3.6)} km/h · ${Math.round(st[2])} veh/h · ${Math.round(st[3] * 100)}% full`;
+                `${name} — ${st[0] | 0} veh · ${Math.round(st[1] * MPS_TO[unitsRef.current])} ${UNIT_LABEL[unitsRef.current]} · ${Math.round(st[2])} veh/h · ${Math.round(st[3] * 100)}% full`;
               panelRef.current.style.display = "block";
             } else {
               panelRef.current.style.display = "none";
@@ -451,18 +486,91 @@ export default function EngineCanvas() {
               <option value="arterial">Test: arterial junction</option>
               <option value="corridor">Test: signal corridor</option>
             </select>
+            <label className={styles.zoomLabel} title="Freeway through-traffic: enters at a highway gateway, bound for the far end of the same highway, another highway exit, or a surface street.">
+              <input
+                type="checkbox"
+                checked={highwayTraffic}
+                disabled={!ready}
+                onChange={(e) => {
+                  simRef.current?.set_demand_sources(e.target.checked, surfaceTraffic);
+                  setHighwayTraffic(e.target.checked);
+                }}
+              />
+              Highway traffic
+            </label>
+            <label className={styles.zoomLabel} title="Local/arterial traffic on the surface streets (through the city, arriving, leaving, and internal trips).">
+              <input
+                type="checkbox"
+                checked={surfaceTraffic}
+                disabled={!ready}
+                onChange={(e) => {
+                  simRef.current?.set_demand_sources(highwayTraffic, e.target.checked);
+                  setSurfaceTraffic(e.target.checked);
+                }}
+              />
+              Surface traffic
+            </label>
+            <label
+              className={styles.zoomLabel}
+              title="Drive US-101 and I-280 at real rush-hour volumes: each freeway gateway feeds in its lane count × the route's per-lane hourly flow, from Caltrans PeMS typical-weekday data. The volume builds and fades as the simulated time of day advances."
+            >
+              <input
+                type="checkbox"
+                checked={rushHour}
+                disabled={!ready || !highwayTraffic}
+                onChange={(e) => {
+                  simRef.current?.set_highway_rush_hour(e.target.checked);
+                  setRushHour(e.target.checked);
+                }}
+              />
+              Highway rush hour
+              {rushHour && highwayTraffic && <span ref={rushClockRef} className={styles.rushClock} />}
+            </label>
+            <label className={styles.zoomLabel} title="Spawn-rate multiplier applied to every enabled traffic stream.">
+              Rate {demandRate.toFixed(2)}×
+              <input
+                type="range"
+                min={0}
+                max={4}
+                step={0.25}
+                value={demandRate}
+                disabled={!ready}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  simRef.current?.set_demand_rate(v);
+                  setDemandRate(v);
+                }}
+              />
+            </label>
+            <label className={styles.zoomLabel} title="Cap on the speed vehicles enter the map at — still never above the origin road's own speed limit.">
+              Start ≤ {Math.round(startSpeedMps * MPS_TO[units])} {UNIT_LABEL[units]}
+              <input
+                type="range"
+                min={0}
+                max={36}
+                step={1}
+                value={startSpeedMps}
+                disabled={!ready}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  simRef.current?.set_entry_speed_cap(v);
+                  setStartSpeedMps(v);
+                }}
+              />
+            </label>
             <select
               className={styles.button}
-              value={mode}
+              value={units}
               disabled={!ready}
-              title="Where traffic originates"
+              title="Speed units for the road readout and the start-speed control."
               onChange={(e) => {
-                simRef.current?.set_demand_mode(e.target.value);
-                setMode(e.target.value);
+                const v = e.target.value as "mi" | "km";
+                unitsRef.current = v;
+                setUnits(v);
               }}
             >
-              <option value="balanced">Traffic: balanced</option>
-              <option value="highway">Traffic: from highways</option>
+              <option value="mi">Units: mph</option>
+              <option value="km">Units: km/h</option>
             </select>
             <select
               className={styles.button}

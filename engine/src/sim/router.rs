@@ -101,6 +101,13 @@ impl FieldRouter {
     /// `dests_in_slot_order()[s]`. Equivalent to [`recompute`] but with the
     /// expensive Bellman–Ford done off-core.
     pub fn recompute_from_distances(&mut self, cost: &[u64], dist_per_slot: &[Vec<u64>]) {
+        // A batch whose slot count differs from the current field set is stale — the
+        // destinations changed (the router was reinstalled) after it was dispatched.
+        // Applying it would index past the fields or bind distances to the wrong
+        // destinations, so drop it wholesale; the next dispatch matches the new set.
+        if dist_per_slot.len() != self.next_hop.len() {
+            return;
+        }
         for (s, dist) in dist_per_slot.iter().enumerate() {
             self.next_hop[s] = flowfield::next_hops(&self.adj, dist, cost);
         }
@@ -213,6 +220,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn stale_distance_batch_is_ignored_not_applied() {
+        // A GPU readback dispatched for a larger destination set can land after the
+        // router is reinstalled with fewer destinations (the checkbox-toggle path).
+        // Feeding that oversized batch must not panic (index past the fields) nor
+        // corrupt the current fields — it is simply dropped.
+        let net = diamond();
+        let cost = free_costs(&net);
+        let mut router = FieldRouter::new(&net, &[LinkId(5)], &cost);
+        let before = router.next_hop(LinkId(5), LinkId(0));
+        // Two slots' worth of distances fed into a one-slot router.
+        let stale = vec![
+            flowfield::distances_to(router.adjacency(), LinkId(5), &cost),
+            flowfield::distances_to(router.adjacency(), LinkId(4), &cost),
+        ];
+        router.recompute_from_distances(&cost, &stale); // must not panic
+        assert_eq!(router.next_hop(LinkId(5), LinkId(0)), before, "stale batch left the field untouched");
     }
 
     #[test]

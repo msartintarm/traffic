@@ -98,6 +98,14 @@ impl Fleet {
         let n = self.hist_len[i] as usize;
         self.hist[i][n - 1 - ticks.min(n - 1)]
     }
+
+    /// Whether row `i` has more than `ticks` samples on its *current* lane, so a
+    /// `ticks`-delayed lookup is a real in-frame position rather than one clamped back
+    /// to (or across) a recent segment crossing. History is reset on crossing, so this
+    /// gates the reaction-delay model back on only once the car has settled.
+    fn settled(&self, i: usize, ticks: usize) -> bool {
+        self.hist_len[i] as usize > ticks
+    }
 }
 
 /// Append the current `(position, speed)` to a history column entry, dropping the
@@ -249,9 +257,10 @@ fn threads_available() -> bool {
 }
 
 /// Default for [`NetWorld::par_threshold`]: below this vehicle count rayon's per-task
-/// overhead outweighs the win (measured crossover on the Millbrae step is ~4–5k), so
-/// [`map_collect`] stays serial even on the `Threads` backend. Adjustable at runtime.
-pub const DEFAULT_PAR_THRESHOLD: usize = 4000;
+/// overhead outweighs the win (measured crossover on the Millbrae step is ~4–5k, but the
+/// default is set lower so threads engage sooner under climbing load), so [`map_collect`]
+/// stays serial even on the `Threads` backend below it. Adjustable at runtime.
+pub const DEFAULT_PAR_THRESHOLD: usize = 2000;
 
 /// Map `0..n` through `f` on the given `backend`. On `Threads`, runs serially when
 /// `n < threshold` (rayon overhead isn't worth it below the crossover). Order-preserving
@@ -1115,8 +1124,12 @@ impl NetWorld {
         // `self.fleet.rows`.
         let block_entry: Vec<bool> = map_collect(backend, par_threshold, self.fleet.rows.len(), |i| {
             let veh = &self.fleet.rows[i];
-            intended_mv[i]
-                .is_some_and(|mid| self.box_conflict(mid, self.network.link(self.network.lane(veh.lane).link).to, &nb))
+            intended_mv[i].is_some_and(|mid| {
+                // Free-flow freeway movements never hard-block on a box conflict (the
+                // merge is a zipper); only at-grade crossings gate on box occupancy.
+                !self.network.is_interchange_movement(mid)
+                    && self.box_conflict(mid, self.network.link(self.network.lane(veh.lane).link).to, &nb)
+            })
         });
 
         let n = self.fleet.len();
@@ -1144,6 +1157,11 @@ impl NetWorld {
                 Fate::Entered(link) => {
                     self.link_entries[link.idx()] += 1;
                     veh.wait_ticks = 0;
+                    // Crossed into a new lane: the retained position history is in the
+                    // previous segment's frame. Discard it so the reaction-delay leader
+                    // gap doesn't read a stale cross-frame position and phantom-brake the
+                    // car to a dead stop the instant it traverses a segment boundary.
+                    hl = 0;
                     true
                 }
                 Fate::Exited => {
@@ -1290,11 +1308,21 @@ impl NetWorld {
         let leader = if let Some(li) = nb.leader_of[i] {
             let lead = &self.fleet.rows[li];
             let delay = (driver.reaction_time / dt).round() as usize;
-            let (my_p, _) = self.fleet.delayed(i, delay);
-            let (lead_p, lead_v) = self.fleet.delayed(li, delay);
-            let delayed_gap = lead_p - my_p - lead.driver.vehicle_length;
             let current_gap = lead.position - veh.position - lead.driver.vehicle_length;
-            Some(Obstacle { gap: delayed_gap.min(current_gap), speed: lead_v })
+            // The reaction-delay gap is only meaningful when both cars have a full delay
+            // window of history on the *current* lane. Right after either crosses a
+            // segment boundary its delayed position is in a stale frame (history is reset
+            // on crossing), so fall back to the true current gap and the leader's current
+            // speed — otherwise the delayed lookup reads a cross-frame position and
+            // phantom-brakes the car to a dead stop the moment it traverses a boundary.
+            let (gap, speed) = if self.fleet.settled(i, delay) && self.fleet.settled(li, delay) {
+                let (my_p, _) = self.fleet.delayed(i, delay);
+                let (lead_p, lead_v) = self.fleet.delayed(li, delay);
+                ((lead_p - my_p - lead.driver.vehicle_length).min(current_gap), lead_v)
+            } else {
+                (current_gap, lead.speed)
+            };
+            Some(Obstacle { gap, speed })
         } else if let Some(mid) = intended {
             let to_lane = self.network.movement(mid).to_lane;
             nb.lane_front.get(&to_lane.0).map(|&front| {
@@ -1379,14 +1407,15 @@ impl NetWorld {
         let stop_sign = (matches!(control, NodeControl::Stop) && veh.stopped_at != Some(node))
             .then_some(to_line);
 
-        // Never enter a box occupied by conflicting crossing traffic (any node type);
+        // A freeway diverge/merge is free-flow — no crossing traffic to yield to (the
+        // merge is a zipper, handled by `merge`, not a box crossing). So a freeway
+        // through/merge/diverge movement never box-yields or box-blocks; that gating is
+        // what was wrongly stopping cars mid-freeway at on-ramp merges.
+        let free_flow = intended.is_some_and(|mid| self.network.is_interchange_movement(mid));
+        // Never enter a box occupied by conflicting crossing traffic (at-grade nodes);
         // additionally, at unsignalized nodes defer to higher-priority approaching
         // traffic by right-of-way.
-        let box_yield = intended.is_some_and(|mid| self.box_conflict(mid, node, nb));
-        // A freeway diverge/merge is free-flow — no cross traffic to yield to, so skip
-        // the right-of-way scan (which otherwise walks the whole dense freeway approach
-        // for every car on it).
-        let free_flow = intended.is_some_and(|mid| self.network.is_interchange_movement(mid));
+        let box_yield = !free_flow && intended.is_some_and(|mid| self.box_conflict(mid, node, nb));
         let prio_yield = !free_flow
             && matches!(control, NodeControl::Uncontrolled | NodeControl::Stop | NodeControl::Yield)
             && self.conflicting_priority_traffic(i, veh.lane, node, nb).is_some();
@@ -2579,7 +2608,7 @@ mod tests {
 
     #[test]
     fn real_map_highway_mode_originates_traffic_on_the_freeways() {
-        use super::super::demand::{self, DemandGenerator, DemandMode};
+        use super::super::demand::{self, DemandGenerator, DemandSources};
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
         let Ok(text) = std::fs::read_to_string(path) else { return };
         let net = super::super::map::OsmMap::from_json(&text).expect("map json").build();
@@ -2588,9 +2617,30 @@ mod tests {
         assert!(!boundary::highway_entry_links(&net).is_empty(), "the map has freeway gateways (101/280)");
 
         let seed = 2u64;
-        let pairs = demand::od_pairs(&net, seed, 40, DemandMode::HighwayBiased);
+        let pairs = demand::od_pairs(&net, seed, 40, DemandSources::new(true, false));
         let hw = pairs.iter().filter(|p| boundary::is_highway_link(&net, p.origin)).count();
         assert!(hw * 2 > pairs.len(), "most trips originate on a freeway: {hw} of {}", pairs.len());
+
+        // Every freeway trip: enters from outside (a highway gateway); ends at a highway
+        // exit or a surface street, never on a mid-freeway segment; and a meaningful
+        // share run the *same* freeway end-to-end (matched by OSM `ref`, US-101/I-280).
+        use std::collections::HashSet;
+        let entries: HashSet<u32> = boundary::highway_entry_links(&net).iter().map(|l| l.0).collect();
+        let hw_exit: HashSet<u32> = boundary::highway_exit_links(&net).iter().map(|l| l.0).collect();
+        let surface_int: HashSet<u32> = boundary::surface_interior_links(&net).iter().map(|l| l.0).collect();
+        let mid_freeway: HashSet<u32> =
+            boundary::interior_links(&net).iter().filter(|&&l| boundary::is_highway_link(&net, l)).map(|l| l.0).collect();
+        let mut same_hw = 0;
+        for p in &pairs {
+            assert!(entries.contains(&p.origin.0), "trip {p:?} must enter at a freeway gateway (from outside)");
+            assert!(!mid_freeway.contains(&p.dest.0), "no destination on a mid-freeway segment: {p:?}");
+            assert!(hw_exit.contains(&p.dest.0) || surface_int.contains(&p.dest.0), "dest is a highway exit or surface street: {p:?}");
+            let (ro, rd) = (net.link_ref(p.origin), net.link_ref(p.dest));
+            if hw_exit.contains(&p.dest.0) && !ro.is_empty() && ro.split(';').any(|t| rd.split(';').any(|u| u == t)) {
+                same_hw += 1;
+            }
+        }
+        assert!(same_hw > 0, "some freeway trips run the same highway end-to-end (ref-matched): {same_hw}/{}", pairs.len());
 
         let mut world = NetWorld::new(net, cfg());
         let mut gen = DemandGenerator::new(&world, &pairs, seed);
@@ -2610,7 +2660,7 @@ mod tests {
         // ramps form free-flow interchange nodes (no stop box). Under highway
         // demand, cars crossing those interchange movements keep real speed instead
         // of crawling as if through an intersection.
-        use super::super::demand::{self, DemandGenerator, DemandMode};
+        use super::super::demand::{self, DemandGenerator, DemandSources};
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
         let Ok(text) = std::fs::read_to_string(path) else { return };
         let net = super::super::map::OsmMap::from_json(&text).expect("map json").build();
@@ -2626,7 +2676,7 @@ mod tests {
         );
 
         let seed = 7u64;
-        let pairs = demand::od_pairs(&net, seed, 48, DemandMode::HighwayBiased);
+        let pairs = demand::od_pairs(&net, seed, 48, DemandSources::new(true, false));
         let mut world = NetWorld::new(net, cfg());
         let mut gen = DemandGenerator::new(&world, &pairs, seed);
         world.install_router(&gen.destinations());
@@ -2999,6 +3049,7 @@ mod tests {
                 layer: 0,
                 name: String::new(),
                 road_class: String::new(),
+                highway_ref: String::new(),
             }],
         }
         .build();

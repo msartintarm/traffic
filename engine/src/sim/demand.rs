@@ -11,51 +11,107 @@ use super::config::VehicleClass;
 use super::net_world::NetWorld;
 use super::network::{LinkId, Network};
 use super::rng::{self, Stream};
+use super::rush_hour;
 
+#[derive(Debug)]
 pub struct OdPair {
     pub origin: LinkId,
     pub dest: LinkId,
     pub rate_per_sec: f64,
 }
 
-/// How origins and destinations are distributed across the map — the "traffic
-/// mode" the UI exposes.
+/// Which streams of traffic to spawn — the independent toggles the UI exposes, so
+/// they compose. Freeway traffic enters at highway gateways bound for the far end of
+/// its highway (or another highway exit, or a surface street it leaves the freeway
+/// for); surface traffic is the local/arterial boundary mix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DemandMode {
-    /// Boundary-balanced: through / inbound / outbound / internal in fixed shares.
-    Balanced,
-    /// Freeway-dominated: most trips originate at a highway gateway (the US-101 /
-    /// I-280 on-ramps into the map), the rest keep the surface streets alive.
-    HighwayBiased,
+pub struct DemandSources {
+    pub highway: bool,
+    pub surface: bool,
+    /// Drive the freeway stream at real rush-hour peak volumes — each US-101 / I-280
+    /// gateway pushes its lane count × [`RUSH_HOUR_VEH_PER_LANE_HOUR`] instead of the
+    /// generic capacity-scaled rate, saturating the freeways the way a peak commute does.
+    pub rush_hour: bool,
 }
 
-impl DemandMode {
-    /// Parse the UI's mode name; unknown names fall back to [`Balanced`].
-    pub fn from_name(name: &str) -> Self {
-        match name {
-            "highway" | "highways" | "highway-biased" => DemandMode::HighwayBiased,
-            _ => DemandMode::Balanced,
-        }
+impl DemandSources {
+    pub const fn new(highway: bool, surface: bool) -> Self {
+        Self { highway, surface, rush_hour: false }
+    }
+
+    pub const fn with_rush_hour(highway: bool, surface: bool, rush_hour: bool) -> Self {
+        Self { highway, surface, rush_hour }
     }
 }
 
-/// OD demand for a mode. [`DemandMode::Balanced`] is the boundary mix;
-/// [`DemandMode::HighwayBiased`] anchors most origins on the freeway gateways.
-/// Both fall back to the balanced mix when the map lacks the gateways a mode needs.
-pub fn od_pairs(net: &Network, seed: u64, target: usize, mode: DemandMode) -> Vec<OdPair> {
-    match mode {
-        DemandMode::Balanced => boundary_od_pairs(net, seed, target),
-        DemandMode::HighwayBiased => highway_biased_od_pairs(net, seed, target),
+/// OD demand for the enabled sources — the union of the freeway and surface streams,
+/// with `target` trips split across whichever are on. Falls back to the plain
+/// boundary mix only if the enabled sources yield nothing (e.g. no gateways at all).
+pub fn od_pairs(net: &Network, seed: u64, target: usize, sources: DemandSources) -> Vec<OdPair> {
+    let n = (sources.highway as usize) + (sources.surface as usize);
+    if n == 0 {
+        return Vec::new();
     }
+    let per = (target / n).max(1);
+    let mut pairs = Vec::new();
+    if sources.highway {
+        highway_od_pairs(net, seed, per, &mut pairs);
+    }
+    if sources.surface {
+        surface_od_pairs(net, seed, per, &mut pairs);
+    }
+    if pairs.is_empty() {
+        pairs = boundary_od_pairs(net, seed, target);
+    }
+    pairs
+}
+
+/// Hour of day (0–24) the rush-hour clock starts at — mid pre-peak build-up, so the
+/// morning ramp is imminent when the mode is switched on.
+const RUSH_START_HOUR: f64 = 5.5;
+/// Simulated day-seconds elapsed per second of sim time: the 24 h profile plays over
+/// ~24 min of sim time, fast enough to watch the peak build and fade while vehicles
+/// still have real time to form and clear the queues it creates.
+const RUSH_DAY_COMPRESSION: f64 = 60.0;
+
+/// One origin→destination stream and how fast it spawns. Off-peak (or on a surface
+/// street) it fires at a fixed `base_rate`; a freeway stream under rush hour instead
+/// follows its route's real diurnal profile via `rush`.
+struct OdStream {
+    origin: LinkId,
+    dest: LinkId,
+    /// Generic (off-peak) spawn rate, veh/sec.
+    base_rate: f64,
+    /// Set when rush hour is on and this stream enters on a freeway.
+    rush: Option<RushRate>,
+}
+
+/// The time-varying spawn model for a freeway stream at rush hour: its gateway's lane
+/// count × the route's per-lane hourly volume, split across the gateway's pairs so the
+/// aggregate inflow stays calibrated to real data however the trips fan out.
+#[derive(Clone, Copy)]
+struct RushRate {
+    lanes: f64,
+    profile: &'static [u16; 24],
+    /// This stream's fraction (1 / pairs-sharing-origin) of its gateway's inflow.
+    share: f64,
 }
 
 pub struct DemandGenerator {
-    /// `(rate_per_sec, origin, dest)` for OD pairs with at least one valid route.
-    pairs: Vec<(f64, LinkId, LinkId)>,
+    /// OD streams with at least one valid route.
+    pairs: Vec<OdStream>,
     seed: u64,
     tick: u64,
     next_id: u32,
     spawned: u32,
+    /// Global multiplier on every stream's spawn rate (the UI frequency control).
+    rate_scale: f64,
+    /// Cap (m/s) on the speed a vehicle enters the map at, applied on top of the
+    /// origin road's limit and the driver's desired speed (the UI start-speed control).
+    entry_speed_cap: f64,
+    /// Simulated seconds-into-day while the rush-hour profile is driving the freeway
+    /// streams; `None` off-peak. Advances by [`RUSH_DAY_COMPRESSION`] each sim second.
+    rush_clock: Option<f64>,
 }
 
 impl DemandGenerator {
@@ -63,19 +119,70 @@ impl DemandGenerator {
         let pairs = pairs
             .iter()
             .filter(|p| world.network.route_links(p.origin, p.dest).is_some())
-            .map(|p| (p.rate_per_sec, p.origin, p.dest))
+            .map(|p| OdStream { origin: p.origin, dest: p.dest, base_rate: p.rate_per_sec, rush: None })
             .collect();
-        Self { pairs, seed, tick: 0, next_id: 0, spawned: 0 }
+        Self {
+            pairs, seed, tick: 0, next_id: 0, spawned: 0,
+            rate_scale: 1.0, entry_speed_cap: f64::INFINITY, rush_clock: None,
+        }
     }
 
     pub fn spawned(&self) -> u32 {
         self.spawned
     }
 
+    /// Switch the freeway streams onto the real diurnal PeMS profile (see
+    /// [`rush_hour`]) or back to their generic rate. When on, each freeway gateway
+    /// feeds in its lane count × the route's per-lane hourly volume, evolving as the
+    /// simulated time of day advances. No effect on surface streams.
+    pub fn set_rush_hour(&mut self, net: &Network, enabled: bool) {
+        if !enabled {
+            for s in &mut self.pairs {
+                s.rush = None;
+            }
+            self.rush_clock = None;
+            return;
+        }
+        for i in 0..self.pairs.len() {
+            let o = self.pairs[i].origin;
+            self.pairs[i].rush = boundary::is_highway_link(net, o).then(|| {
+                let n = self.pairs.iter().filter(|s| s.origin == o).count();
+                RushRate {
+                    lanes: net.link(o).lane_count as f64,
+                    profile: rush_hour::profile_for(net.link_ref(o)),
+                    share: 1.0 / n as f64,
+                }
+            });
+        }
+        self.rush_clock.get_or_insert(RUSH_START_HOUR * 3600.0);
+    }
+
+    /// Whether the rush-hour profile is currently driving the freeway streams.
+    pub fn rush_hour_active(&self) -> bool {
+        self.rush_clock.is_some()
+    }
+
+    /// The simulated time of day (seconds since midnight) the rush-hour clock is at,
+    /// for the UI readout; 0 when the mode is off.
+    pub fn rush_hour_day_secs(&self) -> f64 {
+        self.rush_clock.unwrap_or(0.0)
+    }
+
+    /// Scale every stream's spawn rate (1.0 = as configured; 0.0 = no spawning).
+    pub fn set_rate_scale(&mut self, scale: f64) {
+        self.rate_scale = scale.max(0.0);
+    }
+
+    /// Cap the entry speed (m/s); vehicles still never exceed the origin road's limit
+    /// or the driver's desired speed. `f64::INFINITY` = enter at the road's limit.
+    pub fn set_entry_speed_cap(&mut self, cap: f64) {
+        self.entry_speed_cap = cap.max(0.0);
+    }
+
     /// The distinct destinations demanded — the destination set to build a
     /// [`NetWorld`] flow-field router over.
     pub fn destinations(&self) -> Vec<LinkId> {
-        let mut dests: Vec<LinkId> = self.pairs.iter().map(|&(_, _, d)| d).collect();
+        let mut dests: Vec<LinkId> = self.pairs.iter().map(|s| s.dest).collect();
         dests.sort_by_key(|l| l.0);
         dests.dedup();
         dests
@@ -83,13 +190,19 @@ impl DemandGenerator {
 
     pub fn step(&mut self, world: &mut NetWorld, dt: f64) {
         let costs = world.live_link_costs();
+        let day = self.rush_clock;
         for i in 0..self.pairs.len() {
-            let (rate, origin, dest) = self.pairs[i];
-            if rng::uniform01(self.seed, i as u32, self.tick, Stream::RouteChoice) >= (rate * dt).min(1.0) {
+            let s = &self.pairs[i];
+            let (origin, dest) = (s.origin, s.dest);
+            let rate = match (day, s.rush) {
+                (Some(t), Some(r)) => r.lanes * rush_hour::interp(r.profile, t) / 3600.0 * r.share,
+                _ => s.base_rate,
+            };
+            if rng::uniform01(self.seed, i as u32, self.tick, Stream::RouteChoice) >= (rate * self.rate_scale * dt).min(1.0) {
                 continue;
             }
             let driver = class_of(self.seed, self.next_id).driver().sample(self.seed, self.next_id);
-            let speed = entry_speed(&world.network, origin, &driver);
+            let speed = entry_speed(&world.network, origin, &driver).min(self.entry_speed_cap);
             let spawned = if world.router_knows(dest) {
                 world.spawn_to(self.next_id, origin, dest, speed, driver)
             } else if let Some(route) = world.network.route_links_with_costs(origin, dest, &costs) {
@@ -101,6 +214,9 @@ impl DemandGenerator {
                 self.spawned += 1;
             }
             self.next_id += 1;
+        }
+        if let Some(t) = &mut self.rush_clock {
+            *t = (*t + dt * RUSH_DAY_COMPRESSION).rem_euclid(86_400.0);
         }
         self.tick += 1;
     }
@@ -136,36 +252,115 @@ pub fn boundary_od_pairs(net: &Network, seed: u64, target: usize) -> Vec<OdPair>
     pairs
 }
 
-/// Freeway-dominated OD demand: most trips originate on a highway gateway (off
-/// the freeway into town, or through to another gateway), with a minority leaving
-/// town onto the freeway or staying local, so the surface network still lives.
-/// Falls back to the balanced mix on a map with no highway gateways.
-pub fn highway_biased_od_pairs(net: &Network, seed: u64, target: usize) -> Vec<OdPair> {
+/// Freeway traffic: each trip enters at a highway gateway (from outside the map) and
+/// is bound for — by likelihood — the far end of the *same* highway (through-traffic),
+/// another highway exit (an interchange), or a surface street it leaves the freeway
+/// for. Never a mid-freeway segment. Same-highway matching uses the OSM route `ref`;
+/// a map without refs or freeway gateways contributes nothing (the caller falls back).
+pub fn highway_od_pairs(net: &Network, seed: u64, target: usize, out: &mut Vec<OdPair>) {
     let hw_in = boundary::highway_entry_links(net);
-    let hw_out = boundary::highway_exit_links(net);
-    let exits = boundary::exit_links(net);
-    let interior = boundary::interior_links(net);
     if hw_in.is_empty() {
-        return boundary_od_pairs(net, seed, target);
+        return;
     }
+    let hw_out = boundary::highway_exit_links(net);
+    let surface = boundary::surface_interior_links(net);
+
+    // Per highway entry, its routable highway exits split into same-highway (route
+    // ref matches) and other. Precomputed once; surface destinations are sampled
+    // per-attempt (there are too many to route-check up front).
+    let pools: Vec<(LinkId, Vec<LinkId>, Vec<LinkId>)> = hw_in
+        .iter()
+        .map(|&e| {
+            let r = net.link_ref(e);
+            let (mut same, mut other) = (Vec::new(), Vec::new());
+            for &d in &hw_out {
+                if d == e || net.route_links(e, d).is_none() {
+                    continue;
+                }
+                if !r.is_empty() && same_highway(net.link_ref(d), r) {
+                    same.push(d);
+                } else {
+                    other.push(d);
+                }
+            }
+            (e, same, other)
+        })
+        .collect();
+
+    let mut found = 0usize;
+    let mut attempt = 0u64;
+    while found < target && attempt < target as u64 * 40 + 400 {
+        let (e, same, other) = &pools[(rng::hash(seed, 60, attempt, Stream::RouteChoice) as usize) % pools.len()];
+        let r = rng::uniform01(seed, e.0, attempt, Stream::RouteChoice);
+        // Weighted by category, cascading when a pool is empty so the majority still
+        // lands on the same highway wherever refs make it possible.
+        let dest = if r < 0.60 {
+            pick(same, seed, attempt)
+                .or_else(|| pick(other, seed, attempt))
+                .or_else(|| pick_routable(net, *e, &surface, seed, attempt))
+        } else if r < 0.75 {
+            pick(other, seed, attempt)
+                .or_else(|| pick(same, seed, attempt))
+                .or_else(|| pick_routable(net, *e, &surface, seed, attempt))
+        } else {
+            pick_routable(net, *e, &surface, seed, attempt)
+                .or_else(|| pick(same, seed, attempt))
+                .or_else(|| pick(other, seed, attempt))
+        };
+        attempt += 1;
+        if let Some(d) = dest {
+            if d != *e {
+                out.push(OdPair { origin: *e, dest: d, rate_per_sec: capacity_rate(net, *e) });
+                found += 1;
+            }
+        }
+    }
+}
+
+/// Surface (local/arterial) traffic: the boundary mix over non-freeway gateways and
+/// interior streets — through the city, inbound, outbound, and internal trips.
+pub fn surface_od_pairs(net: &Network, seed: u64, target: usize, out: &mut Vec<OdPair>) {
+    let entries = boundary::surface_entry_links(net);
+    let exits = boundary::surface_exit_links(net);
+    let interior = boundary::surface_interior_links(net);
     let categories: [(&[LinkId], &[LinkId], f64); 4] = [
-        (&hw_in, &interior, 0.45),    // off the freeway into the city
-        (&hw_in, &exits, 0.30),       // through: freeway → any gateway (incl. the other freeway)
-        (&interior, &hw_out, 0.15),   // city onto the freeway
-        (&interior, &interior, 0.10), // residual local trips
+        (&entries, &exits, 0.35),     // through the city
+        (&entries, &interior, 0.25),  // arriving to a local destination
+        (&interior, &exits, 0.20),    // leaving town
+        (&interior, &interior, 0.20), // internal local trips
     ];
-    let mut pairs = Vec::new();
     for (cat, (origins, dests, share)) in categories.iter().enumerate() {
         if origins.is_empty() || dests.is_empty() {
             continue;
         }
         let want = ((target as f64 * share).round() as usize).max(1);
-        sample_pairs(net, seed, 50 + cat as u32, origins, dests, want, &mut pairs);
+        sample_pairs(net, seed, 80 + cat as u32, origins, dests, want, out);
     }
-    if pairs.is_empty() {
-        return boundary_od_pairs(net, seed, target);
+}
+
+/// Pick a random link from a small, pre-route-checked pool.
+fn pick(pool: &[LinkId], seed: u64, attempt: u64) -> Option<LinkId> {
+    (!pool.is_empty()).then(|| pool[(rng::hash(seed, 61, attempt, Stream::RouteChoice) as usize) % pool.len()])
+}
+
+/// Pick a link from `pool` that is routable from `e` (a few candidate tries).
+fn pick_routable(net: &Network, e: LinkId, pool: &[LinkId], seed: u64, attempt: u64) -> Option<LinkId> {
+    if pool.is_empty() {
+        return None;
     }
-    pairs
+    for k in 0..8u64 {
+        let d = pool[(rng::hash(seed, 62, attempt.wrapping_mul(8).wrapping_add(k), Stream::RouteChoice) as usize) % pool.len()];
+        if d != e && net.route_links(e, d).is_some() {
+            return Some(d);
+        }
+    }
+    None
+}
+
+/// Whether two OSM route refs designate the same highway — sharing any route token
+/// ("I 280;CA 35" and "I 280" match on "I 280").
+fn same_highway(a: &str, b: &str) -> bool {
+    a.split(';').any(|t| !t.is_empty() && b.split(';').any(|u| u == t))
 }
 
 fn sample_pairs(
@@ -265,6 +460,27 @@ mod tests {
     }
 
     #[test]
+    fn rate_scale_gates_spawning() {
+        let net = corridor().build();
+        let pairs = [OdPair { origin: LinkId(0), dest: LinkId(1), rate_per_sec: 0.5 }];
+        let mut world = NetWorld::new(net, SimConfig::default_config());
+        let mut gen = DemandGenerator::new(&world, &pairs, 7);
+        world.install_router(&gen.destinations());
+        gen.set_rate_scale(0.0);
+        for _ in 0..200 {
+            gen.step(&mut world, 0.2);
+            world.step();
+        }
+        assert_eq!(gen.spawned(), 0, "rate scale 0 stops all spawning");
+        gen.set_rate_scale(2.0);
+        for _ in 0..200 {
+            gen.step(&mut world, 0.2);
+            world.step();
+        }
+        assert!(gen.spawned() > 0, "restoring the rate resumes spawning");
+    }
+
+    #[test]
     fn demand_rate_scales_with_road_capacity() {
         // A 4-way with a high-capacity entry (3 lanes, 30 m/s — a freeway-ramp-like
         // road) and a low-capacity one (1 lane, 11 m/s — a local street). Demand
@@ -322,7 +538,7 @@ mod tests {
         assert!(boundary::is_highway_link(&net, LinkId(0)));
         assert!(!boundary::is_highway_link(&net, LinkId(3)));
 
-        let pairs = od_pairs(&net, 4, 40, DemandMode::HighwayBiased);
+        let pairs = od_pairs(&net, 4, 40, DemandSources::new(true, false));
         assert!(!pairs.is_empty(), "highway mode yields demand");
         let hw_origin = pairs.iter().filter(|p| boundary::is_highway_link(&net, p.origin)).count();
         assert!(
@@ -350,8 +566,97 @@ mod tests {
         // The plain corridor has no highway gateway, so highway mode degrades to the
         // balanced boundary mix rather than producing nothing.
         let net = corridor().build();
-        let pairs = od_pairs(&net, 3, 10, DemandMode::HighwayBiased);
+        let pairs = od_pairs(&net, 3, 10, DemandSources::new(true, false));
         assert!(!pairs.is_empty(), "no freeways → fall back to the balanced mix");
+    }
+
+    /// US-101 crossing the map (entry gateway → mid-freeway → exit gateway, all ref
+    /// "US 101") with a surface off-ramp to a local street.
+    fn freeway_corridor_with_ref() -> Network {
+        let hw = |a, b, r: &str| LinkSpec {
+            road_class: "motorway".into(),
+            highway_ref: r.into(),
+            ..LinkSpec::oneway(a, b, 3, 29.0)
+        };
+        OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, -900.0, 0.0), // W freeway gateway
+                NodeSpec::uncontrolled(2, -300.0, 0.0), // interior (mid-freeway)
+                NodeSpec::uncontrolled(3, 300.0, 0.0),  // interior interchange
+                NodeSpec::uncontrolled(4, 900.0, 0.0),  // E freeway gateway
+                NodeSpec::uncontrolled(5, 300.0, 300.0), // interior surface node
+                NodeSpec::uncontrolled(6, 300.0, 600.0), // S surface gateway
+            ],
+            links: vec![
+                hw(1, 2, "US 101"),              // 0: entry W→interior
+                hw(2, 3, "US 101"),              // 1: mid-freeway interior segment
+                hw(3, 4, "US 101"),              // 2: interior→E exit (same highway)
+                LinkSpec::oneway(3, 5, 1, 13.0), // 3: surface interior segment
+                LinkSpec::oneway(5, 6, 1, 13.0), // 4: surface exit
+            ],
+        }
+        .build()
+    }
+
+    #[test]
+    fn highway_trips_run_same_highway_or_surface_never_midfreeway() {
+        let net = freeway_corridor_with_ref();
+        assert_eq!(boundary::highway_entry_links(&net), vec![LinkId(0)]);
+        assert_eq!(boundary::highway_exit_links(&net), vec![LinkId(2)]);
+        let surface: std::collections::HashSet<u32> =
+            boundary::surface_interior_links(&net).iter().map(|l| l.0).collect();
+        assert!(surface.contains(&3) && !surface.contains(&1), "link 1 is mid-freeway, not a surface dest");
+
+        let mut pairs = Vec::new();
+        highway_od_pairs(&net, 7, 200, &mut pairs);
+        assert!(!pairs.is_empty(), "yields freeway demand");
+        let mut same = 0;
+        for p in &pairs {
+            assert_eq!(p.origin, LinkId(0), "every highway trip enters at the freeway gateway (from outside)");
+            assert!(
+                p.dest == LinkId(2) || surface.contains(&p.dest.0),
+                "destination is the highway exit or a surface street, never mid-freeway: {:?}",
+                p.dest
+            );
+            assert_ne!(p.dest, LinkId(1), "no destination on the mid-freeway segment");
+            same += (p.dest == LinkId(2)) as usize;
+        }
+        assert!(same * 2 > pairs.len(), "majority reach the far end of the same highway: {same}/{}", pairs.len());
+    }
+
+    #[test]
+    fn rush_hour_drives_gateways_from_the_real_profile() {
+        // The 3-lane US-101 gateway (link 0, ref "US 101") should feed in exactly
+        // 3 lanes × the route's per-lane hourly volume in aggregate — regardless of how
+        // many destination pairs it fans out to — and follow the real curve over the day.
+        let net = freeway_corridor_with_ref();
+        let world = NetWorld::new(net, SimConfig::default_config());
+        let mut pairs = Vec::new();
+        highway_od_pairs(&world.network, 7, 60, &mut pairs);
+        let mut gen = DemandGenerator::new(&world, &pairs, 7);
+
+        gen.set_rush_hour(&world.network, true);
+        assert!(gen.rush_hour_active());
+        assert_eq!(gen.rush_hour_day_secs(), RUSH_START_HOUR * 3600.0, "clock starts pre-peak");
+
+        let aggregate_at = |g: &DemandGenerator, secs: f64| {
+            g.pairs
+                .iter()
+                .filter(|s| s.origin == LinkId(0))
+                .map(|s| {
+                    let r = s.rush.expect("freeway stream is on the profile");
+                    r.lanes * rush_hour::interp(r.profile, secs) / 3600.0 * r.share
+                })
+                .sum::<f64>()
+        };
+        let peak = aggregate_at(&gen, 7.0 * 3600.0);
+        assert!((peak - 3.0 * 1484.0 / 3600.0).abs() < 1e-6, "AM-peak gateway inflow = lanes × US-101 curve, got {peak}");
+        // The curve varies through the day: the 3am trough is far below the 7am peak.
+        assert!(aggregate_at(&gen, 3.0 * 3600.0) < peak * 0.2, "pre-dawn is a small fraction of the peak");
+
+        gen.set_rush_hour(&world.network, false);
+        assert!(!gen.rush_hour_active());
+        assert!(gen.pairs.iter().all(|s| s.rush.is_none()), "toggling off restores the generic rate");
     }
 
     #[test]

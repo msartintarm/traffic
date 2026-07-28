@@ -66,11 +66,15 @@ pub struct LinkSpec {
     /// OSM `highway` class (e.g. "motorway", "motorway_link", "residential"),
     /// distilled into [`RoadKind`] at build; drives free-flow ramp interchanges.
     pub road_class: String,
+    /// OSM `ref` — the route designation of a numbered road (e.g. "US 101",
+    /// "I 280;CA 35"). Empty for unnumbered streets. Carried to the network so
+    /// demand can send freeway through-traffic to the far end of the *same* highway.
+    pub highway_ref: String,
 }
 
 impl LinkSpec {
     pub fn oneway(from_osm: i64, to_osm: i64, lanes: u32, speed_limit: f64) -> Self {
-        Self { from_osm, to_osm, lanes, speed_limit, geometry: Vec::new(), layer: 0, name: String::new(), road_class: String::new() }
+        Self { from_osm, to_osm, lanes, speed_limit, geometry: Vec::new(), layer: 0, name: String::new(), road_class: String::new(), highway_ref: String::new() }
     }
 
     pub fn twoway(a: i64, b: i64, lanes: u32, speed_limit: f64) -> [Self; 2] {
@@ -214,6 +218,7 @@ impl OsmMap {
             });
             net.polylines.push(polyline);
             net.link_names.push(spec.name.clone());
+            net.link_refs.push(spec.highway_ref.clone());
         }
 
         offset_ramps_to_curb(&mut net);
@@ -275,10 +280,16 @@ impl OsmMap {
                 for (k, exits) in lane_exits.iter_mut().enumerate() {
                     exits.insert(mains[nearest(k, n - 1, mm - 1)]);
                 }
-                // Off-ramps hang off the curb lane only (shared with the mainline).
+                // Off-ramps hang off the curb lanes: a k-lane ramp takes the curb-most
+                // k freeway lanes, so a multi-lane exit is fed at full width instead of
+                // being funnelled through one lane and backing up onto the mainline. The
+                // curb lanes still carry the mainline too (option lanes, not exit-only).
                 for i in 0..m {
                     if ramp_exit(i) {
-                        lane_exits[n - 1].insert(i);
+                        let rl = net.links[onward[i].0].lane_count as usize;
+                        for k in 0..rl.min(n) {
+                            lane_exits[n - 1 - k].insert(i);
+                        }
                     }
                 }
             } else if m > 0 {
@@ -295,9 +306,15 @@ impl OsmMap {
                 for &exit_i in exits {
                     let out = net.links[onward[exit_i].0];
                     // An on-ramp merges onto the freeway's curb (rightmost) lane, not
-                    // the same index it left (which would land it on the median).
+                    // the same index it left (which would land it on the median). A
+                    // multi-lane off-ramp maps the curb-most freeway lanes parallel onto
+                    // the ramp's lanes (outermost-to-outermost), so every ramp lane is
+                    // fed and none is a dead lane — and no path crosses the mainline.
                     let to_index = if link.kind == RoadKind::Ramp && out.kind == RoadKind::Freeway {
                         out.lane_count - 1
+                    } else if link.kind == RoadKind::Freeway && out.kind == RoadKind::Ramp {
+                        let from_curb = (link.lane_count - 1).saturating_sub(k as u32); // 0 at the curb lane
+                        (out.lane_count - 1).saturating_sub(from_curb)
                     } else {
                         (k as u32).min(out.lane_count - 1)
                     };
@@ -539,17 +556,40 @@ fn next_collapse(
         let find = |from: i64, to: i64| links.iter().position(|l| l.from_osm == from && l.to_osm == to);
         let (a_in, a_out, b_in, b_out) = (find(a, n), find(n, a), find(b, n), find(n, b));
 
+        let link_len = |l: &LinkSpec| -> f64 {
+            let mut pts = vec![pos[&l.from_osm]];
+            pts.extend(l.geometry.iter().copied());
+            pts.push(pos[&l.to_osm]);
+            pts.windows(2).map(|w| distance(w[0], w[1])).sum()
+        };
         let joined = |s1: usize, s2: usize, from: i64, to: i64| -> Option<LinkSpec> {
             let (l1, l2) = (&links[s1], &links[s2]);
-            if l1.lanes != l2.lanes || l1.speed_limit != l2.speed_limit || l1.layer != l2.layer {
+            if l1.speed_limit != l2.speed_limit || l1.layer != l2.layer {
                 return None;
             }
+            // Lane counts must match, except when one side is a grade-separated ramp
+            // sliver too short to hold a vehicle — an OSM lane-count fragment on a ramp
+            // approach (e.g. a 16 m 3-lane nub before a surface junction). Absorb it into
+            // the substantive segment, adopting that segment's lane count, so the ramp
+            // isn't chopped into micro-links that thrash the node-crossing logic.
+            const SLIVER_MAX: f64 = 30.0;
+            let lanes = if l1.lanes == l2.lanes {
+                l1.lanes
+            } else {
+                let ramp = |l: &LinkSpec| RoadKind::from_osm(&l.road_class).is_grade_separated();
+                let (len1, len2) = (link_len(l1), link_len(l2));
+                if !(ramp(l1) && ramp(l2)) || len1.min(len2) >= SLIVER_MAX {
+                    return None;
+                }
+                if len1 >= len2 { l1.lanes } else { l2.lanes }
+            };
             let mut geometry = l1.geometry.clone();
             geometry.push(pos[&n]);
             geometry.extend(l2.geometry.iter().copied());
             let name = if l1.name.is_empty() { l2.name.clone() } else { l1.name.clone() };
             let road_class = if l1.road_class.is_empty() { l2.road_class.clone() } else { l1.road_class.clone() };
-            Some(LinkSpec { from_osm: from, to_osm: to, lanes: l1.lanes, speed_limit: l1.speed_limit, geometry, layer: l1.layer, name, road_class })
+            let highway_ref = if l1.highway_ref.is_empty() { l2.highway_ref.clone() } else { l1.highway_ref.clone() };
+            Some(LinkSpec { from_osm: from, to_osm: to, lanes, speed_limit: l1.speed_limit, geometry, layer: l1.layer, name, road_class, highway_ref })
         };
 
         if incident.len() == 4 {
@@ -711,6 +751,8 @@ mod json {
         name: String,
         #[serde(default)]
         road_class: String,
+        #[serde(default, rename = "ref")]
+        highway_ref: String,
     }
 
     #[derive(Deserialize)]
@@ -757,6 +799,7 @@ mod json {
                 layer: l.layer,
                 name: l.name,
                 road_class: l.road_class,
+                highway_ref: l.highway_ref,
             })
             .collect();
         Ok(OsmMap { nodes, links })
@@ -1149,7 +1192,7 @@ mod tests {
             ],
             links: vec![
                 LinkSpec::oneway(1, 2, 1, 20.0), // surface road, crosses origin
-                LinkSpec { from_osm: 3, to_osm: 4, lanes: 1, speed_limit: 25.0, geometry: Vec::new(), layer: 1, name: String::new(), road_class: String::new() }, // bridge over it
+                LinkSpec { from_osm: 3, to_osm: 4, lanes: 1, speed_limit: 25.0, geometry: Vec::new(), layer: 1, name: String::new(), road_class: String::new(), highway_ref: String::new() }, // bridge over it
             ],
         }
         .build();

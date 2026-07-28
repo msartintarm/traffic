@@ -95,6 +95,23 @@ pub fn highway_exit_links(net: &Network) -> Vec<LinkId> {
     exit_links(net).into_iter().filter(|&l| is_highway_link(net, l)).collect()
 }
 
+/// Entry links that are ordinary surface streets (not freeways) — where local /
+/// arterial traffic enters the map.
+pub fn surface_entry_links(net: &Network) -> Vec<LinkId> {
+    entry_links(net).into_iter().filter(|&l| !is_highway_link(net, l)).collect()
+}
+
+/// Exit links that are ordinary surface streets (not freeways).
+pub fn surface_exit_links(net: &Network) -> Vec<LinkId> {
+    exit_links(net).into_iter().filter(|&l| !is_highway_link(net, l)).collect()
+}
+
+/// Interior links that are ordinary surface streets — the "non-major road" trip
+/// ends a highway traveller may leave the freeway for (never a mid-freeway segment).
+pub fn surface_interior_links(net: &Network) -> Vec<LinkId> {
+    interior_links(net).into_iter().filter(|&l| !is_highway_link(net, l)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
