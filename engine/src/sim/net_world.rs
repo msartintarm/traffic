@@ -4,10 +4,11 @@
 //! Accelerations read committed pre-step state and apply in a second pass.
 
 use std::collections::HashMap;
-use std::hash::BuildHasherDefault;
 
 use super::config::{DriverConfig, SimConfig};
 use super::constraint::{self, LongContext, Obstacle, SpeedTarget};
+use super::congestion::{CongestionConfig, CongestionLod};
+use super::hash::IntMap;
 use super::idm;
 use super::mobil::{self, MobilParams};
 use super::junction::{self, Junctions, SignalController};
@@ -163,6 +164,11 @@ pub struct NetWorld {
     /// Vehicle count at/above which the `Threads` backend actually parallelizes (below
     /// it, serial — rayon overhead isn't worth it). Runtime-tunable for measurement.
     par_threshold: usize,
+    /// Congestion level-of-detail: while a link stays saturated, its queued followers
+    /// use cheap leader-only car-following instead of the full gather. Cars stay
+    /// individual; this only cuts per-car work. Inert unless `congestion_cfg.enabled`.
+    congestion: CongestionLod,
+    congestion_cfg: CongestionConfig,
 }
 
 /// Sim seconds between flow-field rebuilds — often enough that routing tracks
@@ -480,31 +486,6 @@ impl AccelInput {
     }
 }
 
-/// FxHash-style hasher for the dense integer ids that key the per-tick maps —
-/// far cheaper than the default SipHash.
-#[derive(Default)]
-pub struct FxHasher(u64);
-const FX_K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
-impl std::hash::Hasher for FxHasher {
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(FX_K);
-        }
-    }
-    #[inline]
-    fn write_u32(&mut self, i: u32) {
-        self.0 = (self.0.rotate_left(5) ^ i as u64).wrapping_mul(FX_K);
-    }
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.0
-    }
-}
-/// Map/set keyed by a dense integer id, hashed with [`FxHasher`].
-type IntMap<V> = HashMap<u32, V, BuildHasherDefault<FxHasher>>;
-
-
 /// How far ahead a driver reads signals to ease off early for a red at the next
 /// intersection (metres) — anticipatory braking across the current link.
 const SIGNAL_LOOKAHEAD: f64 = 90.0;
@@ -523,12 +504,14 @@ impl NetWorld {
         let signals = SignalController::build(&network);
         let link_entries = vec![0u32; network.links.len()];
         let junctions = Junctions::build(&network);
+        let congestion = CongestionLod::new(network.links.len());
         Self {
             network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0,
             merges, signals, link_entries, router: None, external_reroute: false, junctions,
             accel_backend: AccelBackend::Serial,
             threads_ready: cfg!(not(target_arch = "wasm32")),
             par_threshold: DEFAULT_PAR_THRESHOLD,
+            congestion, congestion_cfg: CongestionConfig::disabled(),
         }
     }
 
@@ -571,6 +554,76 @@ impl NetWorld {
     pub fn install_router(&mut self, dests: &[LinkId]) {
         let costs = self.live_link_costs();
         self.router = Some(FieldRouter::new(&self.network, dests, &costs));
+    }
+
+    /// Configure the congestion level-of-detail. Turning it off returns every link to
+    /// full per-car detail immediately.
+    pub fn set_congestion(&mut self, cfg: CongestionConfig) {
+        if !cfg.enabled {
+            self.congestion.reset();
+        }
+        self.congestion_cfg = cfg;
+    }
+
+    pub fn congestion_config(&self) -> CongestionConfig {
+        self.congestion_cfg
+    }
+
+    /// How many links are currently running the cheap queue model.
+    pub fn congestion_active_links(&self) -> u32 {
+        self.congestion.active_count()
+    }
+
+    /// Per-link occupancy ratio (rolling car count ÷ jam capacity), the signal the
+    /// congestion LOD thresholds on.
+    fn link_occupancy(&self) -> Vec<f64> {
+        let n = self.network.links.len();
+        let mut count = vec![0u32; n];
+        for v in &self.fleet.rows {
+            if v.crossing.is_none() {
+                count[self.network.lane(v.lane).link.idx()] += 1;
+            }
+        }
+        (0..n)
+            .map(|i| {
+                let l = self.network.link(LinkId(i as u32));
+                let lane = self.network.lane(l.lane_start);
+                let jam = (lane.length / 7.0 * l.lane_count as f64).max(1.0);
+                (count[i] as f64 / jam).min(1.0)
+            })
+            .collect()
+    }
+
+    /// A cheap accel context for a queued follower: leader car-following (at the true
+    /// current gap, no reaction-delay history) capped at the lane speed, and nothing
+    /// else. The full gather's curve/merge/yield/signal-lookahead scans are skipped —
+    /// they barely bind for a car crawling behind a leader, and the front-of-lane car
+    /// (which has no leader, so it takes the full path) still handles the junction.
+    fn queue_context(&self, i: usize, leader: usize) -> VehicleContext {
+        let veh = &self.fleet.rows[i];
+        let lane = self.network.lane(veh.lane);
+        let lead = &self.fleet.rows[leader];
+        let mut cx = VehicleContext::new(veh.driver.capped_to(lane.speed_limit), veh.speed, veh.id);
+        cx.set_leader(Some(Obstacle {
+            gap: lead.position - veh.position - lead.driver.vehicle_length,
+            speed: lead.speed,
+        }));
+        cx
+    }
+
+    /// The same-lane leader if car `i` qualifies for the cheap queue model — it is on a
+    /// congested (queue-mode) link and has a leader ahead. Returns `None` otherwise
+    /// (including the front-of-lane car), so those take the full gather path.
+    fn queue_follower(&self, i: usize, nb: &Neighbors) -> Option<usize> {
+        if !self.congestion_cfg.enabled {
+            return None;
+        }
+        let link = self.network.lane(self.fleet.rows[i].lane).link;
+        if self.congestion.is_queue(link.idx()) {
+            nb.leader_of[i]
+        } else {
+            None
+        }
     }
 
     pub fn router_knows(&self, dest: LinkId) -> bool {
@@ -891,6 +944,14 @@ impl NetWorld {
         }
         let mut changes: Vec<(usize, LaneId)> = Vec::new();
         for i in 0..self.fleet.rows.len() {
+            // Cars on a congested (queue-mode) link skip lane-change evaluation — the
+            // expensive MOBIL scan, for negligible movement in a jam.
+            if self.congestion_cfg.enabled {
+                let link = self.network.lane(self.fleet.rows[i].lane).link;
+                if self.congestion.is_queue(link.idx()) {
+                    continue;
+                }
+            }
             if let Some(t) = self.best_lane_change(i, &by_lane) {
                 changes.push((i, t));
             }
@@ -1064,6 +1125,11 @@ impl NetWorld {
         prof.lap(0);
         self.advance_signals(dt);
         prof.lap(1);
+        if self.congestion_cfg.enabled {
+            let occ = self.link_occupancy();
+            let cfg = self.congestion_cfg;
+            self.congestion.update_modes(&occ, &cfg);
+        }
         self.lane_changes();
         prof.lap(2);
         let nb = self.neighbors();
@@ -1096,6 +1162,9 @@ impl NetWorld {
         let inputs: Vec<AccelInput> = map_collect(backend, par_threshold, self.fleet.rows.len(), |i| {
             if self.fleet.rows[i].crossing.is_some() {
                 AccelInput::Crossing(self.crossing_accel(i, &nb, &cross_by_mv))
+            } else if let Some(leader) = self.queue_follower(i, &nb) {
+                // Congested-link follower: cheap leader-only car-following.
+                AccelInput::Rolling(self.queue_context(i, leader))
             } else {
                 AccelInput::Rolling(self.gather_context(i, &nb, &intended_mv))
             }
@@ -2311,6 +2380,69 @@ mod tests {
             links: vec![LinkSpec::oneway(1, 2, 1, 40.0)],
         }
         .build()
+    }
+
+    fn packed_queue(cong: CongestionConfig) -> (NetWorld, u32) {
+        // A single link packed near jam density, feeding a gateway — the queued state
+        // the congestion LOD is meant to engage on.
+        let net = straight_link(400.0);
+        let mut w = NetWorld::new(net, cfg());
+        w.set_congestion(cong);
+        let lane = w.network.lanes_of(LinkId(0)).next().unwrap();
+        let n = 45u32;
+        for i in 0..n {
+            w.spawn(i, lane, i as f64 * 8.0, 0.0, DriverConfig::car());
+        }
+        (w, n)
+    }
+
+    #[test]
+    fn congestion_lod_engages_but_never_crashes_or_loses_cars() {
+        let cong = CongestionConfig { enabled: true, engage_occ: 0.3, release_occ: 0.1, dwell_ticks: 3 };
+        let (mut w, n) = packed_queue(cong);
+        let mut engaged = false;
+        for _ in 0..3000 {
+            w.step();
+            engaged |= w.congestion_active_links() > 0;
+            // Every car is either still on the road or cleanly exited — none lost, and
+            // the cheap follower must never manufacture a collision.
+            assert_eq!(w.crashed(), 0, "the queue model must not cause crashes");
+            assert_eq!(w.vehicles().len() as u32 + w.exited(), n, "no vehicles created or lost");
+        }
+        assert!(engaged, "the packed link should engage the queue model");
+        assert_eq!(w.exited(), n, "the whole queue discharges through the gateway");
+    }
+
+    #[test]
+    fn congestion_lod_matches_full_detail_throughput() {
+        // The cheap queue model should discharge a jam at essentially the same rate as
+        // the full per-car model — behaviour stays equivalent, only cheaper.
+        let off = CongestionConfig::disabled();
+        let on = CongestionConfig { enabled: true, engage_occ: 0.3, release_occ: 0.1, dwell_ticks: 3 };
+        let (mut full, _) = packed_queue(off);
+        let (mut lod, _) = packed_queue(on);
+        for _ in 0..1500 {
+            full.step();
+            lod.step();
+        }
+        assert!(!lod.congestion_config().enabled || lod.exited() > 0, "the queue should be discharging");
+        let diff = (full.exited() as i64 - lod.exited() as i64).abs();
+        assert!(diff <= 3, "throughput differs by {diff} (full {} vs lod {})", full.exited(), lod.exited());
+    }
+
+    #[test]
+    fn congestion_disabled_by_default_keeps_full_detail() {
+        let net = straight_link(300.0);
+        let mut w = NetWorld::new(net, cfg());
+        let lane = w.network.lanes_of(LinkId(0)).next().unwrap();
+        for i in 0..10u32 {
+            w.spawn(i, lane, i as f64 * 12.0, 8.0, DriverConfig::car());
+        }
+        for _ in 0..400 {
+            w.step();
+            assert_eq!(w.congestion_active_links(), 0, "no link uses the queue model while disabled");
+        }
+        assert_eq!(w.exited(), 10, "all vehicles drive out under full per-car");
     }
 
     /// A full uncontrolled four-way with every in/out leg, each `arm` metres.

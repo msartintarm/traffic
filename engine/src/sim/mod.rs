@@ -4,9 +4,11 @@
 pub mod boundary;
 pub mod clock;
 pub mod config;
+pub mod congestion;
 pub mod constraint;
 pub mod demand;
 pub mod flowfield;
+pub mod hash;
 // Compiled whenever a wgpu device is available: natively under the `gpu` feature
 // (Vulkan/GL), and always in the browser (WebGPU) so routing can run on the
 // renderer's device. Device-creating helpers inside are further gated to native.

@@ -57,6 +57,9 @@ type Sim = {
   rush_hour_flows(): Float32Array;
   set_demand_rate(scale: number): void;
   set_entry_speed_cap(mps: number): void;
+  set_congestion_enabled(enabled: boolean): void;
+  set_congestion_engage(occ: number): void;
+  congestion_active_links(): number;
   enable_gpu_routing(renderer: Renderer): void;
 };
 
@@ -119,6 +122,8 @@ export default function EngineCanvas() {
   const [accelBackend, setAccelBackend] = useState("serial");
   const [parThreshold, setParThreshold] = useState(2000);
   const [demandRate, setDemandRate] = useState(1);
+  const [congestionEnabled, setCongestionEnabled] = useState(false);
+  const [congestionEngage, setCongestionEngage] = useState(0.85);
   const [startSpeedMps, setStartSpeedMps] = useState(36); // ≥ every road limit ⇒ "enter at limit"
   const [units, setUnits] = useState<"mi" | "km">("mi");
   const unitsRef = useRef<"mi" | "km">("mi"); // read inside the rAF draw loop (avoids stale closure)
@@ -250,7 +255,7 @@ export default function EngineCanvas() {
         const scenario = new URLSearchParams(window.location.search).get("scenario") ?? "millbrae";
         let loaded: Sim | null = null;
         let label = "sample map";
-        if (scenario === "arterial" || scenario === "corridor") {
+        if (scenario === "arterial" || scenario === "corridor" || scenario === "gridlock") {
           loaded = mod.Simulation.scenario(scenario, 0xc0ffee);
           label = `${scenario} scenario`;
         } else {
@@ -269,6 +274,12 @@ export default function EngineCanvas() {
         simRef.current = sim;
         if (threadsReady) sim.set_threads_ready(true); // CPU-threads pool usable
         sim.set_accel_backend(compute); // honour ?compute= (falls back to serial if unavailable)
+        // The gridlock scenario exists to show the congestion LOD, so engage it by
+        // default there; elsewhere it stays off (full per-car detail is the default).
+        const congestionOn = scenario === "gridlock";
+        setCongestionEnabled(congestionOn);
+        sim.set_congestion_engage(congestionEngage);
+        sim.set_congestion_enabled(congestionOn);
         setMapLabel(label);
         // Hover/click hit-test against the engine's own links (post collapse/merge),
         // index-aligned with link ids, so selection can't deviate from the engine.
@@ -376,8 +387,10 @@ export default function EngineCanvas() {
               const thr = sim.par_threshold();
               execStr = count >= thr ? `threads ▸ parallel (≥${thr})` : `threads ▸ serial (<${thr})`;
             }
+            const queued = sim.congestion_active_links();
+            const queuedStr = queued > 0 ? ` · ${queued} links queued` : "";
             statsRef.current.textContent =
-              `${count} vehicles · ${sim.crashed()} crashed · ${speedStr} · ${execStr}`;
+              `${count} vehicles · ${sim.crashed()} crashed · ${speedStr} · ${execStr}${queuedStr}`;
           }
           if (rushClockRef.current && sim.demand_rush_hour()) {
             const h = sim.rush_hour_time();
@@ -485,6 +498,7 @@ export default function EngineCanvas() {
               <option value="millbrae">Millbrae (real map)</option>
               <option value="arterial">Test: arterial junction</option>
               <option value="corridor">Test: signal corridor</option>
+              <option value="gridlock">Test: gridlock (fast jam)</option>
             </select>
             <label className={styles.zoomLabel} title="Freeway through-traffic: enters at a highway gateway, bound for the far end of the same highway, another highway exit, or a surface street.">
               <input
@@ -610,6 +624,42 @@ export default function EngineCanvas() {
                   }}
                 />
                 cars
+              </label>
+            )}
+            <label
+              className={styles.zoomLabel}
+              title="Congestion level-of-detail: while a link stays saturated, its queued cars use cheap leader-only car-following instead of the full model, and skip lane-change checks. Cars stay individual and keep their positions — this only cuts per-car cost in jams. Off by default (full detail everywhere)."
+            >
+              <input
+                type="checkbox"
+                checked={congestionEnabled}
+                disabled={!ready}
+                onChange={(e) => {
+                  simRef.current?.set_congestion_enabled(e.target.checked);
+                  setCongestionEnabled(e.target.checked);
+                }}
+              />
+              Fast jam model
+            </label>
+            {congestionEnabled && (
+              <label
+                className={styles.zoomLabel}
+                title="Occupancy (share of jam density) a link must hold before its queued cars switch to the cheap follower model. Lower engages sooner on lighter congestion."
+              >
+                Engage {Math.round(congestionEngage * 100)}%
+                <input
+                  type="range"
+                  min={0.4}
+                  max={0.98}
+                  step={0.01}
+                  value={congestionEngage}
+                  disabled={!ready}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    simRef.current?.set_congestion_engage(v);
+                    setCongestionEngage(v);
+                  }}
+                />
               </label>
             )}
           </>

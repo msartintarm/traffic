@@ -36,6 +36,19 @@ impl CtmParams {
     }
 }
 
+/// A cell's send capability: how many vehicles it can dispatch downstream this tick,
+/// its occupancy capped at flow capacity.
+pub(crate) fn sending(cell: f64, p: CtmParams) -> f64 {
+    cell.min(p.capacity)
+}
+
+/// A cell's receive capability: free space it can accept this tick, the backward
+/// wave `backward_ratio·(cell_max − occupancy)` capped at flow capacity.
+pub(crate) fn receiving(cell: f64, p: CtmParams) -> f64 {
+    let supply = p.backward_ratio * (p.cell_max - cell);
+    p.capacity.min(supply.max(0.0))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Boundary {
     /// Closed loop: the last cell feeds the first; total occupancy is conserved.
@@ -73,12 +86,11 @@ impl MesoCorridor {
     }
 
     fn sending(&self, i: usize) -> f64 {
-        self.cells[i].min(self.params.capacity)
+        sending(self.cells[i], self.params)
     }
 
     fn receiving(&self, i: usize) -> f64 {
-        let supply = self.params.backward_ratio * (self.params.cell_max - self.cells[i]);
-        self.params.capacity.min(supply.max(0.0))
+        receiving(self.cells[i], self.params)
     }
 
     pub fn step(&mut self) {

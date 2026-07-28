@@ -1013,6 +1013,31 @@ pub fn corridor_with_signal() -> Network {
     .build()
 }
 
+/// A deliberate bottleneck for demonstrating the adaptive mass layer: a long
+/// three-lane arterial approaches a signal and drops to a single-lane exit, so under
+/// steady demand the approach saturates and backs up — exactly the congested link
+/// the mesoscopic layer aggregates. A cross street shares the signal so the arterial
+/// never gets full green.
+pub fn gridlock() -> Network {
+    let plan = SignalPlan { green_secs: 16.0, yellow_secs: 3.0, offset: 0.0 };
+    OsmMap {
+        nodes: vec![
+            NodeSpec::uncontrolled(1, -600.0, 0.0),
+            NodeSpec::signalized(2, 0.0, 0.0, plan),
+            NodeSpec::uncontrolled(3, 350.0, 0.0),
+            NodeSpec::uncontrolled(4, 0.0, -350.0),
+            NodeSpec::uncontrolled(5, 0.0, 350.0),
+        ],
+        links: vec![
+            LinkSpec::oneway(1, 2, 3, 25.0), // wide approach (jams behind the drop + signal)
+            LinkSpec::oneway(2, 3, 1, 20.0), // single-lane bottleneck exit
+            LinkSpec::oneway(4, 2, 2, 18.0), // cross approach
+            LinkSpec::oneway(2, 5, 2, 18.0), // cross exit
+        ],
+    }
+    .build()
+}
+
 /// Real complex junctions lifted from the scraped Millbrae map (re-centred to the
 /// origin, names stripped — geometry only), as deterministic test fixtures. #0 is
 /// a divided arterial whose crossing OSM splits across four signal nodes; the

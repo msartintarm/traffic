@@ -4,12 +4,9 @@
 //! for instanced GPU rendering. Everything numeric lives in [`sim`] and is
 //! tested natively; this layer is only marshalling.
 
-use std::collections::HashMap;
-use std::hash::BuildHasherDefault;
-
-use crate::sim::net_world::FxHasher;
+use crate::sim::hash::IntMap;
 /// Pose map keyed by (sparse) vehicle id, hashed cheaply for the per-frame rebuild.
-type PoseMap = HashMap<u32, [f32; 4], BuildHasherDefault<FxHasher>>;
+type PoseMap = IntMap<[f32; 4]>;
 
 use wasm_bindgen::prelude::*;
 
@@ -22,6 +19,7 @@ use crate::sim::flowfield;
 use crate::sim::flowfield_gpu::{GpuFlowField, PendingReadback};
 use crate::sim::config::{SimConfig, VehicleClass};
 use crate::sim::demand::{self, DemandGenerator, DemandSources};
+use crate::sim::congestion::CongestionConfig;
 use crate::sim::map;
 use crate::sim::net_world::{AccelBackend, NetWorld};
 use crate::sim::network::{LinkId, Network, LANE_WIDTH};
@@ -100,6 +98,7 @@ impl Simulation {
         let net = match name {
             "arterial" => map::arterial_intersection(),
             "corridor" => map::corridor_with_signal(),
+            "gridlock" => map::gridlock(),
             _ => map::millbrae_sample(),
         };
         Self::assemble(net, seed)
@@ -437,6 +436,32 @@ impl Simulation {
     /// against real observed counts for calibration.
     pub fn link_flows(&self) -> Vec<f32> {
         self.world.link_flows().iter().map(|&f| f as f32).collect()
+    }
+
+    /// Enable or disable the congestion level-of-detail: while a link stays saturated,
+    /// its queued cars use cheap leader-only car-following instead of the full model.
+    /// Cars stay individual and keep their positions — only the per-car cost drops.
+    /// Off by default (full detail everywhere).
+    pub fn set_congestion_enabled(&mut self, enabled: bool) {
+        let cfg = CongestionConfig { enabled, ..self.world.congestion_config() };
+        self.world.set_congestion(cfg);
+    }
+
+    /// Occupancy ratio (0..1) at which a saturated link switches to the cheap queue
+    /// model; the release threshold trails it so links don't thrash near the boundary.
+    pub fn set_congestion_engage(&mut self, engage: f64) {
+        let engage = engage.clamp(0.05, 1.0);
+        let cfg = CongestionConfig {
+            engage_occ: engage,
+            release_occ: (engage - 0.3).max(0.05),
+            ..self.world.congestion_config()
+        };
+        self.world.set_congestion(cfg);
+    }
+
+    /// How many links are currently running the cheap queue model — for the status line.
+    pub fn congestion_active_links(&self) -> u32 {
+        self.world.congestion_active_links()
     }
 
     /// Select a link to highlight (negative clears the selection).
