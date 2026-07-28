@@ -148,6 +148,13 @@ pub struct NetWorld {
     junctions: Junctions,
     /// Executor requested for the per-vehicle accel passes (see [`AccelBackend`]).
     accel_backend: AccelBackend,
+    /// Whether the CPU worker pool is up. Native: rayon's global pool auto-inits, so
+    /// always true. Browser: false until JS finishes `initThreadPool` (SharedArrayBuffer
+    /// needs cross-origin isolation), gating the `Threads` backend until then.
+    threads_ready: bool,
+    /// Vehicle count at/above which the `Threads` backend actually parallelizes (below
+    /// it, serial — rayon overhead isn't worth it). Runtime-tunable for measurement.
+    par_threshold: usize,
 }
 
 /// Sim seconds between flow-field rebuilds — often enough that routing tracks
@@ -241,23 +248,25 @@ fn threads_available() -> bool {
     cfg!(feature = "parallel")
 }
 
-/// Below this vehicle count, rayon's per-task overhead outweighs the win (measured
-/// crossover on the Millbrae step is ~4–5k vehicles), so [`map_collect`] stays serial
-/// even on the `Threads` backend. Only referenced on the parallel path.
-#[cfg(feature = "parallel")]
-const PAR_THRESHOLD: usize = 4000;
+/// Default for [`NetWorld::par_threshold`]: below this vehicle count rayon's per-task
+/// overhead outweighs the win (measured crossover on the Millbrae step is ~4–5k), so
+/// [`map_collect`] stays serial even on the `Threads` backend. Adjustable at runtime.
+pub const DEFAULT_PAR_THRESHOLD: usize = 4000;
 
-/// Map `0..n` through `f` on the given `backend`. Order-preserving on every backend,
-/// so the collected result is bit-for-bit the serial one — the per-vehicle passes it
-/// drives read only committed pre-step state, so the elements are independent.
-fn map_collect<T, F>(backend: AccelBackend, n: usize, f: F) -> Vec<T>
+/// Map `0..n` through `f` on the given `backend`. On `Threads`, runs serially when
+/// `n < threshold` (rayon overhead isn't worth it below the crossover). Order-preserving
+/// on every backend, so the collected result is bit-for-bit the serial one — the
+/// per-vehicle passes it drives read only committed pre-step state.
+fn map_collect<T, F>(backend: AccelBackend, threshold: usize, n: usize, f: F) -> Vec<T>
 where
     T: Send,
     F: Fn(usize) -> T + Sync + Send,
 {
+    let _ = threshold; // used by the parallel arm's guard below; referenced here so the
+                       // serial-only (no `parallel` feature) build doesn't flag it unused.
     match backend {
         #[cfg(feature = "parallel")]
-        AccelBackend::Threads if n >= PAR_THRESHOLD => {
+        AccelBackend::Threads if n >= threshold => {
             use rayon::prelude::*;
             (0..n).into_par_iter().map(f).collect()
         }
@@ -353,11 +362,12 @@ impl VehicleContext {
         }
     }
 
-    /// The pure evaluate kernel: rebuild the constraint context from the flat fields
-    /// (`+∞` → `None`), fold the constraints, add the reproducible per-tick noise.
-    /// Reads only `self` — no graph access — so this is exactly what a WGSL kernel
-    /// mirrors when the accel math moves onto the GPU.
-    fn evaluate(&self, seed: u64, tick: u64) -> f64 {
+    /// The deterministic binding acceleration — the constraint fold, no noise.
+    /// Rebuilds the constraint context from the flat fields (`+∞` → `None`). Reads
+    /// only `self` (no graph access), so this is exactly what the WGSL kernel
+    /// (`accel.wgsl`) mirrors; `accel_noise` is added separately (its RNG is `u64`,
+    /// which WGSL lacks, so it stays on the CPU).
+    fn binding(&self) -> f64 {
         let opt = |x: f64| x.is_finite().then_some(x);
         let ctx = LongContext {
             driver: &self.driver,
@@ -372,8 +382,76 @@ impl VehicleContext {
             curve: opt(self.curve_dist).map(|distance| SpeedTarget { speed: self.curve_speed, distance }),
         };
         constraint::binding_acceleration(&ctx, constraint::DEFAULT)
-            + constraint::accel_noise(self.driver.accel_noise, seed, self.agent_id, tick)
     }
+
+    /// The full per-vehicle acceleration: the binding fold plus the reproducible
+    /// per-tick noise.
+    fn evaluate(&self, seed: u64, tick: u64) -> f64 {
+        self.binding() + constraint::accel_noise(self.driver.accel_noise, seed, self.agent_id, tick)
+    }
+
+    /// Pack into the f32 layout the GPU kernel reads (`accel.wgsl`'s `Ctx`). An
+    /// absent optional (`+∞`) becomes the `BIG` sentinel the shader tests against;
+    /// every field is dropped to `f32` (WGSL has no `f64`). Exercised by the GPU
+    /// equivalence test; the step wires it into the `Gpu` backend later.
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn to_gpu(&self) -> VehicleContextGpu {
+        let f = |x: f64| if x.is_finite() { x as f32 } else { GPU_BIG };
+        VehicleContextGpu {
+            desired_speed: self.driver.desired_speed as f32,
+            accel_exponent: self.driver.accel_exponent as f32,
+            min_gap: self.driver.min_gap as f32,
+            time_headway: self.driver.time_headway as f32,
+            max_accel: self.driver.max_accel as f32,
+            comfort_decel: self.driver.comfort_decel as f32,
+            speed: self.speed as f32,
+            leader_gap: f(self.leader_gap),
+            leader_speed: self.leader_speed as f32,
+            stop_line: f(self.stop_line),
+            speed_target_speed: f(self.speed_target_speed),
+            speed_target_dist: f(self.speed_target_dist),
+            stop_sign: f(self.stop_sign),
+            yield_line: f(self.yield_line),
+            curve_speed: f(self.curve_speed),
+            curve_dist: f(self.curve_dist),
+            merge_gap: f(self.merge_gap),
+            merge_speed: self.merge_speed as f32,
+        }
+    }
+}
+
+/// Sentinel for an absent optional constraint in the GPU layout (mirrors `+∞` in
+/// [`VehicleContext`]); `accel.wgsl` treats any field `>=` this as not binding.
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+#[cfg_attr(not(test), allow(dead_code))]
+const GPU_BIG: f32 = 1e30;
+
+/// The f32, `#[repr(C)]`/`Pod` layout a slice of which uploads to the GPU accel
+/// kernel's storage buffer verbatim (field order matches `accel.wgsl`'s `Ctx`).
+/// Only the scalars the binding fold reads — no `agent_id` (noise is CPU-side).
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct VehicleContextGpu {
+    pub desired_speed: f32,
+    pub accel_exponent: f32,
+    pub min_gap: f32,
+    pub time_headway: f32,
+    pub max_accel: f32,
+    pub comfort_decel: f32,
+    pub speed: f32,
+    pub leader_gap: f32,
+    pub leader_speed: f32,
+    pub stop_line: f32,
+    pub speed_target_speed: f32,
+    pub speed_target_dist: f32,
+    pub stop_sign: f32,
+    pub yield_line: f32,
+    pub curve_speed: f32,
+    pub curve_dist: f32,
+    pub merge_gap: f32,
+    pub merge_speed: f32,
 }
 
 /// Per-vehicle input to the accel evaluate pass. A rolling vehicle carries its full
@@ -440,7 +518,25 @@ impl NetWorld {
             network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0,
             merges, signals, link_entries, router: None, external_reroute: false, junctions,
             accel_backend: AccelBackend::Serial,
+            threads_ready: cfg!(not(target_arch = "wasm32")),
+            par_threshold: DEFAULT_PAR_THRESHOLD,
         }
+    }
+
+    /// Mark the CPU worker pool ready (the browser calls this once `initThreadPool`
+    /// resolves). Until then the `Threads` backend falls back to serial.
+    pub fn set_threads_ready(&mut self, ready: bool) {
+        self.threads_ready = ready;
+    }
+
+    /// Vehicle count at/above which the `Threads` backend parallelizes (below it,
+    /// serial). Tune to find the crossover on a given device.
+    pub fn set_par_threshold(&mut self, n: usize) {
+        self.par_threshold = n;
+    }
+
+    pub fn par_threshold(&self) -> usize {
+        self.par_threshold
     }
 
     /// Request an executor for the per-vehicle accel passes. Resolved against
@@ -454,7 +550,7 @@ impl NetWorld {
     /// it isn't available (no worker pool, or the GPU evaluate kernel isn't wired yet).
     pub fn active_backend(&self) -> AccelBackend {
         match self.accel_backend {
-            AccelBackend::Threads if threads_available() => AccelBackend::Threads,
+            AccelBackend::Threads if threads_available() && self.threads_ready => AccelBackend::Threads,
             // The GPU evaluate kernel is a follow-up; until then it runs serially
             // (the gather is CPU-side regardless).
             _ => AccelBackend::Serial,
@@ -972,12 +1068,14 @@ impl NetWorld {
         }
 
         // Executor for the per-vehicle passes below (serial / CPU threads / GPU),
-        // resolved against what's available on this device.
+        // resolved against what's available on this device, plus the count at which the
+        // Threads backend starts parallelizing.
         let backend = self.active_backend();
+        let par_threshold = self.par_threshold;
 
         // Compute each vehicle's intended movement once (used by accel, the box
         // gate, and the transition).
-        let intended_mv: Vec<Option<MovementId>> = map_collect(backend, self.fleet.rows.len(), |i| {
+        let intended_mv: Vec<Option<MovementId>> = map_collect(backend, par_threshold, self.fleet.rows.len(), |i| {
             let v = &self.fleet.rows[i];
             if v.crossing.is_some() { None } else { self.intended_movement(v) }
         });
@@ -986,7 +1084,7 @@ impl NetWorld {
         // neighbor, signal and router lookup lives here (CPU-only; a GPU kernel can't
         // chase these pointers). Rolling vehicles get a flat `VehicleContext`; in-node
         // crossers carry their bespoke `crossing_accel` through unchanged.
-        let inputs: Vec<AccelInput> = map_collect(backend, self.fleet.rows.len(), |i| {
+        let inputs: Vec<AccelInput> = map_collect(backend, par_threshold, self.fleet.rows.len(), |i| {
             if self.fleet.rows[i].crossing.is_some() {
                 AccelInput::Crossing(self.crossing_accel(i, &nb, &cross_by_mv))
             } else {
@@ -996,7 +1094,7 @@ impl NetWorld {
         // Phase 4b — evaluate: the pure constraint fold + reproducible noise over the
         // flat context. No graph access — this half transliterates to a WGSL kernel.
         let (seed, tick) = (self.cfg.seed, self.tick);
-        let accels: Vec<f64> = map_collect(backend, inputs.len(), |i| inputs[i].evaluate(seed, tick));
+        let accels: Vec<f64> = map_collect(backend, par_threshold, inputs.len(), |i| inputs[i].evaluate(seed, tick));
         prof.lap(4);
 
         // Destination-lane occupancy (nearest-to-entrance rear), so a crosser
@@ -1015,7 +1113,7 @@ impl NetWorld {
         // which the soft box-yield can't guarantee under momentum. Precomputed here
         // while committed state and `nb` are valid, since the advance pass empties
         // `self.fleet.rows`.
-        let block_entry: Vec<bool> = map_collect(backend, self.fleet.rows.len(), |i| {
+        let block_entry: Vec<bool> = map_collect(backend, par_threshold, self.fleet.rows.len(), |i| {
             let veh = &self.fleet.rows[i];
             intended_mv[i]
                 .is_some_and(|mid| self.box_conflict(mid, self.network.link(self.network.lane(veh.lane).link).to, &nb))
@@ -1672,14 +1770,14 @@ mod tests {
 
     #[test]
     fn map_collect_matches_serial_on_every_backend() {
-        // Every backend must collect element-for-element what the plain serial map
-        // does — the per-vehicle step passes depend on this order preservation. 5000 is
-        // above the ~4k rayon crossover, so `Threads` actually engages rayon (under
-        // `--features parallel`); Gpu falls back but must still agree.
+        // Every backend must collect element-for-element what the plain serial map does
+        // — the per-vehicle step passes depend on this order preservation. A threshold of
+        // 0 forces `Threads` onto rayon (under `--features parallel`); Gpu falls back but
+        // must still agree.
         let n = 5000;
         let serial: Vec<usize> = (0..n).map(|i| i * i + 7).collect();
         for backend in [AccelBackend::Serial, AccelBackend::Threads, AccelBackend::Gpu] {
-            assert_eq!(map_collect(backend, n, |i| i * i + 7), serial, "backend {backend:?}");
+            assert_eq!(map_collect(backend, 0, n, |i| i * i + 7), serial, "backend {backend:?}");
         }
     }
 
@@ -1697,6 +1795,61 @@ mod tests {
         assert_eq!(w.active_backend(), expected);
         assert_eq!(AccelBackend::from_name("threads"), AccelBackend::Threads);
         assert_eq!(AccelBackend::from_name("nonsense"), AccelBackend::Serial);
+    }
+
+    #[test]
+    fn accel_wgsl_parses_and_validates() {
+        // The GPU accel kernel must parse and type-check under plain `cargo test`, so a
+        // WGSL typo fails CI here rather than silently in a browser (no adapter needed).
+        let src = include_str!("accel.wgsl");
+        let module = naga::front::wgsl::parse_str(src).expect("accel.wgsl should parse");
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+            .validate(&module)
+            .expect("accel.wgsl should type-check");
+    }
+
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    #[test]
+    fn accel_gpu_matches_cpu_binding() {
+        // The `accel.wgsl` fold must reproduce the CPU `binding` (noise excluded)
+        // across a spread of constraint mixes, within f32 tolerance.
+        use crate::sim::accel_gpu::binding_accels_gpu;
+        let d = DriverConfig::car();
+        let mut ctxs = Vec::new();
+        ctxs.push(VehicleContext::new(d.capped_to(25.0), 12.0, 0)); // free road
+        {
+            let mut c = VehicleContext::new(d.capped_to(25.0), 20.0, 1);
+            c.set_leader(Some(Obstacle { gap: 18.0, speed: 8.0 }));
+            ctxs.push(c);
+        }
+        {
+            let mut c = VehicleContext::new(d.capped_to(20.0), 15.0, 2);
+            c.set_stop_line(Some(30.0));
+            c.set_curve(Some(SpeedTarget { speed: 6.0, distance: 40.0 }));
+            ctxs.push(c);
+        }
+        {
+            let mut c = VehicleContext::new(d.capped_to(30.0), 22.0, 3);
+            c.set_speed_target(Some(SpeedTarget { speed: 10.0, distance: 50.0 }));
+            c.set_merge(Some(Obstacle { gap: 25.0, speed: 12.0 }));
+            c.set_yield_line(Some(35.0));
+            ctxs.push(c);
+        }
+        {
+            let mut c = VehicleContext::new(d.capped_to(15.0), 8.0, 4);
+            c.set_stop_sign(Some(12.0));
+            ctxs.push(c);
+        }
+
+        let gpu_in: Vec<VehicleContextGpu> = ctxs.iter().map(VehicleContext::to_gpu).collect();
+        let Some(gpu) = binding_accels_gpu(&gpu_in) else {
+            eprintln!("no GPU adapter; skipping accel GPU/CPU equivalence test");
+            return;
+        };
+        for (i, (c, &g)) in ctxs.iter().zip(&gpu).enumerate() {
+            let cpu = c.binding();
+            assert!((g as f64 - cpu).abs() < 0.02, "ctx {i}: gpu {g} vs cpu {cpu}");
+        }
     }
 
     fn approach_lane(net: &Network) -> LaneId {

@@ -21,6 +21,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+      # Nightly + rust-src for the atomics/`build-std` threaded wasm build below.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
       - uses: actions/cache@v4
         with:
           path: |
@@ -40,10 +44,24 @@ jobs:
       - run: npm ci
         working-directory: web
 
+      # Threaded wasm build (nightly + build-std) into public/wasm-pkg-threads/, so the
+      # deployed site can serve the CPU-threads module to cross-origin-isolated browsers.
+      # Additive: the single-threaded package is still built by `npm run build`'s
+      # prebuild below, and browsers without isolation fall back to it.
+      - name: Build the threaded wasm package
+        run: npm run wasm:build:threads
+        working-directory: web
+        # Required: a threaded-build failure fails the whole deploy, so a broken build
+        # never ships a degraded, silently single-threaded site — the last good deploy
+        # stays live until it's fixed. (The frontend still falls back at *runtime* for
+        # browsers that can't cross-origin isolate; that's a capability limit, not a
+        # broken build.)
+
       # The Millbrae map (public OSM data, projected to local metres) is
       # committed at web/public/map.json; `npm run build` runs `prebuild` to
-      # rebuild the wasm package, then the Next export copies the map to
-      # /traffic/map.json. GitHub Pages gzips it on the wire (~16 KB).
+      # rebuild the (single-threaded) wasm package, then the Next export copies
+      # public/ (both wasm packages + the map) to the site. GitHub Pages gzips
+      # map.json on the wire (~16 KB).
       - name: Build static export
         run: npm run build
         working-directory: web

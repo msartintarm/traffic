@@ -43,6 +43,11 @@ type Sim = {
   effective_speed(): number;
   selected_speed(): number;
   is_throttled(): boolean;
+  set_accel_backend(name: string): void;
+  accel_backend(): string;
+  set_threads_ready(ready: boolean): void;
+  set_par_threshold(n: number): void;
+  par_threshold(): number;
   set_demand_mode(mode: string): void;
   demand_mode(): string;
   enable_gpu_routing(renderer: Renderer): void;
@@ -64,6 +69,19 @@ type Renderer = {
   resize(width: number, height: number): void;
 };
 
+// The wasm-bindgen module namespace we consume from the generated `engine.js`. The
+// threaded build additionally exports `initThreadPool` (the rayon worker pool).
+type EngineModule = {
+  default: (input?: unknown) => Promise<unknown>;
+  Simulation: {
+    new (seed: number): Sim;
+    scenario(name: string, seed: number): Sim;
+    from_map_json?(json: string, seed: number): Sim;
+  };
+  Renderer: { create(canvas: HTMLCanvasElement): Promise<Renderer> };
+};
+type ThreadedEngineModule = EngineModule & { initThreadPool(numThreads: number): Promise<void> };
+
 const ZOOM_RANGE = 60; // fit-out … max-in ratio driving the slider
 
 export default function EngineCanvas() {
@@ -84,6 +102,8 @@ export default function EngineCanvas() {
   const [mapLabel, setMapLabel] = useState("");
   const [scenario, setScenario] = useState("millbrae");
   const [mode, setMode] = useState("balanced");
+  const [accelBackend, setAccelBackend] = useState("serial");
+  const [parThreshold, setParThreshold] = useState(4000);
   const [showSettings, setShowSettings] = useState(false);
 
   useEffect(() => {
@@ -174,8 +194,39 @@ export default function EngineCanvas() {
 
     (async () => {
       try {
-        const mod = await import(/* webpackIgnore: true */ `${basePath()}/wasm-pkg/engine.js`);
-        await mod.default();
+        // The compute backend is decided at page load because it dictates *which* wasm
+        // module loads — the CPU-threads build (rayon + SharedArrayBuffer) is a separate
+        // artifact from the single-threaded one, so it can't be switched at runtime. The
+        // dropdown reloads with `?compute=<serial|threads|gpu>`; we honour it here.
+        const compute = new URLSearchParams(window.location.search).get("compute") ?? "serial";
+        setAccelBackend(compute);
+        const wantThreads = compute === "threads";
+        // Threads need cross-origin isolation (COOP/COEP via the shim SW, which reloads
+        // once) — only bother when threads are actually requested.
+        if (wantThreads) await ensureCrossOriginIsolation();
+        if (disposed) return;
+        const isolated = typeof window !== "undefined" && window.crossOriginIsolated;
+        let mod: EngineModule | null = null;
+        let threadsReady = false;
+        if (wantThreads && isolated) {
+          try {
+            const t = (await import(/* webpackIgnore: true */ `${basePath()}/wasm-pkg-threads/engine.js`)) as ThreadedEngineModule;
+            await t.default();
+            // Bound the pool init so a build whose workers can't boot degrades instead of hanging.
+            await Promise.race([
+              t.initThreadPool(navigator.hardwareConcurrency || 4),
+              new Promise((_, reject) => setTimeout(() => reject(new Error("initThreadPool timed out")), 10000)),
+            ]);
+            mod = t;
+            threadsReady = true;
+          } catch (e) {
+            console.warn("CPU-threads build unavailable; using single-threaded:", e);
+          }
+        }
+        if (!mod) {
+          mod = (await import(/* webpackIgnore: true */ `${basePath()}/wasm-pkg/engine.js`)) as EngineModule;
+          await mod.default();
+        }
         if (disposed) return;
 
         const scenario = new URLSearchParams(window.location.search).get("scenario") ?? "millbrae";
@@ -198,6 +249,8 @@ export default function EngineCanvas() {
         }
         const sim: Sim = loaded ?? new mod.Simulation(0xc0ffee);
         simRef.current = sim;
+        if (threadsReady) sim.set_threads_ready(true); // CPU-threads pool usable
+        sim.set_accel_backend(compute); // honour ?compute= (falls back to serial if unavailable)
         setMapLabel(label);
         // Hover/click hit-test against the engine's own links (post collapse/merge),
         // index-aligned with link ids, so selection can't deviate from the engine.
@@ -294,7 +347,10 @@ export default function EngineCanvas() {
             const speedStr = sim.is_throttled()
               ? `${sim.effective_speed().toFixed(1)}×/${sel}× (throttled)`
               : `${sel}×`;
-            statsRef.current.textContent = `${sim.vehicle_count()} vehicles · ${sim.crashed()} crashed · ${speedStr}`;
+            // The *active* backend (after availability fallback), so a request that
+            // isn't available on this device is visible rather than silently ignored.
+            statsRef.current.textContent =
+              `${sim.vehicle_count()} vehicles · ${sim.crashed()} crashed · ${speedStr} · ${sim.accel_backend()}`;
           }
           if (panelRef.current) {
             const i = selectedRef.current;
@@ -408,6 +464,46 @@ export default function EngineCanvas() {
               <option value="balanced">Traffic: balanced</option>
               <option value="highway">Traffic: from highways</option>
             </select>
+            <select
+              className={styles.button}
+              value={accelBackend}
+              disabled={!ready}
+              title="Executor for the per-vehicle step. Switching reloads the page (the CPU-threads build is a separate wasm module). Unavailable choices fall back to serial — see the active backend in the status line."
+              onChange={(e) => {
+                // The compute backend dictates which wasm module loads, so it can't be
+                // switched in place — reload with the choice as a query param.
+                const url = new URL(window.location.href);
+                url.searchParams.set("compute", e.target.value);
+                window.location.href = url.toString();
+              }}
+            >
+              <option value="serial">Compute: serial (1 core)</option>
+              <option value="threads">Compute: CPU threads</option>
+              <option value="gpu">Compute: GPU</option>
+            </select>
+            {accelBackend === "threads" && (
+              <label
+                className={styles.zoomLabel}
+                title="Vehicle count at/above which CPU threads parallelize; below it the step runs serial (rayon overhead isn't worth it). Lower it to see threads engage at fewer cars."
+              >
+                Threads ≥
+                <input
+                  className={styles.button}
+                  type="number"
+                  min={0}
+                  step={500}
+                  value={parThreshold}
+                  disabled={!ready}
+                  style={{ width: "5.5em" }}
+                  onChange={(e) => {
+                    const v = Math.max(0, Math.floor(Number(e.target.value) || 0));
+                    simRef.current?.set_par_threshold(v);
+                    setParThreshold(v);
+                  }}
+                />
+                cars
+              </label>
+            )}
           </>
         )}
       </div>
@@ -428,6 +524,25 @@ export default function EngineCanvas() {
       <div ref={tipRef} className={styles.tooltip} />
     </div>
   );
+}
+
+/** Register the COOP/COEP shim service worker so the page becomes cross-origin
+ * isolated (enabling SharedArrayBuffer, and thus the wasm CPU-thread pool). On the
+ * first visit the worker isn't controlling yet, so reload once (guarded against a
+ * loop); on a browser without service workers, or if it fails, we silently stay
+ * single-threaded. */
+async function ensureCrossOriginIsolation(): Promise<void> {
+  if (typeof window === "undefined" || window.crossOriginIsolated) return;
+  if (!("serviceWorker" in navigator)) return;
+  try {
+    const reg = await navigator.serviceWorker.register(`${basePath()}/coi-serviceworker.js`);
+    if (reg.active && !navigator.serviceWorker.controller && !sessionStorage.getItem("coiReloaded")) {
+      sessionStorage.setItem("coiReloaded", "1");
+      window.location.reload();
+    }
+  } catch (e) {
+    console.warn("COOP/COEP shim registration failed:", e);
+  }
 }
 
 // ---- road-name hover --------------------------------------------------------

@@ -25,9 +25,14 @@ gpu = ["dep:wgpu", "dep:pollster"]
 # CPU data-parallelism for the per-vehicle step (rayon). The accel / intended-
 # movement / box-entry passes are order-preserving pure maps over committed state,
 # so this is a drop-in speed-up validated bit-for-bit against the serial result.
-# Native only — browser parallelism needs SharedArrayBuffer workers, a separate
-# effort. Enable with `--features parallel` (e.g. on the `load` bench).
+# Enable with `--features parallel` (e.g. on the `load` bench). In the browser it is
+# pulled in by `wasm-threads` (below), which also supplies the worker pool.
 parallel = ["dep:rayon"]
+# Browser CPU-thread pool via `wasm-bindgen-rayon`. Enable ONLY for the dedicated
+# nightly, atomics-enabled wasm build (`web`'s `wasm:build:threads`) — it needs
+# `-Z build-std` + `target-feature=+atomics`. Never in the default build; the plain
+# `wasm:build` stays single-threaded and stable-toolchain.
+wasm-threads = ["parallel", "dep:wasm-bindgen-rayon"]
 
 [dependencies]
 # Plain-data numeric crunching only in the sim core. GPU/DOM bridges are added
@@ -49,6 +54,9 @@ pollster = { version = "0.4", optional = true }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
+# The browser rayon worker pool (the `wasm-threads` feature). Optional so the default
+# single-threaded wasm build never links it.
+wasm-bindgen-rayon = { version = "1", optional = true }
 web-sys = { version = "0.3", features = ["HtmlCanvasElement", "Window", "Performance"] }
 wgpu = { version = "26", default-features = false, features = ["webgpu", "webgl", "wgsl"] }
 

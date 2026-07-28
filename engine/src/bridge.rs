@@ -335,6 +335,22 @@ impl Simulation {
         self.world.active_backend().name().to_string()
     }
 
+    /// Tell the sim the CPU worker pool is up (the browser calls this once
+    /// `initThreadPool` resolves), so the `Threads` backend stops falling back.
+    pub fn set_threads_ready(&mut self, ready: bool) {
+        self.world.set_threads_ready(ready);
+    }
+
+    /// Vehicle count at/above which the `Threads` backend parallelizes (below it,
+    /// serial). Exposed so the UI can tune the crossover per device.
+    pub fn set_par_threshold(&mut self, n: u32) {
+        self.world.set_par_threshold(n as usize);
+    }
+
+    pub fn par_threshold(&self) -> u32 {
+        self.world.par_threshold() as u32
+    }
+
     pub fn vehicle_count(&self) -> u32 {
         self.world.vehicles().len() as u32
     }

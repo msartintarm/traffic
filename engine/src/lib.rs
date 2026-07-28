@@ -32,3 +32,8 @@ pub use bridge::Simulation;
 
 #[cfg(target_arch = "wasm32")]
 pub use render::gpu::Renderer;
+
+// Re-export so wasm-bindgen emits the `initThreadPool` JS entry point the browser
+// awaits to spin up the rayon worker pool (the `wasm-threads` build only).
+#[cfg(all(target_arch = "wasm32", feature = "wasm-threads"))]
+pub use wasm_bindgen_rayon::init_thread_pool;

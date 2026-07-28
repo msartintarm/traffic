@@ -19,6 +19,10 @@ pub mod meso;
 pub mod mobil;
 #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 pub mod meso_gpu;
+// GPU execution of the per-vehicle binding acceleration (`accel.wgsl`), validated
+// against the CPU reference. Native + `gpu` for now; the browser path is a follow-up.
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+pub mod accel_gpu;
 pub mod net_world;
 pub mod network;
 pub mod rng;
