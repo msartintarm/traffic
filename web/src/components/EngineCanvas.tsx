@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { basePath } from "../lib/basePath";
+import { isDrag, panDelta, pinch, type Scale } from "../lib/gestures";
 import styles from "./EngineCanvas.module.css";
 
 type Sim = {
@@ -99,6 +100,7 @@ const MPS_TO = { mi: 2.23694, km: 3.6 } as const;
 const UNIT_LABEL = { mi: "mph", km: "km/h" } as const;
 
 export default function EngineCanvas() {
+  const wrapperRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const simRef = useRef<Sim | null>(null);
   const sceneRef = useRef<Scene | null>(null);
@@ -128,6 +130,7 @@ export default function EngineCanvas() {
   const [units, setUnits] = useState<"mi" | "km">("mi");
   const unitsRef = useRef<"mi" | "km">("mi"); // read inside the rAF draw loop (avoids stale closure)
   const [showSettings, setShowSettings] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
   useEffect(() => {
     setScenario(new URLSearchParams(window.location.search).get("scenario") ?? "millbrae");
@@ -138,12 +141,40 @@ export default function EngineCanvas() {
     let last = performance.now();
     let disposed = false;
     let removeResize = () => {};
-    const panning = { active: false };
+    // Any-button drag pans; a press that never moves past the threshold is a click
+    // (road selection). Touch mirrors this: one-finger drag pans, a tap selects.
+    const DRAG_THRESHOLD = 5; // CSS px before a press becomes a drag rather than a click
+    const pointer = { pressed: false, dragged: false, down: { x: 0, y: 0 } };
+    const touch = {
+      mode: "none",
+      prev: { x: 0, y: 0 }, // last single-finger point
+      tap: { x: 0, y: 0 }, // where a one-finger gesture started (tap-vs-drag origin)
+      dragged: false,
+      a: { x: 0, y: 0 }, // last two-finger points, for pinch
+      b: { x: 0, y: 0 },
+    };
     const canvas = canvasRef.current!;
 
     const canvasScale = () => {
       const rect = canvas.getBoundingClientRect();
       return { sx: canvas.width / rect.width, sy: canvas.height / rect.height, rect };
+    };
+    // Client→backing-store mapping the pure gesture helpers consume.
+    const scale = (): Scale => {
+      const rect = canvas.getBoundingClientRect();
+      return { sx: canvas.width / rect.width, sy: canvas.height / rect.height, left: rect.left, top: rect.top };
+    };
+    // Map a client point to world coords and select the nearest road under it.
+    const selectAt = (clientX: number, clientY: number, radius: number) => {
+      const sim = simRef.current;
+      if (!sim) return;
+      const { sx, sy, rect } = canvasScale();
+      const [cx, cy, mpp, vw, vh] = sim.camera_params();
+      const wx = cx + ((clientX - rect.left) * sx - vw / 2) * mpp;
+      const wy = cy - ((clientY - rect.top) * sy - vh / 2) * mpp;
+      const i = nearestLink(roadsRef.current, wx, wy, radius);
+      selectedRef.current = i;
+      sim.set_selected_link(i);
     };
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
@@ -155,15 +186,23 @@ export default function EngineCanvas() {
     };
     const onContext = (e: MouseEvent) => e.preventDefault();
     const onDown = (e: MouseEvent) => {
-      if (e.button === 2) panning.active = true;
+      pointer.pressed = true;
+      pointer.dragged = false;
+      pointer.down = { x: e.clientX, y: e.clientY };
     };
     const onMove = (e: MouseEvent) => {
       const sim = simRef.current;
       if (!sim) return;
       const { sx, sy, rect } = canvasScale();
-      if (panning.active) {
-        sim.pan_pixels(e.movementX * sx, e.movementY * sy);
-        return;
+      if (pointer.pressed) {
+        if (!pointer.dragged && isDrag(pointer.down, { x: e.clientX, y: e.clientY }, DRAG_THRESHOLD)) {
+          pointer.dragged = true;
+          if (tipRef.current) tipRef.current.style.display = "none";
+        }
+        if (pointer.dragged) {
+          sim.pan_pixels(e.movementX * sx, e.movementY * sy);
+          return;
+        }
       }
       // Hover: map the cursor to world space and name the nearest road.
       const tip = tipRef.current;
@@ -194,18 +233,64 @@ export default function EngineCanvas() {
       if (tipRef.current) tipRef.current.style.display = "none";
     };
     const onClick = (e: MouseEvent) => {
-      const sim = simRef.current;
-      if (!sim || e.button !== 0) return;
-      const { sx, sy, rect } = canvasScale();
-      const [cx, cy, mpp, vw, vh] = sim.camera_params();
-      const wx = cx + ((e.clientX - rect.left) * sx - vw / 2) * mpp;
-      const wy = cy - ((e.clientY - rect.top) * sy - vh / 2) * mpp;
-      const i = nearestLink(roadsRef.current, wx, wy, 12);
-      selectedRef.current = i;
-      sim.set_selected_link(i);
+      // Suppress selection when the press was a drag (a pan), not a click.
+      if (e.button !== 0 || pointer.dragged) return;
+      selectAt(e.clientX, e.clientY, 12);
     };
     const onUp = () => {
-      panning.active = false;
+      pointer.pressed = false;
+    };
+
+    // Touch: one finger pans (a tap selects); two fingers pinch-zoom toward the
+    // midpoint and pan by the midpoint's movement.
+    const onTouchStart = (e: TouchEvent) => {
+      e.preventDefault();
+      if (e.touches.length === 1) {
+        const t = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+        touch.mode = "pan";
+        touch.dragged = false;
+        touch.prev = t;
+        touch.tap = t;
+      } else if (e.touches.length >= 2) {
+        touch.mode = "pinch";
+        touch.a = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+        touch.b = { x: e.touches[1].clientX, y: e.touches[1].clientY };
+      }
+    };
+    const onTouchMove = (e: TouchEvent) => {
+      e.preventDefault();
+      const sim = simRef.current;
+      if (!sim) return;
+      const s = scale();
+      if (touch.mode === "pan" && e.touches.length === 1) {
+        const cur = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+        const d = panDelta(touch.prev, cur, s);
+        sim.pan_pixels(d.x, d.y);
+        touch.prev = cur;
+        if (isDrag(touch.tap, cur, DRAG_THRESHOLD)) touch.dragged = true;
+      } else if (e.touches.length >= 2) {
+        touch.mode = "pinch";
+        const curA = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+        const curB = { x: e.touches[1].clientX, y: e.touches[1].clientY };
+        const g = pinch(touch.a, touch.b, curA, curB, s);
+        sim.zoom_at(g.factor, g.focusX, g.focusY); // zoom toward the pinch midpoint
+        sim.pan_pixels(g.panX, g.panY); // and follow the midpoint's drag
+        touch.a = curA;
+        touch.b = curB;
+      }
+    };
+    const onTouchEnd = (e: TouchEvent) => {
+      if (touch.mode === "pan" && !touch.dragged) {
+        selectAt(touch.tap.x, touch.tap.y, 20); // a more forgiving tap radius on touch
+      }
+      if (e.touches.length === 0) {
+        touch.mode = "none";
+      } else if (e.touches.length === 1) {
+        // Lifting one finger of a pinch drops back to single-finger panning.
+        touch.mode = "pan";
+        touch.dragged = true; // continuing a gesture, not a tap
+        touch.prev = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+      }
     };
     const onSlider = () => {
       const sim = simRef.current;
@@ -336,13 +421,26 @@ export default function EngineCanvas() {
         };
         resizeCanvas();
         window.addEventListener("resize", resizeCanvas);
-        removeResize = () => window.removeEventListener("resize", resizeCanvas);
+        // Entering/leaving fullscreen resizes the canvas to (or from) the whole screen.
+        const onFsChange = () => {
+          setIsFullscreen(!!document.fullscreenElement);
+          resizeCanvas();
+        };
+        document.addEventListener("fullscreenchange", onFsChange);
+        removeResize = () => {
+          window.removeEventListener("resize", resizeCanvas);
+          document.removeEventListener("fullscreenchange", onFsChange);
+        };
 
         canvas.addEventListener("wheel", onWheel, { passive: false });
         canvas.addEventListener("contextmenu", onContext);
         canvas.addEventListener("mousedown", onDown);
         canvas.addEventListener("mouseleave", onLeave);
         canvas.addEventListener("click", onClick);
+        canvas.addEventListener("touchstart", onTouchStart, { passive: false });
+        canvas.addEventListener("touchmove", onTouchMove, { passive: false });
+        canvas.addEventListener("touchend", onTouchEnd);
+        canvas.addEventListener("touchcancel", onTouchEnd);
         window.addEventListener("mousemove", onMove);
         window.addEventListener("mouseup", onUp);
 
@@ -428,6 +526,10 @@ export default function EngineCanvas() {
       canvas.removeEventListener("mousedown", onDown);
       canvas.removeEventListener("mouseleave", onLeave);
       canvas.removeEventListener("click", onClick);
+      canvas.removeEventListener("touchstart", onTouchStart);
+      canvas.removeEventListener("touchmove", onTouchMove);
+      canvas.removeEventListener("touchend", onTouchEnd);
+      canvas.removeEventListener("touchcancel", onTouchEnd);
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
       removeResize();
@@ -442,8 +544,28 @@ export default function EngineCanvas() {
     setPlaying(!playing);
   };
 
+  const toggleFullscreen = async () => {
+    const el = wrapperRef.current;
+    if (!el) return;
+    try {
+      if (!document.fullscreenElement) {
+        await el.requestFullscreen();
+        // Prefer landscape on devices that can rotate (phones/tablets); harmless
+        // no-op / rejected promise on desktop, so swallow it.
+        try {
+          await (screen.orientation as unknown as { lock?: (o: string) => Promise<void> })?.lock?.("landscape");
+        } catch {}
+      } else {
+        try {
+          (screen.orientation as unknown as { unlock?: () => void })?.unlock?.();
+        } catch {}
+        await document.exitFullscreen();
+      }
+    } catch {}
+  };
+
   return (
-    <div className={styles.wrapper}>
+    <div ref={wrapperRef} className={styles.wrapper}>
       <canvas ref={canvasRef} width={900} height={600} className={styles.canvas} />
 
       <div className={styles.controls}>
@@ -462,6 +584,14 @@ export default function EngineCanvas() {
           title="Show or hide settings"
         >
           {showSettings ? "Settings ▾" : "Settings ▸"}
+        </button>
+        <button
+          className={styles.button}
+          onClick={toggleFullscreen}
+          title="Toggle fullscreen (landscape on mobile)"
+          aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+        >
+          {isFullscreen ? "⛶ Exit" : "⛶"}
         </button>
         {showSettings && (
           <>

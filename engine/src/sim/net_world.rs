@@ -3182,6 +3182,7 @@ mod tests {
                 name: String::new(),
                 road_class: String::new(),
                 highway_ref: String::new(),
+                turn_lanes: String::new(),
             }],
         }
         .build();

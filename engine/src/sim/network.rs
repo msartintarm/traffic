@@ -216,6 +216,9 @@ pub struct Network {
     /// OSM route ref per link (index-aligned with `links`), e.g. "US 101"; empty for
     /// unnumbered roads. Lets demand route freeway through-traffic along one highway.
     pub link_refs: Vec<String>,
+    /// OSM `turn:lanes` per link (index-aligned with `links`), for this travel
+    /// direction; empty when unmapped. The renderer paints lane-use arrows from it.
+    pub link_turn_lanes: Vec<String>,
 }
 
 fn sub(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
@@ -831,7 +834,7 @@ mod tests {
         // L-shaped link (0,0) → bend (100,0) → (100,100).
         let net = OsmMap {
             nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 100.0, 100.0)],
-            links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 1, speed_limit: 20.0, geometry: vec![[100.0, 0.0]], layer: 0, name: String::new(), road_class: String::new(), highway_ref: String::new() }],
+            links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 1, speed_limit: 20.0, geometry: vec![[100.0, 0.0]], layer: 0, name: String::new(), road_class: String::new(), highway_ref: String::new(), turn_lanes: String::new() }],
         }
         .build();
         let lane = LaneId(0);

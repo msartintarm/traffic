@@ -45,9 +45,17 @@ impl NodeSpec {
     pub fn signalized(osm_id: i64, x: f64, y: f64, plan: SignalPlan) -> Self {
         Self { osm_id, x, y, control: MapControl::Signal(plan) }
     }
+
+    pub fn stop(osm_id: i64, x: f64, y: f64) -> Self {
+        Self { osm_id, x, y, control: MapControl::Stop }
+    }
+
+    pub fn give_way(osm_id: i64, x: f64, y: f64) -> Self {
+        Self { osm_id, x, y, control: MapControl::Yield }
+    }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct LinkSpec {
     pub from_osm: i64,
     pub to_osm: i64,
@@ -70,11 +78,16 @@ pub struct LinkSpec {
     /// "I 280;CA 35"). Empty for unnumbered streets. Carried to the network so
     /// demand can send freeway through-traffic to the far end of the *same* highway.
     pub highway_ref: String,
+    /// OSM `turn:lanes` (for this travel direction): a `|`-separated list, one
+    /// entry per lane from the median outward, each a `;`-separated set of turns
+    /// (e.g. `"left|through|through;right"`). Empty when unmapped — the renderer
+    /// then falls back to arrows derived from the lane's actual movements.
+    pub turn_lanes: String,
 }
 
 impl LinkSpec {
     pub fn oneway(from_osm: i64, to_osm: i64, lanes: u32, speed_limit: f64) -> Self {
-        Self { from_osm, to_osm, lanes, speed_limit, geometry: Vec::new(), layer: 0, name: String::new(), road_class: String::new(), highway_ref: String::new() }
+        Self { from_osm, to_osm, lanes, speed_limit, ..Default::default() }
     }
 
     pub fn twoway(a: i64, b: i64, lanes: u32, speed_limit: f64) -> [Self; 2] {
@@ -219,6 +232,7 @@ impl OsmMap {
             net.polylines.push(polyline);
             net.link_names.push(spec.name.clone());
             net.link_refs.push(spec.highway_ref.clone());
+            net.link_turn_lanes.push(spec.turn_lanes.clone());
         }
 
         offset_ramps_to_curb(&mut net);
@@ -589,7 +603,10 @@ fn next_collapse(
             let name = if l1.name.is_empty() { l2.name.clone() } else { l1.name.clone() };
             let road_class = if l1.road_class.is_empty() { l2.road_class.clone() } else { l1.road_class.clone() };
             let highway_ref = if l1.highway_ref.is_empty() { l2.highway_ref.clone() } else { l1.highway_ref.clone() };
-            Some(LinkSpec { from_osm: from, to_osm: to, lanes, speed_limit: l1.speed_limit, geometry, layer: l1.layer, name, road_class, highway_ref })
+            // The downstream segment (l2, ending at the merge's `to`) carries the
+            // turn:lanes that matter at the stop line; fall back to l1 if it lacks them.
+            let turn_lanes = if l2.turn_lanes.is_empty() { l1.turn_lanes.clone() } else { l2.turn_lanes.clone() };
+            Some(LinkSpec { from_osm: from, to_osm: to, lanes, speed_limit: l1.speed_limit, geometry, layer: l1.layer, name, road_class, highway_ref, turn_lanes })
         };
 
         if incident.len() == 4 {
@@ -753,6 +770,8 @@ mod json {
         road_class: String,
         #[serde(default, rename = "ref")]
         highway_ref: String,
+        #[serde(default)]
+        turn_lanes: String,
     }
 
     #[derive(Deserialize)]
@@ -800,6 +819,7 @@ mod json {
                 name: l.name,
                 road_class: l.road_class,
                 highway_ref: l.highway_ref,
+                turn_lanes: l.turn_lanes,
             })
             .collect();
         Ok(OsmMap { nodes, links })
@@ -1217,7 +1237,7 @@ mod tests {
             ],
             links: vec![
                 LinkSpec::oneway(1, 2, 1, 20.0), // surface road, crosses origin
-                LinkSpec { from_osm: 3, to_osm: 4, lanes: 1, speed_limit: 25.0, geometry: Vec::new(), layer: 1, name: String::new(), road_class: String::new(), highway_ref: String::new() }, // bridge over it
+                LinkSpec { from_osm: 3, to_osm: 4, lanes: 1, speed_limit: 25.0, geometry: Vec::new(), layer: 1, name: String::new(), road_class: String::new(), highway_ref: String::new(), turn_lanes: String::new() }, // bridge over it
             ],
         }
         .build();

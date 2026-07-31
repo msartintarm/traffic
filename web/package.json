@@ -10,8 +10,10 @@
     "dev:threads": "npm run wasm:build:threads && npm run dev",
     "prebuild": "npm run wasm:build",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "test": "node --test src/lib/*.test.ts"
   },
+  "type": "module",
   "dependencies": {
     "next": "^15.0.0",
     "react": "^19.0.0",

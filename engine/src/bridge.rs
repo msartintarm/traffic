@@ -63,6 +63,9 @@ pub struct Simulation {
     prev: PoseMap,
     /// The link the user has selected (clicked), highlighted in the density pass.
     selected: Option<usize>,
+    /// Curbside signal-head placements `(group, pos, heading)` — static geometry
+    /// computed once at assembly; each frame only pairs them with live colours.
+    signal_heads: Vec<(usize, [f32; 2], f32)>,
     /// Optional GPU flow-field solver on the renderer's WebGPU device, plus the
     /// in-flight async readback and the cost snapshot it was dispatched with.
     gpu: Option<GpuFlowField>,
@@ -122,9 +125,10 @@ impl Simulation {
         world.install_router(&demand.destinations());
         let mut clock = SimClock::new(&cfg);
         clock.play();
+        let signal_heads = geometry::signal_head_placements(&world.network);
         Simulation {
             world, clock, seed: cfg.seed, demand, demand_sources, demand_rate, entry_speed_cap, camera,
-            prev: PoseMap::default(), selected: None,
+            prev: PoseMap::default(), selected: None, signal_heads,
             gpu: None, gpu_pending: None, gpu_cost: Vec::new(), gpu_last: 0.0,
             effective_speed: 0.0, throttled: false, last_advance_ms: 0.0,
             speed_sim_accum: 0.0, speed_wall_accum: 0.0, speed_dropped: false,
@@ -517,28 +521,12 @@ impl Simulation {
         out
     }
 
-    /// Each signal group's head as `(position, approach heading, state)`. The
-    /// head sits at the stop line of one of the group's approach lanes, nudged
-    /// laterally by group bit so several heads on one approach don't overlap.
+    /// Each signal group's head as `(position, approach heading, state)`, from the
+    /// pure curbside placement in [`geometry::signal_head_placements`] paired with
+    /// the group's live colour.
     fn signal_head_slots(&self) -> Vec<([f32; 2], f32, crate::sim::signal::SignalState)> {
-        let net = &self.world.network;
         let states = self.world.signal_states();
-        let mut rep = vec![None; net.groups.len()];
-        for mv in &net.movements {
-            if let Some(g) = mv.signal_group {
-                rep[g.idx()].get_or_insert(mv.from_lane);
-            }
-        }
-        let mut out = Vec::new();
-        for (gi, lane) in rep.into_iter().enumerate() {
-            let Some(lane) = lane else { continue };
-            let bit = net.groups[gi].bit as f64;
-            let p = net.lane_point(lane, net.lane(lane).length);
-            let dir = net.arrival_dir(net.lane(lane).link);
-            let (px, py) = (p[0] + dir[1] * bit * 2.0, p[1] - dir[0] * bit * 2.0);
-            out.push(([px as f32, py as f32], dir[1].atan2(dir[0]) as f32, states[gi]));
-        }
-        out
+        self.signal_heads.iter().map(|&(gi, pos, heading)| (pos, heading, states[gi])).collect()
     }
 
     /// Paved junctions as `[x, y, radius]` for every node where roads meet.

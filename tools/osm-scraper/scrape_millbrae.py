@@ -7,11 +7,12 @@ The output schema is the contract between this tool and the Rust engine:
     {
       "meta":  {"place", "bbox", "origin"},
       "nodes": [{"osm_id", "x", "y", "control", "signal"?}],
-      "links": [{"from_osm", "to_osm", "lanes", "speed_limit", "road_class"}]
+      "links": [{"from_osm", "to_osm", "lanes", "speed_limit", "road_class", "turn_lanes"?}]
     }
 
 `x`/`y` are metres in a local equirectangular projection about the bbox centre
 (engine geometry is planar); `control` is one of uncontrolled|signal|stop|yield;
+`turn_lanes` (optional) is the OSM `turn:lanes` string for that direction;
 `links` are already directed (two-way streets are emitted as two links), matching
 `LinkSpec`. Ways are split at every intersection node so a link spans exactly one
 block, which is what the signal/movement model expects.
@@ -177,7 +178,7 @@ def build(raw, bbox):
     def geom_of(node_ids):
         return [list(project(nodes[nid]["lat"], nodes[nid]["lon"], lat0, lon0)) for nid in node_ids]
 
-    def emit_link(a, b, lanes, speed, geometry, name, ref, layer, road_class):
+    def emit_link(a, b, lanes, speed, geometry, name, ref, layer, road_class, turn_lanes):
         if (a, b) in emitted:
             return
         emitted.add((a, b))
@@ -192,6 +193,10 @@ def build(raw, bbox):
         # the engine model freeway↔ramp interchanges as free-flow diverges/merges
         # instead of stop-controlled intersections.
         link["road_class"] = road_class
+        if turn_lanes:
+            # OSM turn:lanes for this direction, e.g. "left|through|through;right" —
+            # the renderer paints the lane-use arrows from it.
+            link["turn_lanes"] = turn_lanes
         out_links.append(link)
 
     for way in ways:
@@ -203,6 +208,10 @@ def build(raw, bbox):
         name = tags.get("name")
         ref = tags.get("ref")
         layer = parse_layer(tags)
+        # OSM turn:lanes is ordered left→right in each direction of travel. A
+        # two-way way splits it into :forward / :backward; a oneway carries it bare.
+        tl_forward = tags.get("turn:lanes:forward") or (tags.get("turn:lanes") if oneway else None)
+        tl_backward = tags.get("turn:lanes:backward")
 
         seq = way["nodes"]
         block_start = 0
@@ -214,9 +223,9 @@ def build(raw, bbox):
                 emit_node(a)
                 emit_node(b)
                 mid = geom_of(seq[block_start + 1 : i])  # intermediate bend points
-                emit_link(a, b, lanes, speed, mid, name, ref, layer, highway)
+                emit_link(a, b, lanes, speed, mid, name, ref, layer, highway, tl_forward)
                 if not oneway:
-                    emit_link(b, a, lanes, speed, list(reversed(mid)), name, ref, layer, highway)
+                    emit_link(b, a, lanes, speed, list(reversed(mid)), name, ref, layer, highway, tl_backward)
             block_start = i
 
     return {

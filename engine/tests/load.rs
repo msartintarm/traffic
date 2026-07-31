@@ -230,3 +230,16 @@ fn load_highway_saturation_gpu_routing() {
     // step cost excludes the CPU flow-field recompute.
     scaling_curve(DemandSources::new(true, false), 600, true, "Millbrae highway saturation (external/GPU routing)");
 }
+
+/// The committed Millbrae `map.json` must build *and* render without panicking —
+/// the exact path the browser runs at load (`assemble` → world/marking meshes plus
+/// the cached signal-head placements). Cheap, so it runs by default rather than
+/// `#[ignore]`d; a geometry panic on the real map (e.g. a sub-metre link tripping a
+/// clamp) fails here instead of blanking the page.
+#[test]
+fn real_map_builds_and_renders_without_panicking() {
+    let Some(net) = real_map() else { return }; // map.json may be absent in a bare checkout
+    let _ = engine::render::geometry::world_mesh(&net);
+    let _ = engine::render::geometry::marking_mesh(&net);
+    let _ = engine::render::geometry::signal_head_placements(&net);
+}

@@ -6,6 +6,21 @@
   max-width: 900px;
 }
 
+/* Fullscreen: let the canvas fill the whole screen (drop the aspect-ratio cap). */
+.wrapper:fullscreen {
+  max-width: none;
+  width: 100vw;
+  height: 100vh;
+}
+
+.wrapper:fullscreen .canvas {
+  width: 100%;
+  height: 100%;
+  aspect-ratio: auto;
+  border: none;
+  border-radius: 0;
+}
+
 .canvas {
   width: 100%;
   aspect-ratio: 3 / 2;
