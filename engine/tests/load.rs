@@ -15,9 +15,13 @@ use engine::sim::map::OsmMap;
 use engine::sim::net_world::{prof_take, AccelBackend, NetWorld, PHASE_NAMES, STEP_PHASES};
 use engine::sim::network::Network;
 
-fn real_map() -> Option<Network> {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+fn map_from(file: &str) -> Option<Network> {
+    let path = format!("{}/../web/public/{}", env!("CARGO_MANIFEST_DIR"), file);
     Some(OsmMap::from_json(&std::fs::read_to_string(path).ok()?).ok()?.build())
+}
+
+fn real_map() -> Option<Network> {
+    map_from("map.json")
 }
 
 struct Sample {
@@ -344,6 +348,33 @@ fn real_map_builds_and_renders_without_panicking() {
     let _ = engine::render::geometry::world_mesh(&net);
     let _ = engine::render::geometry::marking_mesh(&net);
     let _ = engine::render::geometry::signal_head_placements(&net);
+}
+
+#[test]
+fn san_carlos_map_builds_renders_and_flows_without_panicking() {
+    let Some(net) = map_from("sancarlos.json") else { return };
+    let _ = engine::render::geometry::world_mesh(&net);
+    let _ = engine::render::geometry::marking_mesh(&net);
+    let _ = engine::render::geometry::signal_head_placements(&net);
+
+    let cfg = SimConfig::default_config();
+    let pairs = demand::od_pairs(&net, 0, 600, DemandSources::new(true, true));
+    let mut world = NetWorld::new(net, cfg);
+    let mut gen = DemandGenerator::new(&world, &pairs, 0);
+    world.install_router(&gen.destinations());
+    for _ in 0..1500 {
+        gen.step(&mut world, cfg.dt);
+        world.step();
+    }
+    eprintln!("san carlos: {} exited, {} crashed, {} leaked", world.exited(), world.crashed(), world.leaked());
+    assert!(world.exited() > 0, "the San Carlos map carries traffic to its destinations");
+    assert_eq!(world.leaked(), 0, "no vehicle vanishes at a San Carlos intersection");
+    assert!(
+        world.crashed() < world.exited() / 20,
+        "collisions stay rare relative to throughput: {} crashed vs {} exited",
+        world.crashed(),
+        world.exited(),
+    );
 }
 
 /// The routing field must be acyclic: following `next_hop` from any link toward

@@ -98,22 +98,27 @@ npm run dev        # predev builds the wasm via wasm-pack
 Requires `wasm-pack` (`cargo install wasm-pack`). The page loads
 `Simulation`, ticks it each animation frame, and draws vehicle instances.
 
-## Import a real map (Millbrae)
+## Import a real map (Millbrae, San Carlos, …)
 
-Scrape OpenStreetMap into the web app's map slot; the browser loads it
-automatically on next run, and origin–destination demand streams routed vehicles
-across its real intersections (falling back to `millbrae_sample()` if absent):
+Scrape OpenStreetMap into a public map file; the scenario selector loads it, and
+origin–destination demand streams routed vehicles across its real intersections
+(falling back to `millbrae_sample()` if absent):
 
 ```
-python3 tools/osm-scraper/scrape_millbrae.py --bbox S W N E --out web/public/map.json
-cd web && npm run dev            # serves /map.json; app prefers it over the sample
+python3 tools/osm-scraper/scrape_millbrae.py --place "Millbrae, CA"   --bbox S W N E --out web/public/map.json
+python3 tools/osm-scraper/scrape_millbrae.py --place "San Carlos, CA" --bbox S W N E --out web/public/sancarlos.json
+cd web && npm run dev            # Settings ▸ map dropdown switches between the cities
 ```
 
-The bounding box is an input, never checked in (flag, gitignored file, or
-`TRAFFIC_BBOX`), and `web/public/map.json` is gitignored (its `meta` carries real
-coordinates). `Simulation::from_map_json` (wasm, `--features import`) parses the
-scraper's JSON — field names line up 1:1 with `NodeSpec`/`LinkSpec` — and
-`build_demand` samples OD pairs whose routes cross ≥1 intersection.
+The scraper is city-agnostic — `--place` sets the map's display name and `--out`
+its file. Register a new file's scenario key → `{ file, name }` in `REAL_MAPS`
+(`web/src/components/EngineCanvas.tsx`) and add an `<option>` to the selector; the
+committed `sancarlos.json` shows the full path (scrape → public file → dropdown).
+
+The bounding box is an input (flag, file, or `TRAFFIC_BBOX`).
+`Simulation::from_map_json` (wasm, `--features import`) parses the scraper's JSON —
+field names line up 1:1 with `NodeSpec`/`LinkSpec` — and `build_demand` samples OD
+pairs whose routes cross ≥1 intersection.
 
 ## Build order / roadmap
 

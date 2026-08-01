@@ -136,6 +136,13 @@ type ThreadedEngineModule = EngineModule & { initThreadPool(numThreads: number):
 
 const ZOOM_RANGE = 60; // fit-out … max-in ratio driving the slider
 
+// Selectable real (OSM-scraped) maps: scenario key → the public map file and its
+// display name. Add a city by scraping it to `web/public/<file>` and listing it here.
+const REAL_MAPS: Record<string, { file: string; name: string }> = {
+  millbrae: { file: "map.json", name: "Millbrae, CA" },
+  sancarlos: { file: "sancarlos.json", name: "San Carlos, CA" },
+};
+
 // Speed unit display: m/s → the shown unit, and its label.
 const MPS_TO = { mi: 2.23694, km: 3.6 } as const;
 const UNIT_LABEL = { mi: "mph", km: "km/h" } as const;
@@ -396,20 +403,21 @@ export default function EngineCanvas() {
         const scenario = new URLSearchParams(window.location.search).get("scenario") ?? "millbrae";
         let loaded: Sim | null = null;
         let label = "sample map";
-        if (scenario === "arterial" || scenario === "corridor" || scenario === "gridlock") {
-          loaded = mod.Simulation.scenario(scenario, 0xc0ffee);
-          label = `${scenario} scenario`;
-        } else {
+        const realMap = REAL_MAPS[scenario];
+        if (realMap) {
           try {
-            const res = await fetch(`${basePath()}/map.json`);
+            const res = await fetch(`${basePath()}/${realMap.file}`);
             if (res.ok && mod.Simulation.from_map_json) {
               const text = await res.text();
               loaded = mod.Simulation.from_map_json(text, 0xc0ffee);
-              label = "OSM map";
+              label = realMap.name;
             }
           } catch {
             loaded = null;
           }
+        } else {
+          loaded = mod.Simulation.scenario(scenario, 0xc0ffee);
+          label = `${scenario} scenario`;
         }
         const sim: Sim = loaded ?? new mod.Simulation(0xc0ffee);
         simRef.current = sim;
@@ -696,6 +704,7 @@ export default function EngineCanvas() {
               }}
             >
               <option value="millbrae">Millbrae (real map)</option>
+              <option value="sancarlos">San Carlos (real map)</option>
               <option value="arterial">Test: arterial junction</option>
               <option value="corridor">Test: signal corridor</option>
               <option value="gridlock">Test: gridlock (fast jam)</option>

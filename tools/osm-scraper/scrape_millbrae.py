@@ -134,7 +134,7 @@ def project(lat, lon, lat0, lon0):
     return round(x, 2), round(y, 2)
 
 
-def build(raw, bbox):
+def build(raw, bbox, place):
     nodes = {e["id"]: e for e in raw["elements"] if e["type"] == "node"}
     ways = [
         e for e in raw["elements"]
@@ -229,7 +229,7 @@ def build(raw, bbox):
             block_start = i
 
     return {
-        "meta": {"place": "Millbrae, CA", "bbox": bbox, "origin": [lat0, lon0]},
+        "meta": {"place": place, "bbox": bbox, "origin": [lat0, lon0]},
         "nodes": list(out_nodes.values()),
         "links": out_links,
     }
@@ -257,12 +257,13 @@ def resolve_bbox(args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="millbrae.json")
+    ap.add_argument("--place", default="Millbrae, CA")
     ap.add_argument("--bbox", nargs=4, type=float, metavar=("S", "W", "N", "E"))
     ap.add_argument("--bbox-file", dest="bbox_file")
     args = ap.parse_args()
 
     bbox = resolve_bbox(args)
-    graph = build(fetch(bbox), bbox)
+    graph = build(fetch(bbox), bbox, args.place)
     with open(args.out, "w") as f:
         json.dump(graph, f, separators=(",", ":"))
     print(f"wrote {args.out}: {len(graph['nodes'])} nodes, {len(graph['links'])} links")
