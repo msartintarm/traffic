@@ -498,15 +498,15 @@ fn assign_signal_program(net: &mut Network, node: NodeId, plan: SignalPlan) -> N
         .iter()
         .map(|gs| {
             let mask = gs.iter().fold(0u64, |m, &g| m | (1u64 << g));
-            // A protected-left-only phase (a left arrow) is short; through phases
-            // get the full green. This keeps the cycle from ballooning when an
-            // intersection needs several protected-left stages.
             let green = if gs.iter().all(|&g| left_group[g]) {
                 (plan.green_secs * 0.45).max(6.0)
             } else {
                 plan.green_secs
             };
-            Phase::new(mask, green, plan.yellow_secs)
+            let phase_movements: Vec<MovementId> =
+                gs.iter().flat_map(|&g| group_movements[g].iter().copied()).collect();
+            let (yellow, all_red) = change_and_clearance_intervals(net, &phase_movements);
+            Phase::with_clearance(mask, green, yellow, all_red)
         })
         .collect();
     net.programs.push(SignalProgram::new(plan.offset, phases));
@@ -516,6 +516,29 @@ fn assign_signal_program(net: &mut Network, node: NodeId, plan: SignalPlan) -> N
         }
     }
     NodeControl::Signalized(program)
+}
+
+const YELLOW_REACTION: f64 = 1.0;
+const YELLOW_DECEL: f64 = 3.0;
+const YELLOW_MIN: f64 = 3.0;
+const YELLOW_MAX: f64 = 6.0;
+const CLEARANCE_VEHICLE_LEN: f64 = 6.0;
+const ALL_RED_MIN: f64 = 1.5;
+const ALL_RED_MAX: f64 = 5.0;
+
+fn change_and_clearance_intervals(net: &Network, movements: &[MovementId]) -> (f64, f64) {
+    let approach = movements
+        .iter()
+        .map(|&m| net.lane(net.movement(m).from_lane).speed_limit)
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    let yellow = (YELLOW_REACTION + approach / (2.0 * YELLOW_DECEL)).clamp(YELLOW_MIN, YELLOW_MAX);
+    let crossing = movements
+        .iter()
+        .map(|&m| net.interior(m).len)
+        .fold(0.0_f64, f64::max);
+    let all_red = ((crossing + CLEARANCE_VEHICLE_LEN) / approach).clamp(ALL_RED_MIN, ALL_RED_MAX);
+    (yellow, all_red)
 }
 
 /// Coordinate signalized arterial corridors into green waves. OSM carries no signal
@@ -659,6 +682,7 @@ fn coordinate_green_waves(net: &mut Network) {
 
     for (idx, offset) in offsets {
         net.programs[idx].offset = offset;
+        net.programs[idx].coordinated = true;
     }
 }
 
@@ -1362,6 +1386,87 @@ mod tests {
         }
     }
 
+    #[test]
+    fn actuated_controller_honors_coordination_offsets_at_runtime() {
+        use super::super::junction::SignalController;
+        use super::super::signal::SignalState;
+        use std::collections::HashSet;
+
+        let plan = SignalPlan { green_secs: 20.0, yellow_secs: 4.0, offset: 0.0 };
+        let road = |a, b, name: &str, lanes, sp| {
+            let mut v = LinkSpec::twoway(a, b, lanes, sp).to_vec();
+            for l in &mut v {
+                l.name = name.to_string();
+            }
+            v
+        };
+        let mut links = Vec::new();
+        for (a, b) in [(0, 1), (1, 2), (2, 3)] {
+            links.extend(road(a, b, "Main Street", 2, 15.0));
+        }
+        for (n, e, name) in [(1, 10, "Cross A"), (2, 11, "Cross B")] {
+            links.extend(road(n, e, name, 1, 12.0));
+        }
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(0, -300.0, 0.0),
+                NodeSpec::signalized(1, 0.0, 0.0, plan),
+                NodeSpec::signalized(2, 300.0, 0.0, plan),
+                NodeSpec::uncontrolled(3, 600.0, 0.0),
+                NodeSpec::uncontrolled(10, 0.0, -200.0),
+                NodeSpec::uncontrolled(11, 300.0, -200.0),
+            ],
+            links,
+        }
+        .build();
+
+        let coordinated = net.programs.iter().filter(|p| p.coordinated).count();
+        assert_eq!(coordinated, 2, "both corridor signals are coordinated");
+
+        let through = |node: NodeId| -> (MovementId, u8, usize) {
+            (0..net.movements.len() as u32)
+                .find_map(|m| {
+                    let mv = net.movement(MovementId(m));
+                    let (fl, tl) = (net.lane(mv.from_lane).link, net.lane(mv.to_lane).link);
+                    (mv.node == node
+                        && net.movement_turn(MovementId(m)) == TurnType::Through
+                        && net.link_names[fl.idx()] == "Main Street"
+                        && net.link_names[tl.idx()] == "Main Street")
+                        .then(|| {
+                            let g = net.groups[mv.signal_group.unwrap().idx()];
+                            (MovementId(m), g.bit, g.program.idx())
+                        })
+                })
+                .expect("a Main-Street through movement")
+        };
+        let up = through(NodeId(1));
+        let down = through(NodeId(2));
+        assert_ne!(net.programs[up.2].offset, net.programs[down.2].offset, "offsets are staggered");
+
+        let cycle = net.programs[up.2].cycle_length();
+        let steps = (cycle / 0.1).ceil() as usize + 4;
+        let mut ctrl = SignalController::build(&net);
+        let empty = HashSet::new();
+        let mut clock = 0.0;
+        let mut staggered_instant = false;
+        for _ in 0..steps {
+            for (mid, bit, pid) in [up, down] {
+                assert_eq!(
+                    ctrl.movement_state(&net, mid),
+                    net.programs[pid].state_of(bit, clock),
+                    "coordinated runtime state must follow the offset schedule at t={clock}",
+                );
+            }
+            let (us, ds) = (ctrl.movement_state(&net, up.0), ctrl.movement_state(&net, down.0));
+            if us == SignalState::Green && ds != SignalState::Green {
+                staggered_instant = true;
+            }
+            ctrl.advance(&net, &empty, 0.1);
+            clock += 0.1;
+        }
+        assert!(staggered_instant, "the wave reaches the upstream green before the downstream one");
+    }
+
     /// A signalized four-way with every in/out leg, centre node on a signal.
     fn signalized_cross() -> Network {
         let plan = SignalPlan { green_secs: 15.0, yellow_secs: 3.0, offset: 0.0 };
@@ -1387,11 +1492,52 @@ mod tests {
         .build()
     }
 
+    fn signalized_cross_at(speed: f64) -> Network {
+        let plan = SignalPlan { green_secs: 15.0, yellow_secs: 3.0, offset: 0.0 };
+        OsmMap {
+            nodes: vec![
+                NodeSpec::signalized(0, 0.0, 0.0, plan),
+                NodeSpec::uncontrolled(1, -100.0, 0.0),
+                NodeSpec::uncontrolled(2, 100.0, 0.0),
+                NodeSpec::uncontrolled(3, 0.0, -100.0),
+                NodeSpec::uncontrolled(4, 0.0, 100.0),
+            ],
+            links: vec![
+                LinkSpec::oneway(1, 0, 1, speed),
+                LinkSpec::oneway(2, 0, 1, speed),
+                LinkSpec::oneway(3, 0, 1, speed),
+                LinkSpec::oneway(4, 0, 1, speed),
+                LinkSpec::oneway(0, 1, 1, speed),
+                LinkSpec::oneway(0, 2, 1, speed),
+                LinkSpec::oneway(0, 3, 1, speed),
+                LinkSpec::oneway(0, 4, 1, speed),
+            ],
+        }
+        .build()
+    }
+
+    #[test]
+    fn signal_change_and_clearance_intervals_scale_with_approach_speed() {
+        let intervals = |speed: f64| -> (f64, f64) {
+            let net = signalized_cross_at(speed);
+            let prog = &net.programs[0];
+            (
+                prog.phases.iter().map(|p| p.yellow_secs).fold(0.0, f64::max),
+                prog.phases.iter().map(|p| p.all_red_secs).fold(0.0, f64::max),
+            )
+        };
+        let (slow_y, slow_ar) = intervals(11.0);
+        let (fast_y, fast_ar) = intervals(29.0);
+        assert!(fast_y > slow_y, "faster approaches get longer yellows: {slow_y} vs {fast_y}");
+        assert!((3.0..=6.0).contains(&slow_y) && (3.0..=6.0).contains(&fast_y), "yellows stay in the ITE range");
+        assert!((fast_y - (1.0 + 29.0 / 6.0)).abs() < 1e-9, "yellow follows the ITE kinematic formula");
+        for ar in [slow_ar, fast_ar] {
+            assert!((1.5..=5.0).contains(&ar), "clearance stays in a realistic band: {ar}");
+        }
+    }
+
     #[test]
     fn signal_phasing_never_greens_conflicting_movements_together() {
-        // The phases are built from the conflict graph, so at no instant in the
-        // cycle are two crossing movements both green — the guarantee that keeps
-        // signalized intersections collision-free.
         use crate::sim::signal::SignalState;
         let net = signalized_cross();
         let cycle = net.programs[0].cycle_length();

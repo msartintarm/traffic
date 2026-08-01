@@ -20,36 +20,40 @@ impl SignalState {
     }
 }
 
-/// One stage of a cycle: the groups whose bit is set show green for
-/// `green_secs`, then yellow for `yellow_secs`; every other group is red.
+pub const DEFAULT_ALL_RED: f64 = 2.5;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Phase {
     pub green_mask: u64,
     pub green_secs: f64,
     pub yellow_secs: f64,
+    pub all_red_secs: f64,
 }
 
 impl Phase {
     pub fn new(green_mask: u64, green_secs: f64, yellow_secs: f64) -> Self {
-        Self { green_mask, green_secs, yellow_secs }
+        Self { green_mask, green_secs, yellow_secs, all_red_secs: 0.0 }
+    }
+
+    pub fn with_clearance(green_mask: u64, green_secs: f64, yellow_secs: f64, all_red_secs: f64) -> Self {
+        Self { green_mask, green_secs, yellow_secs, all_red_secs }
     }
 
     pub fn length(&self) -> f64 {
-        self.green_secs + self.yellow_secs
+        self.green_secs + self.yellow_secs + self.all_red_secs
     }
 }
 
-/// A repeating phase cycle with a coordination `offset` (for green-wave
-/// progression along an arterial).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SignalProgram {
     pub offset: f64,
     pub phases: Vec<Phase>,
+    pub coordinated: bool,
 }
 
 impl SignalProgram {
     pub fn new(offset: f64, phases: Vec<Phase>) -> Self {
-        Self { offset, phases }
+        Self { offset, phases, coordinated: false }
     }
 
     /// Two non-overlapping approaches (bit 0 and bit 1) alternating, a common
@@ -93,8 +97,10 @@ impl SignalProgram {
                 }
                 return if t < phase.green_secs {
                     SignalState::Green
-                } else {
+                } else if t < phase.green_secs + phase.yellow_secs {
                     SignalState::Yellow
+                } else {
+                    SignalState::Red
                 };
             }
             t -= phase.length();
@@ -146,5 +152,32 @@ mod tests {
         let shifted = SignalProgram::two_phase(20.0, 4.0, 24.0);
         assert_eq!(base.state_of(0, 0.0), SignalState::Green);
         assert_eq!(shifted.state_of(0, 0.0), base.state_of(0, 24.0));
+    }
+
+    #[test]
+    fn all_red_clearance_reds_every_group_at_the_phase_boundary() {
+        let all_red = 3.0;
+        let p = SignalProgram::new(
+            0.0,
+            vec![
+                Phase::with_clearance(0b01, 20.0, 4.0, all_red),
+                Phase::with_clearance(0b10, 20.0, 4.0, all_red),
+            ],
+        );
+        assert_eq!(p.cycle_length(), 2.0 * (20.0 + 4.0 + 3.0));
+        assert_eq!(p.state_of(0, 19.9), SignalState::Green);
+        assert_eq!(p.state_of(0, 22.0), SignalState::Yellow);
+        assert_eq!(p.state_of(0, 25.0), SignalState::Red);
+        assert_eq!(p.state_of(1, 25.0), SignalState::Red);
+        assert_eq!(p.state_of(1, 27.1), SignalState::Green);
+        for step in 0..((p.cycle_length() * 10.0) as u32) {
+            let t = step as f64 * 0.1;
+            assert!(!(p.state_of(0, t).is_go() && p.state_of(1, t).is_go()), "conflict at t={t}");
+        }
+    }
+
+    #[test]
+    fn programs_are_uncoordinated_by_default() {
+        assert!(!SignalProgram::two_phase(20.0, 4.0, 0.0).coordinated);
     }
 }

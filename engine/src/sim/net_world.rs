@@ -1570,8 +1570,12 @@ impl NetWorld {
             intended_mv[i].is_some_and(|mid| {
                 // Free-flow freeway movements never hard-block on a box conflict (the
                 // merge is a zipper); only at-grade crossings gate on box occupancy.
-                !self.network.is_interchange_movement(mid)
-                    && self.box_conflict(mid, self.network.link(self.network.lane(veh.lane).link).to, &nb)
+                if self.network.is_interchange_movement(mid) {
+                    return false;
+                }
+                let node = self.network.link(self.network.lane(veh.lane).link).to;
+                self.box_conflict(mid, node, &nb)
+                    || (self.is_permissive(mid) && self.permissive_must_yield(i, mid, node, &nb))
             })
         });
 
@@ -1674,7 +1678,9 @@ impl NetWorld {
         integrate(veh, accel, dt);
         let lane = *self.network.lane(veh.lane);
         let node = self.network.link(lane.link).to;
-        if matches!(self.network.node(node).control, NodeControl::Stop)
+        let must_stop_here = matches!(self.network.node(node).control, NodeControl::Stop)
+            || intended.is_some_and(|mid| self.is_rtor(mid));
+        if must_stop_here
             && veh.speed < 0.3
             && (lane.length - veh.position) < veh.driver.vehicle_length + veh.driver.min_gap + 1.0
         {
@@ -1689,7 +1695,8 @@ impl NetWorld {
         // stalling inside the node where cross traffic will T-bone it.
         match intended {
             Some(mid)
-                if self.movement_state(mid) != SignalState::Red
+                if (self.movement_state(mid) != SignalState::Red
+                    || (self.is_rtor(mid) && veh.stopped_at == Some(node)))
                     && self.receiving_lane_clear(mid, front, veh.driver.min_gap)
                     && !block_entry =>
             {
@@ -1829,7 +1836,7 @@ impl NetWorld {
         // clears on yellow.
         let signal_stop = intended.is_some_and(|mid| match self.movement_state(mid) {
             SignalState::Green => false,
-            SignalState::Red => true,
+            SignalState::Red => !self.is_rtor(mid),
             SignalState::Yellow => can_stop_before(veh.speed, driver.comfort_decel, to_line),
         });
         // Stop at the immediate line (red / blocked box), or ease toward a red one
@@ -1844,7 +1851,8 @@ impl NetWorld {
             (target < driver.desired_speed).then_some(SpeedTarget { speed: target, distance: to_line })
         });
 
-        let stop_sign = (matches!(control, NodeControl::Stop) && veh.stopped_at != Some(node))
+        let rtor = intended.is_some_and(|mid| self.is_rtor(mid));
+        let stop_sign = ((matches!(control, NodeControl::Stop) || rtor) && veh.stopped_at != Some(node))
             .then_some(to_line);
 
         // A freeway diverge/merge is free-flow — no crossing traffic to yield to (the
@@ -1859,7 +1867,9 @@ impl NetWorld {
         let prio_yield = !free_flow
             && matches!(control, NodeControl::Uncontrolled | NodeControl::Stop | NodeControl::Yield)
             && self.conflicting_priority_traffic(i, veh.lane, node, nb).is_some();
-        let yield_line = (box_yield || prio_yield).then_some(to_line);
+        let permissive_yield = intended
+            .is_some_and(|mid| self.is_permissive(mid) && self.permissive_must_yield(i, mid, node, nb));
+        let yield_line = (box_yield || prio_yield || permissive_yield).then_some(to_line);
 
         let merge = self.merge_conflict(veh, lane.length, intended, nb);
 
@@ -2104,6 +2114,61 @@ impl NetWorld {
             }
         }
         None
+    }
+
+    fn is_rtor(&self, mid: MovementId) -> bool {
+        self.network.movement_turn(mid) == TurnType::Right
+            && !self.network.is_interchange_movement(mid)
+            && self.movement_state(mid) == SignalState::Red
+    }
+
+    fn left_is_permissive(&self, mid: MovementId) -> bool {
+        let node = self.network.movement(mid).node;
+        self.junctions.conflict_ids(node).iter().any(|&ci| {
+            let cp = &self.network.conflicts[ci as usize];
+            let other = if cp.a == mid { cp.b } else if cp.b == mid { cp.a } else { return false };
+            self.movement_state(other) != SignalState::Red
+        })
+    }
+
+    fn is_permissive(&self, mid: MovementId) -> bool {
+        if self.network.is_interchange_movement(mid) {
+            return false;
+        }
+        match self.network.movement_turn(mid) {
+            TurnType::Right => self.movement_state(mid) == SignalState::Red,
+            TurnType::Left => {
+                self.network.movement(mid).signal_group.is_some()
+                    && self.movement_state(mid) == SignalState::Green
+                    && self.left_is_permissive(mid)
+            }
+            TurnType::Through => false,
+        }
+    }
+
+    fn permissive_must_yield(&self, i: usize, mid: MovementId, node: NodeId, nb: &Neighbors) -> bool {
+        let critical = self.fleet.rows[i].driver.critical_gap;
+        self.junctions.conflict_ids(node).iter().any(|&ci| {
+            let cp = &self.network.conflicts[ci as usize];
+            let other = if cp.a == mid { cp.b } else if cp.b == mid { cp.a } else { return false };
+            if self.movement_state(other) == SignalState::Red {
+                return false;
+            }
+            let crossing = nb
+                .crossing_at
+                .get(&node.0)
+                .into_iter()
+                .flatten()
+                .any(|&j| self.fleet.rows[j].crossing.unwrap().movement == other);
+            let from_link = self.network.lane(self.network.movement(other).from_lane).link;
+            let approaching = nb.approaching.get(&node.0).into_iter().flatten().any(|&j| {
+                let o = &self.fleet.rows[j];
+                o.speed >= 0.5
+                    && self.network.lane(o.lane).link == from_link
+                    && (self.network.lane(o.lane).length - o.position) / o.speed.max(0.1) < critical
+            });
+            crossing || approaching
+        })
     }
 
     /// The nearest-to-the-merge conflicting vehicle on a converging lane, as an
@@ -2699,6 +2764,83 @@ mod tests {
         }
         assert!(min_speed_on_approach < 0.5, "must come to a full stop, min {min_speed_on_approach}");
         assert_eq!(world.exited(), 1, "and then continue through");
+    }
+
+    fn signalized_four_way() -> OsmMap {
+        let plan = SignalPlan { green_secs: 15.0, yellow_secs: 3.0, offset: 0.0 };
+        OsmMap {
+            nodes: vec![
+                NodeSpec::signalized(0, 0.0, 0.0, plan),
+                NodeSpec::uncontrolled(1, -120.0, 0.0),
+                NodeSpec::uncontrolled(2, 120.0, 0.0),
+                NodeSpec::uncontrolled(3, 0.0, -120.0),
+                NodeSpec::uncontrolled(4, 0.0, 120.0),
+            ],
+            links: vec![
+                LinkSpec::oneway(1, 0, 1, 15.0),
+                LinkSpec::oneway(0, 1, 1, 15.0),
+                LinkSpec::oneway(2, 0, 1, 15.0),
+                LinkSpec::oneway(0, 2, 1, 15.0),
+                LinkSpec::oneway(3, 0, 1, 15.0),
+                LinkSpec::oneway(0, 3, 1, 15.0),
+                LinkSpec::oneway(4, 0, 1, 15.0),
+                LinkSpec::oneway(0, 4, 1, 15.0),
+            ],
+        }
+    }
+
+    #[test]
+    fn right_turn_on_red_clears_before_a_through_that_waits_for_green() {
+        let node = NodeId(0);
+        let find = |net: &Network, turn: TurnType, from: LinkId| -> Option<MovementId> {
+            (0..net.movements.len() as u32).map(MovementId).find(|&m| {
+                net.movement(m).node == node
+                    && net.lane(net.movement(m).from_lane).link == from
+                    && net.movement_turn(m) == turn
+            })
+        };
+
+        let net = signalized_four_way().build();
+        let probe = NetWorld::new(signalized_four_way().build(), cfg());
+        let states = probe.signal_states();
+        let red_from = (0..net.links.len() as u32)
+            .map(LinkId)
+            .filter(|&l| net.link(l).to == node)
+            .find(|&l| {
+                let red_through = find(&net, TurnType::Through, l)
+                    .and_then(|m| net.movement(m).signal_group)
+                    .is_some_and(|g| states[g.idx()] == SignalState::Red);
+                red_through && find(&net, TurnType::Right, l).is_some()
+            })
+            .expect("an approach whose through is red at t=0");
+
+        let run = |turn: TurnType| -> (u32, u32) {
+            let mut w = NetWorld::new(signalized_four_way().build(), cfg());
+            let mv = find(&w.network, turn, red_from).expect("approach has this movement");
+            let dest = w.network.lane(w.network.movement(mv).to_lane).link;
+            w.install_router(&[dest]);
+            let lane = w.network.lanes_of(red_from).next().unwrap();
+            let len = w.network.lane(lane).length;
+            let driver = DriverConfig { accel_noise: 0.0, ..DriverConfig::car() };
+            w.spawn_to_in_lane(1, lane, len - 8.0, dest, 6.0, driver);
+            let mut exit = u32::MAX;
+            for t in 0..400 {
+                w.step();
+                if exit == u32::MAX && w.vehicle(1).is_none() {
+                    exit = t;
+                }
+            }
+            (exit, w.crashed())
+        };
+
+        let (t_right, crashed_r) = run(TurnType::Right);
+        let (t_through, crashed_t) = run(TurnType::Through);
+        assert_eq!((crashed_r, crashed_t), (0, 0), "no collisions in either run");
+        assert!(t_right < 400 && t_through < 400, "both eventually clear: right={t_right} through={t_through}");
+        assert!(
+            t_right < t_through,
+            "right-turn-on-red ({t_right}) clears before the through that must wait for green ({t_through})",
+        );
     }
 
     #[test]
@@ -3678,27 +3820,30 @@ mod tests {
     }
 
     #[test]
-    fn acceleration_noise_keeps_speed_just_below_desired() {
+    fn acceleration_noise_fluctuates_around_desired_without_downward_bias() {
         let steady = |noise: f64| {
             let mut w = NetWorld::new(straight_link(20000.0), cfg());
             let d = DriverConfig { desired_speed: 20.0, accel_noise: noise, reaction_time: 0.0, ..DriverConfig::car() };
             w.spawn(1, LaneId(0), 0.0, 20.0, d);
-            let (mut sum, mut n) = (0.0, 0);
+            let (mut sum, mut sumsq, mut n) = (0.0, 0.0, 0);
             for t in 0..1000 {
                 w.step();
                 if t >= 800 {
                     if let Some(v) = w.vehicle(1) {
                         sum += v.speed;
+                        sumsq += v.speed * v.speed;
                         n += 1;
                     }
                 }
             }
-            sum / n as f64
+            let mean = sum / n as f64;
+            (mean, (sumsq / n as f64 - mean * mean).max(0.0).sqrt())
         };
-        let without = steady(0.0);
-        let with = steady(0.4);
-        assert!((without - 20.0).abs() < 0.1, "noiseless reaches desired: {without}");
-        assert!(with < without - 0.1 && with > 15.0, "noise slows a little: {with}");
+        let (mean0, std0) = steady(0.0);
+        let (mean_n, std_n) = steady(0.4);
+        assert!((mean0 - 20.0).abs() < 0.1 && std0 < 0.05, "noiseless holds desired: mean {mean0} std {std0}");
+        assert!((mean_n - 20.0).abs() < 0.5, "zero-mean noise keeps the mean near desired, not biased below: {mean_n}");
+        assert!(std_n > 0.1, "noise produces real speed fluctuation: std {std_n}");
     }
 
     #[test]

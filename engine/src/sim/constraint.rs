@@ -17,11 +17,8 @@ use super::config::DriverConfig;
 use super::idm;
 use super::rng::{self, Stream};
 
-/// One-sided acceleration jitter in `[-sigma, 0]`, added after the binding
-/// acceleration to model imperfect throttle/hesitation. It never *raises*
-/// acceleration, so it can't turn a safe following distance into a collision.
 pub fn accel_noise(sigma: f64, seed: u64, agent_id: u32, tick: u64) -> f64 {
-    -sigma * rng::uniform01(seed, agent_id, tick, Stream::AccelNoise)
+    sigma * (2.0 * rng::uniform01(seed, agent_id, tick, Stream::AccelNoise) - 1.0)
 }
 
 /// A leader (moving or stationary) ahead in the vehicle's path.
@@ -230,14 +227,20 @@ mod tests {
     }
 
     #[test]
-    fn accel_noise_is_nonpositive_and_bounded() {
-        for tick in 0..1000u64 {
-            let n = accel_noise(0.3, 7, 42, tick);
-            assert!((-0.3..=0.0).contains(&n), "noise {n} out of range");
+    fn accel_noise_is_zero_mean_two_sided_and_bounded() {
+        let sigma = 0.3;
+        let (mut sum, mut saw_pos, mut saw_neg) = (0.0, false, false);
+        let n = 20_000u64;
+        for tick in 0..n {
+            let x = accel_noise(sigma, 7, 42, tick);
+            assert!(x.abs() <= sigma + 1e-9, "bounded by sigma: {x}");
+            sum += x;
+            saw_pos |= x > 0.0;
+            saw_neg |= x < 0.0;
         }
-        // varies over time, and is reproducible for a fixed (seed, agent, tick)
-        assert_ne!(accel_noise(0.3, 7, 42, 1), accel_noise(0.3, 7, 42, 2));
-        assert_eq!(accel_noise(0.3, 7, 42, 5), accel_noise(0.3, 7, 42, 5));
+        assert!((sum / n as f64).abs() < 0.02, "zero-mean over time: {}", sum / n as f64);
+        assert!(saw_pos && saw_neg, "noise is two-sided, not one-sided drag");
+        assert_eq!(accel_noise(sigma, 7, 42, 5), accel_noise(sigma, 7, 42, 5), "reproducible");
     }
 
     #[test]

@@ -10,16 +10,24 @@
 use std::collections::HashSet;
 
 use super::network::{LinkId, MovementId, Network, NodeControl, NodeId, ProgramId};
-use super::signal::{SignalProgram, SignalState};
+use super::signal::{SignalProgram, SignalState, DEFAULT_ALL_RED};
 
 /// Actuation timing: green is held at least `MIN_GREEN`, extended while vehicles
 /// keep arriving (gap-out) up to `MAX_GREEN`, and only terminated when a
 /// conflicting approach is waiting. `DETECT` is how far back a stop-line detector
-/// senses demand; `ALL_RED` clears the box between conflicting phases.
+/// senses demand.
 pub const DETECT: f64 = 35.0;
 const MIN_GREEN: f64 = 6.0;
 const MAX_GREEN: f64 = 45.0;
-const ALL_RED: f64 = 2.5;
+
+fn all_red_of(program: &SignalProgram, phase: usize) -> f64 {
+    let ar = program.phases[phase].all_red_secs;
+    if ar > 0.0 {
+        ar
+    } else {
+        DEFAULT_ALL_RED
+    }
+}
 
 /// Live state of one actuated signal program: which phase is running, how long
 /// it has, and whether it's in the phase's yellow or all-red clearance.
@@ -54,6 +62,7 @@ pub struct SignalController {
     signals: Vec<SignalRuntime>,
     /// Approach links per program, per group bit — the links feeding each group.
     approaches: Vec<Vec<Vec<LinkId>>>,
+    time: f64,
 }
 
 impl SignalController {
@@ -76,7 +85,16 @@ impl SignalController {
                 }
             }
         }
-        Self { signals, approaches }
+        Self { signals, approaches, time: 0.0 }
+    }
+
+    fn group_state(&self, net: &Network, program: ProgramId, bit: u8) -> SignalState {
+        let prog = &net.programs[program.idx()];
+        if prog.coordinated {
+            prog.state_of(bit, self.time)
+        } else {
+            self.signals[program.idx()].state_of(bit, prog)
+        }
     }
 
     /// Signal state of a movement (`Green` if it carries no signal group).
@@ -85,7 +103,7 @@ impl SignalController {
             None => SignalState::Green,
             Some(g) => {
                 let group = net.groups[g.idx()];
-                self.signals[group.program.idx()].state_of(group.bit, &net.programs[group.program.idx()])
+                self.group_state(net, group.program, group.bit)
             }
         }
     }
@@ -94,7 +112,7 @@ impl SignalController {
     pub fn states(&self, net: &Network) -> Vec<SignalState> {
         net.groups
             .iter()
-            .map(|g| self.signals[g.program.idx()].state_of(g.bit, &net.programs[g.program.idx()]))
+            .map(|g| self.group_state(net, g.program, g.bit))
             .collect()
     }
 
@@ -102,10 +120,11 @@ impl SignalController {
     /// terminate on max-green or a gap-out with a conflicting approach waiting.
     /// `demand` is the set of link ids with a vehicle within [`DETECT`] of a line.
     pub fn advance(&mut self, net: &Network, demand: &HashSet<u32>, dt: f64) {
+        self.time += dt;
         for pid in 0..self.signals.len() {
             let (n_phases, green_mask, yellow_dur) = {
                 let program = &net.programs[pid];
-                if program.phases.is_empty() {
+                if program.phases.is_empty() || program.coordinated {
                     continue;
                 }
                 let ph = program.phases[self.signals[pid].phase];
@@ -128,7 +147,7 @@ impl SignalController {
             } else if rt.yellow {
                 if rt.elapsed >= yellow_dur {
                     rt.yellow = false;
-                    rt.all_red = ALL_RED;
+                    rt.all_red = all_red_of(&net.programs[pid], rt.phase);
                     rt.elapsed = 0.0;
                 }
             } else if n_phases > 1
