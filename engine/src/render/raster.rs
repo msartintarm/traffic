@@ -101,6 +101,7 @@ impl Raster {
         (col, row)
     }
 
+
     /// Sizes (px) of paved regions (8-connectivity) that do **not** touch the
     /// image border — largest first. A road truncated at the crop edge touches the
     /// border (a legitimate neighbour, ignored); an interior island of this size
@@ -277,6 +278,7 @@ mod golden {
     use super::*;
     use crate::render::draw_world;
     use crate::sim::map::millbrae_junction;
+    use crate::sim::network::{MovementId, Network};
 
     fn encode(w: usize, h: usize, rgb: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -375,5 +377,103 @@ mod golden {
                 }
             }
         }
+    }
+
+    fn real_map() -> Option<Network> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        Some(crate::sim::map::OsmMap::from_json(&std::fs::read_to_string(path).ok()?).ok()?.build())
+    }
+
+    fn crossing_track(net: &Network, mid: MovementId, step: f64) -> Vec<([f64; 2], u32, bool)> {
+        let mv = net.movement(mid);
+        let (from, to) = (mv.from_lane, mv.to_lane);
+        let from_len = net.lane(from).length;
+        let it_len = net.interior(mid).len;
+        let mut track = Vec::new();
+        let mut pos = (from_len - 5.0 * step).max(0.0);
+        while pos < from_len {
+            let p = net.lane_point(from, pos);
+            track.push(([p[0], p[1]], from.0, false));
+            pos += step;
+        }
+        let mut s = pos - from_len;
+        while s < it_len {
+            let p = net.interior_point(mid, s);
+            track.push(([p[0], p[1]], from.0, true));
+            s += step;
+        }
+        let mut ep = s - it_len;
+        for _ in 0..6 {
+            let p = net.lane_point(to, ep);
+            track.push(([p[0], p[1]], to.0, false));
+            ep += step;
+        }
+        track
+    }
+
+    fn interp_path(net: &Network, track: &[([f64; 2], u32, bool)], honor_crossing: bool) -> Vec<[f64; 2]> {
+        const SUB: usize = 8;
+        let mut path = Vec::new();
+        for w in track.windows(2) {
+            let (pp, pl, pc) = w[0];
+            let (cp, cl, _) = w[1];
+            let (prev, cur) = ([pp[0] as f32, pp[1] as f32], [cp[0] as f32, cp[1] as f32]);
+            let ctrl = crate::render::interp::control_point(net, cl, Some(pl), honor_crossing && pc, prev, cur);
+            for k in 1..=SUB {
+                let a = k as f32 / SUB as f32;
+                let q = crate::render::interp::interp_pos(prev, ctrl, cur, a);
+                path.push([q[0] as f64, q[1] as f64]);
+            }
+        }
+        path
+    }
+
+    fn max_deviation(path: &[[f64; 2]], poly: &[[f64; 2]]) -> f64 {
+        let seg = |q: [f64; 2], a: [f64; 2], b: [f64; 2]| {
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let l2 = dx * dx + dy * dy;
+            let t = if l2 > 0.0 { (((q[0] - a[0]) * dx + (q[1] - a[1]) * dy) / l2).clamp(0.0, 1.0) } else { 0.0 };
+            (q[0] - (a[0] + t * dx)).hypot(q[1] - (a[1] + t * dy))
+        };
+        path.iter()
+            .map(|&q| poly.windows(2).map(|s| seg(q, s[0], s[1])).fold(f64::INFINITY, f64::min))
+            .fold(0.0, f64::max)
+    }
+
+    #[test]
+    fn millbrae_avenue_turns_join_the_intersection_without_a_jump() {
+        let Some(net) = real_map() else { return }; // map.json may be absent in a bare checkout
+        let is_ave = |m: MovementId| net.link_names[net.lane(net.movement(m).from_lane).link.idx()].contains("Millbrae Av");
+        let ave: Vec<MovementId> = (0..net.movements.len() as u32).map(MovementId).filter(|&m| is_ave(m)).collect();
+        assert!(!ave.is_empty(), "the map has Millbrae Avenue");
+
+        let mut per_node: std::collections::HashMap<u32, (f64, MovementId)> = std::collections::HashMap::new();
+        let mut max_fixed = 0.0f64;
+        for &m in &ave {
+            let track = crossing_track(&net, m, 2.0);
+            if track.len() < 3 {
+                continue;
+            }
+            let poses: Vec<[f64; 2]> = track.iter().map(|&(p, _, _)| p).collect();
+            let legacy_dev = max_deviation(&interp_path(&net, &track, false), &poses);
+            max_fixed = max_fixed.max(max_deviation(&interp_path(&net, &track, true), &poses));
+            let e = per_node.entry(net.movement(m).node.0).or_insert((0.0, m));
+            if legacy_dev > e.0 {
+                *e = (legacy_dev, m);
+            }
+        }
+        let mut nodes: Vec<(f64, MovementId)> = per_node.into_values().collect();
+        nodes.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let worst_legacy = nodes[0].0;
+        eprintln!(
+            "Millbrae Avenue: {} movements across {} intersections; worst legacy bulge {:.2} m; max fixed deviation {:.3} m",
+            ave.len(),
+            nodes.len(),
+            worst_legacy,
+            max_fixed,
+        );
+
+        assert!(max_fixed < 0.5, "the fixed join hugs the true crossing path everywhere (worst {max_fixed:.2} m)");
+        assert!(worst_legacy > 1.5, "the legacy interpolation bulged back through the node ({worst_legacy:.2} m) — the enter/exit jump this fixes");
     }
 }

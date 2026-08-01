@@ -28,6 +28,7 @@ index_type!(LaneId);
 index_type!(MovementId);
 index_type!(SignalGroupId);
 index_type!(ProgramId);
+index_type!(JunctionId);
 
 pub const LANE_WIDTH: f64 = 3.5;
 
@@ -190,6 +191,16 @@ pub struct ConflictPoint {
     pub sb: f64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Junction {
+    pub nodes: Vec<NodeId>,
+    pub center: [f64; 2],
+    pub footprint: [[f64; 2]; 4],
+    pub approaches: Vec<LinkId>,
+    pub exits: Vec<LinkId>,
+    pub program: Option<ProgramId>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Network {
     pub nodes: Vec<Node>,
@@ -219,6 +230,8 @@ pub struct Network {
     /// OSM `turn:lanes` per link (index-aligned with `links`), for this travel
     /// direction; empty when unmapped. The renderer paints lane-use arrows from it.
     pub link_turn_lanes: Vec<String>,
+    pub junctions: Vec<Junction>,
+    pub node_junction: Vec<Option<JunctionId>>,
 }
 
 fn sub(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
@@ -232,6 +245,55 @@ fn norm(v: [f64; 2]) -> f64 {
 fn unit(v: [f64; 2]) -> [f64; 2] {
     let n = norm(v).max(1e-9);
     [v[0] / n, v[1] / n]
+}
+
+const JUNCTION_MERGE_GAP: f64 = 14.0;
+const FOOTPRINT_RADIUS: f64 = 28.0;
+
+/// ~ a vehicle width: interior paths passing farther apart than this share the box
+/// safely (e.g. opposing protected lefts), so they neither collide nor force
+/// separate signal phases; only genuine crossings (near-zero separation) conflict.
+const CONFLICT_CLEARANCE: f64 = 2.0;
+
+/// The road axis a junction footprint aligns to: the travel direction whose
+/// near-parallel arms carry the most lanes — the dominant carriageway through the
+/// junction. Aligning the rectangle to this, rather than to the min-area hull edge,
+/// keeps its sides running with the main road instead of skewing across the pavement.
+fn dominant_axis(arms: &[([f64; 2], f64)]) -> [f64; 2] {
+    let mut best = ([1.0, 0.0], f64::NEG_INFINITY);
+    for &(di, _) in arms {
+        if norm(di) < 0.5 {
+            continue;
+        }
+        let score: f64 = arms
+            .iter()
+            .filter(|(dj, _)| (di[0] * dj[0] + di[1] * dj[1]).abs() > 0.866)
+            .map(|(_, w)| w)
+            .sum();
+        if score > best.1 {
+            best = (di, score);
+        }
+    }
+    best.0
+}
+
+/// The bounding rectangle of `pts` with its sides parallel and perpendicular to
+/// `axis`. `pts` must be non-empty.
+fn oriented_rect(pts: &[[f64; 2]], axis: [f64; 2]) -> [[f64; 2]; 4] {
+    let e = if norm(axis) > 1e-6 { unit(axis) } else { [1.0, 0.0] };
+    let nrm = [-e[1], e[0]];
+    let a = pts[0];
+    let (mut lu, mut hu, mut lv, mut hv) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+    for &p in pts {
+        let d = sub(p, a);
+        let (u, v) = (d[0] * e[0] + d[1] * e[1], d[0] * nrm[0] + d[1] * nrm[1]);
+        lu = lu.min(u);
+        hu = hu.max(u);
+        lv = lv.min(v);
+        hv = hv.max(v);
+    }
+    let corner = |u: f64, v: f64| [a[0] + u * e[0] + v * nrm[0], a[1] + u * e[1] + v * nrm[1]];
+    [corner(lu, lv), corner(hu, lv), corner(hu, hv), corner(lu, hv)]
 }
 
 /// Cubic Bézier point at parameter `t` in `[0,1]`.
@@ -427,10 +489,6 @@ impl Network {
             })
             .collect();
 
-        // ~ a vehicle width: paths that pass farther apart than this share the box
-        // safely (e.g. opposing protected lefts), so they neither collide nor force
-        // separate signal phases; only genuine crossings (near-zero separation) do.
-        const CLEARANCE: f64 = 2.0;
         let polys: Vec<Vec<([f64; 2], f64)>> = self.interiors.iter().map(interior_polyline).collect();
         let mut conflicts = Vec::new();
         for i in 0..self.movements.len() {
@@ -444,12 +502,207 @@ impl Network {
                 {
                     continue;
                 }
-                if let Some((sa, sb)) = nearest_crossing(&polys[i], &polys[j], CLEARANCE) {
+                if let Some((sa, sb)) = nearest_crossing(&polys[i], &polys[j], CONFLICT_CLEARANCE) {
                     conflicts.push(ConflictPoint { node: a.node, a: MovementId(i as u32), sa, b: MovementId(j as u32), sb });
                 }
             }
         }
         self.conflicts = conflicts;
+    }
+
+    /// Append conflict points between movements that belong to the same junction
+    /// cluster but different OSM nodes. [`build_interiors`] only pairs movements
+    /// sharing a node; where a real intersection is modelled as several close
+    /// nodes, cross-arm paths that genuinely cross would otherwise be invisible to
+    /// the collision and box-yield logic. Must run after [`build_junctions`].
+    pub fn build_cross_junction_conflicts(&mut self) {
+        let polys: Vec<Vec<([f64; 2], f64)>> = self.interiors.iter().map(interior_polyline).collect();
+        let mut extra = Vec::new();
+        for i in 0..self.movements.len() {
+            for j in (i + 1)..self.movements.len() {
+                let (a, b) = (self.movements[i], self.movements[j]);
+                if a.node == b.node {
+                    continue;
+                }
+                let (ja, jb) = (self.node_junction(a.node), self.node_junction(b.node));
+                if ja.is_none() || ja != jb {
+                    continue;
+                }
+                if self.lane(a.from_lane).link == self.lane(b.from_lane).link
+                    || self.lane(a.to_lane).link == self.lane(b.to_lane).link
+                {
+                    continue;
+                }
+                if let Some((sa, sb)) = nearest_crossing(&polys[i], &polys[j], CONFLICT_CLEARANCE) {
+                    extra.push(ConflictPoint { node: a.node, a: MovementId(i as u32), sa, b: MovementId(j as u32), sb });
+                }
+            }
+        }
+        self.conflicts.extend(extra);
+    }
+
+    pub fn junction(&self, id: JunctionId) -> &Junction {
+        &self.junctions[id.idx()]
+    }
+
+    pub fn node_junction(&self, node: NodeId) -> Option<JunctionId> {
+        self.node_junction.get(node.idx()).copied().flatten()
+    }
+
+    /// A stable id for the whole intersection `node` belongs to: every node in a
+    /// junction cluster returns the same key (its cluster's first member), and a
+    /// node outside any cluster returns its own id. Runtime neighbour maps key on
+    /// this so box gating, priority yielding, and in-box collision detection treat a
+    /// multi-node intersection as one, not as several independent mini-junctions.
+    pub fn intersection_key(&self, node: NodeId) -> u32 {
+        match self.node_junction(node) {
+            Some(j) => self.junction(j).nodes[0].0,
+            None => node.0,
+        }
+    }
+
+    fn arm_mouth(&self, link: LinkId, end_is_to: bool) -> ([f64; 2], [f64; 2]) {
+        let l = self.link(link);
+        let dp = self.drivable_polyline(link);
+        let k = dp.len();
+        if k < 2 {
+            let p = self.node(if end_is_to { l.to } else { l.from }).position;
+            return (p, p);
+        }
+        let (end, travel) = if end_is_to {
+            (dp[k - 1], unit(sub(dp[k - 1], dp[k - 2])))
+        } else {
+            (dp[0], unit(sub(dp[0], dp[1])))
+        };
+        let right = [travel[1], -travel[0]];
+        let full = l.lane_count as f64 * LANE_WIDTH;
+        (end, [end[0] + right[0] * full, end[1] + right[1] * full])
+    }
+
+    pub fn build_junctions(&mut self) {
+        let n = self.nodes.len();
+        let mut nb: Vec<std::collections::BTreeSet<u32>> = vec![Default::default(); n];
+        for l in &self.links {
+            if l.layer != 0 {
+                continue;
+            }
+            nb[l.from.idx()].insert(l.to.0);
+            nb[l.to.idx()].insert(l.from.0);
+        }
+        let is_ix = |i: usize| nb[i].len() >= 3;
+
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn find(p: &mut [usize], x: usize) -> usize {
+            let mut r = x;
+            while p[r] != r {
+                r = p[r];
+            }
+            let mut c = x;
+            while p[c] != r {
+                let nx = p[c];
+                p[c] = r;
+                c = nx;
+            }
+            r
+        }
+        for (i, l) in self.links.iter().enumerate() {
+            if l.layer != 0 || (!is_ix(l.from.idx()) && !is_ix(l.to.idx())) {
+                continue;
+            }
+            let full: f64 = self.polylines[i].windows(2).map(|w| norm(sub(w[1], w[0]))).sum();
+            let gap = full
+                - self.render_setback.get(l.from.idx()).copied().unwrap_or(0.0)
+                - self.render_setback.get(l.to.idx()).copied().unwrap_or(0.0);
+            if gap < JUNCTION_MERGE_GAP {
+                let (ra, rb) = (find(&mut parent, l.from.idx()), find(&mut parent, l.to.idx()));
+                parent[ra] = rb;
+            }
+        }
+        let mut has_ix: std::collections::HashMap<usize, bool> = Default::default();
+        for i in 0..n {
+            let r = find(&mut parent, i);
+            *has_ix.entry(r).or_insert(false) |= is_ix(i);
+        }
+        let mut root_index: std::collections::HashMap<usize, usize> = Default::default();
+        let mut cluster_of = vec![None; n];
+        for i in 0..n {
+            let r = find(&mut parent, i);
+            if has_ix[&r] {
+                let next = root_index.len();
+                let ci = *root_index.entry(r).or_insert(next);
+                cluster_of[i] = Some(ci);
+            }
+        }
+        let ncl = root_index.len();
+
+        let mut members: Vec<Vec<NodeId>> = vec![Vec::new(); ncl];
+        let mut apex = vec![[0.0f64; 2]; ncl];
+        let mut apex_deg = vec![0usize; ncl];
+        let mut arm_pts: Vec<Vec<[f64; 2]>> = vec![Vec::new(); ncl];
+        let mut arm_dirs: Vec<Vec<([f64; 2], f64)>> = vec![Vec::new(); ncl];
+        let mut approaches: Vec<Vec<LinkId>> = vec![Vec::new(); ncl];
+        let mut exits: Vec<Vec<LinkId>> = vec![Vec::new(); ncl];
+        let mut program: Vec<Option<ProgramId>> = vec![None; ncl];
+        for i in 0..n {
+            if let Some(ci) = cluster_of[i] {
+                members[ci].push(NodeId(i as u32));
+                if nb[i].len() >= apex_deg[ci] {
+                    apex_deg[ci] = nb[i].len();
+                    apex[ci] = self.nodes[i].position;
+                }
+                if let NodeControl::Signalized(p) = self.nodes[i].control {
+                    program[ci].get_or_insert(p);
+                }
+            }
+        }
+        for i in 0..self.links.len() as u32 {
+            let l = self.link(LinkId(i));
+            if l.layer != 0 {
+                continue;
+            }
+            let (ca, cb) = (cluster_of[l.from.idx()], cluster_of[l.to.idx()]);
+            if ca.is_some() && ca == cb {
+                continue;
+            }
+            if let Some(ci) = cb {
+                approaches[ci].push(LinkId(i));
+                let (m, o) = self.arm_mouth(LinkId(i), true);
+                if norm(sub(m, apex[ci])) < FOOTPRINT_RADIUS {
+                    arm_pts[ci].push(m);
+                    arm_pts[ci].push(o);
+                    arm_dirs[ci].push((self.arrival_dir(LinkId(i)), l.lane_count as f64));
+                }
+            }
+            if let Some(ci) = ca {
+                exits[ci].push(LinkId(i));
+                let (m, o) = self.arm_mouth(LinkId(i), false);
+                if norm(sub(m, apex[ci])) < FOOTPRINT_RADIUS {
+                    arm_pts[ci].push(m);
+                    arm_pts[ci].push(o);
+                    arm_dirs[ci].push((self.departure_dir(LinkId(i)), l.lane_count as f64));
+                }
+            }
+        }
+
+        self.junctions = (0..ncl)
+            .map(|ci| {
+                let footprint = if arm_pts[ci].len() >= 4 {
+                    oriented_rect(&arm_pts[ci], dominant_axis(&arm_dirs[ci]))
+                } else {
+                    let c = apex[ci];
+                    [[c[0] - 3.0, c[1] - 3.0], [c[0] + 3.0, c[1] - 3.0], [c[0] + 3.0, c[1] + 3.0], [c[0] - 3.0, c[1] + 3.0]]
+                };
+                Junction {
+                    nodes: std::mem::take(&mut members[ci]),
+                    center: apex[ci],
+                    footprint,
+                    approaches: std::mem::take(&mut approaches[ci]),
+                    exits: std::mem::take(&mut exits[ci]),
+                    program: program[ci],
+                }
+            })
+            .collect();
+        self.node_junction = cluster_of.iter().map(|c| c.map(|ci| JunctionId(ci as u32))).collect();
     }
 
     pub fn lanes_of(&self, link: LinkId) -> impl Iterator<Item = LaneId> {
@@ -787,6 +1040,52 @@ impl Network {
 mod tests {
     use super::super::map::{self, LinkSpec, NodeSpec, OsmMap};
     use super::*;
+
+    #[test]
+    fn build_junctions_makes_a_signalized_crossing_first_class() {
+        let net = map::arterial_intersection();
+        assert_eq!(net.junctions.len(), 1, "a lone crossing is one junction");
+        let j = &net.junctions[0];
+        assert!(j.program.is_some(), "the signalized crossing owns its signal program");
+        assert!(!j.approaches.is_empty() && !j.exits.is_empty(), "it has approaches and exits");
+        for &nd in &j.nodes {
+            assert_eq!(net.node_junction(nd), Some(JunctionId(0)), "member nodes map back to the junction");
+        }
+        let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+        for c in j.footprint {
+            lo = [lo[0].min(c[0]), lo[1].min(c[1])];
+            hi = [hi[0].max(c[0]), hi[1].max(c[1])];
+        }
+        assert!(hi[0] - lo[0] > 5.0 && hi[1] - lo[1] > 5.0, "footprint spans the crossing");
+        assert!(
+            (lo[0] - 1.0..=hi[0] + 1.0).contains(&j.center[0]) && (lo[1] - 1.0..=hi[1] + 1.0).contains(&j.center[1]),
+            "the crossing centre sits inside its footprint",
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "import")]
+    fn cross_junction_conflicts_join_sibling_nodes_and_are_indexed() {
+        use super::super::junction::Junctions;
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        let Ok(txt) = std::fs::read_to_string(path) else { return };
+        let net = OsmMap::from_json(&txt).unwrap().build();
+        let junctions = Junctions::build(&net);
+        let mut cross = 0usize;
+        for (idx, c) in net.conflicts.iter().enumerate() {
+            let (na, nb) = (net.movement(c.a).node, net.movement(c.b).node);
+            if na == nb {
+                continue;
+            }
+            cross += 1;
+            let (ja, jb) = (net.node_junction(na), net.node_junction(nb));
+            assert!(ja.is_some() && ja == jb, "a cross-node conflict joins two nodes of one junction");
+            assert!(net.movements_conflict(c.a, c.b), "the conflict is visible to the collision test");
+            assert!(junctions.conflict_ids(na).contains(&(idx as u32)), "indexed from one sibling node");
+            assert!(junctions.conflict_ids(nb).contains(&(idx as u32)), "and from the other");
+        }
+        assert!(cross > 0, "multi-node Millbrae junctions produce cross-node conflicts");
+    }
 
     #[test]
     fn signal_states_cover_every_group_once() {

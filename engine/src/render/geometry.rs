@@ -507,8 +507,16 @@ pub fn marking_mesh(net: &Network) -> StaticMesh {
     lane_use_arrows(net, &interior, &stop, &mut mesh);
     crosswalks(net, &interior, &stop, &mut mesh);
     stop_yield_markings(net, &interior, &stop, &mut mesh);
+    for j in &net.junctions {
+        for k in 0..4 {
+            mesh.push_ribbon(j.footprint[k], j.footprint[(k + 1) % 4], JUNCTION_MARKER_HALF_W, JUNCTION_MARKER_COLOR, 0.0);
+        }
+    }
     mesh
 }
+
+pub const JUNCTION_MARKER_COLOR: [f32; 3] = [0.28, 0.55, 0.72];
+const JUNCTION_MARKER_HALF_W: f64 = 0.35;
 
 pub const ARROW_COLOR: [f32; 3] = [0.88, 0.88, 0.82];
 pub const CROSSWALK_COLOR: [f32; 3] = [0.82, 0.82, 0.78];
@@ -722,15 +730,19 @@ fn sign_triangle(mesh: &mut StaticMesh, c: [f64; 2], fwd: [f64; 2], r: f64) {
 /// pavement. Returns `(group_index, [x, y], heading)`; pure, state-independent
 /// geometry the bridge pairs with each group's live colour. Groups sharing one
 /// approach step outward by their local ordinal so their heads don't overlap.
-pub fn signal_head_placements(net: &Network) -> Vec<(usize, [f32; 2], f32)> {
+pub fn signal_head_placements(net: &Network) -> Vec<(usize, [f32; 2], f32, bool)> {
     const POLE_MARGIN: f64 = 1.6; // road edge → pole (m)
     const HEAD_SPACING: f64 = 2.4; // lateral step between heads on one approach (m)
     const HALF_HEAD: f64 = 2.8; // half the housing length, so its green end lands on the stop line
     let stop = stop_positions(net, &junction_rings(net));
     let mut rep = vec![None; net.groups.len()];
-    for mv in &net.movements {
+    let mut is_left = vec![false; net.groups.len()];
+    for (mi, mv) in net.movements.iter().enumerate() {
         if let Some(g) = mv.signal_group {
-            rep[g.idx()].get_or_insert(mv.from_lane);
+            if rep[g.idx()].is_none() {
+                rep[g.idx()] = Some(mv.from_lane);
+                is_left[g.idx()] = net.movement_turn(MovementId(mi as u32)) == TurnType::Left;
+            }
         }
     }
     let mut out = Vec::new();
@@ -747,9 +759,28 @@ pub fn signal_head_placements(net: &Network) -> Vec<(usize, [f32; 2], f32)> {
         let dir = net.arrival_dir(link);
         let right = [dir[1], -dir[0]]; // right-hand normal of travel
         let off = LANE_WIDTH * 0.5 + POLE_MARGIN + ord * HEAD_SPACING;
-        out.push((gi, [(p[0] + right[0] * off) as f32, (p[1] + right[1] * off) as f32], dir[1].atan2(dir[0]) as f32));
+        let mut world = [p[0] + right[0] * off, p[1] + right[1] * off];
+        if let Some(jid) = net.node_junction(net.link(link).to) {
+            world = snap_to_footprint(world, &net.junction(jid).footprint);
+        }
+        out.push((gi, [world[0] as f32, world[1] as f32], dir[1].atan2(dir[0]) as f32, is_left[gi]));
     }
     out
+}
+
+fn snap_to_footprint(p: [f64; 2], fp: &[[f64; 2]; 4]) -> [f64; 2] {
+    let mut best = (p, f64::INFINITY);
+    for k in 0..4 {
+        let a = fp[k];
+        let e = norm2(sub(fp[(k + 1) % 4], a));
+        let along = (p[0] - a[0]) * e[0] + (p[1] - a[1]) * e[1];
+        let proj = [a[0] + e[0] * along, a[1] + e[1] * along];
+        let dist = norm(sub(p, proj));
+        if dist < best.1 {
+            best = (proj, dist);
+        }
+    }
+    best.0
 }
 
 /// Translucent congestion overlay: shade every polyline segment of a link busy
@@ -941,7 +972,7 @@ mod tests {
                 rep[g.idx()].get_or_insert(mv.from_lane);
             }
         }
-        for (gi, pos, _h) in placements {
+        for (gi, pos, _h, _left) in placements {
             let link = net.lane(rep[gi].unwrap()).link;
             let dir = net.arrival_dir(link);
             let node = net.node(net.link(link).to).position; // on the shared centreline

@@ -81,20 +81,15 @@ pub fn vehicle_instance(v: &VehicleView) -> Instance {
     }
 }
 
-/// A unit emissive disc (radius 1, scaled per-instance) for signal heads;
-/// `light = 1` so the shader renders it fully lit in the instance colour.
+/// A unit emissive square (corners ±1, scaled per-instance) for signal heads and
+/// their lamps; `light = 1` so the shader renders it fully lit in the instance colour.
 pub fn signal_head_mesh() -> Mesh {
-    const SIDES: usize = 10;
     let white = [1.0, 1.0, 1.0];
     let mut m = Mesh::default();
-    m.vertices.push(Vertex::lamp([0.0, 0.0], white, 1.0));
-    for k in 0..SIDES {
-        let a = std::f64::consts::TAU * k as f64 / SIDES as f64;
-        m.vertices.push(Vertex::lamp([a.cos() as f32, a.sin() as f32], white, 1.0));
+    for &c in &[[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]] {
+        m.vertices.push(Vertex::lamp(c, white, 1.0));
     }
-    for k in 0..SIDES as u32 {
-        m.indices.extend([0, 1 + k, 1 + (k + 1) % SIDES as u32]);
-    }
+    m.indices.extend([0, 1, 2, 0, 2, 3]);
     m
 }
 
@@ -113,12 +108,16 @@ fn emissive(pos: [f32; 2], scale: [f32; 2], color: [f32; 3], heading: f32) -> In
     Instance { pos, prev_pos: pos, control: pos, scale, color, heading, prev_heading: heading, brake: 1.0, blinker: 0.0 }
 }
 
-/// A miniature three-lamp signal head (a dark housing with red/yellow/green
-/// lamps, the current state's lamp lit and the others dimmed) at `pos`, aligned
-/// to the approach `heading` — the on-street look of a real Bay Area signal.
-pub fn signal_head_instances(pos: [f32; 2], heading: f32, state: SignalState) -> [Instance; 4] {
-    // Only the active lamp shows colour; the other two are dark (unlit) lenses,
-    // so a red head reads clearly as red and a green as green — no phantom colour.
+/// A miniature signal head at `pos`, aligned to the approach `heading` — a dark
+/// housing with square lamps. A through/right head shows the three red/yellow/green
+/// squares (current state lit, others dark); a protected-left group shows a single
+/// left-turn arrow in the live state colour, pointing toward the driver's left.
+pub fn signal_head_instances(pos: [f32; 2], heading: f32, state: SignalState, is_left: bool) -> [Instance; 4] {
+    let housing = emissive(pos, [5.6, 2.3], SIGNAL_HOUSING, heading);
+    if is_left {
+        let [shaft, arm_l, arm_r] = left_arrow(pos, heading, signal_color(state));
+        return [housing, shaft, arm_l, arm_r];
+    }
     const UNLIT: [f32; 3] = [0.03, 0.03, 0.035];
     let fwd = [heading.cos(), heading.sin()];
     let lamp = |slot: f32, on: bool, base: [f32; 3]| {
@@ -126,10 +125,27 @@ pub fn signal_head_instances(pos: [f32; 2], heading: f32, state: SignalState) ->
         emissive(p, [0.9, 0.9], if on { base } else { UNLIT }, heading)
     };
     [
-        emissive(pos, [5.6, 2.3], SIGNAL_HOUSING, heading), // housing
+        housing,
         lamp(-1.6, state == SignalState::Red, signal_color(SignalState::Red)),
         lamp(0.0, state == SignalState::Yellow, signal_color(SignalState::Yellow)),
         lamp(1.6, state == SignalState::Green, signal_color(SignalState::Green)),
+    ]
+}
+
+/// A left-turn arrow (a shaft plus a two-armed chevron head) as three lamp quads,
+/// pointing toward the driver's left (the head's local +y). Local offsets are
+/// rotated into world by the approach `heading`; the arms carry an extra ±rotation
+/// so they splay from the tip.
+fn left_arrow(center: [f32; 2], heading: f32, color: [f32; 3]) -> [Instance; 3] {
+    let (c, s) = (heading.cos(), heading.sin());
+    let place = |lx: f32, ly: f32, sx: f32, sy: f32, rot: f32| {
+        let world = [center[0] + lx * c - ly * s, center[1] + lx * s + ly * c];
+        emissive(world, [sx, sy], color, heading + rot)
+    };
+    [
+        place(0.0, -0.25, 0.42, 1.5, 0.0),
+        place(-0.55, 0.95, 0.38, 1.05, -0.7),
+        place(0.55, 0.95, 0.38, 1.05, 0.7),
     ]
 }
 
@@ -179,10 +195,23 @@ mod tests {
     }
 
     #[test]
-    fn signal_head_mesh_is_an_emissive_disc() {
+    fn signal_head_mesh_is_an_emissive_quad() {
         let m = signal_head_mesh();
+        assert_eq!(m.vertices.len(), 4);
+        assert_eq!(m.indices.len(), 6);
         assert!(m.vertices.iter().all(|v| v.light == 1.0));
-        assert!(m.indices.len() >= 3 && m.indices.len() % 3 == 0);
+    }
+
+    #[test]
+    fn a_left_group_head_renders_a_live_coloured_arrow() {
+        let through = signal_head_instances([0.0, 0.0], 0.0, SignalState::Green, false);
+        let left_red = signal_head_instances([0.0, 0.0], 0.0, SignalState::Red, true);
+        assert_eq!(through[0].color, SIGNAL_HOUSING);
+        assert_eq!(left_red[0].color, SIGNAL_HOUSING);
+        let red = signal_color(SignalState::Red);
+        assert!(left_red[1..].iter().all(|i| i.color == red), "the whole arrow shows the live state colour");
+        let tip_y = left_red[1..].iter().map(|i| i.pos[1]).fold(f32::MIN, f32::max);
+        assert!(tip_y > 0.0, "with heading 0 the arrow points to the left of travel (+y)");
     }
 
     #[test]

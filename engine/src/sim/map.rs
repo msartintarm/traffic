@@ -360,6 +360,8 @@ impl OsmMap {
             net.nodes[i].control = control;
         }
         coordinate_green_waves(&mut net);
+        net.build_junctions();
+        net.build_cross_junction_conflicts();
         net
     }
 }
@@ -1166,8 +1168,11 @@ mod import_tests {
     #[test]
     fn real_map_signals_are_linked_and_not_all_green() {
         // Load the committed Millbrae map and verify its signalized nodes behave:
-        // no conflicting movements are ever green together (orthogonal approaches
-        // are linked), and greens/reds coexist (they aren't stuck all-green).
+        // within a single signal program no conflicting movements are ever green
+        // together (orthogonal approaches are linked), and greens/reds coexist (they
+        // aren't stuck all-green). Cross-node conflicts spanning two programs at a
+        // multi-node junction can't be separated by either signal — the runtime box
+        // logic serializes those (see the collision-free real-map tests).
         use crate::sim::signal::SignalState;
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
         let Ok(text) = std::fs::read_to_string(path) else { return }; // skip if absent
@@ -1182,14 +1187,16 @@ mod import_tests {
             saw_red |= states.iter().any(|s| *s == SignalState::Red);
             for c in &net.conflicts {
                 let (Some(a), Some(b)) = (net.movement(c.a).signal_group, net.movement(c.b).signal_group) else { continue };
+                if net.groups[a.idx()].program != net.groups[b.idx()].program {
+                    continue; // separate programs; no single signal governs the pair
+                }
                 let ga = net.movement_state(c.a, t);
                 let gb = net.movement_state(c.b, t);
                 let permissive = net.movement_turn(c.a) == TurnType::Left || net.movement_turn(c.b) == TurnType::Left;
                 assert!(
                     permissive || !(ga == SignalState::Green && gb == SignalState::Green),
-                    "conflicting non-permissive movements both green at a real signalized node, t={t}"
+                    "conflicting non-permissive movements both green under one program, t={t}"
                 );
-                let _ = (a, b);
             }
         }
         assert!(saw_red, "real-map signals are not stuck all-green");

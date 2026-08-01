@@ -9,6 +9,7 @@
 pub mod ascii;
 pub mod camera;
 pub mod geometry;
+pub mod interp;
 pub mod mass;
 pub mod raster;
 pub mod scene;

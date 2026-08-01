@@ -11,6 +11,7 @@ type PoseMap = IntMap<[f32; 4]>;
 use wasm_bindgen::prelude::*;
 
 use crate::render::camera::Camera;
+use crate::render::interp;
 use crate::render::scene::{brake_intensity, class_color, class_dims, signal_color, signal_head_instances};
 use crate::render::gpu::Renderer;
 use crate::render::{geometry, Instance, StaticMesh};
@@ -22,7 +23,7 @@ use crate::sim::demand::{self, DemandGenerator, DemandSources};
 use crate::sim::congestion::CongestionConfig;
 use crate::sim::map;
 use crate::sim::net_world::{AccelBackend, NetWorld};
-use crate::sim::network::{LaneId, LinkId, Network, LANE_WIDTH};
+use crate::sim::network::{LinkId, Network, LANE_WIDTH};
 
 /// Soft wall-clock budget (ms) for one frame's catch-up stepping. Past this, the
 /// frame stops advancing the sim and renders, dropping the backlog so a heavy step
@@ -72,11 +73,12 @@ pub struct Simulation {
     /// crossing between `prev` and now and curve the interpolation through the corner
     /// (see [`control_point`]) instead of cutting straight across the intersection.
     prev_lane: IntMap<u32>,
+    prev_crossing: IntMap<bool>,
     /// The link the user has selected (clicked), highlighted in the density pass.
     selected: Option<usize>,
-    /// Curbside signal-head placements `(group, pos, heading)` — static geometry
-    /// computed once at assembly; each frame only pairs them with live colours.
-    signal_heads: Vec<(usize, [f32; 2], f32)>,
+    /// Curbside signal-head placements `(group, pos, heading, is_left)` — static
+    /// geometry computed once at assembly; each frame only pairs them with live colours.
+    signal_heads: Vec<(usize, [f32; 2], f32, bool)>,
     /// Optional GPU flow-field solver on the renderer's WebGPU device, plus the
     /// in-flight async readback and the cost snapshot it was dispatched with.
     gpu: Option<GpuFlowField>,
@@ -148,7 +150,7 @@ impl Simulation {
         let signal_heads = geometry::signal_head_placements(&world.network);
         Simulation {
             world, clock, seed: cfg.seed, demand, demand_sources, demand_rate, entry_speed_cap, camera,
-            prev: PoseMap::default(), prev_lane: IntMap::default(), selected: None, signal_heads,
+            prev: PoseMap::default(), prev_lane: IntMap::default(), prev_crossing: IntMap::default(), selected: None, signal_heads,
             gpu: None, gpu_pending: None, gpu_generation: 0, gpu_cost: Vec::new(), gpu_last: 0.0,
             effective_speed: 0.0, throttled: false, last_advance_ms: 0.0,
             speed_sim_accum: 0.0, speed_wall_accum: 0.0, speed_dropped: false,
@@ -344,6 +346,7 @@ impl Simulation {
         self.world.step();
         self.prev = self.snapshot(); // discrete step: show the new state directly
         self.prev_lane = self.snapshot_lanes();
+        self.prev_crossing = self.snapshot_crossing();
     }
 
     pub fn advance(&mut self, real_elapsed_secs: f64) -> u32 {
@@ -379,6 +382,7 @@ impl Simulation {
                 if last {
                     self.prev = self.snapshot();
                     self.prev_lane = self.snapshot_lanes();
+                    self.prev_crossing = self.snapshot_crossing();
                 }
                 self.demand.step(&mut self.world, dt); // stream routed vehicles in
                 self.world.step();
@@ -570,7 +574,7 @@ impl Simulation {
             // high-speed catch-up skipped the per-tick interior samples.
             let (x, y, h, brake) = match self.prev.get(&v.id) {
                 Some(&[px, py, ph, ps]) => {
-                    let [kx, ky] = self.control_point(v.lane.0, self.prev_lane.get(&v.id).copied(), [px, py], [cx, cy]);
+                    let [kx, ky] = self.control_point(v.id, v.lane.0, [px, py], [cx, cy]);
                     let (u, m, a2) = ((1.0 - alpha) * (1.0 - alpha), 2.0 * (1.0 - alpha) * alpha, alpha * alpha);
                     (
                         u * px + m * kx + a2 * cx,
@@ -587,23 +591,25 @@ impl Simulation {
         out
     }
 
-    /// Signal heads as `[x, y, r, g, b]`, one per signal group, placed at the
-    /// stop line of the approach the group controls and coloured by its state.
+    /// Signal heads as `[x, y, r, g, b, heading, is_left]`, one per signal group,
+    /// placed at the stop line of the approach the group controls and coloured by
+    /// its state; `is_left` (1/0) flags a protected-left group so the 2D fallback
+    /// can draw a turn arrow instead of a square.
     pub fn signal_heads(&self) -> Vec<f32> {
         let mut out = Vec::new();
-        for (pos, _heading, state) in self.signal_head_slots() {
+        for (pos, heading, state, is_left) in self.signal_head_slots() {
             let col = signal_color(state);
-            out.extend_from_slice(&[pos[0], pos[1], col[0], col[1], col[2]]);
+            out.extend_from_slice(&[pos[0], pos[1], col[0], col[1], col[2], heading, is_left as u8 as f32]);
         }
         out
     }
 
-    /// Each signal group's head as `(position, approach heading, state)`, from the
-    /// pure curbside placement in [`geometry::signal_head_placements`] paired with
-    /// the group's live colour.
-    fn signal_head_slots(&self) -> Vec<([f32; 2], f32, crate::sim::signal::SignalState)> {
+    /// Each signal group's head as `(position, approach heading, state, is_left)`,
+    /// from the pure curbside placement in [`geometry::signal_head_placements`]
+    /// paired with the group's live colour.
+    fn signal_head_slots(&self) -> Vec<([f32; 2], f32, crate::sim::signal::SignalState, bool)> {
         let states = self.world.signal_states();
-        self.signal_heads.iter().map(|&(gi, pos, heading)| (pos, heading, states[gi])).collect()
+        self.signal_heads.iter().map(|&(gi, pos, heading, is_left)| (pos, heading, states[gi], is_left)).collect()
     }
 
     /// Paved junctions as `[x, y, radius]` for every node where roads meet.
@@ -700,7 +706,7 @@ impl Simulation {
                 Instance {
                     pos: [cx, cy],
                     prev_pos: [px, py],
-                    control: self.control_point(v.lane.0, self.prev_lane.get(&v.id).copied(), [px, py], [cx, cy]),
+                    control: self.control_point(v.id, v.lane.0, [px, py], [cx, cy]),
                     scale: class_dims(class),
                     color: class_color(class),
                     heading: ch,
@@ -749,7 +755,7 @@ impl Simulation {
     fn signal_instance_vec(&self) -> Vec<Instance> {
         self.signal_head_slots()
             .into_iter()
-            .flat_map(|(pos, heading, state)| signal_head_instances(pos, heading, state))
+            .flat_map(|(pos, heading, state, is_left)| signal_head_instances(pos, heading, state, is_left))
             .collect()
     }
 
@@ -768,26 +774,19 @@ impl Simulation {
         self.world.vehicles().iter().map(|v| (v.id, v.lane.0)).collect()
     }
 
-    /// Quadratic-Bézier control point for a vehicle's `prev`→current motion: the node it
-    /// just crossed (so the interpolated path curves *through* the corner), else the
-    /// segment midpoint (a straight lerp). `pl` is the previous-tick lane if known. This
-    /// is what keeps a turning car on the pavement when high-speed catch-up skips the
-    /// per-tick interior samples that would otherwise trace the turn.
-    fn control_point(&self, cur_lane: u32, pl: Option<u32>, prev: [f32; 2], cur: [f32; 2]) -> [f32; 2] {
-        let mid = [(prev[0] + cur[0]) * 0.5, (prev[1] + cur[1]) * 0.5];
-        let Some(pl) = pl else { return mid };
-        if pl == cur_lane {
-            return mid;
-        }
-        let net = &self.world.network;
-        let prev_link = net.lane(LaneId(pl)).link;
-        let cur_link = net.lane(LaneId(cur_lane)).link;
-        if prev_link != cur_link && net.link(prev_link).to == net.link(cur_link).from {
-            let np = net.node(net.link(cur_link).from).position; // crossed this node
-            [np[0] as f32, np[1] as f32]
-        } else {
-            mid // lane change on the same road → straight
-        }
+    fn snapshot_crossing(&self) -> IntMap<bool> {
+        self.world.vehicles().iter().map(|v| (v.id, v.is_crossing())).collect()
+    }
+
+    fn control_point(&self, v_id: u32, cur_lane: u32, prev: [f32; 2], cur: [f32; 2]) -> [f32; 2] {
+        interp::control_point(
+            &self.world.network,
+            cur_lane,
+            self.prev_lane.get(&v_id).copied(),
+            self.prev_crossing.get(&v_id).copied().unwrap_or(false),
+            prev,
+            cur,
+        )
     }
 
     /// Static carriageway quads `[cx0, cy0, cx1, cy1, width]` per link.

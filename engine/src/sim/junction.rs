@@ -198,6 +198,7 @@ pub struct Junctions {
     cf_off: Vec<u32>,
     cf: Vec<u32>,
     program: Vec<Option<ProgramId>>,
+    node_bucket: Vec<u32>,
 }
 
 fn csr<T: Copy>(n: usize, key: impl Fn(&T) -> usize, items: &[T], id: impl Fn(usize) -> u32) -> (Vec<u32>, Vec<u32>) {
@@ -221,33 +222,53 @@ fn csr<T: Copy>(n: usize, key: impl Fn(&T) -> usize, items: &[T], id: impl Fn(us
 impl Junctions {
     pub fn build(net: &Network) -> Self {
         let n = net.nodes.len();
-        let (mv_off, mv_raw) = csr(n, |m: &super::network::Movement| m.node.idx(), &net.movements, |i| i as u32);
-        let (cf_off, cf) = csr(n, |c: &super::network::ConflictPoint| c.node.idx(), &net.conflicts, |i| i as u32);
+        // Movements and conflicts are grouped per *intersection*, not per OSM node:
+        // every node in a junction cluster shares one bucket, so a conflict stored
+        // under one member node is found when querying any of its siblings. Nodes
+        // outside a cluster get a private singleton bucket after the junctions.
+        let nj = net.junctions.len();
+        let bucket = |node: NodeId| -> usize {
+            match net.node_junction(node) {
+                Some(j) => j.idx(),
+                None => nj + node.idx(),
+            }
+        };
+        let n_buckets = nj + n;
+        let (mv_off, mv_raw) = csr(n_buckets, |m: &super::network::Movement| bucket(m.node), &net.movements, |i| i as u32);
+        let (cf_off, cf) = csr(n_buckets, |c: &super::network::ConflictPoint| bucket(c.node), &net.conflicts, |i| i as u32);
         let mv = mv_raw.into_iter().map(MovementId).collect();
-        let program = net
-            .nodes
-            .iter()
-            .map(|node| match node.control {
-                NodeControl::Signalized(p) => Some(p),
-                _ => None,
-            })
-            .collect();
-        Self { mv_off, mv, cf_off, cf, program }
+        let node_bucket = (0..n as u32).map(|i| bucket(NodeId(i)) as u32).collect();
+        let mut program = vec![None; n_buckets];
+        for (ji, j) in net.junctions.iter().enumerate() {
+            program[ji] = j.program;
+        }
+        for (i, node) in net.nodes.iter().enumerate() {
+            if net.node_junction(NodeId(i as u32)).is_none() {
+                program[nj + i] = match node.control {
+                    NodeControl::Signalized(p) => Some(p),
+                    _ => None,
+                };
+            }
+        }
+        Self { mv_off, mv, cf_off, cf, program, node_bucket }
     }
 
-    /// The movements crossing `node`.
+    /// The movements crossing `node`'s intersection (the whole junction cluster).
     pub fn movements(&self, node: NodeId) -> &[MovementId] {
-        &self.mv[self.mv_off[node.idx()] as usize..self.mv_off[node.idx() + 1] as usize]
+        let b = self.node_bucket[node.idx()] as usize;
+        &self.mv[self.mv_off[b] as usize..self.mv_off[b + 1] as usize]
     }
 
-    /// Indices into [`Network::conflicts`] of the conflict points at `node`.
+    /// Indices into [`Network::conflicts`] of the conflict points at `node`'s
+    /// intersection — aggregated across every OSM node in the junction cluster.
     pub fn conflict_ids(&self, node: NodeId) -> &[u32] {
-        &self.cf[self.cf_off[node.idx()] as usize..self.cf_off[node.idx() + 1] as usize]
+        let b = self.node_bucket[node.idx()] as usize;
+        &self.cf[self.cf_off[b] as usize..self.cf_off[b + 1] as usize]
     }
 
-    /// The signal program controlling `node`, if any.
+    /// The signal program controlling `node`'s intersection, if any.
     pub fn program(&self, node: NodeId) -> Option<ProgramId> {
-        self.program[node.idx()]
+        self.program[self.node_bucket[node.idx()] as usize]
     }
 }
 

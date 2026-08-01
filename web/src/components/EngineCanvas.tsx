@@ -1079,10 +1079,33 @@ function render2d(canvas: HTMLCanvasElement, sim: Sim, scene: Scene | null) {
   }
 
   const heads = sim.signal_heads();
-  for (let i = 0; i < heads.length; i += 5) {
+  const hh = Math.max(2.5, 1.6 * scale); // half-size in px
+  for (let i = 0; i < heads.length; i += 7) {
     ctx.fillStyle = `rgb(${(heads[i + 2] * 255) | 0},${(heads[i + 3] * 255) | 0},${(heads[i + 4] * 255) | 0})`;
-    ctx.beginPath();
-    ctx.arc(sx(heads[i]), sy(heads[i + 1]), Math.max(2.5, 1.6 * scale), 0, Math.PI * 2);
-    ctx.fill();
+    const heading = heads[i + 5];
+    const isLeft = heads[i + 6] > 0.5;
+    ctx.save();
+    ctx.translate(sx(heads[i]), sy(heads[i + 1]));
+    ctx.rotate(-heading); // world heading → screen frame (sy flips y); local −y is world-left
+    if (isLeft) {
+      // A left-turn arrow pointing to the driver's left (local −y): shaft + barbs.
+      const a = hh * 1.6;
+      const bw = hh * 1.15; // barb half-width
+      const sw = hh * 0.42; // shaft half-width
+      const bh = hh * 0.95; // barb depth from the tip
+      ctx.beginPath();
+      ctx.moveTo(0, -a); // tip
+      ctx.lineTo(bw, -a + bh);
+      ctx.lineTo(sw, -a + bh);
+      ctx.lineTo(sw, a);
+      ctx.lineTo(-sw, a);
+      ctx.lineTo(-sw, -a + bh);
+      ctx.lineTo(-bw, -a + bh);
+      ctx.closePath();
+      ctx.fill();
+    } else {
+      ctx.fillRect(-hh, -hh, hh * 2, hh * 2);
+    }
+    ctx.restore();
   }
 }

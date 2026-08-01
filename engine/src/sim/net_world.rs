@@ -1233,6 +1233,36 @@ impl NetWorld {
         None
     }
 
+    /// Don't-block-the-box, extended across a whole multi-node junction. When the
+    /// intended movement crosses into a link that stays within the same junction
+    /// cluster (a sibling-node hop), the car must be able to reach the far side of
+    /// the junction before it enters — otherwise it halts on an internal link, sitting
+    /// in the box in the way of cross traffic. Follows the route through the internal
+    /// links; `true` when the exit past an internal node is occupied, so the caller
+    /// holds the car at the junction's outer stop line instead of on the inside.
+    fn junction_exit_blocked(&self, veh: &NetVehicle, mid: MovementId, node: NodeId, nb: &Neighbors) -> bool {
+        let Some(jid) = self.network.node_junction(node) else { return false };
+        let mut mv = mid;
+        for _ in 0..4 {
+            let to_lane = self.network.movement(mv).to_lane;
+            let to_link = self.network.lane(to_lane).link;
+            if self.network.node_junction(self.network.link(to_link).to) != Some(jid) {
+                return false; // this hop leaves the junction — the car can clear it
+            }
+            let Some(next) = self.intended_movement_from(veh, to_lane) else { return false };
+            let onward = self.network.movement(next).to_lane;
+            let blocked = nb
+                .lane_front
+                .get(&onward.0)
+                .is_some_and(|&f| self.fleet.rows[f].position < veh.driver.vehicle_length + veh.driver.min_gap);
+            if blocked {
+                return true; // the far side of the internal node is occupied
+            }
+            mv = next;
+        }
+        false
+    }
+
     /// The movement from `from_lane` onto `next_link`, if one exists.
     fn movement_to(&self, from_lane: LaneId, next_link: LinkId) -> Option<MovementId> {
         let start = self.network.lane(from_lane).movement_start;
@@ -1249,11 +1279,12 @@ impl NetWorld {
         let mut crossing_at: IntMap<Vec<usize>> = IntMap::default();
         for (i, v) in self.fleet.rows.iter().enumerate() {
             if let Some(c) = v.crossing {
-                crossing_at.entry(self.network.movement(c.movement).node.0).or_default().push(i);
+                let node = self.network.movement(c.movement).node;
+                crossing_at.entry(self.network.intersection_key(node)).or_default().push(i);
                 continue; // inside a node — not part of any lane's car-following
             }
             by_lane.entry(v.lane.0).or_default().push(i);
-            approaching.entry(self.downstream_node(v.lane).0).or_default().push(i);
+            approaching.entry(self.network.intersection_key(self.downstream_node(v.lane))).or_default().push(i);
         }
         let mut leader_of = vec![None; self.fleet.rows.len()];
         let mut lane_front: IntMap<usize> = IntMap::default();
@@ -1909,9 +1940,13 @@ impl NetWorld {
                 !runs_it && can_stop_before(veh.speed, driver.comfort_decel, to_line)
             }
         });
+        // Also hold at the line when crossing would strand the car inside a
+        // multi-node junction (a sibling node ahead is red or its exit is occupied).
+        let junction_blocked =
+            intended.is_some_and(|mid| self.junction_exit_blocked(veh, mid, node, nb));
         // Stop at the immediate line (red / blocked box), or ease toward a red one
         // intersection ahead so the slowdown starts an earlier link.
-        let stop_line = (signal_stop || downstream_blocked)
+        let stop_line = (signal_stop || downstream_blocked || junction_blocked)
             .then_some(to_line)
             .or_else(|| self.red_ahead(veh, intended, to_line));
 
@@ -2152,7 +2187,7 @@ impl NetWorld {
     /// Whether `mid`'s interior path conflicts with a vehicle already crossing
     /// `node` — you must not enter an occupied box, whatever the control.
     fn box_conflict(&self, mid: MovementId, node: NodeId, nb: &Neighbors) -> bool {
-        nb.crossing_at.get(&node.0).into_iter().flatten().any(|&j| {
+        nb.crossing_at.get(&self.network.intersection_key(node)).into_iter().flatten().any(|&j| {
             let o = self.fleet.rows[j].crossing.unwrap().movement;
             self.network.movements_conflict(mid, o)
         })
@@ -2169,7 +2204,7 @@ impl NetWorld {
         let my_key = self.priority_key(my_link);
         let my_dir = self.network.arrival_dir(my_link);
         let my_turn = self.intended_movement(me).map_or(TurnType::Through, |m| self.network.movement_turn(m));
-        for &j in nb.approaching.get(&node.0)? {
+        for &j in nb.approaching.get(&self.network.intersection_key(node))? {
             if j == i {
                 continue;
             }
@@ -2221,7 +2256,7 @@ impl NetWorld {
 
     fn earlier_stopped_conflict(&self, i: usize, mid: MovementId, node: NodeId, nb: &Neighbors) -> bool {
         let me = &self.fleet.rows[i];
-        nb.approaching.get(&node.0).into_iter().flatten().any(|&j| {
+        nb.approaching.get(&self.network.intersection_key(node)).into_iter().flatten().any(|&j| {
             if j == i {
                 return false;
             }
@@ -2245,14 +2280,15 @@ impl NetWorld {
             if self.movement_state(other) == SignalState::Red {
                 return false;
             }
+            let key = self.network.intersection_key(node);
             let crossing = nb
                 .crossing_at
-                .get(&node.0)
+                .get(&key)
                 .into_iter()
                 .flatten()
                 .any(|&j| self.fleet.rows[j].crossing.unwrap().movement == other);
             let from_link = self.network.lane(self.network.movement(other).from_lane).link;
-            let approaching = nb.approaching.get(&node.0).into_iter().flatten().any(|&j| {
+            let approaching = nb.approaching.get(&key).into_iter().flatten().any(|&j| {
                 let o = &self.fleet.rows[j];
                 o.speed >= 0.5
                     && self.network.lane(o.lane).link == from_link
@@ -3532,6 +3568,48 @@ mod tests {
             assert!(world.exited() > 0, "vehicles complete boundary trips (seed {seed}), got {}", world.exited());
             assert_eq!(world.leaked(), 0, "no car disappears at an intersection (seed {seed}), leaked {}", world.leaked());
         }
+    }
+
+    #[test]
+    fn stopped_traffic_queues_on_approaches_not_inside_junctions() {
+        // The reported defect: at a multi-node junction a car crossed the first node
+        // and stopped on the short link *inside* the box (between sibling nodes),
+        // blocking cross traffic. `junction_exit_blocked` (don't-block-the-box across
+        // the whole cluster) holds it at the outer stop line, so the bulk of stopped
+        // traffic sits on approaches, not on the internal links inside a junction.
+        use super::super::demand::{self, DemandGenerator};
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let net = super::super::map::OsmMap::from_json(&text).expect("map json").build();
+        let internal = |net: &Network, link: LinkId| {
+            let l = net.link(link);
+            let a = net.node_junction(l.from);
+            a.is_some() && a == net.node_junction(l.to)
+        };
+        if !(0..net.links.len() as u32).any(|i| internal(&net, LinkId(i))) {
+            return; // no multi-node junction with an internal link to measure
+        }
+        let mut world = NetWorld::new(net, cfg());
+        let pairs = demand::boundary_od_pairs(&world.network, 7, 20);
+        let mut gen = DemandGenerator::new(&world, &pairs, 7);
+        world.install_router(&gen.destinations());
+        let (mut idle_inside, mut idle_total) = (0u64, 0u64);
+        for _ in 0..1200 {
+            gen.step(&mut world, cfg().dt);
+            world.step();
+            for v in world.vehicles() {
+                if v.speed >= 0.5 || v.crossing.is_some() {
+                    continue;
+                }
+                idle_total += 1;
+                if internal(&world.network, world.network.lane(v.lane).link) {
+                    idle_inside += 1;
+                }
+            }
+        }
+        assert!(idle_total > 0, "the run produced stopped traffic to measure");
+        let frac = idle_inside as f64 / idle_total as f64;
+        assert!(frac < 0.35, "stopped traffic piles up inside junctions: {idle_inside}/{idle_total} = {frac:.3}");
     }
 
     #[test]
