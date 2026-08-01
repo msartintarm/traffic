@@ -22,7 +22,7 @@ use crate::sim::demand::{self, DemandGenerator, DemandSources};
 use crate::sim::congestion::CongestionConfig;
 use crate::sim::map;
 use crate::sim::net_world::{AccelBackend, NetWorld};
-use crate::sim::network::{LinkId, Network, LANE_WIDTH};
+use crate::sim::network::{LaneId, LinkId, Network, LANE_WIDTH};
 
 /// Soft wall-clock budget (ms) for one frame's catch-up stepping. Past this, the
 /// frame stops advancing the sim and renders, dropping the backlog so a heavy step
@@ -68,6 +68,10 @@ pub struct Simulation {
     /// render interpolates pose between committed states (smooth at 60fps) and
     /// derives brake lights from the speed delta.
     prev: PoseMap,
+    /// Each vehicle's lane one tick ago, keyed by id, so the render can detect a node
+    /// crossing between `prev` and now and curve the interpolation through the corner
+    /// (see [`control_point`]) instead of cutting straight across the intersection.
+    prev_lane: IntMap<u32>,
     /// The link the user has selected (clicked), highlighted in the density pass.
     selected: Option<usize>,
     /// Curbside signal-head placements `(group, pos, heading)` — static geometry
@@ -144,7 +148,7 @@ impl Simulation {
         let signal_heads = geometry::signal_head_placements(&world.network);
         Simulation {
             world, clock, seed: cfg.seed, demand, demand_sources, demand_rate, entry_speed_cap, camera,
-            prev: PoseMap::default(), selected: None, signal_heads,
+            prev: PoseMap::default(), prev_lane: IntMap::default(), selected: None, signal_heads,
             gpu: None, gpu_pending: None, gpu_generation: 0, gpu_cost: Vec::new(), gpu_last: 0.0,
             effective_speed: 0.0, throttled: false, last_advance_ms: 0.0,
             speed_sim_accum: 0.0, speed_wall_accum: 0.0, speed_dropped: false,
@@ -188,7 +192,20 @@ impl Simulation {
             return;
         }
         self.demand_sources = sources;
+        // Carry the id counter past every vehicle still on the road (and the old
+        // generator's own counter), so the rebuilt generator never reissues a live id.
+        // A restart at 0 would alias two cars onto one id in the render's per-id `prev`
+        // map, flashing one of them across the screen.
+        let next_id = self
+            .world
+            .vehicles()
+            .iter()
+            .map(|v| v.id)
+            .max()
+            .map_or(0, |m| m + 1)
+            .max(self.demand.next_id());
         self.demand = build_demand(&self.world, self.seed, sources, self.demand_rate, self.entry_speed_cap);
+        self.demand.set_next_id(next_id);
         let mut dests = self.demand.destinations();
         for v in self.world.vehicles() {
             if let Some(d) = v.dest {
@@ -326,6 +343,7 @@ impl Simulation {
         self.demand.step(&mut self.world, dt);
         self.world.step();
         self.prev = self.snapshot(); // discrete step: show the new state directly
+        self.prev_lane = self.snapshot_lanes();
     }
 
     pub fn advance(&mut self, real_elapsed_secs: f64) -> u32 {
@@ -360,6 +378,7 @@ impl Simulation {
                 // full pose map several times per frame.
                 if last {
                     self.prev = self.snapshot();
+                    self.prev_lane = self.snapshot_lanes();
                 }
                 self.demand.step(&mut self.world, dt); // stream routed vehicles in
                 self.world.step();
@@ -534,15 +553,20 @@ impl Simulation {
         for v in self.world.vehicles() {
             let c = self.world.vehicle_world_pose(v);
             let (cx, cy, ch, cs) = (c[0] as f32, c[1] as f32, c[2] as f32, v.speed as f32);
-            // The sim samples the interior curve per tick, so a straight lerp
-            // between consecutive poses already traces the turn.
+            // Quadratic Bézier through the turn control (a straight lerp when it's the
+            // midpoint), so a car crossing a node curves through the corner even when
+            // high-speed catch-up skipped the per-tick interior samples.
             let (x, y, h, brake) = match self.prev.get(&v.id) {
-                Some(&[px, py, ph, ps]) => (
-                    px + (cx - px) * alpha,
-                    py + (cy - py) * alpha,
-                    ph + shortest_angle(ph, ch) * alpha,
-                    brake_intensity((cs - ps) / dt),
-                ),
+                Some(&[px, py, ph, ps]) => {
+                    let [kx, ky] = self.control_point(v.lane.0, self.prev_lane.get(&v.id).copied(), [px, py], [cx, cy]);
+                    let (u, m, a2) = ((1.0 - alpha) * (1.0 - alpha), 2.0 * (1.0 - alpha) * alpha, alpha * alpha);
+                    (
+                        u * px + m * kx + a2 * cx,
+                        u * py + m * ky + a2 * cy,
+                        ph + shortest_angle(ph, ch) * alpha,
+                        brake_intensity((cs - ps) / dt),
+                    )
+                }
                 None => (cx, cy, ch, 0.0),
             };
             let blinker = if lit { self.world.vehicle_blinker(v) as f32 } else { 0.0 };
@@ -664,7 +688,7 @@ impl Simulation {
                 Instance {
                     pos: [cx, cy],
                     prev_pos: [px, py],
-                    control: [(px + cx) * 0.5, (py + cy) * 0.5],
+                    control: self.control_point(v.lane.0, self.prev_lane.get(&v.id).copied(), [px, py], [cx, cy]),
                     scale: class_dims(class),
                     color: class_color(class),
                     heading: ch,
@@ -726,6 +750,32 @@ impl Simulation {
                 (v.id, [p[0] as f32, p[1] as f32, p[2] as f32, v.speed as f32])
             })
             .collect()
+    }
+
+    fn snapshot_lanes(&self) -> IntMap<u32> {
+        self.world.vehicles().iter().map(|v| (v.id, v.lane.0)).collect()
+    }
+
+    /// Quadratic-Bézier control point for a vehicle's `prev`→current motion: the node it
+    /// just crossed (so the interpolated path curves *through* the corner), else the
+    /// segment midpoint (a straight lerp). `pl` is the previous-tick lane if known. This
+    /// is what keeps a turning car on the pavement when high-speed catch-up skips the
+    /// per-tick interior samples that would otherwise trace the turn.
+    fn control_point(&self, cur_lane: u32, pl: Option<u32>, prev: [f32; 2], cur: [f32; 2]) -> [f32; 2] {
+        let mid = [(prev[0] + cur[0]) * 0.5, (prev[1] + cur[1]) * 0.5];
+        let Some(pl) = pl else { return mid };
+        if pl == cur_lane {
+            return mid;
+        }
+        let net = &self.world.network;
+        let prev_link = net.lane(LaneId(pl)).link;
+        let cur_link = net.lane(LaneId(cur_lane)).link;
+        if prev_link != cur_link && net.link(prev_link).to == net.link(cur_link).from {
+            let np = net.node(net.link(cur_link).from).position; // crossed this node
+            [np[0] as f32, np[1] as f32]
+        } else {
+            mid // lane change on the same road → straight
+        }
     }
 
     /// Static carriageway quads `[cx0, cy0, cx1, cy1, width]` per link.

@@ -171,6 +171,21 @@ impl DemandGenerator {
         self.spawned
     }
 
+    /// The next vehicle id this generator will assign. Read it before rebuilding the
+    /// generator (a demand-source / rush-hour toggle) so the replacement can continue the
+    /// id sequence — a fresh generator restarts at 0 and would reissue ids still held by
+    /// cars on the map, aliasing them in the renderer's per-id interpolation map.
+    pub fn next_id(&self) -> u32 {
+        self.next_id
+    }
+
+    /// Continue issuing ids from at least `id` (see [`next_id`](Self::next_id)), so a
+    /// rebuilt generator never collides with a live vehicle. Only ever advances the
+    /// counter.
+    pub fn set_next_id(&mut self, id: u32) {
+        self.next_id = self.next_id.max(id);
+    }
+
     /// Switch the freeway streams onto the real diurnal PeMS profile (see
     /// [`rush_hour`]) or back to the generic flat rate. When on, the whole map tracks
     /// the simulated time of day: each freeway gateway feeds in its lane count × the

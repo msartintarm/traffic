@@ -3219,6 +3219,112 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // needs the real map + a few thousand cars; run with `--features import -- --ignored`
+    fn no_vehicle_pose_teleports_under_high_load() {
+        // The render draws each car at its world pose and interpolates linearly toward it,
+        // so a car can only appear "somewhere it shouldn't" (flash across the screen) if
+        // its *sim* pose jumps there in a single tick. Encodes the invariant that a
+        // vehicle's world position moves at most one tick of travel per tick — a generous
+        // bound covering the longest node-interior crossing. Reproduces (or rules out) the
+        // >2000-car flashing artifact in the sim layer. Checked with the active-set
+        // scheduler both off and on, since it is on by default in the browser.
+        use super::super::demand::{self, DemandGenerator, DemandSources};
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let net = super::super::map::OsmMap::from_json(&text).expect("map json").build();
+        let dt = cfg().dt;
+        // A one-tick move can't exceed the fastest reachable speed × dt; add slack for the
+        // longest node interior a crossing can complete in one tick. Anything past this is
+        // a teleport, not motion.
+        let max_speed = net.lanes.iter().map(|l| l.speed_limit).fold(0.0_f64, f64::max) * 1.3;
+        let longest_interior = net.interiors.iter().map(|it| it.len).fold(0.0_f64, f64::max);
+        let bound = max_speed * dt + longest_interior + 5.0;
+
+        for sleep in [false, true] {
+            let mut world = NetWorld::new(net.clone(), SimConfig { sleep_scheduler: sleep, ..cfg() });
+            let pairs = demand::od_pairs(&world.network, 1, 600, DemandSources::new(true, true));
+            let mut gen = DemandGenerator::new(&world, &pairs, 1);
+            world.install_router(&gen.destinations());
+
+            let mut prev: IntMap<[f64; 2]> = IntMap::default();
+            let (mut worst, mut worst_id) = (0.0_f64, 0u32);
+            for _ in 0..2500 {
+                gen.step(&mut world, dt);
+                world.step();
+                let mut next: IntMap<[f64; 2]> = IntMap::default();
+                for v in world.vehicles() {
+                    let p = world.vehicle_world_pose(v);
+                    if let Some(q) = prev.get(&v.id) {
+                        let d = (p[0] - q[0]).hypot(p[1] - q[1]);
+                        if d > worst {
+                            (worst, worst_id) = (d, v.id);
+                        }
+                    }
+                    next.insert(v.id, [p[0], p[1]]);
+                }
+                prev = next;
+            }
+            eprintln!(
+                "sleep={sleep}: peak {} cars, worst one-tick pose jump {worst:.1} m (bound {bound:.1}, id {worst_id})",
+                world.vehicles().len()
+            );
+            assert!(worst < bound, "sleep={sleep}: vehicle {worst_id} teleported {worst:.1} m in one tick (bound {bound:.1})");
+        }
+    }
+
+    #[test]
+    fn rebuilt_demand_keeps_vehicle_ids_unique() {
+        // A demand-source / rush-hour toggle rebuilds the `DemandGenerator`. A fresh
+        // generator restarts its id counter at 0, so its spawns reissue ids still held by
+        // cars on the map — two live vehicles share an id, which the renderer's per-id
+        // `prev` pose map can only key once, so one car interpolates from the other's
+        // position and flashes across the screen. This is the >2000-car flashing artifact.
+        // The rebuilt generator must continue the id sequence past every live vehicle.
+        use super::super::demand::{self, DemandGenerator, DemandSources};
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let net = super::super::map::OsmMap::from_json(&text).expect("map json").build();
+        let dt = cfg().dt;
+
+        // Run demand, rebuild the generator mid-flight (as a toggle does), run more, and
+        // return (live vehicle count, distinct-id count). `carry` chooses the fix.
+        let run = |carry: bool| -> (usize, usize) {
+            let mut world = NetWorld::new(net.clone(), cfg());
+            let pairs = demand::od_pairs(&world.network, 1, 300, DemandSources::new(true, true));
+            let mut gen = DemandGenerator::new(&world, &pairs, 1);
+            world.install_router(&gen.destinations());
+            for _ in 0..600 {
+                gen.step(&mut world, dt);
+                world.step();
+            }
+            assert!(world.vehicles().len() > 50, "enough cars on the map to collide ids");
+            let next_id = if carry {
+                world.vehicles().iter().map(|v| v.id).max().map_or(0, |m| m + 1).max(gen.next_id())
+            } else {
+                0 // the bug: restart the counter
+            };
+            let mut gen2 = DemandGenerator::new(&world, &pairs, 1);
+            gen2.set_next_id(next_id);
+            for _ in 0..600 {
+                gen2.step(&mut world, dt);
+                world.step();
+            }
+            let mut ids: Vec<u32> = world.vehicles().iter().map(|v| v.id).collect();
+            let live = ids.len();
+            ids.sort_unstable();
+            ids.dedup();
+            (live, ids.len())
+        };
+
+        // Without carrying the counter, the rebuild reissues live ids → duplicates.
+        let (live0, uniq0) = run(false);
+        assert!(uniq0 < live0, "a naive rebuild must reissue live ids (live {live0}, unique {uniq0})");
+        // Carrying it past every live vehicle keeps every id unique — no aliasing, no flash.
+        let (live1, uniq1) = run(true);
+        assert_eq!(uniq1, live1, "duplicate vehicle ids remained after a demand rebuild (live {live1}, unique {uniq1})");
+    }
+
+    #[test]
     fn real_map_highway_mode_originates_traffic_on_the_freeways() {
         use super::super::demand::{self, DemandGenerator, DemandSources};
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
