@@ -87,7 +87,11 @@ if (existsSync(wasmFile) && existsSync(stampFile) && readFileSync(stampFile, "ut
 
 const cmd =
   variant === "threads"
-    ? `RUSTUP_TOOLCHAIN=nightly CARGO_UNSTABLE_BUILD_STD="panic_abort,std" wasm-pack build --target web --out-dir ../web/public/wasm-pkg-threads --out-name engine -- --config wasm-threads.cargo.toml --features import,wasm-threads`
+    // Separate target dir: the threaded build compiles std/the crate with `+atomics`, an
+    // ABI incompatible with the single-threaded build. Sharing `engine/target` let the two
+    // clobber each other's `engine.wasm` (a corrupt, all-zeros artifact wasm-bindgen then
+    // rejects). `CARGO_TARGET_DIR` isolates them so either can build without touching the other.
+    ? `CARGO_TARGET_DIR=target/wasm-threads RUSTUP_TOOLCHAIN=nightly CARGO_UNSTABLE_BUILD_STD="panic_abort,std" wasm-pack build --target web --out-dir ../web/public/wasm-pkg-threads --out-name engine -- --config wasm-threads.cargo.toml --features import,wasm-threads`
     : `wasm-pack build --target web --out-dir ../web/public/wasm-pkg --out-name engine -- --features import`;
 
 console.log(`building wasm (${variant})…`);

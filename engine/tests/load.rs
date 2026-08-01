@@ -66,6 +66,50 @@ fn window(world: &mut NetWorld, gen: &mut DemandGenerator, dt: f64, frames: usiz
     }
 }
 
+/// Controlled 2×2: {serial, threads} × {idle-car scheduler off, on}, ramped to a matched
+/// car count and measured back-to-back in one process (so machine state is shared). Isolates
+/// the accel phase via external routing. Answers whether the scheduler compounds with CPU
+/// threads or competes. Run: `--features import,parallel -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn bench_scheduler_vs_threads() {
+    let Some(net) = real_map() else { return };
+    let cfg0 = SimConfig::default_config();
+    let target = 5500usize;
+    // Two passes (order reversed the 2nd time) so thermal drift across the sequence shows up.
+    for pass in 0..2 {
+        eprintln!("\n=== pass {pass} ===");
+        eprintln!("{:>14} {:>6} {:>8} {:>9} {:>8}", "config", "cars", "step_ms", "accel_ms", "ns/car");
+        let mut cases = [
+            ("serial off", AccelBackend::Serial, false),
+            ("serial ON", AccelBackend::Serial, true),
+            ("threads off", AccelBackend::Threads, false),
+            ("threads ON", AccelBackend::Threads, true),
+        ];
+        if pass == 1 {
+            cases.reverse();
+        }
+        for (label, backend, sleep) in cases {
+            let mut world = NetWorld::new(net.clone(), SimConfig { sleep_scheduler: sleep, ..cfg0 });
+            world.set_accel_backend(backend);
+            world.set_scheduler_thread_limit(usize::MAX); // keep the scheduler on under threads, so threads+scheduler is measurable
+            let pairs = demand::od_pairs(&world.network, 1, 600, DemandSources::new(true, true));
+            let mut gen = DemandGenerator::new(&world, &pairs, 1);
+            world.install_router(&gen.destinations());
+            world.set_external_reroute(true); // exclude the single-threaded flow-field
+            let mut t = 0;
+            while world.vehicles().len() < target && t < 6000 {
+                gen.step(&mut world, cfg0.dt);
+                world.step();
+                t += 1;
+            }
+            let s = window(&mut world, &mut gen, cfg0.dt, 120);
+            let ns = if s.cars > 0 { s.step_ms * 1e6 / s.cars as f64 } else { 0.0 };
+            eprintln!("{label:>14} {:>6} {:>8.2} {:>9.2} {:>8.1}", s.cars, s.step_ms, s.phases[4], ns);
+        }
+    }
+}
+
 /// Install the GPU accel solver, or report that no adapter is available. A no-op
 /// (always `false`) without the `gpu` feature, so the harness compiles either way.
 #[cfg(feature = "gpu")]

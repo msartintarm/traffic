@@ -471,6 +471,18 @@ impl Simulation {
         self.world.par_threshold() as u32
     }
 
+    /// Vehicle count at/above which the active-set scheduler yields to plain multi-core
+    /// parallelism under CPU threads (below it, the scheduler runs even threaded). Its own
+    /// lever so the threads↔scheduler crossover is tunable independently of the
+    /// serial↔threads one. Only affects the `Threads` backend.
+    pub fn set_scheduler_thread_limit(&mut self, n: u32) {
+        self.world.set_scheduler_thread_limit(n as usize);
+    }
+
+    pub fn scheduler_thread_limit(&self) -> u32 {
+        self.world.scheduler_thread_limit() as u32
+    }
+
     /// Toggle the active-set scheduler: queued-behind-a-stopped-car vehicles skip the
     /// full per-tick gather, so step cost tracks the *deciding* fraction rather than the
     /// whole fleet. Safe live toggle (non-destructive; changes work distribution only).

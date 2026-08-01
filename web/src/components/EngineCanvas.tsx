@@ -85,6 +85,8 @@ type Sim = {
   set_threads_ready(ready: boolean): void;
   set_par_threshold(n: number): void;
   par_threshold(): number;
+  set_scheduler_thread_limit(n: number): void;
+  scheduler_thread_limit(): number;
   set_demand_sources(highway: boolean, surface: boolean): void;
   demand_highway(): boolean;
   demand_surface(): boolean;
@@ -145,6 +147,8 @@ export default function EngineCanvas() {
   const sceneRef = useRef<Scene | null>(null);
   const sliderRef = useRef<HTMLInputElement>(null);
   const statsRef = useRef<HTMLSpanElement>(null);
+  const perfStatusRef = useRef<HTMLSpanElement>(null); // live "what's running" line in the Performance panel
+  const gpuRoutingRef = useRef(false); // whether GPU flow-field routing engaged (read in the rAF loop)
   const tipRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const roadsRef = useRef<{ name: string; pts: number[][] }[]>([]);
@@ -162,6 +166,7 @@ export default function EngineCanvas() {
   const rushClockRef = useRef<HTMLSpanElement>(null);
   const [accelBackend, setAccelBackend] = useState("serial");
   const [parThreshold, setParThreshold] = useState(2000);
+  const [schedThreadLimit, setSchedThreadLimit] = useState(2000);
   const [demandRate, setDemandRate] = useState(1);
   const [congestionEnabled, setCongestionEnabled] = useState(false);
   const [congestionEngage, setCongestionEngage] = useState(0.85);
@@ -440,6 +445,7 @@ export default function EngineCanvas() {
           if (new URLSearchParams(window.location.search).get("gpu") !== "0") {
             try {
               sim.enable_gpu_routing(renderer!);
+              gpuRoutingRef.current = true;
               setBackend("WebGPU / WebGL2 · GPU routing");
             } catch {
               setBackend("WebGPU / WebGL2");
@@ -518,7 +524,7 @@ export default function EngineCanvas() {
             const t = Math.log(sim.meters_per_pixel() / fitMppRef.current) / Math.log(1 / ZOOM_RANGE);
             sliderRef.current.value = String(Math.round(Math.min(1, Math.max(0, t)) * 1000));
           }
-          if (statsRef.current) {
+          if (statsRef.current || perfStatusRef.current) {
             const sel = sim.selected_speed();
             // Show the selected multiplier while the sim keeps up; only when the frame
             // budget is actually dropping ticks show the achieved speed alongside it.
@@ -546,7 +552,13 @@ export default function EngineCanvas() {
             const waiting = sim.demand_queued();
             if (waiting > 0) lines.push(`${waiting} waiting to enter`);
             // One metric per line as bullets (the container renders `\n` as line breaks).
-            statsRef.current.textContent = lines.map((l) => `• ${l}`).join("\n");
+            if (statsRef.current) statsRef.current.textContent = lines.map((l) => `• ${l}`).join("\n");
+            // Compact live readout for the Performance panel: what's actually running.
+            if (perfStatusRef.current) {
+              const idleStr = idle > 0 ? ` · ${idle} idle-skipped` : "";
+              const routing = gpuRoutingRef.current ? "GPU" : "CPU";
+              perfStatusRef.current.textContent = `▶ ${execStr}${idleStr} · routing ${routing}`;
+            }
           }
           if (rushClockRef.current && sim.demand_rush_hour()) {
             const h = sim.rush_hour_time();
@@ -774,6 +786,14 @@ export default function EngineCanvas() {
               <option value="mi">Units: mph</option>
               <option value="km">Units: km/h</option>
             </select>
+        </Collapsible>
+        <Collapsible
+          className={styles.settings}
+          icon="⚡"
+          label="Performance"
+          defaultOpen={false}
+          title="Show or hide performance controls"
+        >
             <select
               className={styles.button}
               value={accelBackend}
@@ -792,27 +812,50 @@ export default function EngineCanvas() {
               <option value="gpu">Compute: GPU</option>
             </select>
             {accelBackend === "threads" && (
-              <label
-                className={styles.zoomLabel}
-                title="Vehicle count at/above which CPU threads parallelize; below it the step runs serial (rayon overhead isn't worth it). Lower it to see threads engage at fewer cars."
-              >
-                Threads ≥
-                <input
-                  className={styles.button}
-                  type="number"
-                  min={0}
-                  step={500}
-                  value={parThreshold}
-                  disabled={!ready}
-                  style={{ width: "5.5em" }}
-                  onChange={(e) => {
-                    const v = Math.max(0, Math.floor(Number(e.target.value) || 0));
-                    simRef.current?.set_par_threshold(v);
-                    setParThreshold(v);
-                  }}
-                />
-                cars
-              </label>
+              <>
+                <label
+                  className={styles.zoomLabel}
+                  title="Serial ↔ threads crossover: below this car count the step runs serial (rayon overhead isn't worth it); at/above it, CPU threads parallelize. Set it above the live car count to force serial, below to force threads — a lever to A/B the two at a fixed load."
+                >
+                  Parallelize ≥
+                  <input
+                    className={styles.button}
+                    type="number"
+                    min={0}
+                    step={500}
+                    value={parThreshold}
+                    disabled={!ready}
+                    style={{ width: "5.5em" }}
+                    onChange={(e) => {
+                      const v = Math.max(0, Math.floor(Number(e.target.value) || 0));
+                      simRef.current?.set_par_threshold(v);
+                      setParThreshold(v);
+                    }}
+                  />
+                  cars → threads
+                </label>
+                <label
+                  className={styles.zoomLabel}
+                  title="Threads ↔ idle-car scheduler crossover: below this car count the idle-car scheduler runs even while threaded; at/above it, it yields to plain multi-core parallelism. Raise it to keep idle-skipping active under threads (measure threads+scheduler); lower it to hand off to threads sooner. Independent of the parallelize threshold and only matters under CPU threads with idle-car skipping on."
+                >
+                  Idle-skip &lt;
+                  <input
+                    className={styles.button}
+                    type="number"
+                    min={0}
+                    step={500}
+                    value={schedThreadLimit}
+                    disabled={!ready || !sleepScheduler}
+                    style={{ width: "5.5em" }}
+                    onChange={(e) => {
+                      const v = Math.max(0, Math.floor(Number(e.target.value) || 0));
+                      simRef.current?.set_scheduler_thread_limit(v);
+                      setSchedThreadLimit(v);
+                    }}
+                  />
+                  cars
+                </label>
+              </>
             )}
             <label
               className={styles.zoomLabel}
@@ -865,6 +908,7 @@ export default function EngineCanvas() {
                 />
               </label>
             )}
+            <span ref={perfStatusRef} className={styles.perfStatus} />
         </Collapsible>
       </div>
 

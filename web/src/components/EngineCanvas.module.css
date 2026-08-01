@@ -181,6 +181,19 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* Live "what's actually running" readout at the foot of the Performance panel. */
+.perfStatus {
+  margin-top: 0.15rem;
+  padding-top: 0.25rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+  align-self: stretch;
+  color: #93c5fd;
+  font-variant-numeric: tabular-nums;
+}
+.perfStatus:empty {
+  display: none;
+}
+
 /* Bottom-left selected-road panel (shown on click). */
 .panel {
   position: absolute;

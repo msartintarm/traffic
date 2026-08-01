@@ -196,6 +196,11 @@ pub struct NetWorld {
     congestion_cfg: CongestionConfig,
     /// Vehicles the active-set scheduler skipped last step (diagnostic; 0 when off).
     asleep_last: usize,
+    /// Car count at/above which the active-set scheduler yields to plain multi-core
+    /// parallelism under the `Threads` backend (below it, the scheduler runs even threaded).
+    /// Independent of [`par_threshold`](Self::par_threshold) so both crossovers are tunable;
+    /// `usize::MAX` keeps the scheduler on at any threaded load, `0` always yields.
+    scheduler_thread_limit: usize,
 }
 
 /// Sim seconds between flow-field rebuilds — often enough that routing tracks
@@ -676,6 +681,7 @@ impl NetWorld {
             par_threshold: DEFAULT_PAR_THRESHOLD,
             congestion, congestion_cfg: CongestionConfig::disabled(),
             asleep_last: 0,
+            scheduler_thread_limit: DEFAULT_PAR_THRESHOLD,
         }
     }
 
@@ -888,6 +894,17 @@ impl NetWorld {
     /// Toggle the active-set scheduler (see [`SimConfig::sleep_scheduler`]).
     pub fn set_sleep_scheduler(&mut self, on: bool) {
         self.cfg.sleep_scheduler = on;
+    }
+
+    /// Car count at/above which the active-set scheduler yields to multi-core parallelism
+    /// under the `Threads` backend (see the field). `usize::MAX` keeps it on at any threaded
+    /// load; `0` always yields. Independent of [`par_threshold`](Self::par_threshold).
+    pub fn set_scheduler_thread_limit(&mut self, n: usize) {
+        self.scheduler_thread_limit = n;
+    }
+
+    pub fn scheduler_thread_limit(&self) -> usize {
+        self.scheduler_thread_limit
     }
 
     pub fn router_knows(&self, dest: LinkId) -> bool {
@@ -1475,8 +1492,8 @@ impl NetWorld {
         // sweep the fleet), where the extra classification costs more bandwidth than the
         // compute it saves. So gate it off exactly when this step will parallelize.
         let n = self.fleet.rows.len();
-        let sleep_on =
-            self.cfg.sleep_scheduler && !(matches!(backend, AccelBackend::Threads) && n >= par_threshold);
+        let sleep_on = self.cfg.sleep_scheduler
+            && !(matches!(backend, AccelBackend::Threads) && n >= self.scheduler_thread_limit);
 
         // Fused pass: each vehicle's intended movement *and* its sleep decision, in one
         // sweep of the fleet — then unzipped into the two slices the rest of the step needs
