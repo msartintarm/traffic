@@ -109,7 +109,7 @@ mod tests {
     use super::*;
 
     fn clock() -> SimClock {
-        SimClock::new(&SimConfig { dt: 0.2, seed: 0 })
+        SimClock::new(&SimConfig { dt: 0.2, seed: 0, ..SimConfig::default_config() })
     }
 
     #[test]

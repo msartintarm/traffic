@@ -25,6 +25,8 @@ struct Sample {
     step_ms: f64,
     marshal_ms: f64,
     phases: [f64; STEP_PHASES],
+    /// Sleep-scheduler ROI census: [free, frozen, deciding] over the fleet.
+    census: [usize; 3],
 }
 
 fn ramp(world: &mut NetWorld, gen: &mut DemandGenerator, dt: f64, ticks: usize) {
@@ -60,23 +62,41 @@ fn window(world: &mut NetWorld, gen: &mut DemandGenerator, dt: f64, frames: usiz
         step_ms: step / frames as f64,
         marshal_ms: marshal / frames as f64,
         phases,
+        census: world.state_census(),
     }
 }
 
-fn scaling_curve(sources: DemandSources, target: usize, external_reroute: bool, label: &str) {
+/// Install the GPU accel solver, or report that no adapter is available. A no-op
+/// (always `false`) without the `gpu` feature, so the harness compiles either way.
+#[cfg(feature = "gpu")]
+fn enable_gpu_accel(world: &mut NetWorld) -> bool {
+    world.enable_gpu_accel()
+}
+#[cfg(not(feature = "gpu"))]
+fn enable_gpu_accel(_world: &mut NetWorld) -> bool {
+    false
+}
+
+fn scaling_curve(sources: DemandSources, target: usize, external_reroute: bool, accel: AccelBackend, sleep: bool, label: &str) {
     let Some(net) = real_map() else { return };
-    let cfg = SimConfig::default_config();
+    let cfg = SimConfig { sleep_scheduler: sleep, ..SimConfig::default_config() };
     let mut world = NetWorld::new(net, cfg);
-    // Request CPU threads: engages rayon under `--features parallel`, and cleanly
-    // falls back to serial otherwise (so this line is a no-op without the feature).
-    world.set_accel_backend(AccelBackend::Threads);
+    // GPU accel needs a solver installed first; without an adapter, fall back rather
+    // than skewing the curve with a silent serial run under a GPU label.
+    if accel == AccelBackend::Gpu && !enable_gpu_accel(&mut world) {
+        eprintln!("\n=== {label}: no GPU adapter, skipping ===");
+        return;
+    }
+    // Requesting Threads engages rayon under `--features parallel`, and cleanly falls
+    // back to serial otherwise (so it's a no-op without the feature).
+    world.set_accel_backend(accel);
     let pairs = demand::od_pairs(&world.network, 1, target, sources);
     let mut gen = DemandGenerator::new(&world, &pairs, 1);
     world.install_router(&gen.destinations());
     world.set_external_reroute(external_reroute);
 
     eprintln!("\n=== {label} ===");
-    eprintln!("{:>7} {:>8} {:>8} {:>8}   phases ms [{}]", "cars", "step_ms", "marshl", "ns/car", PHASE_NAMES.join(" "));
+    eprintln!("{:>7} {:>8} {:>8} {:>8} {:>10}   phases ms [{}]", "cars", "step_ms", "marshl", "ns/car", "sleepable", PHASE_NAMES.join(" "));
     let mut peak = 0usize;
     let mut prev_cars = 0usize;
     for _ in 0..30 {
@@ -84,7 +104,11 @@ fn scaling_curve(sources: DemandSources, target: usize, external_reroute: bool, 
         let s = window(&mut world, &mut gen, cfg.dt, 60);
         let ns_car = if s.cars > 0 { s.step_ms * 1e6 / s.cars as f64 } else { 0.0 };
         let phases = s.phases.iter().map(|p| format!("{p:.2}")).collect::<Vec<_>>().join(" ");
-        eprintln!("{:>7} {:>8.2} {:>8.2} {:>8.1}   {phases}", s.cars, s.step_ms, s.marshal_ms, ns_car);
+        // sleepable = free + frozen, the fraction the active-set scheduler could skip.
+        let [free, frozen, deciding] = s.census;
+        let sleepable = if s.cars > 0 { 100.0 * (free + frozen) as f64 / s.cars as f64 } else { 0.0 };
+        let census = format!("{sleepable:.0}% (F{free}/Z{frozen}/D{deciding})");
+        eprintln!("{:>7} {:>8.2} {:>8.2} {:>8.1} {census:>10}   {phases}", s.cars, s.step_ms, s.marshal_ms, ns_car);
         assert_eq!(world.leaked(), 0, "no vehicle disappears at an intersection under load");
         peak = peak.max(s.cars);
         if s.cars < prev_cars + 50 {
@@ -101,14 +125,35 @@ fn scaling_curve(sources: DemandSources, target: usize, external_reroute: bool, 
 fn load_highway_saturation() {
     // Off-peak-style freeway inflow driven hard until the surface network jams —
     // the regime where node queues make the per-vehicle constraint work blow up.
-    scaling_curve(DemandSources::new(true, false), 600, false, "Millbrae highway saturation (CPU routing)");
+    scaling_curve(DemandSources::new(true, false), 600, false, AccelBackend::Threads, false, "Millbrae highway saturation (CPU routing)");
 }
 
 #[test]
 #[ignore]
 fn load_balanced_gridlock() {
     // Boundary demand from every gateway, pushed into citywide gridlock.
-    scaling_curve(DemandSources::new(true, true), 600, false, "Millbrae balanced gridlock (CPU routing)");
+    scaling_curve(DemandSources::new(true, true), 600, false, AccelBackend::Threads, false, "Millbrae balanced gridlock (CPU routing)");
+}
+
+#[test]
+#[ignore]
+fn load_balanced_gridlock_scheduler() {
+    // Same citywide gridlock with the active-set scheduler on: queued sleepers skip the
+    // full gather, so the accel (and lane_changes/advance) phase-ms should track the
+    // *deciding* count rather than the fleet. Compare step_ms / phase columns against
+    // `load_balanced_gridlock` (scheduler off) at matching car counts.
+    scaling_curve(DemandSources::new(true, true), 600, false, AccelBackend::Threads, true, "Millbrae balanced gridlock (active-set scheduler)");
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "gpu")]
+fn load_balanced_gridlock_gpu_accel() {
+    // Same citywide gridlock, but the per-vehicle evaluate pass runs on the GPU
+    // (`accel.wgsl`). Compare its step_ms/phase-4 (accel) column against the CPU
+    // curve to see where the GPU fold starts paying off. Run with `--features
+    // gpu,import -- --ignored --nocapture`.
+    scaling_curve(DemandSources::new(true, true), 600, false, AccelBackend::Gpu, false, "Millbrae balanced gridlock (GPU accel)");
 }
 
 /// The scraped 101/280 ramps must be wired tangentially: no grade-separated movement
@@ -186,21 +231,34 @@ fn freeway_traffic_flows_without_phantom_stops() {
     let pairs = demand::od_pairs(&world.network, 1, 600, DemandSources::new(true, false));
     let mut gen = DemandGenerator::new(&world, &pairs, 1);
     world.install_router(&gen.destinations());
+    // Rate, not absolute count: multi-lane injection now loads the freeway to real
+    // density (before, all inflow stacked on one lane, so the freeway ran nearly
+    // empty and any absolute count was tiny). Phantom stops are a *per-car* defect,
+    // so measure them per 1000 freeway car-observations — load-invariant, and what
+    // actually distinguishes the reaction-delay bug (endemic, ~1-in-5 cars) from the
+    // rare genuine emergency brake under congestion.
     let mut prev: std::collections::HashMap<u32, f64> = Default::default();
-    let mut freeway = 0u32;
-    for _ in 0..1500 {
+    let (mut stops, mut freeway_obs) = (0u64, 0u64);
+    for _ in 0..2500 {
         gen.step(&mut world, cfg.dt);
         world.step();
         for v in world.vehicles() {
             let k = world.network.link(world.network.lane(v.lane).link).kind;
-            if format!("{k:?}") == "Freeway" && prev.get(&v.id).copied().unwrap_or(v.speed) > 8.0 && v.speed < 1.0 {
-                freeway += 1;
+            if format!("{k:?}") != "Freeway" {
+                continue;
+            }
+            freeway_obs += 1;
+            if prev.get(&v.id).copied().unwrap_or(v.speed) > 8.0 && v.speed < 1.0 {
+                stops += 1;
             }
         }
         prev.clear();
         for v in world.vehicles() { prev.insert(v.id, v.speed); }
     }
-    assert!(freeway < 40, "freeway phantom stops regressed: {freeway} (was ~279 before the fix)");
+    let per_1k = stops as f64 / freeway_obs.max(1) as f64 * 1000.0;
+    // The bug dead-stopped ~279 of a near-empty freeway (a huge per-car rate); genuine
+    // congestion braking is well under 5 per 1000 observations.
+    assert!(per_1k < 5.0, "freeway phantom stops regressed: {stops} in {freeway_obs} obs = {per_1k:.2}/1000");
 }
 
 #[test]
@@ -228,7 +286,7 @@ fn browser_default_external_reroute_does_not_panic() {
 fn load_highway_saturation_gpu_routing() {
     // Same load with routing owned externally (the browser's ?gpu=1 path), so the
     // step cost excludes the CPU flow-field recompute.
-    scaling_curve(DemandSources::new(true, false), 600, true, "Millbrae highway saturation (external/GPU routing)");
+    scaling_curve(DemandSources::new(true, false), 600, true, AccelBackend::Threads, false, "Millbrae highway saturation (external/GPU routing)");
 }
 
 /// The committed Millbrae `map.json` must build *and* render without panicking —
@@ -242,4 +300,83 @@ fn real_map_builds_and_renders_without_panicking() {
     let _ = engine::render::geometry::world_mesh(&net);
     let _ = engine::render::geometry::marking_mesh(&net);
     let _ = engine::render::geometry::signal_head_placements(&net);
+}
+
+/// The routing field must be acyclic: following `next_hop` from any link toward
+/// any destination must reach it without revisiting a link. This is structural
+/// (`next_hop = argmin(cost+dist)` with positive costs strictly decreases the
+/// distance-to-destination each hop), and it rules out routing as a source of the
+/// "cars running in circles" report — a car never chases a looping next-hop chain.
+#[test]
+fn routing_field_is_acyclic() {
+    use engine::sim::network::LinkId;
+    use engine::sim::router::FieldRouter;
+    let Some(net) = real_map() else { return };
+    let pairs = demand::od_pairs(&net, 0, 600, DemandSources::new(true, true));
+    let mut dests: Vec<LinkId> = pairs.iter().map(|p| p.dest).collect();
+    dests.sort_by_key(|d| d.0);
+    dests.dedup();
+    let cost: Vec<u64> = (0..net.links.len() as u32).map(|i| net.link_travel_time_ms(LinkId(i))).collect();
+    let router = FieldRouter::new(&net, &dests, &cost);
+    for &dest in router.destinations() {
+        for from in (0..net.links.len() as u32).map(LinkId) {
+            let mut cur = from;
+            let mut seen = std::collections::HashSet::new();
+            loop {
+                if cur == dest { break; } // reached the destination
+                assert!(seen.insert(cur.0), "routing cycle toward {dest:?} from {from:?} at {cur:?}");
+                match router.next_hop(dest, cur) { Some(n) => cur = n, None => break } // dead-end/unreachable
+            }
+        }
+    }
+}
+
+/// Under a fixed field (the browser's external-reroute default) and heavy
+/// rush-hour congestion, no vehicle may loop: revisiting a link 3+ times is
+/// persistent circling and must never happen. A single revisit (max 2) is
+/// realistic missed-turn recovery — a car that couldn't merge into its turn lane
+/// (kept out by traffic, as in reality) goes around the block once and retries;
+/// that self-terminating case is bounded loosely, not forbidden.
+#[test]
+fn real_map_traffic_does_not_circle() {
+    use std::collections::HashMap;
+    let Some(net) = real_map() else { return };
+    let cfg = SimConfig::default_config();
+    let mut world = NetWorld::new(net, cfg);
+    let pairs = demand::od_pairs(&world.network, 0, 600, DemandSources::new(true, true));
+    let mut gen = DemandGenerator::new(&world, &pairs, 0);
+    world.install_router(&gen.destinations());
+    world.set_external_reroute(true); // browser default: field stays fixed, worst case for looping
+    gen.set_rush_hour(&world.network, true); // heavy congestion keeps turn lanes blocked
+    let mut hist: HashMap<u32, Vec<u32>> = HashMap::new();
+    for _ in 0..1500 {
+        gen.step(&mut world, cfg.dt);
+        world.step();
+        for v in world.vehicles() {
+            let link = world.network.lane(v.lane).link.0;
+            let h = hist.entry(v.id).or_default();
+            if h.last() != Some(&link) { h.push(link); } // dedup consecutive: keep genuine revisits
+        }
+    }
+    let (mut looped, mut recovered, mut worst) = (0u64, 0u64, 0i32);
+    for h in hist.values() {
+        let mut counts: HashMap<u32, i32> = HashMap::new();
+        let mut m = 0;
+        for &l in h {
+            let c = counts.entry(l).or_insert(0);
+            *c += 1;
+            m = m.max(*c);
+        }
+        if m >= 3 { looped += 1; }
+        if m == 2 { recovered += 1; }
+        worst = worst.max(m);
+    }
+    assert_eq!(looped, 0, "persistent circling: {looped} vehicles revisit a link 3+ times (worst {worst})");
+    // Missed-turn recovery is realistic but should stay rare — guard against a
+    // regression that floods it (baseline ≈ 0.3% of tracked vehicles).
+    assert!(
+        recovered < hist.len() as u64 / 50,
+        "missed-turn recovery spiked: {recovered} of {} vehicles looped back once",
+        hist.len(),
+    );
 }

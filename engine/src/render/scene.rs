@@ -20,9 +20,10 @@ pub fn class_color(c: VehicleClass) -> [f32; 3] {
     }
 }
 
-/// A unit car mesh (extent ±0.5, scaled to metres per-instance): a matte body
-/// plus a red rear-lamp strip flagged `light = 1` so the shader makes it
-/// emissive under braking.
+/// A unit car mesh (extent ±0.5, scaled to metres per-instance): a matte body, a
+/// red rear-lamp strip flagged `light = 1` (emissive under braking), and two
+/// front-corner turn-signal lamps flagged `light = 4` (left, +y) / `light = 5`
+/// (right, −y) that the shader lights amber when the instance's `blinker` matches.
 pub fn unit_car_mesh() -> Mesh {
     let mut m = Mesh::default();
     m.push_quad([[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]], [1.0, 1.0, 1.0]);
@@ -32,6 +33,19 @@ pub fn unit_car_mesh() -> Mesh {
         m.vertices.push(Vertex::lamp(c, red, 1.0));
     }
     m.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+    // Turn-signal lamps at the two front corners. `light` (4/5) selects the side;
+    // the plain body colour lets the fragment fade them to the body when unlit.
+    let body = [1.0, 1.0, 1.0];
+    for (corners, kind) in [
+        ([[0.30, 0.34], [0.5, 0.34], [0.5, 0.5], [0.30, 0.5]], 4.0),   // left (+y)
+        ([[0.30, -0.5], [0.5, -0.5], [0.5, -0.34], [0.30, -0.34]], 5.0), // right (−y)
+    ] {
+        let b = m.vertices.len() as u32;
+        for c in corners {
+            m.vertices.push(Vertex::lamp(c, body, kind));
+        }
+        m.indices.extend([b, b + 1, b + 2, b, b + 2, b + 3]);
+    }
     m
 }
 
@@ -63,6 +77,7 @@ pub fn vehicle_instance(v: &VehicleView) -> Instance {
         heading: v.heading,
         prev_heading: v.prev_heading,
         brake: brake_intensity(v.accel),
+        blinker: 0.0,
     }
 }
 
@@ -95,7 +110,7 @@ pub fn signal_color(state: SignalState) -> [f32; 3] {
 pub const SIGNAL_HOUSING: [f32; 3] = [0.05, 0.05, 0.06];
 
 fn emissive(pos: [f32; 2], scale: [f32; 2], color: [f32; 3], heading: f32) -> Instance {
-    Instance { pos, prev_pos: pos, control: pos, scale, color, heading, prev_heading: heading, brake: 1.0 }
+    Instance { pos, prev_pos: pos, control: pos, scale, color, heading, prev_heading: heading, brake: 1.0, blinker: 0.0 }
 }
 
 /// A miniature three-lamp signal head (a dark housing with red/yellow/green
@@ -154,11 +169,13 @@ mod tests {
     }
 
     #[test]
-    fn unit_car_mesh_has_a_body_and_an_emissive_rear_lamp() {
+    fn unit_car_mesh_has_a_body_brake_and_turn_signal_lamps() {
         let m = unit_car_mesh();
         assert!(m.vertices.iter().any(|v| v.light == 0.0), "has matte body");
         assert!(m.vertices.iter().any(|v| v.light == 1.0), "has a brake lamp");
-        assert_eq!(m.indices.len(), 12); // two quads
+        assert!(m.vertices.iter().any(|v| v.light == 4.0), "has a left turn signal");
+        assert!(m.vertices.iter().any(|v| v.light == 5.0), "has a right turn signal");
+        assert_eq!(m.indices.len(), 24); // body + brake strip + two blinker quads
     }
 
     #[test]

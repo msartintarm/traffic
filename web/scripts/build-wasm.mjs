@@ -55,19 +55,32 @@ const hash = h.digest("hex");
 // wasm-bindgen-rayon's worker re-imports the package via `../../..` — a bundler-only
 // directory resolution. We serve the pkg as raw ES modules from public/, where a static
 // server 404s on the bare directory and the worker never boots (initThreadPool hangs).
-// Rewrite it to the real entry file. Idempotent, and applied on the cached path too so a
-// regenerated/reverted worker file is re-fixed without a full rebuild.
+// Rewrite it to the real entry file, fingerprinted with the build hash so a worker never
+// loads a stale glue against a fresh main thread. Idempotent, and applied on the cached
+// path too so a regenerated/reverted worker file is re-fixed without a full rebuild.
 function patchThreadedWorker() {
   if (variant !== "threads" || !existsSync(outDir)) return;
+  // Match the bare `../../..` (fresh from wasm-pack) or any already-patched form
+  // (`../../../engine.js`, with or without an old `?v=` stamp) and rewrite to the
+  // current fingerprint — so the worker glue is re-stamped even on the cached path.
+  const re = /import\('\.\.\/\.\.\/\.\.(?:\/engine\.js(?:\?v=[a-f0-9]+)?)?'\)/g;
+  const want = `import('../../../engine.js?v=${hash}')`;
   for (const wh of walk(outDir, ["workerHelpers.js"])) {
     const cur = readFileSync(wh, "utf8");
-    const fixed = cur.replace("import('../../..')", "import('../../../engine.js')");
+    const fixed = cur.replace(re, want);
     if (fixed !== cur) writeFileSync(wh, fixed);
   }
 }
 
+// The build fingerprint the client fetches (never cached) to decide the `?v=` on the
+// wasm/glue URLs — so a new build always wins the browser cache, an unchanged one keeps it.
+function writeVersion() {
+  writeFileSync(join(outDir, "version.txt"), hash);
+}
+
 if (existsSync(wasmFile) && existsSync(stampFile) && readFileSync(stampFile, "utf8").trim() === hash) {
   patchThreadedWorker();
+  writeVersion();
   console.log(`wasm (${variant}) unchanged — using cached build`);
   process.exit(0);
 }
@@ -80,4 +93,5 @@ const cmd =
 console.log(`building wasm (${variant})…`);
 execSync(cmd, { cwd: engineDir, stdio: "inherit", shell: "/bin/bash" });
 patchThreadedWorker();
+writeVersion();
 writeFileSync(stampFile, hash);

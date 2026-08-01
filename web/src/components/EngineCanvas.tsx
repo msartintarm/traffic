@@ -1,9 +1,45 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import { basePath } from "../lib/basePath";
 import { isDrag, panDelta, pinch, type Scale } from "../lib/gestures";
 import styles from "./EngineCanvas.module.css";
+
+/** A show/hide panel: an emoji (optionally labelled) header that toggles a vertically
+ * stacked body. Shared by the settings menu and the two corner info overlays so they
+ * expand/collapse identically. Uncontrolled — defined at module scope so its open state
+ * survives the parent's per-frame re-renders. */
+function Collapsible({
+  icon,
+  label,
+  title,
+  defaultOpen = true,
+  className,
+  children,
+}: {
+  icon: string;
+  label?: string;
+  title?: string;
+  defaultOpen?: boolean;
+  className?: string;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className={className}>
+      <button
+        className={styles.overlayToggle}
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        title={title ?? (open ? "Hide" : "Show")}
+      >
+        {icon}
+        {label ? ` ${label}` : ""} {open ? "▾" : "▸"}
+      </button>
+      {open && <div className={styles.overlayBody}>{children}</div>}
+    </div>
+  );
+}
 
 type Sim = {
   advance(dtSecs: number): number;
@@ -52,15 +88,18 @@ type Sim = {
   set_demand_sources(highway: boolean, surface: boolean): void;
   demand_highway(): boolean;
   demand_surface(): boolean;
-  set_highway_rush_hour(enabled: boolean): void;
+  set_rush_hour(enabled: boolean): void;
   demand_rush_hour(): boolean;
   rush_hour_time(): number;
   rush_hour_flows(): Float32Array;
+  demand_queued(): number;
   set_demand_rate(scale: number): void;
   set_entry_speed_cap(mps: number): void;
   set_congestion_enabled(enabled: boolean): void;
   set_congestion_engage(occ: number): void;
   congestion_active_links(): number;
+  set_sleep_scheduler(on: boolean): void;
+  asleep_count(): number;
   enable_gpu_routing(renderer: Renderer): void;
 };
 
@@ -126,10 +165,10 @@ export default function EngineCanvas() {
   const [demandRate, setDemandRate] = useState(1);
   const [congestionEnabled, setCongestionEnabled] = useState(false);
   const [congestionEngage, setCongestionEngage] = useState(0.85);
+  const [sleepScheduler, setSleepScheduler] = useState(true); // on by default (see bridge assemble)
   const [startSpeedMps, setStartSpeedMps] = useState(36); // ≥ every road limit ⇒ "enter at limit"
   const [units, setUnits] = useState<"mi" | "km">("mi");
   const unitsRef = useRef<"mi" | "km">("mi"); // read inside the rAF draw loop (avoids stale closure)
-  const [showSettings, setShowSettings] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
 
   useEffect(() => {
@@ -314,12 +353,23 @@ export default function EngineCanvas() {
         if (wantThreads) await ensureCrossOriginIsolation();
         if (disposed) return;
         const isolated = typeof window !== "undefined" && window.crossOriginIsolated;
+        // Fingerprint the build (`version.txt`, never cached) and stamp it onto the glue
+        // and wasm URLs, so a new build always beats the browser cache while an unchanged
+        // one keeps it — no stale wasm crashing the app after a rebuild.
+        const fingerprint = async (dir: string) => {
+          try {
+            const r = await fetch(`${basePath()}/${dir}/version.txt`, { cache: "no-store" });
+            if (r.ok) return `?v=${(await r.text()).trim()}`;
+          } catch {}
+          return "";
+        };
         let mod: EngineModule | null = null;
         let threadsReady = false;
         if (wantThreads && isolated) {
           try {
-            const t = (await import(/* webpackIgnore: true */ `${basePath()}/wasm-pkg-threads/engine.js`)) as ThreadedEngineModule;
-            await t.default();
+            const q = await fingerprint("wasm-pkg-threads");
+            const t = (await import(/* webpackIgnore: true */ `${basePath()}/wasm-pkg-threads/engine.js${q}`)) as ThreadedEngineModule;
+            await t.default({ module_or_path: `${basePath()}/wasm-pkg-threads/engine_bg.wasm${q}` });
             // Bound the pool init so a build whose workers can't boot degrades instead of hanging.
             await Promise.race([
               t.initThreadPool(navigator.hardwareConcurrency || 4),
@@ -332,8 +382,9 @@ export default function EngineCanvas() {
           }
         }
         if (!mod) {
-          mod = (await import(/* webpackIgnore: true */ `${basePath()}/wasm-pkg/engine.js`)) as EngineModule;
-          await mod.default();
+          const q = await fingerprint("wasm-pkg");
+          mod = (await import(/* webpackIgnore: true */ `${basePath()}/wasm-pkg/engine.js${q}`)) as EngineModule;
+          await mod.default({ module_or_path: `${basePath()}/wasm-pkg/engine_bg.wasm${q}` });
         }
         if (disposed) return;
 
@@ -485,18 +536,26 @@ export default function EngineCanvas() {
               const thr = sim.par_threshold();
               execStr = count >= thr ? `threads ▸ parallel (≥${thr})` : `threads ▸ serial (<${thr})`;
             }
+            // Active-set scheduler diagnostic: how many cars skipped the full step this
+            // frame (parked in queues / cruising open road). 0 when the toggle is off.
+            const idle = sim.asleep_count();
+            const lines = [`${count} vehicles`, `${sim.crashed()} crashed`, speedStr, execStr];
+            if (idle > 0) lines.push(`${idle} idle-skipped`);
             const queued = sim.congestion_active_links();
-            const queuedStr = queued > 0 ? ` · ${queued} links queued` : "";
-            statsRef.current.textContent =
-              `${count} vehicles · ${sim.crashed()} crashed · ${speedStr} · ${execStr}${queuedStr}`;
+            if (queued > 0) lines.push(`${queued} links queued`);
+            const waiting = sim.demand_queued();
+            if (waiting > 0) lines.push(`${waiting} waiting to enter`);
+            // One metric per line as bullets (the container renders `\n` as line breaks).
+            statsRef.current.textContent = lines.map((l) => `• ${l}`).join("\n");
           }
           if (rushClockRef.current && sim.demand_rush_hour()) {
             const h = sim.rush_hour_time();
             const hh = Math.floor(h);
             const mm = Math.floor((h - hh) * 60);
-            const [f101, f280] = sim.rush_hour_flows();
+            const [n101, s101, n280, s280] = sim.rush_hour_flows();
+            const dir = (n: number, s: number) => `N${Math.round(n)}/S${Math.round(s)}`;
             rushClockRef.current.textContent =
-              ` ${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")} · US-101 ${Math.round(f101)} · I-280 ${Math.round(f280)} veh/h/ln`;
+              ` ${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")} · US-101 ${dir(n101, s101)} · I-280 ${dir(n280, s280)} veh/h/ln`;
           }
           if (panelRef.current) {
             const i = selectedRef.current;
@@ -568,33 +627,32 @@ export default function EngineCanvas() {
     <div ref={wrapperRef} className={styles.wrapper}>
       <canvas ref={canvasRef} width={900} height={600} className={styles.canvas} />
 
-      <div className={styles.controls}>
-        <button className={styles.button} onClick={toggle} disabled={!ready}>
-          {playing ? "Pause" : "Play"}
-        </button>
-        {[1, 2, 8, 16, 32].map((s) => (
-          <button key={s} className={styles.button} disabled={!ready} onClick={() => simRef.current?.set_speed(s)}>
-            {s}×
+      <div className={styles.topLeft}>
+        <div className={styles.controls}>
+          <button className={styles.button} onClick={toggle} disabled={!ready}>
+            {playing ? "Pause" : "Play"}
           </button>
-        ))}
-        <button
-          className={styles.button}
-          onClick={() => setShowSettings((v) => !v)}
-          aria-expanded={showSettings}
+          {[1, 2, 8, 16, 32].map((s) => (
+            <button key={s} className={styles.button} disabled={!ready} onClick={() => simRef.current?.set_speed(s)}>
+              {s}×
+            </button>
+          ))}
+          <button
+            className={styles.button}
+            onClick={toggleFullscreen}
+            title="Toggle fullscreen (landscape on mobile)"
+            aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+          >
+            {isFullscreen ? "⛶ Exit" : "⛶"}
+          </button>
+        </div>
+        <Collapsible
+          className={styles.settings}
+          icon="⚙️"
+          label="Settings"
+          defaultOpen={false}
           title="Show or hide settings"
         >
-          {showSettings ? "Settings ▾" : "Settings ▸"}
-        </button>
-        <button
-          className={styles.button}
-          onClick={toggleFullscreen}
-          title="Toggle fullscreen (landscape on mobile)"
-          aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
-        >
-          {isFullscreen ? "⛶ Exit" : "⛶"}
-        </button>
-        {showSettings && (
-          <>
             <label className={styles.zoomLabel}>
               Zoom
               <input
@@ -656,18 +714,18 @@ export default function EngineCanvas() {
             </label>
             <label
               className={styles.zoomLabel}
-              title="Drive US-101 and I-280 at real rush-hour volumes: each freeway gateway feeds in its lane count × the route's per-lane hourly flow, from Caltrans PeMS typical-weekday data. The volume builds and fades as the simulated time of day advances."
+              title="Drive the whole map by the simulated time of day: US-101 and I-280 at their real per-lane volumes (Caltrans PeMS typical-weekday, split by direction), and the surface streets by the urban-arterial diurnal shape. Both build and fade with the commute as the day advances."
             >
               <input
                 type="checkbox"
                 checked={rushHour}
-                disabled={!ready || !highwayTraffic}
+                disabled={!ready || (!highwayTraffic && !surfaceTraffic)}
                 onChange={(e) => {
-                  simRef.current?.set_highway_rush_hour(e.target.checked);
+                  simRef.current?.set_rush_hour(e.target.checked);
                   setRushHour(e.target.checked);
                 }}
               />
-              Highway rush hour
+              Rush hour
               {rushHour && highwayTraffic && <span ref={rushClockRef} className={styles.rushClock} />}
             </label>
             <label className={styles.zoomLabel} title="Spawn-rate multiplier applied to every enabled traffic stream.">
@@ -771,6 +829,21 @@ export default function EngineCanvas() {
               />
               Fast jam model
             </label>
+            <label
+              className={styles.zoomLabel}
+              title="Active-set scheduler: cars that are provably idle this tick — parked in a standing queue, or cruising open straight road far from any junction — skip the full per-car decision and use a cheap synthesized one, so per-frame cost tracks the cars actually making decisions rather than the whole fleet. Behaviour-preserving in normal traffic; a big win in gridlock. On by default (single-threaded builds); it automatically stands down when CPU threads are actively parallelizing."
+            >
+              <input
+                type="checkbox"
+                checked={sleepScheduler}
+                disabled={!ready}
+                onChange={(e) => {
+                  simRef.current?.set_sleep_scheduler(e.target.checked);
+                  setSleepScheduler(e.target.checked);
+                }}
+              />
+              Idle-car skipping
+            </label>
             {congestionEnabled && (
               <label
                 className={styles.zoomLabel}
@@ -792,22 +865,27 @@ export default function EngineCanvas() {
                 />
               </label>
             )}
-          </>
-        )}
+        </Collapsible>
       </div>
 
-      <div className={styles.status}>
+      <Collapsible className={styles.status} icon="📊" title="Show or hide diagnostics">
         {!ready && !error && <span>loading engine…</span>}
-        {ready && <span>{backend} · {mapLabel}</span>}
-        {ready && <span ref={statsRef} />}
-        {error && <span style={{ color: "#ff7b72" }}>engine failed: {error}</span>}
-      </div>
+        {ready && <span>• {backend}</span>}
+        {ready && <span>• {mapLabel}</span>}
+        {ready && <span ref={statsRef} className={styles.statusStats} />}
+        {error && <span style={{ color: "#ff7b72" }}>• engine failed: {error}</span>}
+      </Collapsible>
 
       <div ref={panelRef} className={styles.panel} />
 
-      <p className={styles.hint}>
-        Wheel to zoom · right-drag to pan · hover a road for its name · click to select
-      </p>
+      <Collapsible className={styles.hint} icon="❓" title="Show or hide the controls guide">
+        <ul className={styles.hintList}>
+          <li>Wheel to zoom</li>
+          <li>Right-drag to pan</li>
+          <li>Hover a road for its name</li>
+          <li>Click to select</li>
+        </ul>
+      </Collapsible>
 
       <div ref={tipRef} className={styles.tooltip} />
     </div>
@@ -924,8 +1002,9 @@ function render2d(canvas: HTMLCanvasElement, sim: Sim, scene: Scene | null) {
   const inst = sim.vehicle_instances();
   const len = 4.6 * scale;
   const wid = 2.0 * scale;
-  for (let i = 0; i < inst.length; i += 4) {
+  for (let i = 0; i < inst.length; i += 5) {
     const brake = inst[i + 3];
+    const blink = inst[i + 4]; // -1 left, +1 right, 0 none (already blink-gated)
     ctx.save();
     ctx.translate(sx(inst[i]), sy(inst[i + 1]));
     ctx.rotate(-inst[i + 2]);
@@ -934,6 +1013,14 @@ function render2d(canvas: HTMLCanvasElement, sim: Sim, scene: Scene | null) {
     if (brake > 0.01) {
       ctx.fillStyle = `rgba(255,40,30,${(0.3 + 0.7 * brake).toFixed(3)})`;
       ctx.fillRect(-len / 2, -wid / 2, len * 0.18, wid);
+    }
+    if (blink !== 0) {
+      // Front-corner amber lamp; world-left is local −y after the sy() flip.
+      const bw = len * 0.16;
+      const bh = wid * 0.42;
+      const by = blink < 0 ? -wid / 2 : wid / 2 - bh;
+      ctx.fillStyle = "#ff9e00";
+      ctx.fillRect(len / 2 - bw, by, bw, bh);
     }
     ctx.restore();
   }

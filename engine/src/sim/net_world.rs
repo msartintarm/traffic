@@ -16,6 +16,9 @@ use super::network::{LaneId, LinkId, MovementId, Network, NodeControl, NodeId, T
 use super::router::FieldRouter;
 use super::signal::SignalState;
 
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+use super::accel_gpu::GpuAccel;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct NetVehicle {
     pub id: u32,
@@ -107,6 +110,15 @@ impl Fleet {
     fn settled(&self, i: usize, ticks: usize) -> bool {
         self.hist_len[i] as usize > ticks
     }
+
+    /// Drop row `i`'s retained history down to just `(position, speed)`, so its
+    /// delayed leader-gap lookup falls back to the true current gap until it has
+    /// re-accumulated a full window — used when a lane change moves the car to a new
+    /// lane (and thus a new leader) whose old-frame positions would phantom-brake it.
+    fn reset_history(&mut self, i: usize, position: f64, speed: f64) {
+        self.hist[i][0] = (position, speed);
+        self.hist_len[i] = 1;
+    }
 }
 
 /// Append the current `(position, speed)` to a history column entry, dropping the
@@ -142,6 +154,14 @@ pub struct NetWorld {
     /// Downstream lanes fed by more than one lane — the merge points; value is
     /// the list of feeding (from) lane ids.
     merges: HashMap<u32, Vec<u32>>,
+    /// Per-link: is the whole link gentle enough that its curvature never limits speed
+    /// (curve speed ≥ its limit)? Precomputed from fixed geometry; lets the active-set
+    /// scheduler's free-car path skip the per-tick curve scan on straight links.
+    link_straight: Vec<bool>,
+    /// Per-lane: does this lane feed a merge point? A car here can face a moving cross-merger
+    /// (`merge_conflict`) that the synthesized sleeper contexts don't see, so the free-car
+    /// path excludes it (e.g. freeway mainline lanes an on-ramp merges into).
+    merge_feeder_lane: Vec<bool>,
     /// Actuated signal timing (see [`SignalController`]).
     signals: SignalController,
     /// Cumulative vehicles that have entered each link (spawned onto it or
@@ -157,6 +177,11 @@ pub struct NetWorld {
     junctions: Junctions,
     /// Executor requested for the per-vehicle accel passes (see [`AccelBackend`]).
     accel_backend: AccelBackend,
+    /// GPU binding-fold solver, installed by [`NetWorld::enable_gpu_accel`]. When
+    /// present it backs the `Gpu` backend's evaluate pass; absent, `Gpu` falls back
+    /// to `Serial`. Native only — the browser can't block on the same-step readback.
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    gpu_accel: Option<GpuAccel>,
     /// Whether the CPU worker pool is up. Native: rayon's global pool auto-inits, so
     /// always true. Browser: false until JS finishes `initThreadPool` (SharedArrayBuffer
     /// needs cross-origin isolation), gating the `Threads` backend until then.
@@ -169,6 +194,8 @@ pub struct NetWorld {
     /// individual; this only cuts per-car work. Inert unless `congestion_cfg.enabled`.
     congestion: CongestionLod,
     congestion_cfg: CongestionConfig,
+    /// Vehicles the active-set scheduler skipped last step (diagnostic; 0 when off).
+    asleep_last: usize,
 }
 
 /// Sim seconds between flow-field rebuilds — often enough that routing tracks
@@ -223,9 +250,9 @@ impl Prof {
 /// Which executor runs the per-vehicle accel passes. Selected at runtime so a
 /// device without a good GPU (or without cross-origin isolation for CPU threads)
 /// can fall back; [`NetWorld::active_backend`] resolves the request against what's
-/// actually available. Each backend is validated to match [`AccelBackend::Serial`]
-/// bit-for-bit — the passes read only committed pre-step state, so order-preserving
-/// parallelism is exact.
+/// actually available. The CPU backends match [`AccelBackend::Serial`] bit-for-bit
+/// (the passes read only committed pre-step state, so order-preserving parallelism is
+/// exact); the `Gpu` backend matches only within f32 tolerance (it folds in f32).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AccelBackend {
     /// Single-threaded — always available, and the correctness reference.
@@ -233,8 +260,10 @@ pub enum AccelBackend {
     /// Data-parallel across CPU cores (rayon). Native under `--features parallel`;
     /// the browser additionally needs a SharedArrayBuffer worker pool (a follow-up).
     Threads,
-    /// GPU compute kernel for the evaluate pass (a follow-up); the gather stays on
-    /// CPU. Until wired, [`NetWorld::active_backend`] falls it back to `Serial`.
+    /// GPU compute kernel (`accel.wgsl`) for the evaluate pass; the gather stays on
+    /// CPU. Native + `gpu`, after [`NetWorld::enable_gpu_accel`] installs a solver;
+    /// otherwise [`NetWorld::active_backend`] falls it back to `Serial`. The browser
+    /// can't block on the same-step readback, so it too falls back there.
     Gpu,
 }
 
@@ -287,6 +316,34 @@ where
         }
         _ => (0..n).map(f).collect(),
     }
+}
+
+/// The `Gpu` backend's evaluate pass: the binding fold in `accel.wgsl` (f32) with the
+/// u64-RNG noise term re-added on the CPU. Rolling vehicles go to the kernel; in-node
+/// crossers carry their precomputed accel through unchanged. Native + `gpu` only.
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+fn gpu_evaluate(solver: &mut GpuAccel, inputs: &[AccelInput], seed: u64, tick: u64) -> Vec<f64> {
+    let mut gpu_in = Vec::with_capacity(inputs.len());
+    let mut rolling = Vec::with_capacity(inputs.len());
+    for (i, inp) in inputs.iter().enumerate() {
+        if let AccelInput::Rolling(cx) = inp {
+            rolling.push(i);
+            gpu_in.push(cx.to_gpu());
+        }
+    }
+    let bindings = solver.binding_accels(&gpu_in);
+    let mut out = vec![0.0f64; inputs.len()];
+    for (i, inp) in inputs.iter().enumerate() {
+        if let AccelInput::Crossing(a) = inp {
+            out[i] = *a;
+        }
+    }
+    for (j, &i) in rolling.iter().enumerate() {
+        if let AccelInput::Rolling(cx) = &inputs[i] {
+            out[i] = bindings[j] as f64 + constraint::accel_noise(cx.driver.accel_noise, seed, cx.agent_id, tick);
+        }
+    }
+    out
 }
 
 /// A rolling vehicle's flattened accel-decision inputs — the output of the gather
@@ -407,10 +464,9 @@ impl VehicleContext {
 
     /// Pack into the f32 layout the GPU kernel reads (`accel.wgsl`'s `Ctx`). An
     /// absent optional (`+∞`) becomes the `BIG` sentinel the shader tests against;
-    /// every field is dropped to `f32` (WGSL has no `f64`). Exercised by the GPU
-    /// equivalence test; the step wires it into the `Gpu` backend later.
+    /// every field is dropped to `f32` (WGSL has no `f64`). The `Gpu` backend's
+    /// evaluate pass ([`gpu_evaluate`]) uploads a slice of these each step.
     #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
-    #[cfg_attr(not(test), allow(dead_code))]
     fn to_gpu(&self) -> VehicleContextGpu {
         let f = |x: f64| if x.is_finite() { x as f32 } else { GPU_BIG };
         VehicleContextGpu {
@@ -439,7 +495,6 @@ impl VehicleContext {
 /// Sentinel for an absent optional constraint in the GPU layout (mirrors `+∞` in
 /// [`VehicleContext`]); `accel.wgsl` treats any field `>=` this as not binding.
 #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
-#[cfg_attr(not(test), allow(dead_code))]
 const GPU_BIG: f32 = 1e30;
 
 /// The f32, `#[repr(C)]`/`Pod` layout a slice of which uploads to the GPU accel
@@ -469,6 +524,18 @@ pub struct VehicleContextGpu {
     pub merge_speed: f32,
 }
 
+/// The active-set scheduler's per-vehicle decision for a tick: run the full gather, or
+/// synthesize a cheap context because the car's motion is trivially determined.
+#[derive(Clone, Copy)]
+enum Sleep {
+    /// Run the full gather (the car is actually deciding).
+    Awake,
+    /// Queued behind the given stopped-leader index — hold via [`NetWorld::queue_context`].
+    Queued(usize),
+    /// Isolated on open, straight road far from its node — cruise on a free-road context.
+    Free,
+}
+
 /// Per-vehicle input to the accel evaluate pass. A rolling vehicle carries its full
 /// [`VehicleContext`]; an in-node crosser carries the acceleration its bespoke
 /// [`NetWorld::crossing_accel`] already produced (a separate kernel, and noiseless).
@@ -490,7 +557,83 @@ impl AccelInput {
 /// intersection (metres) — anticipatory braking across the current link.
 const SIGNAL_LOOKAHEAD: f64 = 90.0;
 
+/// Below this speed (m/s) a vehicle counts as stopped for the sleep-scheduler's
+/// state classification (matches the stop-line detection thresholds elsewhere).
+const MOVE_EPS: f64 = 0.3;
+/// Leader gap (m) beyond which the leader's IDM term is effectively non-binding, so
+/// a car with nothing closer is cruising on the free road.
+const LEADER_PERCEPTION: f64 = 120.0;
+/// Distance (m) within which a stopped car is treated as queued at a stop line / behind
+/// a stopped leader (so it can sleep as frozen rather than counting as deciding).
+const STOP_QUEUE_GAP: f64 = 12.0;
+/// Speed (m/s) below which the scheduler will sleep a queued car — deliberately far
+/// stricter than [`MOVE_EPS`]: only a *genuinely parked* car behind a *genuinely
+/// parked* leader gets the synthesized leader-only context, because for such a car the
+/// leader term provably dominates every other constraint and the IDM fold is bitwise
+/// identical to the full gather (so sleeping cannot perturb the trajectory). A car
+/// still rolling — even slowly — takes the full gather, where `queue_context` would
+/// diverge (no reaction delay, no curve/merge/yield terms).
+const SLEEP_SPEED_EPS: f64 = 0.02;
+/// Beyond this distance to the next node (m), and with no slower zone downstream, no node
+/// constraint (signal/box/yield/stop) can yet bind — [`NetWorld::gather_context`] LOD-skips
+/// the node stack, and the active-set scheduler's free-car path applies from here out.
+const DECISION_HORIZON: f64 = 180.0;
+/// Comfortable lateral acceleration (m/s²) bounding curve speed (`v = √(A_LAT·r)`), and how
+/// far ahead a curve is read.
+const A_LAT: f64 = 3.0;
+const CURVE_LOOKAHEAD: f64 = 45.0;
+
+/// A vehicle's decision state for the active-set scheduler. `Free` and `Frozen` are the
+/// analytically-predictable states that may sleep; `Deciding` must run the full step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CarState {
+    /// No leader within perception and no intersection/event within lookahead — cruising
+    /// the free road toward desired speed.
+    Free,
+    /// Stopped behind a stopped leader or at a stop line — held until woken.
+    Frozen,
+    /// Anything else: car-following a live leader, approaching a node, mid-crossing, etc.
+    Deciding,
+}
+
 impl NetWorld {
+    /// Classify vehicle `i`'s decision state from committed state + neighbours. Reads
+    /// only current positions/speeds (no router/signal mutation), so it is safe to call
+    /// for measurement or to gate the active set.
+    fn classify(&self, i: usize, nb: &Neighbors) -> CarState {
+        let v = &self.fleet.rows[i];
+        if v.crossing.is_some() {
+            return CarState::Deciding;
+        }
+        let lane = self.network.lane(v.lane);
+        let to_end = lane.length - v.position;
+        let leader_gap = nb.leader_of[i]
+            .map(|l| (self.fleet.rows[l].position - self.fleet.rows[l].driver.vehicle_length) - v.position);
+        let leader_stopped_close = nb.leader_of[i]
+            .zip(leader_gap)
+            .is_some_and(|(l, g)| g < STOP_QUEUE_GAP && self.fleet.rows[l].speed < MOVE_EPS);
+        if v.speed < MOVE_EPS && (leader_stopped_close || to_end < STOP_QUEUE_GAP) {
+            return CarState::Frozen;
+        }
+        let leader_close = leader_gap.is_some_and(|g| g < LEADER_PERCEPTION);
+        if !leader_close && to_end >= SIGNAL_LOOKAHEAD {
+            return CarState::Free;
+        }
+        CarState::Deciding
+    }
+
+    /// Census of the current fleet by [`CarState`] as `[free, frozen, deciding]` — the
+    /// measurement behind the sleep-scheduler ROI (how large the sleepable fraction is).
+    /// Builds neighbours internally; call sparingly (e.g. from the load bench window).
+    pub fn state_census(&self) -> [usize; 3] {
+        let nb = self.neighbors();
+        let mut counts = [0usize; 3];
+        for i in 0..self.fleet.rows.len() {
+            counts[self.classify(i, &nb) as usize] += 1;
+        }
+        counts
+    }
+
     pub fn new(network: Network, cfg: SimConfig) -> Self {
         let mut merges: HashMap<u32, Vec<u32>> = HashMap::new();
         for m in &network.movements {
@@ -501,17 +644,38 @@ impl NetWorld {
         }
         merges.retain(|_, froms| froms.len() > 1);
 
+        let mut merge_feeder_lane = vec![false; network.lanes.len()];
+        for froms in merges.values() {
+            for &f in froms {
+                merge_feeder_lane[f as usize] = true;
+            }
+        }
+
+        // Per-link straightness: does the tightest curve anywhere on the link still allow
+        // its speed limit? If so, a car on it is never curve-limited, so the free-car path
+        // can skip the curve scan. Conservative (whole-link min radius) and geometry-only.
+        let link_straight = (0..network.links.len())
+            .map(|i| {
+                let lane_start = network.link(LinkId(i as u32)).lane_start;
+                let r = network.min_radius_ahead(lane_start, 0.0, f64::INFINITY);
+                (A_LAT * r).sqrt() >= network.lane(lane_start).speed_limit
+            })
+            .collect();
+
         let signals = SignalController::build(&network);
         let link_entries = vec![0u32; network.links.len()];
         let junctions = Junctions::build(&network);
         let congestion = CongestionLod::new(network.links.len());
         Self {
             network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0,
-            merges, signals, link_entries, router: None, external_reroute: false, junctions,
+            merges, link_straight, merge_feeder_lane, signals, link_entries, router: None, external_reroute: false, junctions,
             accel_backend: AccelBackend::Serial,
+            #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+            gpu_accel: None,
             threads_ready: cfg!(not(target_arch = "wasm32")),
             par_threshold: DEFAULT_PAR_THRESHOLD,
             congestion, congestion_cfg: CongestionConfig::disabled(),
+            asleep_last: 0,
         }
     }
 
@@ -538,15 +702,42 @@ impl NetWorld {
         self.accel_backend = backend;
     }
 
+    /// Install the GPU binding-fold solver so the `Gpu` backend runs its evaluate pass
+    /// on the GPU (native only; the browser can't block on the same-step readback).
+    /// Returns whether an adapter was acquired — `false` leaves `Gpu` falling back to
+    /// `Serial`. Idempotent enough to call once at setup.
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    pub fn enable_gpu_accel(&mut self) -> bool {
+        if self.gpu_accel.is_none() {
+            self.gpu_accel = GpuAccel::new();
+        }
+        self.gpu_accel.is_some()
+    }
+
     /// The backend actually used this step: the request, downgraded to `Serial` when
-    /// it isn't available (no worker pool, or the GPU evaluate kernel isn't wired yet).
+    /// it isn't available (no CPU worker pool, or no GPU solver installed).
     pub fn active_backend(&self) -> AccelBackend {
         match self.accel_backend {
             AccelBackend::Threads if threads_available() && self.threads_ready => AccelBackend::Threads,
-            // The GPU evaluate kernel is a follow-up; until then it runs serially
-            // (the gather is CPU-side regardless).
+            #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+            AccelBackend::Gpu if self.gpu_accel.is_some() => AccelBackend::Gpu,
             _ => AccelBackend::Serial,
         }
+    }
+
+    /// Run the evaluate pass over the gathered `inputs`. Serial/Threads fold the
+    /// constraints and add per-tick noise in one order-preserving map; the `Gpu`
+    /// backend runs the binding fold in `accel.wgsl` (f32) and re-adds the noise
+    /// CPU-side, so it agrees with `Serial` only within f32 tolerance — a throughput
+    /// option, not the bit-exact reference the CPU backends are.
+    fn evaluate_accels(&mut self, backend: AccelBackend, par_threshold: usize, inputs: &[AccelInput], seed: u64, tick: u64) -> Vec<f64> {
+        #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+        if backend == AccelBackend::Gpu {
+            if let Some(solver) = self.gpu_accel.as_mut() {
+                return gpu_evaluate(solver, inputs, seed, tick);
+            }
+        }
+        map_collect(backend, par_threshold, inputs.len(), |i| inputs[i].evaluate(seed, tick))
     }
 
     /// Install a flow-field router covering `dests`; vehicles spawned via
@@ -626,6 +817,79 @@ impl NetWorld {
         }
     }
 
+    /// Active-set scheduler gate (queued sleepers): the same-lane leader if car `i` may
+    /// sleep this tick — it is stopped behind a *close, stopped* leader, so its
+    /// acceleration is pinned by that leader and the full node/signal/router gather can be
+    /// skipped (synthesised as [`queue_context`](Self::queue_context)). Returns `None`
+    /// (⇒ full gather) for moving cars and for the front-of-queue car (no leader), which
+    /// must keep the full path so it reacts to a green / an opening gap. When the leader
+    /// starts moving, this returns `None` next tick and the follower wakes — a one-tick
+    /// discharge lag, within the reaction-time model. Cheap: one neighbour + gap check, no
+    /// graph walk. The caller decides *whether* the scheduler runs (see `step`).
+    fn sleep_leader(&self, i: usize, nb: &Neighbors) -> Option<usize> {
+        let v = &self.fleet.rows[i];
+        if v.crossing.is_some() || v.speed >= SLEEP_SPEED_EPS {
+            return None;
+        }
+        let li = nb.leader_of[i]?;
+        let lead = &self.fleet.rows[li];
+        let gap = lead.position - v.position - lead.driver.vehicle_length;
+        // gap ≥ 0 so an already-overlapping pair takes the full (hard-braking) gather;
+        // gap < STOP_QUEUE_GAP so a nearby stopped leader is the binding constraint.
+        ((0.0..STOP_QUEUE_GAP).contains(&gap) && lead.speed < SLEEP_SPEED_EPS).then_some(li)
+    }
+
+    /// Active-set scheduler gate (isolated free-flow cars): true when car `i` is cruising
+    /// open road with nothing to decide — no leader within perception, far from its node
+    /// (past [`DECISION_HORIZON`]), on a straight link, heading straight through onto a
+    /// same-or-faster link. For exactly this case [`gather_context`](Self::gather_context)
+    /// LOD-returns just the (non-binding) leader and (absent) curve, so a bare free-road
+    /// context reproduces its fold — sleeping is behaviour-preserving. `intended` is the
+    /// already-resolved next hop (so this adds no router lookup).
+    fn is_free_sleeper(&self, i: usize, nb: &Neighbors, intended: Option<MovementId>) -> bool {
+        let v = &self.fleet.rows[i];
+        let lane = self.network.lane(v.lane);
+        if lane.length - v.position <= DECISION_HORIZON
+            || !self.link_straight[lane.link.idx()]
+            || self.merge_feeder_lane[v.lane.0 as usize]
+        {
+            return false; // near a node, on a curve, or feeding a merge → run the full gather
+        }
+        if let Some(li) = nb.leader_of[i] {
+            let gap = self.fleet.rows[li].position - v.position - self.fleet.rows[li].driver.vehicle_length;
+            if gap <= LEADER_PERCEPTION {
+                return false; // a leader is close enough to matter
+            }
+        }
+        match intended {
+            // A turn or a slower downstream link means gather anticipates a slowdown here.
+            Some(mid) => {
+                matches!(self.network.movement_turn(mid), TurnType::Through)
+                    && self.network.lane(self.network.movement(mid).to_lane).speed_limit >= lane.speed_limit
+            }
+            None => true, // no onward hop resolved — nothing downstream to anticipate
+        }
+    }
+
+    /// A free-road accel context: desired-speed pursuit with no leader/node constraints —
+    /// what an isolated cruising car (see [`is_free_sleeper`](Self::is_free_sleeper)) needs.
+    fn free_context(&self, i: usize) -> VehicleContext {
+        let veh = &self.fleet.rows[i];
+        let lane = self.network.lane(veh.lane);
+        VehicleContext::new(veh.driver.capped_to(lane.speed_limit), veh.speed, veh.id)
+    }
+
+    /// Vehicles skipped by the active-set scheduler on the last step (queued sleepers).
+    /// Zero when the scheduler is off. A diagnostic for the UI / load bench.
+    pub fn asleep_count(&self) -> usize {
+        self.asleep_last
+    }
+
+    /// Toggle the active-set scheduler (see [`SimConfig::sleep_scheduler`]).
+    pub fn set_sleep_scheduler(&mut self, on: bool) {
+        self.cfg.sleep_scheduler = on;
+    }
+
     pub fn router_knows(&self, dest: LinkId) -> bool {
         self.router.as_ref().is_some_and(|r| r.knows(dest))
     }
@@ -694,11 +958,8 @@ impl NetWorld {
     /// still occupied, so demand can't stack vehicles on top of each other.
     pub fn spawn_routed(&mut self, id: u32, route: Vec<LinkId>, speed: f64, driver: DriverConfig) -> bool {
         let Some(&first) = route.first() else { return false };
-        let Some(lane) = self.network.lanes_of(first).next() else { return false };
-        if !self.entrance_clear(lane, driver.min_gap) {
-            return false;
-        }
-        self.link_entries[self.network.lane(lane).link.idx()] += 1;
+        let Some(lane) = self.entry_lane(first, driver.min_gap, id) else { return false };
+        self.link_entries[first.idx()] += 1;
         self.fleet.push(NetVehicle {
             id, lane, position: 0.0, speed, driver, route, route_idx: 0, dest: None,
             stopped_at: None, wait_ticks: 0, crossing: None,
@@ -707,18 +968,29 @@ impl NetWorld {
     }
 
     /// Spawn at the start of `entry_link` bound for `dest`, routed live by the
-    /// world's flow-field. Refused if the entrance is still occupied.
+    /// world's flow-field. Refused if every entry lane is still occupied.
     pub fn spawn_to(&mut self, id: u32, entry_link: LinkId, dest: LinkId, speed: f64, driver: DriverConfig) -> bool {
-        let Some(lane) = self.network.lanes_of(entry_link).next() else { return false };
-        if !self.entrance_clear(lane, driver.min_gap) {
-            return false;
-        }
+        let Some(lane) = self.entry_lane(entry_link, driver.min_gap, id) else { return false };
         self.link_entries[entry_link.idx()] += 1;
         self.fleet.push(NetVehicle {
             id, lane, position: 0.0, speed, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
             stopped_at: None, wait_ticks: 0, crossing: None,
         });
         true
+    }
+
+    /// Choose an entry lane on `link` whose start is clear, spreading successive
+    /// spawns across the link's lanes (the try order is rotated by `id`) so a
+    /// multi-lane gateway fills every lane instead of stacking all inflow on the
+    /// median lane — a prerequisite for a wide road to accept its real per-lane
+    /// rush-hour volume. `None` when every lane's entrance is still occupied, which
+    /// refuses the spawn and becomes natural inflow backpressure.
+    fn entry_lane(&self, link: LinkId, min_gap: f64, id: u32) -> Option<LaneId> {
+        let l = self.network.link(link);
+        let n = l.lane_count;
+        (0..n)
+            .map(|k| LaneId(l.lane_start.0 + (id.wrapping_add(k)) % n))
+            .find(|&lane| self.entrance_clear(lane, min_gap))
     }
 
     /// Test-only: spawn a destination-routed vehicle in a specific lane at a
@@ -820,12 +1092,56 @@ impl NetWorld {
         };
         // Take the routed movement when this lane serves it; otherwise proceed on
         // whatever this lane offers (reroute from where it lands) — a car in the
-        // wrong lane must never vanish mid-network. If even this lane serves
+        // wrong lane must never vanish mid-network. Among the lane's movements pick
+        // the one landing nearest the destination (`forward_movement`) rather than
+        // an arbitrary first movement, so a wrong-lane car makes forward progress
+        // instead of taking a backtracking turn and looping. If this lane serves
         // nothing, borrow a sibling lane's movement rather than dropping the car;
         // only a genuine dead end (no lane on the link moves on) truly exits.
         preferred
+            .or_else(|| self.forward_movement(veh, veh.lane))
             .or_else(|| (lane.movement_count > 0).then_some(lane.movement_start))
             .or_else(|| self.any_movement_on(lane.link))
+    }
+
+    /// Of the movements this lane can actually take, the one landing on the link
+    /// nearest the vehicle's destination by the router's field — the forward-most
+    /// fallback when the lane can't serve the routed next link. Keeps a wrong-lane
+    /// car progressing toward its goal instead of taking an arbitrary (possibly
+    /// backtracking) movement and looping back. `None` for non-routed cars or when
+    /// no movement reaches the destination.
+    fn forward_movement(&self, veh: &NetVehicle, lane: LaneId) -> Option<MovementId> {
+        let (dest, router) = (veh.dest?, self.router.as_ref()?);
+        let l = self.network.lane(lane);
+        (0..l.movement_count)
+            .filter_map(|k| {
+                let mid = MovementId(l.movement_start.0 + k);
+                let to_link = self.network.lane(self.network.movement(mid).to_lane).link;
+                router.distance(dest, to_link).map(|d| (d, mid))
+            })
+            .min_by_key(|&(d, _)| d)
+            .map(|(_, mid)| mid)
+    }
+
+    /// Which way a vehicle is signalling a lane change: `-1` left, `+1` right,
+    /// `0` none. A car whose current lane can't serve its route signals toward the
+    /// nearest lane that can (the turn lane it needs to merge into) — higher lane
+    /// index is further right, so the sign of the index gap is the physical turn
+    /// side. Read only by the renderer to blink an indicator; never affects the sim.
+    pub fn vehicle_blinker(&self, veh: &NetVehicle) -> i8 {
+        if veh.crossing.is_some() || self.lane_serves_route(veh, veh.lane) != Some(false) {
+            return 0; // mid-junction, or the lane already serves the route
+        }
+        let Some(next) = self.next_link_on_path(veh) else { return 0 };
+        let link = self.network.link(self.network.lane(veh.lane).link);
+        let cur = self.network.lane(veh.lane).index_in_link as i64;
+        let goal = (0..link.lane_count as i64)
+            .filter(|&k| {
+                let l = LaneId(link.lane_start.0 + k as u32);
+                self.network.movements_of(l).iter().any(|m| self.network.lane(m.to_lane).link == next)
+            })
+            .min_by_key(|&k| (k - cur).abs());
+        goal.map_or(0, |g| (g - cur).signum() as i8)
     }
 
     /// The first available movement from any lane of `link` — a last-resort so a
@@ -970,8 +1286,13 @@ impl NetWorld {
             }
             let len = veh.driver.vehicle_length;
             if self.lane_slot_clear(target, new_pos, len, i) {
+                let speed = self.fleet.rows[i].speed;
                 self.fleet.rows[i].lane = target;
                 self.fleet.rows[i].position = new_pos;
+                // New lane → new leader; the retained history is in the old lane's
+                // frame, so discard it (as a segment crossing does) to keep the
+                // reaction-delay gap from reading a stale position and phantom-braking.
+                self.fleet.reset_history(i, new_pos, speed);
             }
         }
     }
@@ -1148,31 +1469,67 @@ impl NetWorld {
         let backend = self.active_backend();
         let par_threshold = self.par_threshold;
 
-        // Compute each vehicle's intended movement once (used by accel, the box
-        // gate, and the transition).
-        let intended_mv: Vec<Option<MovementId>> = map_collect(backend, par_threshold, self.fleet.rows.len(), |i| {
-            let v = &self.fleet.rows[i];
-            if v.crossing.is_some() { None } else { self.intended_movement(v) }
-        });
+        // Active-set scheduler engages only when it will actually pay: a serial or GPU
+        // step is compute-bound, so skipping the gather for queued sleepers is a clear
+        // win; a *parallel* threads step is memory-bandwidth-bound (all cores already
+        // sweep the fleet), where the extra classification costs more bandwidth than the
+        // compute it saves. So gate it off exactly when this step will parallelize.
+        let n = self.fleet.rows.len();
+        let sleep_on =
+            self.cfg.sleep_scheduler && !(matches!(backend, AccelBackend::Threads) && n >= par_threshold);
 
-        // Phase 4a — gather each vehicle's accel-decision inputs. Every graph,
-        // neighbor, signal and router lookup lives here (CPU-only; a GPU kernel can't
-        // chase these pointers). Rolling vehicles get a flat `VehicleContext`; in-node
-        // crossers carry their bespoke `crossing_accel` through unchanged.
+        // Fused pass: each vehicle's intended movement *and* its sleep decision, in one
+        // sweep of the fleet — then unzipped into the two slices the rest of the step needs
+        // (the unzip is cheap: small values, not the fat rows). Threading them separately
+        // would re-sweep the whole fleet, which on a bandwidth-bound parallel step is the
+        // dominant cost. Queued sleepers skip the router next-hop (they can't reach a stop
+        // line); free-flow cars still resolve it (cheaply) to confirm they're going
+        // straight, then drop it (they too can't reach the line this tick).
+        let (intended_mv, sleeping): (Vec<Option<MovementId>>, Vec<Sleep>) =
+            map_collect(backend, par_threshold, n, |i| {
+                let v = &self.fleet.rows[i];
+                if v.crossing.is_some() {
+                    return (None, Sleep::Awake);
+                }
+                if sleep_on {
+                    if let Some(l) = self.sleep_leader(i, &nb) {
+                        return (None, Sleep::Queued(l));
+                    }
+                }
+                let intended = self.intended_movement(v);
+                if sleep_on && self.is_free_sleeper(i, &nb, intended) {
+                    return (None, Sleep::Free);
+                }
+                (intended, Sleep::Awake)
+            })
+            .into_iter()
+            .unzip();
+        self.asleep_last = sleeping.iter().filter(|s| !matches!(s, Sleep::Awake)).count();
+
+        // Phase 4a — gather each vehicle's accel-decision inputs. Every graph, neighbor,
+        // signal and router lookup lives here (CPU-only; a GPU kernel can't chase these
+        // pointers). In-node crossers carry their bespoke `crossing_accel`; queued sleepers
+        // and congested-link followers take the leader-only `queue_context`; isolated free
+        // cars take the bare `free_context`; everyone else runs the full gather.
         let inputs: Vec<AccelInput> = map_collect(backend, par_threshold, self.fleet.rows.len(), |i| {
             if self.fleet.rows[i].crossing.is_some() {
                 AccelInput::Crossing(self.crossing_accel(i, &nb, &cross_by_mv))
-            } else if let Some(leader) = self.queue_follower(i, &nb) {
-                // Congested-link follower: cheap leader-only car-following.
-                AccelInput::Rolling(self.queue_context(i, leader))
             } else {
-                AccelInput::Rolling(self.gather_context(i, &nb, &intended_mv))
+                match sleeping[i] {
+                    Sleep::Queued(leader) => AccelInput::Rolling(self.queue_context(i, leader)),
+                    Sleep::Free => AccelInput::Rolling(self.free_context(i)),
+                    Sleep::Awake => match self.queue_follower(i, &nb) {
+                        Some(leader) => AccelInput::Rolling(self.queue_context(i, leader)),
+                        None => AccelInput::Rolling(self.gather_context(i, &nb, &intended_mv)),
+                    },
+                }
             }
         });
         // Phase 4b — evaluate: the pure constraint fold + reproducible noise over the
-        // flat context. No graph access — this half transliterates to a WGSL kernel.
+        // flat context. No graph access — this half runs on the CPU (serial/threads) or,
+        // on the `Gpu` backend, the `accel.wgsl` kernel with noise re-added CPU-side.
         let (seed, tick) = (self.cfg.seed, self.tick);
-        let accels: Vec<f64> = map_collect(backend, par_threshold, inputs.len(), |i| inputs[i].evaluate(seed, tick));
+        let accels: Vec<f64> = self.evaluate_accels(backend, par_threshold, &inputs, seed, tick);
         prof.lap(4);
 
         // Destination-lane occupancy (nearest-to-entrance rear), so a crosser
@@ -1407,8 +1764,6 @@ impl NetWorld {
 
         // Upcoming curve (lateral-accel limit) and turn speed; the LOD path below
         // needs these, so compute them before it.
-        const A_LAT: f64 = 3.0;
-        const CURVE_LOOKAHEAD: f64 = 45.0;
         let geom_curve = {
             let r = self.network.min_radius_ahead(veh.lane, veh.position, CURVE_LOOKAHEAD);
             r.is_finite().then(|| SpeedTarget { speed: (A_LAT * r).sqrt(), distance: CURVE_LOOKAHEAD })
@@ -1437,7 +1792,6 @@ impl NetWorld {
         // LOD: beyond the range at which any node constraint can bind (and with no
         // slower zone downstream), only the leader and local curvature matter — skip
         // the node stack. Identical result, cheaper.
-        const DECISION_HORIZON: f64 = 180.0;
         let downstream_slower = intended
             .is_some_and(|mid| self.network.lane(self.network.movement(mid).to_lane).speed_limit < lane.speed_limit);
         if to_line > DECISION_HORIZON && !downstream_slower {
@@ -1883,7 +2237,7 @@ mod tests {
     fn active_backend_falls_back_when_a_backend_is_unavailable() {
         let mut w = NetWorld::new(millbrae_sample(), cfg());
         assert_eq!(w.active_backend(), AccelBackend::Serial, "default is serial");
-        // The GPU evaluate kernel isn't wired yet, so requesting it runs serially.
+        // Requesting Gpu without a solver installed (enable_gpu_accel) runs serially.
         w.set_accel_backend(AccelBackend::Gpu);
         assert_eq!(w.active_backend(), AccelBackend::Serial);
         // Threads resolves to itself only when the CPU pool is linked (the `parallel`
@@ -1948,6 +2302,43 @@ mod tests {
             let cpu = c.binding();
             assert!((g as f64 - cpu).abs() < 0.02, "ctx {i}: gpu {g} vs cpu {cpu}");
         }
+    }
+
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    #[test]
+    fn gpu_accel_backend_drives_a_safe_sim() {
+        // The Gpu backend must drive a full sim end to end — rolling cars *and* in-node
+        // crossers through the evaluate pass — as safely as Serial and with comparable
+        // throughput. The fold is f32, so exact parity isn't expected; only collision-
+        // free flow that tracks the serial reference within a band.
+        let run = |gpu: bool| -> Option<u32> {
+            let mut world = NetWorld::new(symmetric_diamond(), cfg());
+            if gpu && !world.enable_gpu_accel() {
+                return None; // no adapter in this environment
+            }
+            let want = if gpu { AccelBackend::Gpu } else { AccelBackend::Serial };
+            world.set_accel_backend(want);
+            assert_eq!(world.active_backend(), want, "requested backend is the active one");
+            world.install_router(&[LinkId(5)]);
+            let mut next = 0u32;
+            for t in 0..3000 {
+                if t % 3 == 0 && world.spawn_to(next, LinkId(0), LinkId(5), 12.0, DriverConfig::car()) {
+                    next += 1;
+                }
+                world.step();
+            }
+            assert_eq!(world.crashed(), 0, "gpu={gpu}: rerouting stays collision-free");
+            assert_eq!(world.leaked(), 0, "gpu={gpu}: no car vanishes at a node");
+            Some(world.exited())
+        };
+        let serial = run(false).unwrap();
+        let Some(gpu) = run(true) else {
+            eprintln!("no GPU adapter; skipping GPU accel step test");
+            return;
+        };
+        assert!(gpu > 20, "the GPU-backed sim keeps traffic flowing, got {gpu}");
+        let ratio = gpu as f64 / serial as f64;
+        assert!((0.6..1.7).contains(&ratio), "GPU throughput {gpu} tracks serial {serial} (ratio {ratio:.2})");
     }
 
     fn approach_lane(net: &Network) -> LaneId {
@@ -2382,6 +2773,26 @@ mod tests {
         .build()
     }
 
+    #[test]
+    fn inflow_spreads_across_a_multilane_entry() {
+        // A 3-lane gateway: three back-to-back spawns land on three distinct lanes,
+        // not stacked on the median lane — so a wide road can physically accept its
+        // full per-lane rush-hour inflow. A fourth (all entrances now occupied) is
+        // refused, which is the correct backpressure.
+        let net = OsmMap {
+            nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 300.0, 0.0)],
+            links: vec![LinkSpec::oneway(1, 2, 3, 29.0)],
+        }
+        .build();
+        let mut w = NetWorld::new(net, cfg());
+        for id in 0..3 {
+            assert!(w.spawn_to(id, LinkId(0), LinkId(0), 29.0, DriverConfig::car()), "spawn {id} accepted");
+        }
+        let lanes: std::collections::BTreeSet<u32> = w.vehicles().iter().map(|v| v.lane.0).collect();
+        assert_eq!(lanes.len(), 3, "the three entrants occupy three distinct lanes, got {lanes:?}");
+        assert!(!w.spawn_to(3, LinkId(0), LinkId(0), 29.0, DriverConfig::car()), "every lane occupied → spawn refused");
+    }
+
     fn packed_queue(cong: CongestionConfig) -> (NetWorld, u32) {
         // A single link packed near jam density, feeding a gateway — the queued state
         // the congestion LOD is meant to engage on.
@@ -2735,6 +3146,75 @@ mod tests {
             assert_eq!(world.crashed(), 0, "flow-field-routed traffic stays collision-free (seed {seed})");
             assert!(world.exited() > 0, "vehicles complete boundary trips (seed {seed}), got {}", world.exited());
             assert_eq!(world.leaked(), 0, "no car disappears at an intersection (seed {seed}), leaked {}", world.leaked());
+        }
+    }
+
+    #[test]
+    fn sleep_scheduler_matches_the_all_cars_step() {
+        // The active-set scheduler must drive a congesting network as safely as the
+        // all-cars reference and carry comparable throughput — it changes which cars run
+        // the full gather, not the physics of a car that is actually deciding. The
+        // `corridor_with_signal` scenario backs its two-lane arterial into a standing
+        // queue behind the signal (a *non-merge* approach, so the queue sleeps), while
+        // the cross street keeps the intersection busy. Runs the same demand with the
+        // scheduler off (reference) vs on and compares.
+        let run = |sleep: bool| {
+            let cfg = SimConfig { sleep_scheduler: sleep, ..cfg() };
+            let mut world = NetWorld::new(corridor_with_signal(), cfg);
+            // dests: link 1 (arterial through, 1→2→4), link 3 (cross, 3→2→5).
+            world.install_router(&[LinkId(1), LinkId(3)]);
+            let mut next = 0u32;
+            let mut peak_asleep = 0usize;
+            for t in 0..4000 {
+                // Push both approaches; spawn_to refuses when the entrance is occupied,
+                // which becomes natural inflow backpressure (a standing queue at the red).
+                if world.spawn_to(next, LinkId(0), LinkId(1), 15.0, DriverConfig::car()) {
+                    next += 1;
+                }
+                if t % 2 == 0 && world.spawn_to(next, LinkId(2), LinkId(3), 12.0, DriverConfig::car()) {
+                    next += 1;
+                }
+                world.step();
+                peak_asleep = peak_asleep.max(world.asleep_count());
+            }
+            assert_eq!(world.crashed(), 0, "sleep={sleep}: stays collision-free");
+            assert_eq!(world.leaked(), 0, "sleep={sleep}: no car vanishes at a node");
+            (world.exited(), peak_asleep)
+        };
+        let (ref_exit, ref_asleep) = run(false);
+        let (sched_exit, sched_asleep) = run(true);
+        assert_eq!(ref_asleep, 0, "the reference all-cars step never sleeps a car");
+        assert!(sched_asleep > 0, "the scheduler actually sleeps queued cars, got {sched_asleep}");
+        assert!(sched_exit > 0, "the scheduled run keeps traffic flowing, got {sched_exit}");
+        let ratio = sched_exit as f64 / ref_exit as f64;
+        assert!((0.85..1.18).contains(&ratio), "scheduler throughput {sched_exit} tracks reference {ref_exit} (ratio {ratio:.2})");
+    }
+
+    #[test]
+    fn sleep_scheduler_stays_collision_free_on_the_real_map() {
+        // The safety guarantee within the model's *guaranteed envelope*: the real city
+        // under the same boundary demand the all-cars step keeps collision-free
+        // (`real_map_boundary_demand_routes_live_and_stays_safe`), now with the scheduler
+        // on. Must stay crash- and leak-free and keep traffic flowing.
+        use super::super::demand::{self, DemandGenerator};
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let net = super::super::map::OsmMap::from_json(&text).expect("map json").build();
+        for seed in 0..4u64 {
+            let mut world = NetWorld::new(net.clone(), SimConfig { sleep_scheduler: true, ..cfg() });
+            let pairs = demand::boundary_od_pairs(&world.network, seed, 16);
+            let mut gen = DemandGenerator::new(&world, &pairs, seed);
+            world.install_router(&gen.destinations());
+            let mut peak_asleep = 0usize;
+            for _ in 0..1500 {
+                gen.step(&mut world, cfg().dt);
+                world.step();
+                peak_asleep = peak_asleep.max(world.asleep_count());
+            }
+            assert_eq!(world.crashed(), 0, "scheduler stays collision-free on the real map (seed {seed})");
+            assert_eq!(world.leaked(), 0, "scheduler leaks no car at a node (seed {seed})");
+            assert!(world.exited() > 0, "scheduled traffic completes trips (seed {seed})");
+            assert!(peak_asleep > 0, "the scheduler sleeps queued cars on the real map (seed {seed})");
         }
     }
 

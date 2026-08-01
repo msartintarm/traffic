@@ -28,9 +28,9 @@ pub struct OdPair {
 pub struct DemandSources {
     pub highway: bool,
     pub surface: bool,
-    /// Drive the freeway stream at real rush-hour peak volumes — each US-101 / I-280
-    /// gateway pushes its lane count × [`RUSH_HOUR_VEH_PER_LANE_HOUR`] instead of the
-    /// generic capacity-scaled rate, saturating the freeways the way a peak commute does.
+    /// Drive the whole map by the simulated time of day: freeway gateways at their
+    /// real per-lane PeMS volumes and surface streets by the arterial diurnal shape,
+    /// so the network builds and fades the way a real peak commute does.
     pub rush_hour: bool,
 }
 
@@ -63,7 +63,24 @@ pub fn od_pairs(net: &Network, seed: u64, target: usize, sources: DemandSources)
     if pairs.is_empty() {
         pairs = boundary_od_pairs(net, seed, target);
     }
+    calibrate_origin_inflow(&mut pairs);
     pairs
+}
+
+/// Hold each origin's *aggregate* off-peak inflow to one `capacity_rate` by
+/// splitting it across the pairs sharing that origin (each already carries the full
+/// rate). Without this, a gateway that happens to seed many OD pairs would inject
+/// `pairs × rate` — harmless while injection stacked everything on one lane and the
+/// entrance throttled it, but a flood once inflow fills all lanes. Mirrors the
+/// rush-hour path, which already divides a gateway's volume by its pair `share`.
+fn calibrate_origin_inflow(pairs: &mut [OdPair]) {
+    let mut count: std::collections::HashMap<LinkId, usize> = std::collections::HashMap::new();
+    for p in pairs.iter() {
+        *count.entry(p.origin).or_insert(0) += 1;
+    }
+    for p in pairs.iter_mut() {
+        p.rate_per_sec /= count[&p.origin] as f64;
+    }
 }
 
 /// Hour of day (0–24) the rush-hour clock starts at — mid pre-peak build-up, so the
@@ -74,21 +91,28 @@ const RUSH_START_HOUR: f64 = 5.5;
 /// still have real time to form and clear the queues it creates.
 const RUSH_DAY_COMPRESSION: f64 = 60.0;
 
-/// One origin→destination stream and how fast it spawns. Off-peak (or on a surface
-/// street) it fires at a fixed `base_rate`; a freeway stream under rush hour instead
-/// follows its route's real diurnal profile via `rush`.
+/// One origin→destination stream and how fast it spawns. Off-peak it fires at a
+/// fixed `base_rate`; under rush hour `rush` makes it follow the time of day.
 struct OdStream {
     origin: LinkId,
     dest: LinkId,
     /// Generic (off-peak) spawn rate, veh/sec.
     base_rate: f64,
-    /// Set when rush hour is on and this stream enters on a freeway.
-    rush: Option<RushRate>,
+    /// Set when rush hour is on: how this stream tracks the simulated time of day.
+    rush: Option<RushMode>,
 }
 
-/// The time-varying spawn model for a freeway stream at rush hour: its gateway's lane
-/// count × the route's per-lane hourly volume, split across the gateway's pairs so the
-/// aggregate inflow stays calibrated to real data however the trips fan out.
+/// How a stream's spawn rate varies through the day under rush hour.
+#[derive(Clone, Copy)]
+enum RushMode {
+    /// Freeway gateway: its lane count × the route's real per-lane PeMS hourly volume,
+    /// split across the gateway's pairs so the aggregate stays calibrated to real data.
+    Freeway(RushRate),
+    /// Surface street: the calibrated `base_rate` scaled by the arterial diurnal
+    /// multiplier (see [`rush_hour::arterial_factor`]) so it breathes with the commute.
+    Surface,
+}
+
 #[derive(Clone, Copy)]
 struct RushRate {
     lanes: f64,
@@ -112,7 +136,16 @@ pub struct DemandGenerator {
     /// Simulated seconds-into-day while the rush-hour profile is driving the freeway
     /// streams; `None` off-peak. Advances by [`RUSH_DAY_COMPRESSION`] each sim second.
     rush_clock: Option<f64>,
+    /// Per-gateway (origin link) backlog of fired-but-not-yet-admitted trips
+    /// `(stream, id)`. When demand outruns what the entrance can accept, trips wait
+    /// here instead of being dropped, and are released FIFO as lanes clear — a real
+    /// metered gateway queue that conserves demand and grows/dissipates with the peak.
+    queues: std::collections::BTreeMap<u32, std::collections::VecDeque<(usize, u32)>>,
 }
+
+/// Max backlog held per gateway before further trips spill (are dropped) — the
+/// off-map storage a gateway queue can represent before it backs out of the region.
+const MAX_QUEUE: usize = 400;
 
 impl DemandGenerator {
     pub fn new(world: &NetWorld, pairs: &[OdPair], seed: u64) -> Self {
@@ -124,7 +157,14 @@ impl DemandGenerator {
         Self {
             pairs, seed, tick: 0, next_id: 0, spawned: 0,
             rate_scale: 1.0, entry_speed_cap: f64::INFINITY, rush_clock: None,
+            queues: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Trips currently waiting at gateways to enter (demand the entrances can't yet
+    /// admit) — the metered backlog, for the UI to surface rush-hour pressure.
+    pub fn queued(&self) -> u32 {
+        self.queues.values().map(|q| q.len()).sum::<usize>() as u32
     }
 
     pub fn spawned(&self) -> u32 {
@@ -132,9 +172,10 @@ impl DemandGenerator {
     }
 
     /// Switch the freeway streams onto the real diurnal PeMS profile (see
-    /// [`rush_hour`]) or back to their generic rate. When on, each freeway gateway
-    /// feeds in its lane count × the route's per-lane hourly volume, evolving as the
-    /// simulated time of day advances. No effect on surface streams.
+    /// [`rush_hour`]) or back to the generic flat rate. When on, the whole map tracks
+    /// the simulated time of day: each freeway gateway feeds in its lane count × the
+    /// route's per-lane PeMS volume, and each surface street scales by the arterial
+    /// diurnal shape — so both breathe with the commute as the day advances.
     pub fn set_rush_hour(&mut self, net: &Network, enabled: bool) {
         if !enabled {
             for s in &mut self.pairs {
@@ -145,13 +186,18 @@ impl DemandGenerator {
         }
         for i in 0..self.pairs.len() {
             let o = self.pairs[i].origin;
-            self.pairs[i].rush = boundary::is_highway_link(net, o).then(|| {
+            self.pairs[i].rush = Some(if boundary::is_highway_link(net, o) {
                 let n = self.pairs.iter().filter(|s| s.origin == o).count();
-                RushRate {
+                // The gateway's travel direction picks the matching directional curve,
+                // so an inbound and an outbound freeway gate peak at different times.
+                let northbound = net.node(net.link(o).to).position[1] > net.node(net.link(o).from).position[1];
+                RushMode::Freeway(RushRate {
                     lanes: net.link(o).lane_count as f64,
-                    profile: rush_hour::profile_for(net.link_ref(o)),
+                    profile: rush_hour::profile_for(net.link_ref(o), northbound),
                     share: 1.0 / n as f64,
-                }
+                })
+            } else {
+                RushMode::Surface
             });
         }
         self.rush_clock.get_or_insert(RUSH_START_HOUR * 3600.0);
@@ -191,34 +237,67 @@ impl DemandGenerator {
     pub fn step(&mut self, world: &mut NetWorld, dt: f64) {
         let costs = world.live_link_costs();
         let day = self.rush_clock;
+
+        // 1. Release each gateway's backlog first, oldest trip first, until its
+        //    entrance is occupied again — so waiting demand takes priority over fresh.
+        let origins: Vec<u32> = self.queues.keys().copied().collect();
+        for o in origins {
+            while let Some(&(stream, id)) = self.queues[&o].front() {
+                if self.launch(world, &costs, stream, id) {
+                    self.queues.get_mut(&o).unwrap().pop_front();
+                    self.spawned += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // 2. Fire fresh trips from each stream's Poisson rate; a trip the entrance
+        //    can't admit joins its gateway's queue rather than vanishing.
         for i in 0..self.pairs.len() {
             let s = &self.pairs[i];
-            let (origin, dest) = (s.origin, s.dest);
             let rate = match (day, s.rush) {
-                (Some(t), Some(r)) => r.lanes * rush_hour::interp(r.profile, t) / 3600.0 * r.share,
+                (Some(t), Some(RushMode::Freeway(r))) => r.lanes * rush_hour::interp(r.profile, t) / 3600.0 * r.share,
+                (Some(t), Some(RushMode::Surface)) => s.base_rate * rush_hour::arterial_factor(t),
                 _ => s.base_rate,
             };
             if rng::uniform01(self.seed, i as u32, self.tick, Stream::RouteChoice) >= (rate * self.rate_scale * dt).min(1.0) {
                 continue;
             }
-            let driver = class_of(self.seed, self.next_id).driver().sample(self.seed, self.next_id);
-            let speed = entry_speed(&world.network, origin, &driver).min(self.entry_speed_cap);
-            let spawned = if world.router_knows(dest) {
-                world.spawn_to(self.next_id, origin, dest, speed, driver)
-            } else if let Some(route) = world.network.route_links_with_costs(origin, dest, &costs) {
-                world.spawn_routed(self.next_id, route, speed, driver)
-            } else {
-                false
-            };
-            if spawned {
-                self.spawned += 1;
-            }
+            let (origin, id) = (s.origin, self.next_id);
             self.next_id += 1;
+            if self.launch(world, &costs, i, id) {
+                self.spawned += 1;
+            } else {
+                let q = self.queues.entry(origin.0).or_default();
+                if q.len() < MAX_QUEUE {
+                    q.push_back((i, id));
+                }
+            }
         }
+
         if let Some(t) = &mut self.rush_clock {
             *t = (*t + dt * RUSH_DAY_COMPRESSION).rem_euclid(86_400.0);
         }
         self.tick += 1;
+    }
+
+    /// Attempt to admit trip `id` of stream `stream` at its origin: destination-routed
+    /// via the live flow-field when the router knows the destination, else on a
+    /// cost-routed link path. `false` if the entrance is occupied (try again later) or
+    /// no route exists. Driver and entry speed are derived from `id`, so a queued trip
+    /// keeps its identity across the wait.
+    fn launch(&self, world: &mut NetWorld, costs: &[u64], stream: usize, id: u32) -> bool {
+        let (origin, dest) = (self.pairs[stream].origin, self.pairs[stream].dest);
+        let driver = class_of(self.seed, id).driver().sample(self.seed, id);
+        let speed = entry_speed(&world.network, origin, &driver).min(self.entry_speed_cap);
+        if world.router_knows(dest) {
+            world.spawn_to(id, origin, dest, speed, driver)
+        } else if let Some(route) = world.network.route_links_with_costs(origin, dest, costs) {
+            world.spawn_routed(id, route, speed, driver)
+        } else {
+            false
+        }
     }
 }
 
@@ -343,13 +422,49 @@ fn pick(pool: &[LinkId], seed: u64, attempt: u64) -> Option<LinkId> {
     (!pool.is_empty()).then(|| pool[(rng::hash(seed, 61, attempt, Stream::RouteChoice) as usize) % pool.len()])
 }
 
-/// Pick a link from `pool` that is routable from `e` (a few candidate tries).
-fn pick_routable(net: &Network, e: LinkId, pool: &[LinkId], seed: u64, attempt: u64) -> Option<LinkId> {
+/// Gravity-model distance-decay exponent: trip attraction falls as `1/dist^β`. 1.0 is
+/// at the gentle end of the standard urban range (~1.0–2.0) — it still favours nearer,
+/// bigger roads, but a steeper decay over-concentrates trips onto a handful of nearby
+/// destinations, bursting demand into merges hard enough to expose collisions.
+const GRAVITY_BETA: f64 = 1.0;
+/// Distance floor (m) so co-located destinations don't get an unbounded weight.
+const GRAVITY_MIN_DIST: f64 = 40.0;
+
+/// A link's midpoint, the point trips gravitate toward / from.
+fn link_centroid(net: &Network, link: LinkId) -> [f64; 2] {
+    let l = net.link(link);
+    let (a, b) = (net.node(l.from).position, net.node(l.to).position);
+    [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5]
+}
+
+/// Gravity draw from `pool`: destination `d` is chosen with probability ∝
+/// `link_capacity(d) / dist(o, d)^β` — the classic gravity model, so trips prefer
+/// bigger (higher-capacity, AADT-correlated) roads and nearer ones over a uniform
+/// scatter. `None` only for an empty pool.
+fn gravity_pick(net: &Network, o: LinkId, pool: &[LinkId], seed: u64, salt: u32, attempt: u64) -> Option<LinkId> {
     if pool.is_empty() {
         return None;
     }
+    let op = link_centroid(net, o);
+    let mut total = 0.0;
+    let mut cum = Vec::with_capacity(pool.len());
+    for &d in pool {
+        let dp = link_centroid(net, d);
+        let dist = (op[0] - dp[0]).hypot(op[1] - dp[1]).max(GRAVITY_MIN_DIST);
+        total += link_capacity(net, d) / dist.powf(GRAVITY_BETA);
+        cum.push(total);
+    }
+    if total <= 0.0 {
+        return None;
+    }
+    let r = rng::uniform01(seed, salt, attempt, Stream::RouteChoice) * total;
+    Some(pool[cum.partition_point(|&c| c < r).min(pool.len() - 1)])
+}
+
+/// Gravity-weighted pick from `pool` that is routable from `e` (a few candidate tries).
+fn pick_routable(net: &Network, e: LinkId, pool: &[LinkId], seed: u64, attempt: u64) -> Option<LinkId> {
     for k in 0..8u64 {
-        let d = pool[(rng::hash(seed, 62, attempt.wrapping_mul(8).wrapping_add(k), Stream::RouteChoice) as usize) % pool.len()];
+        let d = gravity_pick(net, e, pool, seed, 62, attempt.wrapping_mul(8).wrapping_add(k))?;
         if d != e && net.route_links(e, d).is_some() {
             return Some(d);
         }
@@ -376,11 +491,14 @@ fn sample_pairs(
     let mut attempt = 0u64;
     while found < want && attempt < want as u64 * 40 + 200 {
         let o = origins[(rng::hash(seed, salt * 2, attempt, Stream::RouteChoice) as usize) % origins.len()];
-        let d = dests[(rng::hash(seed, salt * 2 + 1, attempt, Stream::RouteChoice) as usize) % dests.len()];
+        // Destination by gravity (bigger/nearer roads win), not a uniform scatter.
+        let d = gravity_pick(net, o, dests, seed, salt * 2 + 1, attempt);
         attempt += 1;
-        if o != d && net.route_links(o, d).is_some_and(|r| r.len() >= 2) {
-            out.push(OdPair { origin: o, dest: d, rate_per_sec: capacity_rate(net, o) });
-            found += 1;
+        if let Some(d) = d {
+            if o != d && net.route_links(o, d).is_some_and(|r| r.len() >= 2) {
+                out.push(OdPair { origin: o, dest: d, rate_per_sec: capacity_rate(net, o) });
+                found += 1;
+            }
         }
     }
 }
@@ -643,20 +761,107 @@ mod tests {
             g.pairs
                 .iter()
                 .filter(|s| s.origin == LinkId(0))
-                .map(|s| {
-                    let r = s.rush.expect("freeway stream is on the profile");
-                    r.lanes * rush_hour::interp(r.profile, secs) / 3600.0 * r.share
+                .map(|s| match s.rush.expect("freeway stream is on the profile") {
+                    RushMode::Freeway(r) => r.lanes * rush_hour::interp(r.profile, secs) / 3600.0 * r.share,
+                    RushMode::Surface => unreachable!("a freeway gateway stream is Freeway mode"),
                 })
                 .sum::<f64>()
         };
         let peak = aggregate_at(&gen, 7.0 * 3600.0);
-        assert!((peak - 3.0 * 1484.0 / 3600.0).abs() < 1e-6, "AM-peak gateway inflow = lanes × US-101 curve, got {peak}");
+        // The gateway (link 0) runs W→E, so its north-ward component is zero and the
+        // direction resolves to southbound → the US-101 SB curve (1507 at 07:00).
+        let expected = 3.0 * rush_hour::interp(&rush_hour::US101_S, 7.0 * 3600.0) / 3600.0;
+        assert!((peak - expected).abs() < 1e-6, "AM-peak gateway inflow = 3 lanes × US-101 SB curve, got {peak}");
         // The curve varies through the day: the 3am trough is far below the 7am peak.
         assert!(aggregate_at(&gen, 3.0 * 3600.0) < peak * 0.2, "pre-dawn is a small fraction of the peak");
 
         gen.set_rush_hour(&world.network, false);
         assert!(!gen.rush_hour_active());
         assert!(gen.pairs.iter().all(|s| s.rush.is_none()), "toggling off restores the generic rate");
+    }
+
+    #[test]
+    fn rush_hour_makes_surface_streams_breathe_with_the_arterial_curve() {
+        // On a plain surface corridor (no freeway ref), rush hour puts every stream in
+        // Surface mode — its base rate scaled by the arterial diurnal — so the surface
+        // network peaks with the commute too, not just the freeways.
+        let net = corridor().build(); // 1-lane, 20 m/s → surface, not highway
+        let world = NetWorld::new(net, SimConfig::default_config());
+        let pairs = boundary_od_pairs(&world.network, 3, 10);
+        assert!(!pairs.is_empty(), "the corridor yields surface streams");
+        let mut gen = DemandGenerator::new(&world, &pairs, 3);
+
+        gen.set_rush_hour(&world.network, true);
+        assert!(
+            gen.pairs.iter().all(|s| matches!(s.rush, Some(RushMode::Surface))),
+            "surface streams track the arterial diurnal under rush hour"
+        );
+        // The multiplier genuinely swings the rate: the PM peak is several× pre-dawn.
+        assert!(rush_hour::arterial_factor(17.0 * 3600.0) > rush_hour::arterial_factor(3.0 * 3600.0) * 5.0);
+
+        gen.set_rush_hour(&world.network, false);
+        assert!(gen.pairs.iter().all(|s| s.rush.is_none()), "toggling off restores the flat rate");
+    }
+
+    #[test]
+    fn gravity_favours_bigger_destinations_over_a_uniform_scatter() {
+        // From one origin, two destinations equidistant but very different capacity: a
+        // 3-lane, 25 m/s arterial vs a 1-lane, 11 m/s local street. The gravity draw
+        // should pick the arterial the large majority of the time (capacity 75 vs 11 →
+        // ~87%), where a uniform draw would be 50/50.
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(0, 0.0, 0.0),    // hub
+                NodeSpec::uncontrolled(1, -200.0, 0.0), // origin start
+                NodeSpec::uncontrolled(2, 0.0, 200.0),  // arterial dest end
+                NodeSpec::uncontrolled(3, 0.0, -200.0), // local dest end (equidistant)
+            ],
+            links: vec![
+                LinkSpec::oneway(1, 0, 1, 15.0), // origin approach
+                LinkSpec::oneway(0, 2, 3, 25.0), // arterial exit — high capacity
+                LinkSpec::oneway(0, 3, 1, 11.0), // local exit — low capacity
+            ],
+        }
+        .build();
+        let by = |lanes: u32, to_north: bool| {
+            (0..net.links.len() as u32).map(LinkId).find(|&l| {
+                let link = net.link(l);
+                link.lane_count == lanes && (net.node(link.to).position[1] > 0.0) == to_north && net.node(link.from).position[0].abs() < 1.0
+            })
+        };
+        let origin = (0..net.links.len() as u32).map(LinkId).find(|&l| net.node(net.link(l).from).position[0] < -100.0).unwrap();
+        let (arterial, local) = (by(3, true).unwrap(), by(1, false).unwrap());
+        let pool = vec![arterial, local];
+        let big = (0..2000u64).filter(|&a| gravity_pick(&net, origin, &pool, 7, 5, a) == Some(arterial)).count();
+        assert!(big > 1600, "gravity strongly favours the higher-capacity arterial: {big}/2000");
+    }
+
+    #[test]
+    fn excess_demand_queues_at_the_gateway_and_drains() {
+        // A 1-lane gateway fed far faster than one lane can admit: trips that can't
+        // enter wait in the gateway queue (conserved, not dropped) and the backlog
+        // drains once demand eases — a real metered gateway queue.
+        let net = corridor().build(); // 1-lane entry (link 0) → exit (link 1)
+        let mut world = NetWorld::new(net, SimConfig::default_config());
+        let pairs = vec![OdPair { origin: LinkId(0), dest: LinkId(1), rate_per_sec: 5.0 }];
+        let mut gen = DemandGenerator::new(&world, &pairs, 1);
+        world.install_router(&gen.destinations());
+        for _ in 0..300 {
+            gen.step(&mut world, 0.5);
+            world.step();
+        }
+        assert!(gen.queued() > 0, "excess demand backs up at the gateway, got {}", gen.queued());
+
+        // Ease off: with no new demand the backlog drains as the entrance clears, and
+        // those waiting trips are admitted (spawned rises) rather than lost.
+        gen.set_rate_scale(0.0);
+        let (backlog, spawned_before) = (gen.queued(), gen.spawned());
+        for _ in 0..600 {
+            gen.step(&mut world, 0.5);
+            world.step();
+        }
+        assert!(gen.queued() < backlog, "the queue drains once demand eases: {backlog} -> {}", gen.queued());
+        assert!(gen.spawned() > spawned_before, "queued trips get admitted, not dropped");
     }
 
     #[test]

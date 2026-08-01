@@ -81,6 +81,9 @@ pub struct Instance {
     pub prev_heading: f32,
     /// 0 = coasting, 1 = braking; scales the rear-lamp emissive.
     pub brake: f32,
+    /// Turn-signal side, gated by the blink phase: `-1` left lamp lit, `+1` right
+    /// lamp lit, `0` none. The bridge toggles it on/off so the shader stays timeless.
+    pub blinker: f32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -249,7 +252,7 @@ mod tests {
     fn instance_layout_matches_the_shader_stride() {
         // The instanced vertex buffer packs these fields back-to-back; the GPU
         // attribute offsets and scene.wgsl's `@location`s assume this layout.
-        assert_eq!(std::mem::size_of::<Instance>(), 56);
+        assert_eq!(std::mem::size_of::<Instance>(), 60);
         assert_eq!(std::mem::offset_of!(Instance, prev_pos), 8);
         assert_eq!(std::mem::offset_of!(Instance, control), 16);
         assert_eq!(std::mem::offset_of!(Instance, scale), 24);
@@ -257,6 +260,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Instance, heading), 44);
         assert_eq!(std::mem::offset_of!(Instance, prev_heading), 48);
         assert_eq!(std::mem::offset_of!(Instance, brake), 52);
+        assert_eq!(std::mem::offset_of!(Instance, blinker), 56);
     }
 
     #[test]

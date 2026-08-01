@@ -133,11 +133,16 @@ impl VehicleClass {
 pub struct SimConfig {
     pub dt: f64,
     pub seed: u64,
+    /// Active-set scheduler: when set, vehicles queued behind a stopped leader skip the
+    /// full gather each tick (their accel is leader-dominated), so per-tick work tracks
+    /// the *deciding* fraction rather than the whole fleet. Off by default; the all-cars
+    /// step stays the behavioural reference it is A/B'd against.
+    pub sleep_scheduler: bool,
 }
 
 impl SimConfig {
     pub const fn default_config() -> Self {
-        Self { dt: 0.2, seed: 0xC0FFEE }
+        Self { dt: 0.2, seed: 0xC0FFEE, sleep_scheduler: false }
     }
 }
 

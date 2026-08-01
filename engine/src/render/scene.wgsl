@@ -22,6 +22,9 @@ struct VOut {
     @location(0) color: vec3<f32>,
     @location(1) light: f32,
     @location(2) brake: f32,
+    // 1.0 when this vertex is a turn-signal lamp on the side the instance is
+    // signalling (and the blink phase is lit); 0.0 otherwise.
+    @location(3) blink: f32,
 };
 
 @vertex
@@ -43,6 +46,7 @@ fn vs_static(
     o.color = color;
     o.light = light;
     o.brake = 0.0;
+    o.blink = 0.0;
     return o;
 }
 
@@ -59,6 +63,7 @@ fn vs_instanced(
     @location(8) i_heading: f32,
     @location(9) i_prev_heading: f32,
     @location(10) i_brake: f32,
+    @location(11) i_blinker: f32,
 ) -> VOut {
     // Quadratic Bézier prev → control → current: a straight line when the
     // control is the midpoint, a corner-hugging arc when it's an intersection.
@@ -72,11 +77,20 @@ fn vs_instanced(
     let rotated = vec2<f32>(local.x * c - local.y * s, local.x * s + local.y * c);
     let world = pos + rotated;
 
+    // Light 4 = left signal lamp, 5 = right. Lit when the instance is signalling
+    // that side (i_blinker < 0 left, > 0 right); the bridge already gated i_blinker
+    // by the blink phase, so a non-zero value means "on this frame".
+    var blink = 0.0;
+    if ((v_light > 3.5 && v_light < 4.5 && i_blinker < -0.5) || (v_light > 4.5 && i_blinker > 0.5)) {
+        blink = 1.0;
+    }
+
     var o: VOut;
     o.clip = cam.view_proj * vec4<f32>(world, 0.0, 1.0);
     o.color = v_color * i_color;
     o.light = v_light;
     o.brake = i_brake;
+    o.blink = blink;
     return o;
 }
 
@@ -92,5 +106,10 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     if (in.light < 2.5) {
         return vec4<f32>(in.color * 0.7, 1.0);
     }
-    return vec4<f32>(in.color, 0.45); // congestion overlay (translucent)
+    if (in.light < 3.5) {
+        return vec4<f32>(in.color, 0.45); // congestion overlay (translucent)
+    }
+    // Turn-signal lamp (light 4/5): amber when blinking on, else fades to the body.
+    let amber = vec3<f32>(1.0, 0.62, 0.0);
+    return vec4<f32>(mix(in.color * 0.92, amber, in.blink), 1.0);
 }

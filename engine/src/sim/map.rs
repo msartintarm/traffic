@@ -359,6 +359,7 @@ impl OsmMap {
             };
             net.nodes[i].control = control;
         }
+        coordinate_green_waves(&mut net);
         net
     }
 }
@@ -515,6 +516,150 @@ fn assign_signal_program(net: &mut Network, node: NodeId, plan: SignalPlan) -> N
         }
     }
     NodeControl::Signalized(program)
+}
+
+/// Coordinate signalized arterial corridors into green waves. OSM carries no signal
+/// timing, so every imported signal starts at `offset = 0` (all synchronized — the
+/// worst case for progression). This walks each named arterial between consecutive
+/// signals and offsets each program so its **through** phase opens just as a platoon
+/// travelling the corridor at road speed arrives. Best-effort along one direction per
+/// corridor; a mismatched cycle only degrades the coordination — the conflict-built
+/// phases (and thus safety) are never touched.
+fn coordinate_green_waves(net: &mut Network) {
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    const SPEED_FLOOR: f64 = 5.0; // m/s, so a slow arterial still gets a sane travel time
+    const MAX_HOPS: usize = 24; // guard against a road that loops back on itself
+    const MIN_ALIGN: f64 = 0.3; // a continuation link must head roughly the same way
+
+    // Compute every offset while only *reading* the network, then apply them — so the
+    // read-only walk/lookup closures don't clash with mutating `net.programs`.
+    let offsets: Vec<(usize, f64)> = {
+        let mut sig: BTreeMap<u32, ProgramId> = BTreeMap::new();
+        for (i, n) in net.nodes.iter().enumerate() {
+            if let NodeControl::Signalized(p) = n.control {
+                sig.insert(i as u32, p);
+            }
+        }
+        if sig.len() < 2 {
+            return;
+        }
+        let mut out_links: Vec<Vec<u32>> = vec![Vec::new(); net.nodes.len()];
+        for i in 0..net.links.len() {
+            let l = net.link(LinkId(i as u32));
+            if l.layer == 0 {
+                out_links[l.from.idx()].push(i as u32);
+            }
+        }
+        let link_len = |i: u32| net.polylines[i as usize].windows(2).map(|w| distance(w[0], w[1])).sum::<f64>();
+
+        // Walk the same-named arterial from `start` (a link leaving a signal) to the
+        // next signal; returns (that node, travel time, the link arriving there).
+        let walk = |start: u32| -> Option<(u32, f64, u32)> {
+            let name = &net.link_names[start as usize];
+            if name.is_empty() {
+                return None;
+            }
+            let mut cur = start;
+            let mut cum = 0.0;
+            for _ in 0..MAX_HOPS {
+                let l = net.link(LinkId(cur));
+                cum += link_len(cur) / net.lane(l.lane_start).speed_limit.max(SPEED_FLOOR);
+                if sig.contains_key(&l.to.0) {
+                    return Some((l.to.0, cum, cur));
+                }
+                let arr = net.arrival_dir(LinkId(cur));
+                let mut best: Option<(u32, f64)> = None;
+                for &nx in &out_links[l.to.idx()] {
+                    if &net.link_names[nx as usize] != name || net.link(LinkId(nx)).to == l.from {
+                        continue; // different road, or turning straight back
+                    }
+                    let dep = net.departure_dir(LinkId(nx));
+                    let align = arr[0] * dep[0] + arr[1] * dep[1];
+                    if align > MIN_ALIGN && best.map_or(true, |(_, a)| align > a) {
+                        best = Some((nx, align));
+                    }
+                }
+                cur = best?.0;
+            }
+            None
+        };
+
+        // Green-start time (into the cycle) of the corridor's through phase at `node`,
+        // found via a straight-through movement along `corridor_link`.
+        let through_start = |node: u32, corridor_link: u32| -> Option<f64> {
+            let prog = &net.programs[sig.get(&node)?.idx()];
+            for m in 0..net.movements.len() {
+                let mv = net.movements[m];
+                if mv.node.0 != node || net.movement_turn(MovementId(m as u32)) != TurnType::Through {
+                    continue;
+                }
+                if net.lane(mv.from_lane).link.0 != corridor_link && net.lane(mv.to_lane).link.0 != corridor_link {
+                    continue;
+                }
+                let bit = net.groups[mv.signal_group?.idx()].bit;
+                let mut acc = 0.0;
+                for ph in &prog.phases {
+                    if ph.green_mask & (1u64 << bit) != 0 {
+                        return Some(acc);
+                    }
+                    acc += ph.length();
+                }
+            }
+            None
+        };
+
+        // Corridor adjacency: node → [(neighbour, travel time, link leaving here, link arriving there)].
+        let mut adj: BTreeMap<u32, Vec<(u32, f64, u32, u32)>> = BTreeMap::new();
+        for &s in sig.keys() {
+            for &start in &out_links[s as usize] {
+                if let Some((to, time, arriving)) = walk(start) {
+                    adj.entry(s).or_default().push((to, time, start, arriving));
+                }
+            }
+        }
+
+        // BFS each corridor from its lowest-id signal (deterministic); cumulative
+        // travel time sets each signal's offset so the through green opens on arrival.
+        let mut out = Vec::new();
+        let mut visited: BTreeSet<u32> = BTreeSet::new();
+        for &root in sig.keys() {
+            if !visited.insert(root) {
+                continue;
+            }
+            let root_link = adj.get(&root).and_then(|e| e.first()).map(|&(_, _, start, _)| start);
+            let mut members: Vec<(u32, f64, Option<u32>)> = Vec::new();
+            let mut queue: VecDeque<(u32, f64, Option<u32>)> = VecDeque::from([(root, 0.0, root_link)]);
+            while let Some(item) = queue.pop_front() {
+                members.push(item);
+                if let Some(neigh) = adj.get(&item.0) {
+                    let mut ns = neigh.clone();
+                    ns.sort_by_key(|&(m, ..)| m);
+                    for (m, time, _, arriving) in ns {
+                        if visited.insert(m) {
+                            queue.push_back((m, item.1 + time, Some(arriving)));
+                        }
+                    }
+                }
+            }
+            if members.len() < 2 {
+                continue; // an isolated signal isn't a corridor
+            }
+            for (n, cum, link) in members {
+                let pid = sig[&n];
+                let cycle = net.programs[pid.idx()].cycle_length();
+                if let (Some(link), true) = (link, cycle > 1.0) {
+                    if let Some(sp) = through_start(n, link) {
+                        out.push((pid.idx(), (sp - cum).rem_euclid(cycle)));
+                    }
+                }
+            }
+        }
+        out
+    };
+
+    for (idx, offset) in offsets {
+        net.programs[idx].offset = offset;
+    }
 }
 
 fn distance(a: [f64; 2], b: [f64; 2]) -> f64 {
@@ -1127,6 +1272,95 @@ pub fn millbrae_sample() -> Network {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signalized_corridor_is_coordinated_into_a_green_wave() {
+        use super::super::signal::SignalState;
+        // Three signals on one arterial, 300 m apart at 15 m/s (20 s travel each). After
+        // coordination their through greens should open in a ~20 s progression — a green
+        // wave — where the raw import leaves them all synchronized at offset 0.
+        let plan = SignalPlan { green_secs: 20.0, yellow_secs: 4.0, offset: 0.0 };
+        let road = |a, b, name: &str, lanes, sp| {
+            let mut v = LinkSpec::twoway(a, b, lanes, sp).to_vec();
+            for l in &mut v {
+                l.name = name.to_string();
+            }
+            v
+        };
+        let mut links = Vec::new();
+        for (a, b) in [(0, 1), (1, 2), (2, 3), (3, 4)] {
+            links.extend(road(a, b, "Main Street", 2, 15.0)); // the arterial
+        }
+        for (n, e, name) in [(1, 10, "Cross A"), (2, 11, "Cross B"), (3, 12, "Cross C")] {
+            links.extend(road(n, e, name, 1, 12.0)); // a cross street at each signal
+        }
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(0, -300.0, 0.0),
+                NodeSpec::signalized(1, 0.0, 0.0, plan),
+                NodeSpec::signalized(2, 300.0, 0.0, plan),
+                NodeSpec::signalized(3, 600.0, 0.0, plan),
+                NodeSpec::uncontrolled(4, 900.0, 0.0),
+                NodeSpec::uncontrolled(10, 0.0, -200.0),
+                NodeSpec::uncontrolled(11, 300.0, -200.0),
+                NodeSpec::uncontrolled(12, 600.0, -200.0),
+            ],
+            links,
+        }
+        .build();
+
+        // Absolute time each signal's Main-Street through movement turns green.
+        let through_open = |node: NodeId| -> f64 {
+            let NodeControl::Signalized(p) = net.node(node).control else { panic!("signal") };
+            let prog = &net.programs[p.idx()];
+            let bit = (0..net.movements.len() as u32)
+                .find_map(|m| {
+                    let mv = net.movement(MovementId(m));
+                    let (fl, tl) = (net.lane(mv.from_lane).link, net.lane(mv.to_lane).link);
+                    (mv.node == node
+                        && net.movement_turn(MovementId(m)) == TurnType::Through
+                        && net.link_names[fl.idx()] == "Main Street"
+                        && net.link_names[tl.idx()] == "Main Street")
+                        .then(|| net.groups[mv.signal_group.unwrap().idx()].bit)
+                })
+                .expect("a Main-Street through movement");
+            let cycle = prog.cycle_length();
+            let mut t = 0.0;
+            while t < cycle {
+                if prog.state_of(bit, t) == SignalState::Green
+                    && prog.state_of(bit, (t - 0.1).rem_euclid(cycle)) != SignalState::Green
+                {
+                    return t;
+                }
+                t += 0.1;
+            }
+            0.0
+        };
+
+        // The three signals, in corridor order.
+        let mut sigs: Vec<NodeId> = (0..net.nodes.len() as u32)
+            .map(NodeId)
+            .filter(|&n| matches!(net.node(n).control, NodeControl::Signalized(_)))
+            .collect();
+        sigs.sort_by(|&a, &b| net.node(a).position[0].total_cmp(&net.node(b).position[0]));
+        assert_eq!(sigs.len(), 3, "three signals on the corridor");
+
+        let cycle = {
+            let NodeControl::Signalized(p) = net.node(sigs[0]).control else { panic!() };
+            net.programs[p.idx()].cycle_length()
+        };
+        let opens: Vec<f64> = sigs.iter().map(|&n| through_open(n)).collect();
+        // Coordination happened (raw import is offset 0 everywhere → all opens equal).
+        assert!(opens[0] != opens[1] || opens[1] != opens[2], "the signals are staggered, not synchronized: {opens:?}");
+        // Consecutive through greens open ~20 s apart (the travel time) around the cycle.
+        let circ = |a: f64, b: f64| {
+            let d = (a - b).rem_euclid(cycle);
+            d.min(cycle - d)
+        };
+        for w in opens.windows(2) {
+            assert!((circ(w[0], w[1]) - 20.0).abs() < 3.0, "greens progress by the ~20 s travel time: {opens:?} (cycle {cycle})");
+        }
+    }
 
     /// A signalized four-way with every in/out leg, centre node on a signal.
     fn signalized_cross() -> Network {

@@ -135,14 +135,18 @@ struct BatchParams {
     _pad1: u32,
 }
 
-/// Persistent GPU solver for many flow fields at once. Holds the device, pipeline
+/// Persistent GPU solver for many flow fields at once. Holds the device, pipelines
 /// and static CSR-adjacency buffers, plus per-recompute working buffers reused via
 /// `write_buffer` (reallocated only when the destination count changes). One
-/// dispatch relaxes every destination field (`slot_count × link_count` threads).
+/// dispatch stream relaxes every destination field (`slot_count × link_count`
+/// threads) in place, gating itself to a stop once the fields stop changing.
 pub struct GpuFlowField {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    pipeline: wgpu::ComputePipeline,
+    /// The `relax` entry point (`flowfield_batch.wgsl`) — one edge-relaxation pass.
+    relax: wgpu::ComputePipeline,
+    /// The `gate` entry point — latches convergence and resets the changed flag.
+    gate: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
     offsets_buf: wgpu::Buffer,
     targets_buf: wgpu::Buffer,
@@ -153,15 +157,17 @@ pub struct GpuFlowField {
 
 /// The per-recompute buffers, sized for `slot_count` destinations. Persisted so a
 /// recompute writes into them (`queue.write_buffer`) rather than allocating anew.
+/// `dist` is relaxed in place (`atomicMin`), so there is no second ping-pong buffer;
+/// `flags` is the two-word `[changed, done]` convergence state.
 struct Work {
     slot_count: usize,
     params: wgpu::Buffer,
     cost_buf: wgpu::Buffer,
     dests_buf: wgpu::Buffer,
-    buf_a: wgpu::Buffer,
-    buf_b: wgpu::Buffer,
+    dist: wgpu::Buffer,
+    flags: wgpu::Buffer,
     staging: wgpu::Buffer,
-    bind: [wgpu::BindGroup; 2],
+    bind: wgpu::BindGroup,
 }
 
 impl GpuFlowField {
@@ -208,8 +214,8 @@ impl GpuFlowField {
                 entry(2, wgpu::BufferBindingType::Storage { read_only: true }),
                 entry(3, wgpu::BufferBindingType::Storage { read_only: true }),
                 entry(4, wgpu::BufferBindingType::Storage { read_only: true }),
-                entry(5, wgpu::BufferBindingType::Storage { read_only: true }),
-                entry(6, wgpu::BufferBindingType::Storage { read_only: false }),
+                entry(5, wgpu::BufferBindingType::Storage { read_only: false }), // dist (in-place)
+                entry(6, wgpu::BufferBindingType::Storage { read_only: false }), // flags
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -217,15 +223,16 @@ impl GpuFlowField {
             bind_group_layouts: &[&layout],
             push_constant_ranges: &[],
         });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: None,
+        let compute = |entry: &str| device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
             layout: Some(&pipeline_layout),
             module: &shader,
-            entry_point: Some("main"),
+            entry_point: Some(entry),
             compilation_options: Default::default(),
             cache: None,
         });
-        Self { device, queue, pipeline, layout, offsets_buf, targets_buf, link_count, work: None }
+        let (relax, gate) = (compute("relax"), compute("gate"));
+        Self { device, queue, relax, gate, layout, offsets_buf, targets_buf, link_count, work: None }
     }
 
     /// (Re)allocate the working buffers when the destination count changes.
@@ -240,32 +247,29 @@ impl GpuFlowField {
         let params = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("batch-params"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let cost_buf = buf(l.max(1), storage);
         let dests_buf = buf(slot_count.max(1), storage);
-        let buf_a = buf(total, storage);
-        let buf_b = buf(total, storage);
+        let dist = buf(total, storage);
+        let flags = buf(2, storage);
         let staging = buf(total, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
-        let bind = |din: &wgpu::Buffer, dout: &wgpu::Buffer| {
-            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &self.layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: self.offsets_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: self.targets_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: cost_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: dests_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: din.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 6, resource: dout.as_entire_binding() },
-                ],
-            })
-        };
-        let bind = [bind(&buf_a, &buf_b), bind(&buf_b, &buf_a)];
-        self.work = Some(Work { slot_count, params, cost_buf, dests_buf, buf_a, buf_b, staging, bind });
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.offsets_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.targets_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: cost_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: dests_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: dist.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: flags.as_entire_binding() },
+            ],
+        });
+        self.work = Some(Work { slot_count, params, cost_buf, dests_buf, dist, flags, staging, bind });
     }
 
     /// Encode and submit the relaxation for `cost`/`dests` into the working
-    /// buffers, returning the parity of the buffer holding the result. Shared by
-    /// the blocking and (future) async readback paths.
-    fn dispatch(&mut self, cost: &[u32], dests: &[u32]) -> usize {
+    /// buffers. `dist` is relaxed in place, so the result is always in `w.dist`
+    /// (no parity to track). Shared by the blocking and async readback paths.
+    fn dispatch(&mut self, cost: &[u32], dests: &[u32]) {
         let (l, k) = (self.link_count, dests.len());
         self.ensure_work(k);
         let w = self.work.as_ref().unwrap();
@@ -274,28 +278,30 @@ impl GpuFlowField {
         self.queue.write_buffer(&w.params, 0, bytemuck::bytes_of(&BatchParams { link_count: l as u32, slot_count: k as u32, _pad0: 0, _pad1: 0 }));
         self.queue.write_buffer(&w.cost_buf, 0, cast_slice(cost));
         self.queue.write_buffer(&w.dests_buf, 0, cast_slice(dests));
-        self.queue.write_buffer(&w.buf_a, 0, cast_slice(&init));
-        self.queue.write_buffer(&w.buf_b, 0, cast_slice(&init));
+        self.queue.write_buffer(&w.dist, 0, cast_slice(&init));
+        self.queue.write_buffer(&w.flags, 0, cast_slice(&[0u32, 0u32])); // [changed, done]
 
         let groups = (total as u32).div_ceil(64).max(1);
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        let mut parity = 0usize;
-        // At most `link_count` edge relaxations converge every field (a GPU-side
-        // convergence flag would cut this — a follow-up once the path is on real
-        // hardware).
-        for _ in 0..l {
+        // `link_count` is Bellman-Ford's worst-case bound; the `gate` pass latches
+        // convergence, so `relax` passes past the fixed point cost nothing (they read
+        // the `done` flag and return without touching `dist`).
+        for _ in 0..l.max(1) {
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &w.bind[parity], &[]);
+                pass.set_pipeline(&self.relax);
+                pass.set_bind_group(0, &w.bind, &[]);
                 pass.dispatch_workgroups(groups, 1, 1);
             }
-            parity ^= 1;
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+                pass.set_pipeline(&self.gate);
+                pass.set_bind_group(0, &w.bind, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
         }
-        let latest = if parity == 0 { &w.buf_a } else { &w.buf_b };
-        encoder.copy_buffer_to_buffer(latest, 0, &w.staging, 0, (total * 4) as u64);
+        encoder.copy_buffer_to_buffer(&w.dist, 0, &w.staging, 0, (total * 4) as u64);
         self.queue.submit([encoder.finish()]);
-        parity
     }
 
     /// Reverse distances for every destination in `dests`, one `Vec` per

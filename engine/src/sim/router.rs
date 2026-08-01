@@ -20,6 +20,11 @@ pub struct FieldRouter {
     slot: HashMap<u32, usize>,
     /// `next_hop[slot][from_link]` toward `dests[slot]` (`None` = unreachable).
     next_hop: Vec<Vec<Option<LinkId>>>,
+    /// `dist[slot][from_link]` = travel cost from `from_link` to `dests[slot]`,
+    /// kept alongside the next-hop field so a car that can't reach its routed lane
+    /// can fall back onto the *forward-most* movement it can take (nearest to the
+    /// destination) instead of an arbitrary one. `u64::MAX` = unreachable.
+    dist: Vec<Vec<u64>>,
     /// Next slot for [`recompute_incremental`] to refresh — spreads the rebuild.
     cursor: usize,
 }
@@ -38,7 +43,8 @@ impl FieldRouter {
             });
         }
         let next_hop = vec![Vec::new(); unique.len()];
-        let mut router = Self { adj, dests: unique, slot, next_hop, cursor: 0 };
+        let dist = vec![Vec::new(); unique.len()];
+        let mut router = Self { adj, dests: unique, slot, next_hop, dist, cursor: 0 };
         router.recompute(cost);
         router
     }
@@ -61,6 +67,7 @@ impl FieldRouter {
             let s = self.cursor % total;
             let dist = flowfield::distances_to(&self.adj, self.dests[s], cost);
             self.next_hop[s] = flowfield::next_hops(&self.adj, &dist, cost);
+            self.dist[s] = dist;
             self.cursor = (self.cursor + 1) % total;
         }
     }
@@ -81,6 +88,7 @@ impl FieldRouter {
         for (s, &dest) in self.dests.iter().enumerate() {
             let dist = flowfield::distances_to(&self.adj, dest, cost);
             self.next_hop[s] = flowfield::next_hops(&self.adj, &dist, cost);
+            self.dist[s] = dist;
         }
     }
 
@@ -110,6 +118,7 @@ impl FieldRouter {
         }
         for (s, dist) in dist_per_slot.iter().enumerate() {
             self.next_hop[s] = flowfield::next_hops(&self.adj, dist, cost);
+            self.dist[s] = dist.clone();
         }
     }
 
@@ -122,6 +131,17 @@ impl FieldRouter {
         }
         let &s = self.slot.get(&dest.0)?;
         self.next_hop[s].get(from.idx()).copied().flatten()
+    }
+
+    /// Travel cost from `from` to `dest` under the field's current costs — used to
+    /// rank a wrong-lane car's *reachable* movements by forward progress. `None` if
+    /// `dest` isn't tracked or `from` can't reach it.
+    pub fn distance(&self, dest: LinkId, from: LinkId) -> Option<u64> {
+        let &s = self.slot.get(&dest.0)?;
+        match self.dist[s].get(from.idx()).copied() {
+            Some(d) if d != u64::MAX => Some(d),
+            _ => None,
+        }
     }
 }
 

@@ -45,6 +45,13 @@ fn now_ms() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Turn-signal blink phase: `true` during the lit half of a ~1.4 Hz cycle, off the
+/// other half. Driven off the wall clock so blinkers keep flashing while the sim is
+/// paused, and so timing is independent of frame rate.
+fn blink_on() -> bool {
+    (now_ms() * (1.0 / 700.0)).rem_euclid(1.0) < 0.5
+}
+
 #[wasm_bindgen]
 pub struct Simulation {
     world: NetWorld,
@@ -69,7 +76,13 @@ pub struct Simulation {
     /// Optional GPU flow-field solver on the renderer's WebGPU device, plus the
     /// in-flight async readback and the cost snapshot it was dispatched with.
     gpu: Option<GpuFlowField>,
-    gpu_pending: Option<PendingReadback>,
+    /// An in-flight GPU readback paired with the router generation it was dispatched
+    /// under. A demand toggle reinstalls the router (bumping the generation); the
+    /// stale readback must still be *collected* (to unmap its staging buffer) but its
+    /// distances are discarded, never fed into the new field.
+    gpu_pending: Option<(PendingReadback, u64)>,
+    /// Bumped whenever the router is reinstalled, to invalidate an in-flight readback.
+    gpu_generation: u64,
     gpu_cost: Vec<u64>,
     gpu_last: f64,
     /// Achieved sim-time / wall-time over the last window — the speed the sim is
@@ -116,7 +129,10 @@ impl Simulation {
     }
 
     fn assemble(network: Network, seed: u32) -> Simulation {
-        let cfg = SimConfig { seed: seed as u64, ..SimConfig::default_config() };
+        // Browser default: the active-set scheduler on (a clean serial/GPU win, and it
+        // auto-stands-down under actively-parallel threads). The pure engine default stays
+        // off so native tests and A/B baselines are unaffected. Toggle live via the UI.
+        let cfg = SimConfig { seed: seed as u64, sleep_scheduler: true, ..SimConfig::default_config() };
         let camera = Camera::fit_bounds(network.bounds(), [900.0, 600.0], 24.0);
         let mut world = NetWorld::new(network, cfg);
         let demand_sources = DemandSources::new(true, true); // freeway + surface by default
@@ -129,7 +145,7 @@ impl Simulation {
         Simulation {
             world, clock, seed: cfg.seed, demand, demand_sources, demand_rate, entry_speed_cap, camera,
             prev: PoseMap::default(), selected: None, signal_heads,
-            gpu: None, gpu_pending: None, gpu_cost: Vec::new(), gpu_last: 0.0,
+            gpu: None, gpu_pending: None, gpu_generation: 0, gpu_cost: Vec::new(), gpu_last: 0.0,
             effective_speed: 0.0, throttled: false, last_advance_ms: 0.0,
             speed_sim_accum: 0.0, speed_wall_accum: 0.0, speed_dropped: false,
         }
@@ -156,10 +172,11 @@ impl Simulation {
         self.apply_demand_sources(DemandSources { highway, surface, ..self.demand_sources });
     }
 
-    /// Drive the freeway stream at real rush-hour peak volumes (each US-101 / I-280
-    /// gateway pushes its lane count × the per-lane peak flow). Affects new spawns
-    /// only; live and non-destructive like the other demand toggles.
-    pub fn set_highway_rush_hour(&mut self, enabled: bool) {
+    /// Drive the whole map by the simulated time of day: freeways at their real
+    /// per-lane PeMS volumes (US-101 / I-280, by direction) and surface streets by the
+    /// arterial diurnal shape, so both build and fade with the commute. Affects new
+    /// spawns only; live and non-destructive like the other demand toggles.
+    pub fn set_rush_hour(&mut self, enabled: bool) {
         self.apply_demand_sources(DemandSources { rush_hour: enabled, ..self.demand_sources });
     }
 
@@ -181,10 +198,12 @@ impl Simulation {
         dests.sort_by_key(|l| l.0);
         dests.dedup();
         self.world.install_router(&dests);
-        // A GPU readback dispatched for the previous destination set is now stale —
-        // its slot layout no longer matches the reinstalled router. Drop it and force
-        // a fresh dispatch so we never feed mismatched distances into the new fields.
-        self.gpu_pending = None;
+        // A GPU readback dispatched for the previous destination set is now stale.
+        // Bump the generation so `drive_gpu_routing` discards its distances — but
+        // leave the pending in place so it is still collected and its staging buffer
+        // unmapped; dropping it here would leak a mapped buffer that the next
+        // dispatch then writes into (a WebGPU error that crashes the frame loop).
+        self.gpu_generation = self.gpu_generation.wrapping_add(1);
         self.gpu_last = f64::NEG_INFINITY;
     }
 
@@ -210,13 +229,19 @@ impl Simulation {
     }
 
     /// Live per-lane freeway volumes (veh/h/lane) read off the real diurnal profile at
-    /// the current simulated time of day, as `[US-101, I-280]`.
+    /// the current simulated time of day, split by direction to show the commute
+    /// asymmetry: `[US-101 NB, US-101 SB, I-280 NB, I-280 SB]`.
     pub fn rush_hour_flows(&self) -> Vec<f32> {
         let t = self.demand.rush_hour_day_secs();
-        vec![
-            crate::sim::rush_hour::per_lane("US 101", t) as f32,
-            crate::sim::rush_hour::per_lane("I 280", t) as f32,
-        ]
+        let f = |r: &str, nb: bool| crate::sim::rush_hour::per_lane(r, nb, t) as f32;
+        vec![f("US 101", true), f("US 101", false), f("I 280", true), f("I 280", false)]
+    }
+
+    /// Trips waiting at gateways to enter — demand the entrances can't yet admit,
+    /// held (not dropped) and released as lanes clear. Grows and dissipates with the
+    /// peak, so it reads as real rush-hour pressure.
+    pub fn demand_queued(&self) -> u32 {
+        self.demand.queued()
     }
 
     /// Scale the spawn rate of every stream (1.0 = default). Live, non-destructive.
@@ -427,6 +452,19 @@ impl Simulation {
         self.world.par_threshold() as u32
     }
 
+    /// Toggle the active-set scheduler: queued-behind-a-stopped-car vehicles skip the
+    /// full per-tick gather, so step cost tracks the *deciding* fraction rather than the
+    /// whole fleet. Safe live toggle (non-destructive; changes work distribution only).
+    pub fn set_sleep_scheduler(&mut self, on: bool) {
+        self.world.set_sleep_scheduler(on);
+    }
+
+    /// Vehicles the scheduler skipped last step — a diagnostic for the status line
+    /// (0 when the scheduler is off).
+    pub fn asleep_count(&self) -> u32 {
+        self.world.asleep_count() as u32
+    }
+
     pub fn vehicle_count(&self) -> u32 {
         self.world.vehicles().len() as u32
     }
@@ -484,13 +522,15 @@ impl Simulation {
         vec![count as f32, mean as f32, self.world.link_flows()[i] as f32, occ as f32]
     }
 
-    /// `[x, y, heading, brake]` per vehicle: pose interpolated between the last
-    /// two ticks by the clock's sub-tick `alpha`, and a brake-light intensity in
-    /// `[0,1]` derived from deceleration.
+    /// `[x, y, heading, brake, blinker]` per vehicle: pose interpolated between the
+    /// last two ticks by the clock's sub-tick `alpha`, a brake-light intensity in
+    /// `[0,1]` from deceleration, and a turn-signal side (`-1` left, `+1` right, `0`
+    /// none) already gated by the blink phase.
     pub fn vehicle_instances(&self) -> Vec<f32> {
         let alpha = self.clock.alpha() as f32;
         let dt = self.clock.dt() as f32;
-        let mut out = Vec::with_capacity(self.world.vehicles().len() * 4);
+        let lit = blink_on();
+        let mut out = Vec::with_capacity(self.world.vehicles().len() * 5);
         for v in self.world.vehicles() {
             let c = self.world.vehicle_world_pose(v);
             let (cx, cy, ch, cs) = (c[0] as f32, c[1] as f32, c[2] as f32, v.speed as f32);
@@ -505,7 +545,8 @@ impl Simulation {
                 ),
                 None => (cx, cy, ch, 0.0),
             };
-            out.extend_from_slice(&[x, y, h, brake]);
+            let blinker = if lit { self.world.vehicle_blinker(v) as f32 } else { 0.0 };
+            out.extend_from_slice(&[x, y, h, brake, blinker]);
         }
         out
     }
@@ -610,6 +651,7 @@ impl Simulation {
     /// shader interpolates by `alpha`), class size/colour, and brake intensity.
     pub fn render_instances(&self) -> Vec<u8> {
         let dt = self.clock.dt() as f32;
+        let lit = blink_on();
         let instances: Vec<Instance> = self
             .world
             .vehicles()
@@ -628,6 +670,7 @@ impl Simulation {
                     heading: ch,
                     prev_heading: ph,
                     brake: brake_intensity((cs - ps) / dt),
+                    blinker: if lit { self.world.vehicle_blinker(v) as f32 } else { 0.0 },
                 }
             })
             .collect();
@@ -720,10 +763,12 @@ impl Simulation {
         if self.gpu.is_none() {
             return;
         }
-        // Collect an in-flight readback, if the GPU has finished it.
-        if let Some(pending) = self.gpu_pending.take() {
+        // Collect an in-flight readback, if the GPU has finished it. Always unmap
+        // (via `try_take`); only feed the result if it's still for the current
+        // router generation — a demand toggle since dispatch invalidates it.
+        if let Some((pending, generation)) = self.gpu_pending.take() {
             match self.gpu.as_ref().unwrap().try_take(&pending) {
-                Some(fields) => {
+                Some(fields) if generation == self.gpu_generation => {
                     let dist: Vec<Vec<u64>> = fields
                         .into_iter()
                         .map(|f| f.into_iter().map(|d| if d == u32::MAX { flowfield::UNREACHABLE } else { d as u64 }).collect())
@@ -731,7 +776,8 @@ impl Simulation {
                     self.world.feed_router_distances(&self.gpu_cost, &dist);
                     self.gpu_last = self.world.time();
                 }
-                None => self.gpu_pending = Some(pending), // still mapping
+                Some(_) => self.gpu_last = f64::NEG_INFINITY, // stale: unmapped, dispatch fresh next frame
+                None => self.gpu_pending = Some((pending, generation)), // still mapping
             }
             return; // one GPU action per frame
         }
@@ -745,7 +791,8 @@ impl Simulation {
         }
         self.gpu_cost = self.world.live_link_costs();
         let cost32: Vec<u32> = self.gpu_cost.iter().map(|&c| c.min(u32::MAX as u64) as u32).collect();
-        self.gpu_pending = Some(self.gpu.as_mut().unwrap().begin_readback(&cost32, &dests));
+        let readback = self.gpu.as_mut().unwrap().begin_readback(&cost32, &dests);
+        self.gpu_pending = Some((readback, self.gpu_generation));
     }
 }
 

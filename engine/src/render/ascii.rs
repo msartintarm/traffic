@@ -175,6 +175,37 @@ mod scenarios {
     }
 
     #[test]
+    fn a_car_signals_toward_the_turn_lane_it_needs() {
+        // Same 2-lane west approach: a car spawned in the left lane (index 0) but
+        // bound for the right-turn exit (→S) must signal right (+1) — toward the
+        // higher-index lane that serves its route — until it has merged over.
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(0, 0.0, 0.0),
+                NodeSpec::uncontrolled(1, -220.0, 0.0),
+                NodeSpec::uncontrolled(2, 220.0, 0.0),
+                NodeSpec::uncontrolled(3, 0.0, 220.0),
+                NodeSpec::uncontrolled(4, 0.0, -220.0),
+            ],
+            links: vec![
+                LinkSpec::oneway(1, 0, 2, 15.0),
+                LinkSpec::oneway(0, 2, 1, 15.0),
+                LinkSpec::oneway(0, 3, 1, 15.0),
+                LinkSpec::oneway(0, 4, 1, 15.0),
+            ],
+        }
+        .build();
+        let mut w = NetWorld::new(net, SimConfig::default_config());
+        w.install_router(&[LinkId(3)]); // destination: the right-turn exit (→S)
+        // Fill the right lane's entrance so the test car is forced into the left
+        // lane (index 0), which serves only the left turn — the wrong lane for →S.
+        assert!(w.spawn_to(1, LinkId(0), LinkId(3), 10.0, DriverConfig::car()));
+        assert!(w.spawn_to(2, LinkId(0), LinkId(3), 10.0, DriverConfig::car()));
+        let wrong = w.vehicles().iter().find(|v| w.network.lane(v.lane).index_in_link == 0).expect("a car in the left lane");
+        assert_eq!(w.vehicle_blinker(wrong), 1, "signals right toward the turn lane");
+    }
+
+    #[test]
     fn a_car_stuck_in_the_wrong_lane_crosses_instead_of_vanishing() {
         // Regression for cars disappearing when they enter an intersection: a
         // dest-routed car that can't reach a lane serving its route must still
