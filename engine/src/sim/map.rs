@@ -449,6 +449,7 @@ fn assign_signal_program(net: &mut Network, node: NodeId, plan: SignalPlan) -> N
     // greedy assignment pairs opposing throughs before protecting lefts.
     let mut group_movements: Vec<Vec<MovementId>> = Vec::new();
     let mut left_group: Vec<bool> = Vec::new();
+    let mut group_link: Vec<u32> = Vec::new();
     let mut key_index: HashMap<(u32, bool), usize> = HashMap::new();
     for want_left in [false, true] {
         for m in 0..net.movements.len() {
@@ -460,10 +461,11 @@ fn assign_signal_program(net: &mut Network, node: NodeId, plan: SignalPlan) -> N
             if is_left != want_left {
                 continue;
             }
-            let key = (net.lane(mv.from_lane).link.0, is_left);
-            let idx = *key_index.entry(key).or_insert_with(|| {
+            let link = net.lane(mv.from_lane).link.0;
+            let idx = *key_index.entry((link, is_left)).or_insert_with(|| {
                 group_movements.push(Vec::new());
                 left_group.push(is_left);
+                group_link.push(link);
                 group_movements.len() - 1
             });
             group_movements[idx].push(MovementId(m as u32));
@@ -494,10 +496,23 @@ fn assign_signal_program(net: &mut Network, node: NodeId, plan: SignalPlan) -> N
             id
         })
         .collect();
+    let mut phase_mask: Vec<u64> = phase_groups
+        .iter()
+        .map(|gs| gs.iter().fold(0u64, |m, &g| m | (1u64 << g)))
+        .collect();
+    for g in 0..group_movements.len() {
+        if !left_group[g] {
+            continue;
+        }
+        let through = (0..group_movements.len()).find(|&h| !left_group[h] && group_link[h] == group_link[g]);
+        if let Some(p) = through.and_then(|h| phase_groups.iter().position(|gs| gs.contains(&h))) {
+            phase_mask[p] |= 1u64 << g;
+        }
+    }
     let phases = phase_groups
         .iter()
-        .map(|gs| {
-            let mask = gs.iter().fold(0u64, |m, &g| m | (1u64 << g));
+        .enumerate()
+        .map(|(p, gs)| {
             let green = if gs.iter().all(|&g| left_group[g]) {
                 (plan.green_secs * 0.45).max(6.0)
             } else {
@@ -506,7 +521,7 @@ fn assign_signal_program(net: &mut Network, node: NodeId, plan: SignalPlan) -> N
             let phase_movements: Vec<MovementId> =
                 gs.iter().flat_map(|&g| group_movements[g].iter().copied()).collect();
             let (yellow, all_red) = change_and_clearance_intervals(net, &phase_movements);
-            Phase::with_clearance(mask, green, yellow, all_red)
+            Phase::with_clearance(phase_mask[p], green, yellow, all_red)
         })
         .collect();
     net.programs.push(SignalProgram::new(plan.offset, phases));
@@ -1169,9 +1184,10 @@ mod import_tests {
                 let (Some(a), Some(b)) = (net.movement(c.a).signal_group, net.movement(c.b).signal_group) else { continue };
                 let ga = net.movement_state(c.a, t);
                 let gb = net.movement_state(c.b, t);
+                let permissive = net.movement_turn(c.a) == TurnType::Left || net.movement_turn(c.b) == TurnType::Left;
                 assert!(
-                    !(ga == SignalState::Green && gb == SignalState::Green),
-                    "conflicting movements both green at a real signalized node, t={t}"
+                    permissive || !(ga == SignalState::Green && gb == SignalState::Green),
+                    "conflicting non-permissive movements both green at a real signalized node, t={t}"
                 );
                 let _ = (a, b);
             }
@@ -1537,7 +1553,7 @@ mod tests {
     }
 
     #[test]
-    fn signal_phasing_never_greens_conflicting_movements_together() {
+    fn conflicting_non_permissive_movements_never_green_together() {
         use crate::sim::signal::SignalState;
         let net = signalized_cross();
         let cycle = net.programs[0].cycle_length();
@@ -1549,7 +1565,11 @@ mod tests {
             for c in &conflicts {
                 let a = net.movement_state(c.a, t);
                 let b = net.movement_state(c.b, t);
-                assert!(!(a == SignalState::Green && b == SignalState::Green), "conflicting greens at t={t}");
+                let permissive = net.movement_turn(c.a) == TurnType::Left || net.movement_turn(c.b) == TurnType::Left;
+                assert!(
+                    permissive || !(a == SignalState::Green && b == SignalState::Green),
+                    "conflicting non-permissive greens at t={t}",
+                );
             }
             steps += 1;
         }
@@ -1572,9 +1592,11 @@ mod tests {
         while steps as f64 * 0.5 < cycle + 1.0 {
             let t = steps as f64 * 0.5;
             for c in &net.conflicts {
+                let permissive = net.movement_turn(c.a) == TurnType::Left || net.movement_turn(c.b) == TurnType::Left;
                 assert!(
-                    !(net.movement_state(c.a, t) == SignalState::Green && net.movement_state(c.b, t) == SignalState::Green),
-                    "conflicting greens at t={t}"
+                    permissive
+                        || !(net.movement_state(c.a, t) == SignalState::Green && net.movement_state(c.b, t) == SignalState::Green),
+                    "conflicting non-permissive greens at t={t}"
                 );
             }
             for &m in &signalized {
@@ -1601,6 +1623,28 @@ mod tests {
             }
         }
         assert!(found, "the four-way has a left-turn conflict to protect");
+    }
+
+    #[test]
+    fn left_turns_also_show_a_permissive_green_with_the_through_phase() {
+        use crate::sim::signal::SignalState;
+        let net = signalized_cross();
+        let cycle = net.programs[0].cycle_length();
+        let mut saw_permissive = false;
+        let mut t = 0.0;
+        while t < cycle {
+            for c in &net.conflicts {
+                let has_left = net.movement_turn(c.a) == TurnType::Left || net.movement_turn(c.b) == TurnType::Left;
+                if has_left
+                    && net.movement_state(c.a, t) == SignalState::Green
+                    && net.movement_state(c.b, t) == SignalState::Green
+                {
+                    saw_permissive = true;
+                }
+            }
+            t += 0.1;
+        }
+        assert!(saw_permissive, "a left shows green concurrent with the through it must yield to");
     }
 
     #[test]

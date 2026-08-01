@@ -116,6 +116,35 @@ impl SignalController {
             .collect()
     }
 
+    pub fn green_elapsed(&self, net: &Network, mid: MovementId) -> f64 {
+        let Some(gid) = net.movement(mid).signal_group else { return f64::INFINITY };
+        let group = net.groups[gid.idx()];
+        let program = &net.programs[group.program.idx()];
+        let mask = 1u64 << group.bit;
+        if program.coordinated {
+            let cycle = program.cycle_length();
+            if cycle <= 0.0 {
+                return 0.0;
+            }
+            let mut t = (self.time + program.offset).rem_euclid(cycle);
+            for phase in &program.phases {
+                if t < phase.length() {
+                    return if phase.green_mask & mask != 0 && t < phase.green_secs { t } else { 0.0 };
+                }
+                t -= phase.length();
+            }
+            0.0
+        } else {
+            let rt = self.signals[group.program.idx()];
+            let served = program.phases.get(rt.phase).is_some_and(|ph| ph.green_mask & mask != 0);
+            if served && !rt.yellow && rt.all_red <= 0.0 {
+                rt.elapsed
+            } else {
+                0.0
+            }
+        }
+    }
+
     /// Advance actuated signals: hold green while its approaches keep demand,
     /// terminate on max-green or a gap-out with a conflicting approach waiting.
     /// `demand` is the set of link ids with a vehicle within [`DETECT`] of a line.

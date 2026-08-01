@@ -22,8 +22,8 @@ pub struct DriverConfig {
     /// Perception–reaction delay in seconds: the driver responds to the traffic
     /// situation as it was this long ago (0 = the idealized instantaneous IDM).
     pub reaction_time: f64,
-    /// Magnitude (m/s²) of one-sided acceleration jitter modelling imperfect
-    /// throttle/hesitation. Only ever reduces acceleration, so it is collision-safe.
+    /// Half-amplitude (m/s²) of zero-mean acceleration jitter modelling imperfect
+    /// throttle; fluctuates speed around the desired value without biasing it.
     pub accel_noise: f64,
     /// MOBIL politeness: how much this driver weighs the braking it would impose
     /// on others when changing lanes (0 = selfish, 1 = very considerate).
