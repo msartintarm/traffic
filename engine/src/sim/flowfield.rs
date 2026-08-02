@@ -36,36 +36,46 @@ pub fn csr(adj: &[Vec<u32>]) -> (Vec<u32>, Vec<u32>) {
     (offsets, targets)
 }
 
-/// Reverse shortest-path distances (ms) from every link to `dest` under
-/// `cost`, by Bellman–Ford Jacobi relaxation to convergence. `UNREACHABLE` where
-/// no path exists.
+/// Reverse shortest-path distances (ms) from every link to `dest` under `cost`
+/// (`dist[a] = min over outgoing b of cost[b] + dist[b]`). `UNREACHABLE` where no
+/// path exists. Computed by a reverse Dijkstra — identical to the Bellman–Ford
+/// relaxation the GPU runs, but O(E log V) rather than O(V·E), so it stays fast on a
+/// whole-city graph. Builds the predecessor lists itself; use [`distances_to_with`]
+/// with a shared reverse index when computing many fields over one graph.
 pub fn distances_to(adj: &[Vec<u32>], dest: LinkId, cost: &[u64]) -> Vec<u64> {
-    let n = adj.len();
-    let mut dist = vec![UNREACHABLE; n];
-    dist[dest.idx()] = 0;
-    let mut next = dist.clone();
-    for _ in 0..=n {
-        let mut changed = false;
-        for (a, outs) in adj.iter().enumerate() {
-            if a == dest.idx() {
-                next[a] = 0;
-                continue;
-            }
-            let mut best = UNREACHABLE;
-            for &b in outs {
-                let db = dist[b as usize];
-                if db != UNREACHABLE {
-                    best = best.min(cost[b as usize].saturating_add(db));
-                }
-            }
-            next[a] = best.min(dist[a]);
-            if best < dist[a] {
-                changed = true;
-            }
+    distances_to_with(&reverse(adj), dest, cost)
+}
+
+/// Predecessor lists (`pred[b]` = links that have `b` as an outgoing link) — the
+/// reverse graph a field's Dijkstra pulls along. Build once, reuse per destination.
+pub fn reverse(adj: &[Vec<u32>]) -> Vec<Vec<u32>> {
+    let mut pred: Vec<Vec<u32>> = vec![Vec::new(); adj.len()];
+    for (a, outs) in adj.iter().enumerate() {
+        for &b in outs {
+            pred[b as usize].push(a as u32);
         }
-        std::mem::swap(&mut dist, &mut next);
-        if !changed {
-            break;
+    }
+    pred
+}
+
+/// [`distances_to`] with a prebuilt reverse index (see [`reverse`]).
+pub fn distances_to_with(pred: &[Vec<u32>], dest: LinkId, cost: &[u64]) -> Vec<u64> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    let mut dist = vec![UNREACHABLE; pred.len()];
+    dist[dest.idx()] = 0;
+    let mut heap = BinaryHeap::new();
+    heap.push(Reverse((0u64, dest.0)));
+    while let Some(Reverse((d, b))) = heap.pop() {
+        if d > dist[b as usize] {
+            continue; // a stale, superseded entry
+        }
+        let step = cost[b as usize].saturating_add(d);
+        for &a in &pred[b as usize] {
+            if step < dist[a as usize] {
+                dist[a as usize] = step;
+                heap.push(Reverse((step, a)));
+            }
         }
     }
     dist

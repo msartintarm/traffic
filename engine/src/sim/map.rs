@@ -108,18 +108,85 @@ impl OsmMap {
     /// spurious junction boxes. Only merges segments sharing lanes, speed and
     /// layer; controlled nodes and attribute changes are left intact.
     pub fn collapse_pass_through_nodes(&self) -> OsmMap {
+        use std::collections::VecDeque;
         let pos: HashMap<i64, [f64; 2]> = self.nodes.iter().map(|n| (n.osm_id, [n.x, n.y])).collect();
-        let mut nodes = self.nodes.clone();
-        let mut links = self.links.clone();
-        while let Some((node, mut remove, add)) = next_collapse(&nodes, &links, &pos) {
-            remove.sort_unstable();
-            for &i in remove.iter().rev() {
-                links.remove(i);
-            }
-            links.extend(add);
-            nodes.retain(|n| n.osm_id != node);
+        // Tombstoned link table with a node→incident-link index, so each candidate is
+        // examined in O(degree) and collapses drive off a work-queue — near-linear,
+        // instead of re-scanning every link for every node on every pass.
+        let mut links: Vec<Option<LinkSpec>> = self.links.iter().cloned().map(Some).collect();
+        let mut inc: HashMap<i64, Vec<usize>> = HashMap::new();
+        for (i, l) in links.iter().enumerate() {
+            let l = l.as_ref().unwrap();
+            inc.entry(l.from_osm).or_default().push(i);
+            inc.entry(l.to_osm).or_default().push(i);
         }
-        OsmMap { nodes, links }
+        let uncontrolled: std::collections::HashSet<i64> =
+            self.nodes.iter().filter(|n| n.control == MapControl::Uncontrolled).map(|n| n.osm_id).collect();
+        let mut removed: std::collections::HashSet<i64> = Default::default();
+        let mut queue: VecDeque<i64> =
+            self.nodes.iter().filter(|n| n.control == MapControl::Uncontrolled).map(|n| n.osm_id).collect();
+        while let Some(n) = queue.pop_front() {
+            if removed.contains(&n) || !uncontrolled.contains(&n) {
+                continue;
+            }
+            let incident: Vec<usize> =
+                inc.get(&n).map_or(Vec::new(), |v| v.iter().copied().filter(|&i| links[i].is_some()).collect());
+            let neigh: BTreeSet<i64> = incident
+                .iter()
+                .map(|&i| {
+                    let l = links[i].as_ref().unwrap();
+                    if l.from_osm == n { l.to_osm } else { l.from_osm }
+                })
+                .collect();
+            if neigh.len() != 2 {
+                continue;
+            }
+            let mut nb = neigh.iter().copied();
+            let (a, b) = (nb.next().unwrap(), nb.next().unwrap());
+            let seg = |from: i64, to: i64| {
+                incident.iter().copied().find(|&i| {
+                    let l = links[i].as_ref().unwrap();
+                    l.from_osm == from && l.to_osm == to
+                })
+            };
+            let (a_in, a_out, b_in, b_out) = (seg(a, n), seg(n, a), seg(b, n), seg(n, b));
+            let merge = match (incident.len(), a_in, a_out, b_in, b_out) {
+                (4, Some(ai), Some(ao), Some(bi), Some(bo)) => match (
+                    join_pass_through(&links, ai, bo, a, b, n, &pos),
+                    join_pass_through(&links, bi, ao, b, a, n, &pos),
+                ) {
+                    (Some(fwd), Some(rev)) => Some((vec![ai, ao, bi, bo], vec![fwd, rev])),
+                    _ => None,
+                },
+                (2, Some(ai), None, None, Some(bo)) => {
+                    join_pass_through(&links, ai, bo, a, b, n, &pos).map(|fwd| (vec![ai, bo], vec![fwd]))
+                }
+                (2, None, Some(ao), Some(bi), None) => {
+                    join_pass_through(&links, bi, ao, b, a, n, &pos).map(|rev| (vec![bi, ao], vec![rev]))
+                }
+                _ => None,
+            };
+            if let Some((old, new)) = merge {
+                for i in old {
+                    links[i] = None;
+                }
+                for l in new {
+                    let id = links.len();
+                    inc.entry(l.from_osm).or_default().push(id);
+                    inc.entry(l.to_osm).or_default().push(id);
+                    links.push(Some(l));
+                }
+                removed.insert(n);
+                // Re-examine the neighbours: the merge may have changed the joined link's
+                // lane count (the ramp-sliver rule), which can make an adjacent
+                // pass-through now collapsible where it wasn't. The `uncontrolled` guard
+                // on pop keeps this from ever dissolving a real (controlled) junction.
+                queue.push_back(a);
+                queue.push_back(b);
+            }
+        }
+        let nodes = self.nodes.iter().filter(|n| !removed.contains(&n.osm_id)).cloned().collect();
+        OsmMap { nodes, links: links.into_iter().flatten().collect() }
     }
 
     /// Merge intersections that OSM splits across several nodes a few metres apart
@@ -246,6 +313,13 @@ impl OsmMap {
         // serves rights. `lane_point` places lane 0 adjacent to the centreline (the
         // left lane) with higher indices toward the curb, so exits are ordered
         // left-to-right and mapped in that same order onto lanes 0…n-1.
+        // Index links by their upstream node so each approach scans only the roads
+        // actually leaving its downstream node — O(links · degree) instead of O(links²),
+        // the dominant build cost on a city-sized map.
+        let mut links_from: Vec<Vec<usize>> = vec![Vec::new(); net.nodes.len()];
+        for (li, l) in net.links.iter().enumerate() {
+            links_from[l.from.idx()].push(li);
+        }
         let mut movements: Vec<Movement> = Vec::new();
         for in_li in 0..net.links.len() {
             let link = net.links[in_li];
@@ -254,10 +328,10 @@ impl OsmMap {
             // Valid onward links (skip U-turns by node identity and by geometry),
             // as `(link, signed turn angle)`; ascending = rightmost turn first.
             let mut onward: Vec<(usize, f64)> = Vec::new();
-            for out_li in 0..net.links.len() {
+            for &out_li in &links_from[node.idx()] {
                 let out = net.links[out_li];
-                if out.from != node || out.to == link.from {
-                    continue;
+                if out.to == link.from {
+                    continue; // a U-turn back onto the road we came from
                 }
                 let dep = net.departure_dir(LinkId(out_li as u32));
                 let dot = arr[0] * dep[0] + arr[1] * dep[1];
@@ -348,20 +422,23 @@ impl OsmMap {
         net.build_interiors();
 
         let plans = relocate_signals_to_junctions(&net, &self.nodes);
+        // Fixed (non-signal) controls now; the signal programs are built after the
+        // junctions and cross-node conflicts exist, so each multi-node junction is
+        // timed as one coordinated signal rather than several independent ones.
         for i in 0..self.nodes.len() {
-            let control = match plans[i] {
-                Some(plan) => assign_signal_program(&mut net, NodeId(i as u32), plan),
-                None => match self.nodes[i].control {
+            if plans[i].is_none() {
+                net.nodes[i].control = match self.nodes[i].control {
                     MapControl::Stop => NodeControl::Stop,
                     MapControl::Yield => NodeControl::Yield,
                     _ => NodeControl::Uncontrolled,
-                },
-            };
-            net.nodes[i].control = control;
+                };
+            }
         }
-        coordinate_green_waves(&mut net);
         net.build_junctions();
         net.build_cross_junction_conflicts();
+        net.build_conflict_index();
+        coordinate_junction_signals(&mut net, &plans);
+        coordinate_green_waves(&mut net);
         net
     }
 }
@@ -446,35 +523,52 @@ fn assign_turn_pockets(net: &mut Network) {
 /// from the same conflict data the collision model uses, the signal can never
 /// green two movements that would crash — opposing throughs pair up, and a left
 /// that crosses opposing traffic gets its own protected phase.
-fn assign_signal_program(net: &mut Network, node: NodeId, plan: SignalPlan) -> NodeControl {
+fn assign_signal_program(
+    net: &mut Network,
+    nodes: &[NodeId],
+    plan: SignalPlan,
+    feeders: &[Vec<MovementId>],
+    movements_by_node: &[Vec<MovementId>],
+) -> NodeControl {
     // Group movements by (approach link, is-left); non-left groups first so the
-    // greedy assignment pairs opposing throughs before protecting lefts.
+    // greedy assignment pairs opposing throughs before protecting lefts. When
+    // `nodes` is a whole junction cluster the groups span its member nodes, so the
+    // conflict-phased program coordinates them: through movements across the junction
+    // never conflict, land in one phase, and go green together (progression).
+    let junction_movements: Vec<MovementId> =
+        nodes.iter().flat_map(|n| movements_by_node[n.idx()].iter().copied()).collect();
     let mut group_movements: Vec<Vec<MovementId>> = Vec::new();
     let mut left_group: Vec<bool> = Vec::new();
     let mut group_link: Vec<u32> = Vec::new();
     let mut key_index: HashMap<(u32, bool), usize> = HashMap::new();
     for want_left in [false, true] {
-        for m in 0..net.movements.len() {
-            let mv = net.movements[m];
-            if mv.node != node {
-                continue;
-            }
-            let is_left = net.movement_turn(MovementId(m as u32)) == TurnType::Left;
+        for &mid in &junction_movements {
+            let mv = net.movement(mid);
+            let is_left = net.movement_turn(mid) == TurnType::Left;
             if is_left != want_left {
                 continue;
             }
-            let link = net.lane(mv.from_lane).link.0;
-            let idx = *key_index.entry((link, is_left)).or_insert_with(|| {
-                group_movements.push(Vec::new());
-                left_group.push(is_left);
-                group_link.push(link);
-                group_movements.len() - 1
-            });
-            group_movements[idx].push(MovementId(m as u32));
+            // Key by the *entry* approach so a whole through-path across the junction
+            // shares one group and goes green together — but never fold a movement into
+            // a group it conflicts with (a phase can't split movements within a group),
+            // so a mis-traced or genuinely crossing movement gets its own group instead.
+            let link = net.entry_link(mv.from_lane, feeders).0;
+            let idx = match key_index.get(&(link, is_left)).copied() {
+                Some(i) if !group_movements[i].iter().any(|&x| net.movements_conflict(mid, x)) => i,
+                _ => {
+                    group_movements.push(Vec::new());
+                    left_group.push(is_left);
+                    group_link.push(link);
+                    let i = group_movements.len() - 1;
+                    key_index.entry((link, is_left)).or_insert(i);
+                    i
+                }
+            };
+            group_movements[idx].push(mid);
         }
     }
-    if group_movements.is_empty() {
-        return NodeControl::Uncontrolled;
+    if group_movements.is_empty() || group_movements.len() > 64 {
+        return NodeControl::Uncontrolled; // no movements, or too many groups for a 64-bit phase mask
     }
 
     let conflicts = |a: usize, b: usize| {
@@ -533,6 +627,50 @@ fn assign_signal_program(net: &mut Network, node: NodeId, plan: SignalPlan) -> N
         }
     }
     NodeControl::Signalized(program)
+}
+
+/// Give each multi-node junction a single coordinated signal spanning all its member
+/// nodes, so through movements across the junction share one green phase and vehicles
+/// never stop between the interior nodes. Runs after the cross-node conflict graph is
+/// built, so genuinely conflicting cross-node movements still land in separate phases.
+/// Signalized nodes outside any junction keep an independent per-node program.
+fn coordinate_junction_signals(net: &mut Network, plans: &[Option<SignalPlan>]) {
+    let feeders = net.feeders_by_lane();
+    let mut movements_by_node: Vec<Vec<MovementId>> = vec![Vec::new(); net.nodes.len()];
+    for (m, mv) in net.movements.iter().enumerate() {
+        movements_by_node[mv.node.idx()].push(MovementId(m as u32));
+    }
+    for ji in 0..net.junctions.len() {
+        let mut members = net.junctions[ji].nodes.clone();
+        members.sort_by_key(|nd| nd.0);
+        let Some(plan) = members.iter().find_map(|&nd| plans[nd.idx()]) else {
+            continue;
+        };
+        let control = assign_signal_program(net, &members, plan, &feeders, &movements_by_node);
+        if let NodeControl::Signalized(pid) = control {
+            for &nd in &members {
+                net.nodes[nd.idx()].control = control;
+            }
+            net.junctions[ji].program = Some(pid);
+        } else {
+            // Too many groups for one 64-bit phase mask — fall back to per-node signals.
+            for &nd in &members {
+                if let Some(p) = plans[nd.idx()] {
+                    net.nodes[nd.idx()].control = assign_signal_program(net, &[nd], p, &feeders, &movements_by_node);
+                }
+            }
+            net.junctions[ji].program = members.iter().find_map(|&nd| match net.nodes[nd.idx()].control {
+                NodeControl::Signalized(p) => Some(p),
+                _ => None,
+            });
+        }
+    }
+    for i in 0..net.nodes.len() {
+        let nd = NodeId(i as u32);
+        if plans[i].is_some() && net.node_junction(nd).is_none() {
+            net.nodes[i].control = assign_signal_program(net, &[nd], plans[i].unwrap(), &feeders, &movements_by_node);
+        }
+    }
 }
 
 const YELLOW_REACTION: f64 = 1.0;
@@ -728,94 +866,54 @@ fn control_rank(c: MapControl) -> u8 {
     }
 }
 
-/// Find one uncontrolled pass-through node to dissolve: returns its osm id, the
-/// indices of the links to remove, and the merged link(s) to add. `None` when no
-/// node is collapsible (the fixpoint).
-fn next_collapse(
-    nodes: &[NodeSpec],
-    links: &[LinkSpec],
+/// Merge the two link segments meeting at a dissolved pass-through node `n` into one
+/// link `from`→`to` (segment `s1` ends at `n`, `s2` starts at `n`), threading the
+/// merged geometry through `n`. `None` if the segments' speed, layer or lane count
+/// don't match (so the node is a real attribute change and stays a junction).
+fn join_pass_through(
+    links: &[Option<LinkSpec>],
+    s1: usize,
+    s2: usize,
+    from: i64,
+    to: i64,
+    n: i64,
     pos: &HashMap<i64, [f64; 2]>,
-) -> Option<(i64, Vec<usize>, Vec<LinkSpec>)> {
-    for node in nodes.iter().filter(|n| n.control == MapControl::Uncontrolled) {
-        let n = node.osm_id;
-        let incident: Vec<usize> = links
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.from_osm == n || l.to_osm == n)
-            .map(|(i, _)| i)
-            .collect();
-        let neigh: BTreeSet<i64> = incident
-            .iter()
-            .map(|&i| if links[i].from_osm == n { links[i].to_osm } else { links[i].from_osm })
-            .collect();
-        if neigh.len() != 2 {
-            continue;
-        }
-        let mut nb = neigh.iter().copied();
-        let (a, b) = (nb.next().unwrap(), nb.next().unwrap());
-        let find = |from: i64, to: i64| links.iter().position(|l| l.from_osm == from && l.to_osm == to);
-        let (a_in, a_out, b_in, b_out) = (find(a, n), find(n, a), find(b, n), find(n, b));
-
-        let link_len = |l: &LinkSpec| -> f64 {
-            let mut pts = vec![pos[&l.from_osm]];
-            pts.extend(l.geometry.iter().copied());
-            pts.push(pos[&l.to_osm]);
-            pts.windows(2).map(|w| distance(w[0], w[1])).sum()
-        };
-        let joined = |s1: usize, s2: usize, from: i64, to: i64| -> Option<LinkSpec> {
-            let (l1, l2) = (&links[s1], &links[s2]);
-            if l1.speed_limit != l2.speed_limit || l1.layer != l2.layer {
-                return None;
-            }
-            // Lane counts must match, except when one side is a grade-separated ramp
-            // sliver too short to hold a vehicle — an OSM lane-count fragment on a ramp
-            // approach (e.g. a 16 m 3-lane nub before a surface junction). Absorb it into
-            // the substantive segment, adopting that segment's lane count, so the ramp
-            // isn't chopped into micro-links that thrash the node-crossing logic.
-            const SLIVER_MAX: f64 = 30.0;
-            let lanes = if l1.lanes == l2.lanes {
-                l1.lanes
-            } else {
-                let ramp = |l: &LinkSpec| RoadKind::from_osm(&l.road_class).is_grade_separated();
-                let (len1, len2) = (link_len(l1), link_len(l2));
-                if !(ramp(l1) && ramp(l2)) || len1.min(len2) >= SLIVER_MAX {
-                    return None;
-                }
-                if len1 >= len2 { l1.lanes } else { l2.lanes }
-            };
-            let mut geometry = l1.geometry.clone();
-            geometry.push(pos[&n]);
-            geometry.extend(l2.geometry.iter().copied());
-            let name = if l1.name.is_empty() { l2.name.clone() } else { l1.name.clone() };
-            let road_class = if l1.road_class.is_empty() { l2.road_class.clone() } else { l1.road_class.clone() };
-            let highway_ref = if l1.highway_ref.is_empty() { l2.highway_ref.clone() } else { l1.highway_ref.clone() };
-            // The downstream segment (l2, ending at the merge's `to`) carries the
-            // turn:lanes that matter at the stop line; fall back to l1 if it lacks them.
-            let turn_lanes = if l2.turn_lanes.is_empty() { l1.turn_lanes.clone() } else { l2.turn_lanes.clone() };
-            Some(LinkSpec { from_osm: from, to_osm: to, lanes, speed_limit: l1.speed_limit, geometry, layer: l1.layer, name, road_class, highway_ref, turn_lanes })
-        };
-
-        if incident.len() == 4 {
-            if let (Some(ai), Some(ao), Some(bi), Some(bo)) = (a_in, a_out, b_in, b_out) {
-                if let (Some(fwd), Some(rev)) = (joined(ai, bo, a, b), joined(bi, ao, b, a)) {
-                    return Some((n, vec![ai, ao, bi, bo], vec![fwd, rev]));
-                }
-            }
-        }
-        if incident.len() == 2 {
-            if let (Some(ai), None, None, Some(bo)) = (a_in, a_out, b_in, b_out) {
-                if let Some(fwd) = joined(ai, bo, a, b) {
-                    return Some((n, vec![ai, bo], vec![fwd]));
-                }
-            }
-            if let (None, Some(ao), Some(bi), None) = (a_in, a_out, b_in, b_out) {
-                if let Some(rev) = joined(bi, ao, b, a) {
-                    return Some((n, vec![bi, ao], vec![rev]));
-                }
-            }
-        }
+) -> Option<LinkSpec> {
+    let (l1, l2) = (links[s1].as_ref().unwrap(), links[s2].as_ref().unwrap());
+    if l1.speed_limit != l2.speed_limit || l1.layer != l2.layer {
+        return None;
     }
-    None
+    let link_len = |l: &LinkSpec| -> f64 {
+        let mut pts = vec![pos[&l.from_osm]];
+        pts.extend(l.geometry.iter().copied());
+        pts.push(pos[&l.to_osm]);
+        pts.windows(2).map(|w| distance(w[0], w[1])).sum()
+    };
+    // Lane counts must match, except when one side is a grade-separated ramp sliver
+    // too short to hold a vehicle — an OSM lane-count fragment on a ramp approach.
+    // Absorb it into the substantive segment, adopting that segment's lane count, so
+    // the ramp isn't chopped into micro-links that thrash the node-crossing logic.
+    const SLIVER_MAX: f64 = 30.0;
+    let lanes = if l1.lanes == l2.lanes {
+        l1.lanes
+    } else {
+        let ramp = |l: &LinkSpec| RoadKind::from_osm(&l.road_class).is_grade_separated();
+        let (len1, len2) = (link_len(l1), link_len(l2));
+        if !(ramp(l1) && ramp(l2)) || len1.min(len2) >= SLIVER_MAX {
+            return None;
+        }
+        if len1 >= len2 { l1.lanes } else { l2.lanes }
+    };
+    let mut geometry = l1.geometry.clone();
+    geometry.push(pos[&n]);
+    geometry.extend(l2.geometry.iter().copied());
+    let name = if l1.name.is_empty() { l2.name.clone() } else { l1.name.clone() };
+    let road_class = if l1.road_class.is_empty() { l2.road_class.clone() } else { l1.road_class.clone() };
+    let highway_ref = if l1.highway_ref.is_empty() { l2.highway_ref.clone() } else { l1.highway_ref.clone() };
+    // The downstream segment (l2, ending at the merge's `to`) carries the turn:lanes
+    // that matter at the stop line; fall back to l1 if it lacks them.
+    let turn_lanes = if l2.turn_lanes.is_empty() { l1.turn_lanes.clone() } else { l2.turn_lanes.clone() };
+    Some(LinkSpec { from_osm: from, to_osm: to, lanes, speed_limit: l1.speed_limit, geometry, layer: l1.layer, name, road_class, highway_ref, turn_lanes })
 }
 
 /// Pull every lane back from its end nodes to the junction boundary so vehicles

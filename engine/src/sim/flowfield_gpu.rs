@@ -153,6 +153,10 @@ pub struct GpuFlowField {
     link_count: usize,
     /// Working buffers, (re)allocated only when the destination count changes.
     work: Option<Work>,
+    /// Relax passes encoded so far in the current chunked (browser) solve — see
+    /// [`run_chunk`](Self::run_chunk). Only the wasm async path reads it.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    passes_done: usize,
 }
 
 /// The per-recompute buffers, sized for `slot_count` destinations. Persisted so a
@@ -167,6 +171,10 @@ struct Work {
     dist: wgpu::Buffer,
     flags: wgpu::Buffer,
     staging: wgpu::Buffer,
+    /// Two-word readback of `flags` (`[changed, done]`) so the browser can poll the
+    /// convergence flag between relax chunks. Only the wasm async path reads it.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    flag_staging: wgpu::Buffer,
     bind: wgpu::BindGroup,
 }
 
@@ -232,7 +240,7 @@ impl GpuFlowField {
             cache: None,
         });
         let (relax, gate) = (compute("relax"), compute("gate"));
-        Self { device, queue, relax, gate, layout, offsets_buf, targets_buf, link_count, work: None }
+        Self { device, queue, relax, gate, layout, offsets_buf, targets_buf, link_count, work: None, passes_done: 0 }
     }
 
     /// (Re)allocate the working buffers when the destination count changes.
@@ -250,6 +258,7 @@ impl GpuFlowField {
         let dist = buf(total, storage);
         let flags = buf(2, storage);
         let staging = buf(total, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
+        let flag_staging = buf(2, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
         let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.layout,
@@ -263,13 +272,12 @@ impl GpuFlowField {
                 wgpu::BindGroupEntry { binding: 6, resource: flags.as_entire_binding() },
             ],
         });
-        self.work = Some(Work { slot_count, params, cost_buf, dests_buf, dist, flags, staging, bind });
+        self.work = Some(Work { slot_count, params, cost_buf, dests_buf, dist, flags, staging, flag_staging, bind });
     }
 
-    /// Encode and submit the relaxation for `cost`/`dests` into the working
-    /// buffers. `dist` is relaxed in place, so the result is always in `w.dist`
-    /// (no parity to track). Shared by the blocking and async readback paths.
-    fn dispatch(&mut self, cost: &[u32], dests: &[u32]) {
+    /// Write the input buffers for a fresh solve: `dist` re-initialised to 0 at each
+    /// destination link and INF elsewhere, and the `[changed, done]` flags cleared.
+    fn init_buffers(&mut self, cost: &[u32], dests: &[u32]) {
         let (l, k) = (self.link_count, dests.len());
         self.ensure_work(k);
         let w = self.work.as_ref().unwrap();
@@ -280,13 +288,16 @@ impl GpuFlowField {
         self.queue.write_buffer(&w.dests_buf, 0, cast_slice(dests));
         self.queue.write_buffer(&w.dist, 0, cast_slice(&init));
         self.queue.write_buffer(&w.flags, 0, cast_slice(&[0u32, 0u32])); // [changed, done]
+    }
 
+    /// Encode `count` relax+gate iterations into `encoder` — the graph-relaxation step,
+    /// relaxing `dist` in place. Passes past the fixed point early-out on the GPU via
+    /// the `done` flag. Shared by the blocking native solve and the chunked async one.
+    fn encode_relax_passes(&self, encoder: &mut wgpu::CommandEncoder, count: usize) {
+        let w = self.work.as_ref().unwrap();
+        let total = self.link_count * w.slot_count;
         let groups = (total as u32).div_ceil(64).max(1);
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        // `link_count` is Bellman-Ford's worst-case bound; the `gate` pass latches
-        // convergence, so `relax` passes past the fixed point cost nothing (they read
-        // the `done` flag and return without touching `dist`).
-        for _ in 0..l.max(1) {
+        for _ in 0..count.max(1) {
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
                 pass.set_pipeline(&self.relax);
@@ -300,7 +311,19 @@ impl GpuFlowField {
                 pass.dispatch_workgroups(1, 1, 1);
             }
         }
-        encoder.copy_buffer_to_buffer(&w.dist, 0, &w.staging, 0, (total * 4) as u64);
+    }
+
+    /// A full blocking solve — native only (the browser can't block, so it drives the
+    /// chunked async path). `link_count` is Bellman-Ford's worst-case bound; the `gate`
+    /// pass makes passes past the fixed point free.
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    fn dispatch(&mut self, cost: &[u32], dests: &[u32]) {
+        let (l, k) = (self.link_count, dests.len());
+        self.init_buffers(cost, dests);
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        self.encode_relax_passes(&mut encoder, l);
+        let w = self.work.as_ref().unwrap();
+        encoder.copy_buffer_to_buffer(&w.dist, 0, &w.staging, 0, (l * k * 4) as u64);
         self.queue.submit([encoder.finish()]);
     }
 
@@ -332,20 +355,86 @@ pub struct PendingReadback {
     slot_count: usize,
 }
 
+/// An in-flight readback of the two-word `[changed, done]` flags, mapped between
+/// relax chunks so the driver can tell when the fields have converged.
+#[cfg(target_arch = "wasm32")]
+pub struct PendingFlag {
+    ready: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
 /// Browser (async) readback: the GPU cannot be blocked on, so a recompute is
 /// *dispatched* on one frame and *collected* on a later one.
 #[cfg(target_arch = "wasm32")]
 impl GpuFlowField {
-    /// Dispatch a recompute and begin mapping the result. Poll [`try_take`](Self::try_take)
-    /// on later frames. Non-blocking.
-    pub fn begin_readback(&mut self, cost: &[u32], dests: &[u32]) -> PendingReadback {
-        let k = dests.len();
-        self.dispatch(cost, dests);
+    /// Begin a fresh chunked solve for `dests` under `cost`: write the input buffers
+    /// and reset the pass counter. Then drive [`run_chunk`](Self::run_chunk) /
+    /// [`poll_flag`](Self::poll_flag) / [`finish`](Self::finish) across frames.
+    pub fn start(&mut self, cost: &[u32], dests: &[u32]) {
+        self.init_buffers(cost, dests);
+        self.passes_done = 0;
+    }
+
+    /// Encode and submit one bounded chunk of relax+gate passes and begin mapping the
+    /// convergence flags — this is what keeps a whole-city reroute from encoding tens of
+    /// thousands of passes on the main thread in a single frame. Poll the returned
+    /// [`PendingFlag`] with [`poll_flag`](Self::poll_flag).
+    pub fn run_chunk(&mut self) -> PendingFlag {
+        const CHUNK: usize = 64;
+        let count = CHUNK.min(self.link_count.saturating_sub(self.passes_done)).max(1);
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        self.encode_relax_passes(&mut encoder, count);
+        let ready = std::rc::Rc::new(std::cell::Cell::new(false));
+        {
+            let w = self.work.as_ref().unwrap();
+            encoder.copy_buffer_to_buffer(&w.flags, 0, &w.flag_staging, 0, 8);
+            self.queue.submit([encoder.finish()]);
+            let flag = ready.clone();
+            w.flag_staging.slice(..8).map_async(wgpu::MapMode::Read, move |res| {
+                if res.is_ok() {
+                    flag.set(true);
+                }
+            });
+        }
+        self.passes_done += count;
+        PendingFlag { ready }
+    }
+
+    /// If the flag map has completed, read the `done` word (and unmap): `Some(true)`
+    /// once the fields have converged, `Some(false)` if more chunks are needed, `None`
+    /// while the map is still in flight.
+    pub fn poll_flag(&self, pending: &PendingFlag) -> Option<bool> {
+        let _ = self.device.poll(wgpu::PollType::Poll); // pump; a no-op driver on the web
+        if !pending.ready.get() {
+            return None;
+        }
+        let w = self.work.as_ref().unwrap();
+        let done = {
+            let flags: Vec<u32> = cast_slice(&w.flag_staging.slice(..8).get_mapped_range()).to_vec();
+            flags.get(1).copied().unwrap_or(0) != 0
+        };
+        w.flag_staging.unmap();
+        Some(done)
+    }
+
+    /// The solve has run its worst-case bound of passes without the `done` flag
+    /// latching — a safety net so a pathological graph can't spin forever; the driver
+    /// then finishes with whatever has converged.
+    pub fn passes_capped(&self) -> bool {
+        self.passes_done >= self.link_count.max(1)
+    }
+
+    /// Converged (or capped): copy the distance fields to the staging buffer and begin
+    /// mapping them for collection by [`try_take`](Self::try_take).
+    pub fn finish(&mut self) -> PendingReadback {
+        let w = self.work.as_ref().unwrap();
+        let (l, k) = (self.link_count, w.slot_count);
+        let bytes = (l * k * 4).max(4) as u64;
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_buffer_to_buffer(&w.dist, 0, &w.staging, 0, bytes);
+        self.queue.submit([encoder.finish()]);
         let ready = std::rc::Rc::new(std::cell::Cell::new(false));
         let flag = ready.clone();
-        let bytes = (self.link_count * k * 4) as u64;
-        let staging = &self.work.as_ref().unwrap().staging;
-        staging.slice(..bytes.max(4)).map_async(wgpu::MapMode::Read, move |res| {
+        w.staging.slice(..bytes).map_async(wgpu::MapMode::Read, move |res| {
             if res.is_ok() {
                 flag.set(true);
             }

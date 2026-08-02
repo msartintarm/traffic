@@ -16,6 +16,10 @@ use super::network::{LinkId, Network};
 
 pub struct FieldRouter {
     adj: Vec<Vec<u32>>,
+    /// Reverse adjacency (predecessor lists), built once so each field's Dijkstra
+    /// doesn't rebuild it — the difference between a city router installing in ~1 s
+    /// and ~40 s.
+    pred: Vec<Vec<u32>>,
     dests: Vec<LinkId>,
     slot: HashMap<u32, usize>,
     /// `next_hop[slot][from_link]` toward `dests[slot]` (`None` = unreachable).
@@ -34,6 +38,7 @@ impl FieldRouter {
     /// initialised against `cost`.
     pub fn new(net: &Network, dests: &[LinkId], cost: &[u64]) -> Self {
         let adj = flowfield::adjacency(net);
+        let pred = flowfield::reverse(&adj);
         let mut unique = Vec::new();
         let mut slot = HashMap::new();
         for &d in dests {
@@ -44,7 +49,7 @@ impl FieldRouter {
         }
         let next_hop = vec![Vec::new(); unique.len()];
         let dist = vec![Vec::new(); unique.len()];
-        let mut router = Self { adj, dests: unique, slot, next_hop, dist, cursor: 0 };
+        let mut router = Self { adj, pred, dests: unique, slot, next_hop, dist, cursor: 0 };
         router.recompute(cost);
         router
     }
@@ -63,13 +68,25 @@ impl FieldRouter {
         if total == 0 {
             return;
         }
-        for _ in 0..count.min(total) {
-            let s = self.cursor % total;
-            let dist = flowfield::distances_to(&self.adj, self.dests[s], cost);
-            self.next_hop[s] = flowfield::next_hops(&self.adj, &dist, cost);
+        let count = count.min(total);
+        let slots: Vec<usize> = (0..count).map(|k| (self.cursor + k) % total).collect();
+        let (pred, adj, dests) = (&self.pred, &self.adj, &self.dests);
+        let field = |&s: &usize| {
+            let dist = flowfield::distances_to_with(pred, dests[s], cost);
+            (s, flowfield::next_hops(adj, &dist, cost), dist)
+        };
+        #[cfg(feature = "parallel")]
+        let fields: Vec<_> = {
+            use rayon::prelude::*;
+            slots.par_iter().map(field).collect()
+        };
+        #[cfg(not(feature = "parallel"))]
+        let fields: Vec<_> = slots.iter().map(field).collect();
+        for (s, next_hop, dist) in fields {
+            self.next_hop[s] = next_hop;
             self.dist[s] = dist;
-            self.cursor = (self.cursor + 1) % total;
         }
+        self.cursor = (self.cursor + count) % total;
     }
 
     /// The destinations this router routes to.
@@ -83,11 +100,26 @@ impl FieldRouter {
     }
 
     /// Rebuild every next-hop field against the current per-link `cost` (ms).
-    /// Call periodically so routing tracks live congestion.
+    /// Call periodically so routing tracks live congestion. The fields are
+    /// independent, so with the `parallel` feature (the browser's wasm-thread pool)
+    /// they're computed across cores — the whole-city install, hundreds of fields,
+    /// otherwise dominates the first frame.
     pub fn recompute(&mut self, cost: &[u64]) {
-        for (s, &dest) in self.dests.iter().enumerate() {
-            let dist = flowfield::distances_to(&self.adj, dest, cost);
-            self.next_hop[s] = flowfield::next_hops(&self.adj, &dist, cost);
+        let (pred, adj) = (&self.pred, &self.adj);
+        let field = |&dest: &LinkId| {
+            let dist = flowfield::distances_to_with(pred, dest, cost);
+            let next_hop = flowfield::next_hops(adj, &dist, cost);
+            (next_hop, dist)
+        };
+        #[cfg(feature = "parallel")]
+        let fields: Vec<_> = {
+            use rayon::prelude::*;
+            self.dests.par_iter().map(field).collect()
+        };
+        #[cfg(not(feature = "parallel"))]
+        let fields: Vec<_> = self.dests.iter().map(field).collect();
+        for (s, (next_hop, dist)) in fields.into_iter().enumerate() {
+            self.next_hop[s] = next_hop;
             self.dist[s] = dist;
         }
     }
@@ -116,9 +148,22 @@ impl FieldRouter {
         if dist_per_slot.len() != self.next_hop.len() {
             return;
         }
-        for (s, dist) in dist_per_slot.iter().enumerate() {
-            self.next_hop[s] = flowfield::next_hops(&self.adj, dist, cost);
-            self.dist[s] = dist.clone();
+        // Rebuild every destination's next-hop field from the GPU-computed distances.
+        // O(dests × links), so on a city map parallelize it across cores (with the
+        // `parallel` feature / browser thread pool) to keep it off the frame's critical
+        // path when a readback lands.
+        let adj = &self.adj;
+        let field = |dist: &Vec<u64>| (flowfield::next_hops(adj, dist, cost), dist.clone());
+        #[cfg(feature = "parallel")]
+        let fields: Vec<_> = {
+            use rayon::prelude::*;
+            dist_per_slot.par_iter().map(field).collect()
+        };
+        #[cfg(not(feature = "parallel"))]
+        let fields: Vec<_> = dist_per_slot.iter().map(field).collect();
+        for (s, (next_hop, dist)) in fields.into_iter().enumerate() {
+            self.next_hop[s] = next_hop;
+            self.dist[s] = dist;
         }
     }
 

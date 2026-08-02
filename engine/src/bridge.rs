@@ -17,7 +17,7 @@ use crate::render::gpu::Renderer;
 use crate::render::{geometry, Instance, StaticMesh};
 use crate::sim::clock::SimClock;
 use crate::sim::flowfield;
-use crate::sim::flowfield_gpu::{GpuFlowField, PendingReadback};
+use crate::sim::flowfield_gpu::{GpuFlowField, PendingFlag, PendingReadback};
 use crate::sim::config::{SimConfig, VehicleClass};
 use crate::sim::demand::{self, DemandGenerator, DemandSources};
 use crate::sim::congestion::CongestionConfig;
@@ -87,6 +87,9 @@ pub struct Simulation {
     /// stale readback must still be *collected* (to unmap its staging buffer) but its
     /// distances are discarded, never fed into the new field.
     gpu_pending: Option<(PendingReadback, u64)>,
+    /// An in-flight relax-chunk flag readback (the reroute is mid-convergence). Same
+    /// generation tagging as `gpu_pending` so a reinstall abandons a stale solve.
+    gpu_relax: Option<(PendingFlag, u64)>,
     /// Bumped whenever the router is reinstalled, to invalidate an in-flight readback.
     gpu_generation: u64,
     gpu_cost: Vec<u64>,
@@ -151,7 +154,7 @@ impl Simulation {
         Simulation {
             world, clock, seed: cfg.seed, demand, demand_sources, demand_rate, entry_speed_cap, camera,
             prev: PoseMap::default(), prev_lane: IntMap::default(), prev_crossing: IntMap::default(), selected: None, signal_heads,
-            gpu: None, gpu_pending: None, gpu_generation: 0, gpu_cost: Vec::new(), gpu_last: 0.0,
+            gpu: None, gpu_pending: None, gpu_relax: None, gpu_generation: 0, gpu_cost: Vec::new(), gpu_last: 0.0,
             effective_speed: 0.0, throttled: false, last_advance_ms: 0.0,
             speed_sim_accum: 0.0, speed_wall_accum: 0.0, speed_dropped: false,
         }
@@ -167,6 +170,7 @@ impl Simulation {
         let (device, queue) = renderer.device_queue();
         self.gpu = Some(GpuFlowField::from_device(device, queue, &offsets, &targets));
         self.gpu_pending = None;
+        self.gpu_relax = None;
         self.world.set_external_reroute(true);
         self.gpu_last = f64::NEG_INFINITY; // recompute on the next frame
     }
@@ -817,16 +821,18 @@ impl Simulation {
 const GPU_REROUTE_SECS: f64 = 3.0;
 
 impl Simulation {
-    /// Pump the async GPU routing recompute once per frame: collect a finished
-    /// readback into the router, else (when idle and due) dispatch a fresh one.
-    /// Non-blocking — the browser can't wait on the GPU, so a rebuild spans frames.
+    /// Pump the async GPU routing recompute once per frame. A whole-city reroute is a
+    /// chunked state machine spread over several frames so no single frame encodes the
+    /// worst-case pass count: `idle → start + run_chunk → poll_flag → {converged | capped
+    /// → finish → collect → feed} else run_chunk`. Non-blocking — the browser can't wait
+    /// on the GPU, so a solve spans frames.
     fn drive_gpu_routing(&mut self) {
         if self.gpu.is_none() {
             return;
         }
-        // Collect an in-flight readback, if the GPU has finished it. Always unmap
-        // (via `try_take`); only feed the result if it's still for the current
-        // router generation — a demand toggle since dispatch invalidates it.
+        // Phase A — collect the final distance readback. Always unmap (via `try_take`);
+        // only feed the result if it's still for the current router generation — a demand
+        // toggle since dispatch invalidates it.
         if let Some((pending, generation)) = self.gpu_pending.take() {
             match self.gpu.as_ref().unwrap().try_take(&pending) {
                 Some(fields) if generation == self.gpu_generation => {
@@ -842,7 +848,26 @@ impl Simulation {
             }
             return; // one GPU action per frame
         }
-        // Idle: dispatch a rebuild when the field is due for a refresh.
+        // Phase B — advance an in-flight convergence: poll the last chunk's flags, then
+        // either finish (converged, or hit the safety cap) or encode the next chunk.
+        if let Some((pending, generation)) = self.gpu_relax.take() {
+            match self.gpu.as_ref().unwrap().poll_flag(&pending) {
+                None => self.gpu_relax = Some((pending, generation)), // chunk still mapping
+                Some(_) if generation != self.gpu_generation => self.gpu_last = f64::NEG_INFINITY, // stale solve: unmapped, dispatch fresh
+                Some(done) => {
+                    let gpu = self.gpu.as_mut().unwrap();
+                    if done || gpu.passes_capped() {
+                        let readback = gpu.finish();
+                        self.gpu_pending = Some((readback, generation));
+                    } else {
+                        let flag = gpu.run_chunk();
+                        self.gpu_relax = Some((flag, generation));
+                    }
+                }
+            }
+            return; // one GPU action per frame
+        }
+        // Phase C — idle: begin a fresh solve when the field is due for a refresh.
         if self.world.time() - self.gpu_last < GPU_REROUTE_SECS {
             return;
         }
@@ -852,8 +877,10 @@ impl Simulation {
         }
         self.gpu_cost = self.world.live_link_costs();
         let cost32: Vec<u32> = self.gpu_cost.iter().map(|&c| c.min(u32::MAX as u64) as u32).collect();
-        let readback = self.gpu.as_mut().unwrap().begin_readback(&cost32, &dests);
-        self.gpu_pending = Some((readback, self.gpu_generation));
+        let gpu = self.gpu.as_mut().unwrap();
+        gpu.start(&cost32, &dests);
+        let flag = gpu.run_chunk();
+        self.gpu_relax = Some((flag, self.gpu_generation));
     }
 }
 

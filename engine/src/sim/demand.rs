@@ -372,8 +372,16 @@ pub fn highway_od_pairs(net: &Network, seed: u64, target: usize, out: &mut Vec<O
                     continue;
                 }
                 if !r.is_empty() && same_highway(net.link_ref(d), r) {
-                    same.push(d);
+                    // Same highway: a through-trip only if the exit continues in the
+                    // entry's direction of travel. The opposite carriageway shares the
+                    // route ref but heads back the other way — a U-turn onto the same
+                    // freeway, which is impossible without leaving the freeway system —
+                    // so it's dropped, not offered as through-traffic.
+                    if continues_forward(net, e, d) {
+                        same.push(d);
+                    }
                 } else {
+                    // A different highway (either direction is fine) or an unrefed exit.
                     other.push(d);
                 }
             }
@@ -491,6 +499,26 @@ fn pick_routable(net: &Network, e: LinkId, pool: &[LinkId], seed: u64, attempt: 
 /// ("I 280;CA 35" and "I 280" match on "I 280").
 fn same_highway(a: &str, b: &str) -> bool {
     a.split(';').any(|t| !t.is_empty() && b.split(';').any(|u| u == t))
+}
+
+/// Unit travel direction of `link` (from its `from` node toward its `to` node). For a
+/// boundary link this points the way traffic crosses the map edge: inward for an entry,
+/// outward for an exit — so an entry and its through-exit on the same carriageway share
+/// a heading, while the opposite carriageway's exit heads the other way.
+fn travel_dir(net: &Network, link: LinkId) -> [f64; 2] {
+    let l = net.link(link);
+    let (a, b) = (net.node(l.from).position, net.node(l.to).position);
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let m = dx.hypot(dy).max(1e-6);
+    [dx / m, dy / m]
+}
+
+/// Whether a highway `exit` continues in the `entry`'s direction of travel rather than
+/// doubling back on the opposite carriageway — a same-highway exit is genuine
+/// through-traffic only when the two headings agree (positive dot product).
+fn continues_forward(net: &Network, entry: LinkId, exit: LinkId) -> bool {
+    let (e, x) = (travel_dir(net, entry), travel_dir(net, exit));
+    e[0] * x[0] + e[1] * x[1] > 0.0
 }
 
 fn sample_pairs(
@@ -755,6 +783,71 @@ mod tests {
             same += (p.dest == LinkId(2)) as usize;
         }
         assert!(same * 2 > pairs.len(), "majority reach the far end of the same highway: {same}/{}", pairs.len());
+    }
+
+    /// A divided freeway: two one-way carriageways (NB, SB) sharing a route ref, joined
+    /// by crossovers so the opposing exit is *routable* from either entry. A same-ref
+    /// exit is only through-traffic when it continues the entry's direction — the
+    /// opposing carriageway's exit is a U-turn and must never be a destination.
+    fn divided_freeway_with_crossover() -> Network {
+        let hw = |a, b| LinkSpec {
+            road_class: "motorway".into(),
+            highway_ref: "US 101".into(),
+            ..LinkSpec::oneway(a, b, 3, 29.0)
+        };
+        OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, 0.0, -900.0), // NB south gateway (enters heading N)
+                NodeSpec::uncontrolled(2, 0.0, 0.0),    // NB interior
+                NodeSpec::uncontrolled(3, 0.0, 900.0),  // NB north gateway (exits heading N)
+                NodeSpec::uncontrolled(4, 50.0, 900.0), // SB north gateway (enters heading S)
+                NodeSpec::uncontrolled(5, 50.0, 0.0),   // SB interior
+                NodeSpec::uncontrolled(6, 50.0, -900.0), // SB south gateway (exits heading S)
+            ],
+            links: vec![
+                hw(1, 2),                        // NB entry (heading +y)
+                hw(2, 3),                        // NB exit  (heading +y)
+                hw(4, 5),                        // SB entry (heading -y)
+                hw(5, 6),                        // SB exit  (heading -y)
+                LinkSpec::oneway(2, 5, 1, 13.0), // crossover NB→SB (makes the SB exit routable from the NB entry)
+                LinkSpec::oneway(5, 2, 1, 13.0), // crossover SB→NB (and the NB exit from the SB entry)
+            ],
+        }
+        .build()
+    }
+
+    #[test]
+    fn highway_through_trips_never_u_turn_onto_the_opposing_carriageway() {
+        let net = divided_freeway_with_crossover();
+        let entries = boundary::highway_entry_links(&net);
+        let exits: std::collections::HashSet<u32> =
+            boundary::highway_exit_links(&net).iter().map(|l| l.0).collect();
+        assert_eq!(entries.len(), 2, "two entry carriageways (NB, SB)");
+        assert_eq!(exits.len(), 2, "two exit carriageways (NB, SB)");
+
+        let dir = |l: LinkId| {
+            let lk = net.link(l);
+            let (a, b) = (net.node(lk.from).position, net.node(lk.to).position);
+            [b[0] - a[0], b[1] - a[1]]
+        };
+
+        let mut pairs = Vec::new();
+        highway_od_pairs(&net, 11, 300, &mut pairs);
+        assert!(!pairs.is_empty(), "yields freeway demand");
+
+        let mut through = 0;
+        for p in &pairs {
+            assert!(entries.contains(&p.origin), "every trip enters at a freeway carriageway");
+            if exits.contains(&p.dest.0) {
+                let (e, x) = (dir(p.origin), dir(p.dest));
+                assert!(
+                    e[0] * x[0] + e[1] * x[1] > 0.0,
+                    "U-turn: entered heading {e:?} but exits heading {x:?} on the same freeway",
+                );
+                through += 1;
+            }
+        }
+        assert!(through > 0, "same-carriageway through-traffic still runs");
     }
 
     #[test]

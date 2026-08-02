@@ -1536,10 +1536,17 @@ impl NetWorld {
         // Spread the flow-field rebuild across the reroute interval: refresh a slice
         // of destinations each tick so every field is current within the interval,
         // without the whole-graph recompute landing on one tick (a visible freeze).
+        // Also bound the per-tick work by a link budget so this CPU fallback (no GPU
+        // routing) stays interactive on a whole-city map: a field costs ~O(links), so a
+        // big graph refreshes fewer fields per tick (staler routing) rather than
+        // stalling the frame. Small maps stay under the budget and are unaffected.
+        const REROUTE_LINK_BUDGET: usize = 120_000;
         let interval_ticks = (REROUTE_INTERVAL_SECS / self.cfg.dt).max(1.0);
+        let budget_fields = (REROUTE_LINK_BUDGET / self.network.links.len().max(1)).max(1);
         let costs = self.live_link_costs();
         if let Some(r) = self.router.as_mut() {
-            let per_tick = (r.destination_count() as f64 / interval_ticks).ceil().max(1.0) as usize;
+            let per_tick =
+                ((r.destination_count() as f64 / interval_ticks).ceil().max(1.0) as usize).min(budget_fields);
             r.recompute_incremental(&costs, per_tick);
         }
     }
@@ -1926,20 +1933,30 @@ impl NetWorld {
                 .get(&to_lane.0)
                 .is_some_and(|&f| self.fleet.rows[f].position < driver.vehicle_length + driver.min_gap)
         });
+        // A multi-node junction acts as one signal at its entrances: once a vehicle
+        // is on an internal link (both endpoints in the same junction) it has already
+        // been admitted and commits through the interior nodes rather than stopping at
+        // a sibling node's line inside the box — real drivers never stop mid-junction.
+        let on_internal_link = {
+            let from = self.network.link(lane.link).from;
+            let j = self.network.node_junction(from);
+            j.is_some() && j == self.network.node_junction(node)
+        };
         // Signal: red always stops; yellow stops only if the vehicle can brake
         // comfortably before the line (dilemma zone) — otherwise it proceeds and
         // clears on yellow.
-        let signal_stop = intended.is_some_and(|mid| match self.movement_state(mid) {
-            SignalState::Green => veh.speed < 2.0 && self.signal_green_elapsed(mid) < driver.reaction_time,
-            SignalState::Red => !self.is_rtor(mid),
-            SignalState::Yellow => {
-                let committed = veh.speed > 3.0 && to_line < veh.speed * 3.0;
-                let runs_it = committed
-                    && rng::uniform01(self.cfg.seed, veh.id, YELLOW_RUN_SALT, Stream::GapAcceptance)
-                        < yellow_run_prob(&veh.driver);
-                !runs_it && can_stop_before(veh.speed, driver.comfort_decel, to_line)
-            }
-        });
+        let signal_stop = !on_internal_link
+            && intended.is_some_and(|mid| match self.movement_state(mid) {
+                SignalState::Green => veh.speed < 2.0 && self.signal_green_elapsed(mid) < driver.reaction_time,
+                SignalState::Red => !self.is_rtor(mid),
+                SignalState::Yellow => {
+                    let committed = veh.speed > 3.0 && to_line < veh.speed * 3.0;
+                    let runs_it = committed
+                        && rng::uniform01(self.cfg.seed, veh.id, YELLOW_RUN_SALT, Stream::GapAcceptance)
+                            < yellow_run_prob(&veh.driver);
+                    !runs_it && can_stop_before(veh.speed, driver.comfort_decel, to_line)
+                }
+            });
         // Also hold at the line when crossing would strand the car inside a
         // multi-node junction (a sibling node ahead is red or its exit is occupied).
         let junction_blocked =
@@ -1957,8 +1974,10 @@ impl NetWorld {
         });
 
         let rtor = intended.is_some_and(|mid| self.is_rtor(mid));
-        let stop_sign = ((matches!(control, NodeControl::Stop) || rtor) && veh.stopped_at != Some(node))
-            .then_some(to_line);
+        let stop_sign = (!on_internal_link
+            && (matches!(control, NodeControl::Stop) || rtor)
+            && veh.stopped_at != Some(node))
+        .then_some(to_line);
 
         // A freeway diverge/merge is free-flow — no crossing traffic to yield to (the
         // merge is a zipper, handled by `merge`, not a box crossing). So a freeway
@@ -1977,7 +1996,11 @@ impl NetWorld {
         let fifo_yield = matches!(control, NodeControl::Stop)
             && veh.stopped_at == Some(node)
             && intended.is_some_and(|mid| self.earlier_stopped_conflict(i, mid, node, nb));
-        let yield_line = (box_yield || prio_yield || permissive_yield || fifo_yield).then_some(to_line);
+        // A car already committed on an interior link clears the junction rather than
+        // pulling up and waiting for a gap inside it; only the hard box-occupancy gate
+        // (crash safety) still applies to it.
+        let soft_yield = (prio_yield || permissive_yield || fifo_yield) && !on_internal_link;
+        let yield_line = (box_yield || soft_yield).then_some(to_line);
 
         let merge = self.merge_conflict(veh, lane.length, intended, nb);
 

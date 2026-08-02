@@ -141,7 +141,20 @@ const ZOOM_RANGE = 60; // fit-out … max-in ratio driving the slider
 const REAL_MAPS: Record<string, { file: string; name: string }> = {
   millbrae: { file: "map.json", name: "Millbrae, CA" },
   sancarlos: { file: "sancarlos.json", name: "San Carlos, CA" },
+  sf: { file: "sf.json", name: "San Francisco, CA" },
 };
+
+// Splash-screen scenario menu: the real maps followed by the synthetic test scenes,
+// in the order they're offered. Picking one navigates to `?scenario=<key>`, which boots
+// that scene — already cross-origin isolated, so the threaded build loads with no reload.
+const SCENARIOS: { key: string; name: string; kind: "Real map" | "Test" }[] = [
+  { key: "millbrae", name: "Millbrae, CA", kind: "Real map" },
+  { key: "sancarlos", name: "San Carlos, CA", kind: "Real map" },
+  { key: "sf", name: "San Francisco, CA", kind: "Real map" },
+  { key: "arterial", name: "Arterial junction", kind: "Test" },
+  { key: "corridor", name: "Signal corridor", kind: "Test" },
+  { key: "gridlock", name: "Gridlock", kind: "Test" },
+];
 
 // Speed unit display: m/s → the shown unit, and its label.
 const MPS_TO = { mi: 2.23694, km: 3.6 } as const;
@@ -167,6 +180,9 @@ export default function EngineCanvas() {
   const [backend, setBackend] = useState("");
   const [mapLabel, setMapLabel] = useState("");
   const [scenario, setScenario] = useState("millbrae");
+  // "splash" (no `?scenario=`: show the picker) · "sim" (boot the chosen scene) · null
+  // (undetermined on the server / first client paint, before the URL is read).
+  const [route, setRoute] = useState<"splash" | "sim" | null>(null);
   const [highwayTraffic, setHighwayTraffic] = useState(true);
   const [surfaceTraffic, setSurfaceTraffic] = useState(true);
   const [rushHour, setRushHour] = useState(false);
@@ -184,10 +200,13 @@ export default function EngineCanvas() {
   const [isFullscreen, setIsFullscreen] = useState(false);
 
   useEffect(() => {
-    setScenario(new URLSearchParams(window.location.search).get("scenario") ?? "millbrae");
+    const params = new URLSearchParams(window.location.search);
+    setScenario(params.get("scenario") ?? "millbrae");
+    setRoute(params.has("scenario") ? "sim" : "splash");
   }, []);
 
   useEffect(() => {
+    if (route !== "sim") return; // splash / undetermined: no sim to boot
     let raf = 0;
     let last = performance.now();
     let disposed = false;
@@ -357,7 +376,13 @@ export default function EngineCanvas() {
         // module loads — the CPU-threads build (rayon + SharedArrayBuffer) is a separate
         // artifact from the single-threaded one, so it can't be switched at runtime. The
         // dropdown reloads with `?compute=<serial|threads|gpu>`; we honour it here.
-        const compute = new URLSearchParams(window.location.search).get("compute") ?? "serial";
+        // Every map defaults to the parallel (CPU-threads) build — the browser's most
+        // performant config (GPU per-vehicle accel is native-only) — and falls back to
+        // serial if the threaded build or cross-origin isolation isn't available. The
+        // splash establishes isolation first, so booting a scene needs no further reload.
+        const params0 = new URLSearchParams(window.location.search);
+        const scenario0 = params0.get("scenario") ?? "millbrae";
+        const compute = params0.get("compute") ?? "threads";
         setAccelBackend(compute);
         const wantThreads = compute === "threads";
         // Threads need cross-origin isolation (COOP/COEP via the shim SW, which reloads
@@ -400,7 +425,7 @@ export default function EngineCanvas() {
         }
         if (disposed) return;
 
-        const scenario = new URLSearchParams(window.location.search).get("scenario") ?? "millbrae";
+        const scenario = scenario0;
         let loaded: Sim | null = null;
         let label = "sample map";
         const realMap = REAL_MAPS[scenario];
@@ -423,6 +448,11 @@ export default function EngineCanvas() {
         simRef.current = sim;
         if (threadsReady) sim.set_threads_ready(true); // CPU-threads pool usable
         sim.set_accel_backend(compute); // honour ?compute= (falls back to serial if unavailable)
+        // Active-set scheduler: queued/idle cars skip the full per-vehicle gather, so the
+        // step cost tracks the *deciding* cars, not the whole fleet — the difference
+        // between a smooth and a stalling city. Safe (matches the all-cars step) and a
+        // pure win, so it's on for every map.
+        sim.set_sleep_scheduler(true);
         // The gridlock scenario exists to show the congestion LOD, so engage it by
         // default there; elsewhere it stays off (full per-car detail is the default).
         const congestionOn = scenario === "gridlock";
@@ -613,7 +643,7 @@ export default function EngineCanvas() {
       window.removeEventListener("mouseup", onUp);
       removeResize();
     };
-  }, []);
+  }, [route]);
 
   const toggle = () => {
     const sim = simRef.current;
@@ -642,6 +672,12 @@ export default function EngineCanvas() {
       }
     } catch {}
   };
+
+  // No `?scenario=` yet: show the picker (which also warms up cross-origin isolation)
+  // instead of booting a scene. `null` is the pre-URL paint — render the empty frame so
+  // there's no splash flash before we know which way to go.
+  if (route === "splash") return <SplashScreen />;
+  if (route === null) return <div className={styles.wrapper} aria-busy="true" />;
 
   return (
     <div ref={wrapperRef} className={styles.wrapper}>
@@ -705,6 +741,7 @@ export default function EngineCanvas() {
             >
               <option value="millbrae">Millbrae (real map)</option>
               <option value="sancarlos">San Carlos (real map)</option>
+              <option value="sf">San Francisco (real map)</option>
               <option value="arterial">Test: arterial junction</option>
               <option value="corridor">Test: signal corridor</option>
               <option value="gridlock">Test: gridlock (fast jam)</option>
@@ -941,6 +978,37 @@ export default function EngineCanvas() {
       </Collapsible>
 
       <div ref={tipRef} className={styles.tooltip} />
+    </div>
+  );
+}
+
+/** The scenario picker shown when the URL carries no `?scenario=`. It warms up
+ * cross-origin isolation on mount so the one-time COOP/COEP service-worker reload
+ * happens *here*, before any map loads — then a card's navigation boots the scene
+ * already-isolated, and the threaded wasm loads with no further reload. */
+function SplashScreen() {
+  useEffect(() => {
+    void ensureCrossOriginIsolation();
+  }, []);
+  const pick = (key: string) => {
+    const url = new URL(window.location.href);
+    url.searchParams.set("scenario", key);
+    window.location.href = url.toString();
+  };
+  return (
+    <div className={styles.splash}>
+      <div className={styles.splashInner}>
+        <h1 className={styles.splashTitle}>Traffic</h1>
+        <p className={styles.splashSubtitle}>Pick a map to simulate</p>
+        <div className={styles.splashGrid}>
+          {SCENARIOS.map((s) => (
+            <button key={s.key} className={styles.splashCard} onClick={() => pick(s.key)}>
+              <span className={styles.splashCardName}>{s.name}</span>
+              <span className={`${styles.splashBadge} ${s.kind === "Test" ? styles.splashBadgeTest : ""}`}>{s.kind}</span>
+            </button>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }

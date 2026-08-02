@@ -232,6 +232,17 @@ pub struct Network {
     pub link_turn_lanes: Vec<String>,
     pub junctions: Vec<Junction>,
     pub node_junction: Vec<Option<JunctionId>>,
+    /// O(1) membership index over `conflicts` (unordered movement-id pair packed into
+    /// a `u64`), so [`Network::movements_conflict`] is a hash lookup rather than a scan
+    /// of every conflict — the difference between a city-sized map building in seconds
+    /// and in minutes. Rebuilt by [`Network::build_conflict_index`] whenever conflicts
+    /// change.
+    conflict_pairs: std::collections::HashSet<u64>,
+}
+
+fn movement_pair_key(a: MovementId, b: MovementId) -> u64 {
+    let (lo, hi) = if a.0 <= b.0 { (a.0, b.0) } else { (b.0, a.0) };
+    (lo as u64) << 32 | hi as u64
 }
 
 fn sub(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
@@ -376,6 +387,23 @@ fn segment_intersection(p1: [f64; 2], p2: [f64; 2], p3: [f64; 2], p4: [f64; 2]) 
 /// the closest approach if it's within `clearance` (a near-miss like two
 /// same-direction curves). Segment-exact so long interiors at big intersections
 /// can't slip a real crossing between samples.
+/// Axis-aligned bounds `[min_x, min_y, max_x, max_y]` of an interior polyline, for a
+/// cheap rejection test before the segment-exact crossing search.
+fn poly_bbox(p: &[([f64; 2], f64)]) -> [f64; 4] {
+    let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+    for &(pt, _) in p {
+        lo = [lo[0].min(pt[0]), lo[1].min(pt[1])];
+        hi = [hi[0].max(pt[0]), hi[1].max(pt[1])];
+    }
+    [lo[0], lo[1], hi[0], hi[1]]
+}
+
+/// Whether two bounding boxes come within `margin` of each other — if not, the two
+/// polylines can't be within `margin`, so there's no need to test for a crossing.
+fn bbox_overlap(a: [f64; 4], b: [f64; 4], margin: f64) -> bool {
+    a[0] - margin <= b[2] && b[0] - margin <= a[2] && a[1] - margin <= b[3] && b[1] - margin <= a[3]
+}
+
 fn nearest_crossing(a: &[([f64; 2], f64)], b: &[([f64; 2], f64)], clearance: f64) -> Option<(f64, f64)> {
     let lerp = |x: f64, y: f64, k: f64| x + (y - x) * k;
     let mut best = f64::MAX;
@@ -448,7 +476,13 @@ impl Network {
 
     /// Whether two movements have a crossing conflict point.
     pub fn movements_conflict(&self, a: MovementId, b: MovementId) -> bool {
-        self.conflicts.iter().any(|c| (c.a == a && c.b == b) || (c.a == b && c.b == a))
+        self.conflict_pairs.contains(&movement_pair_key(a, b))
+    }
+
+    /// Rebuild the O(1) conflict-lookup index from `conflicts`. Call after every pass
+    /// that adds conflict points and before anything queries `movements_conflict`.
+    pub fn build_conflict_index(&mut self) {
+        self.conflict_pairs = self.conflicts.iter().map(|c| movement_pair_key(c.a, c.b)).collect();
     }
 
     /// World `[x, y, heading]` of a point `s` metres along a movement's interior
@@ -490,20 +524,30 @@ impl Network {
             .collect();
 
         let polys: Vec<Vec<([f64; 2], f64)>> = self.interiors.iter().map(interior_polyline).collect();
+        let bboxes: Vec<[f64; 4]> = polys.iter().map(|p| poly_bbox(p)).collect();
+        // Only movements sharing a node can cross, so group by node and pair within
+        // each node — O(Σ node_movements²) instead of O(movements²), which is what
+        // lets a whole-city map build in reasonable time.
+        let mut by_node: Vec<Vec<usize>> = vec![Vec::new(); self.nodes.len()];
+        for (i, mv) in self.movements.iter().enumerate() {
+            by_node[mv.node.idx()].push(i);
+        }
         let mut conflicts = Vec::new();
-        for i in 0..self.movements.len() {
-            for j in (i + 1)..self.movements.len() {
-                let (a, b) = (self.movements[i], self.movements[j]);
-                if a.node != b.node {
-                    continue;
-                }
-                if self.lane(a.from_lane).link == self.lane(b.from_lane).link
-                    || self.lane(a.to_lane).link == self.lane(b.to_lane).link
-                {
-                    continue;
-                }
-                if let Some((sa, sb)) = nearest_crossing(&polys[i], &polys[j], CONFLICT_CLEARANCE) {
-                    conflicts.push(ConflictPoint { node: a.node, a: MovementId(i as u32), sa, b: MovementId(j as u32), sb });
+        for members in &by_node {
+            for (x, &i) in members.iter().enumerate() {
+                for &j in &members[x + 1..] {
+                    if !bbox_overlap(bboxes[i], bboxes[j], CONFLICT_CLEARANCE) {
+                        continue; // paths can't come within clearance — skip the crossing test
+                    }
+                    let (a, b) = (self.movements[i], self.movements[j]);
+                    if self.lane(a.from_lane).link == self.lane(b.from_lane).link
+                        || self.lane(a.to_lane).link == self.lane(b.to_lane).link
+                    {
+                        continue;
+                    }
+                    if let Some((sa, sb)) = nearest_crossing(&polys[i], &polys[j], CONFLICT_CLEARANCE) {
+                        conflicts.push(ConflictPoint { node: a.node, a: MovementId(i as u32), sa, b: MovementId(j as u32), sb });
+                    }
                 }
             }
         }
@@ -517,24 +561,33 @@ impl Network {
     /// the collision and box-yield logic. Must run after [`build_junctions`].
     pub fn build_cross_junction_conflicts(&mut self) {
         let polys: Vec<Vec<([f64; 2], f64)>> = self.interiors.iter().map(interior_polyline).collect();
+        // Group movements by junction so only same-cluster pairs are tested — O(Σ
+        // junction_movements²) rather than O(movements²).
+        let mut by_junction: Vec<Vec<usize>> = vec![Vec::new(); self.junctions.len()];
+        for (i, mv) in self.movements.iter().enumerate() {
+            if let Some(j) = self.node_junction(mv.node) {
+                by_junction[j.idx()].push(i);
+            }
+        }
         let mut extra = Vec::new();
-        for i in 0..self.movements.len() {
-            for j in (i + 1)..self.movements.len() {
-                let (a, b) = (self.movements[i], self.movements[j]);
-                if a.node == b.node {
-                    continue;
-                }
-                let (ja, jb) = (self.node_junction(a.node), self.node_junction(b.node));
-                if ja.is_none() || ja != jb {
-                    continue;
-                }
-                if self.lane(a.from_lane).link == self.lane(b.from_lane).link
-                    || self.lane(a.to_lane).link == self.lane(b.to_lane).link
-                {
-                    continue;
-                }
-                if let Some((sa, sb)) = nearest_crossing(&polys[i], &polys[j], CONFLICT_CLEARANCE) {
-                    extra.push(ConflictPoint { node: a.node, a: MovementId(i as u32), sa, b: MovementId(j as u32), sb });
+        for members in &by_junction {
+            for (x, &i) in members.iter().enumerate() {
+                for &j in &members[x + 1..] {
+                    let (a, b) = (self.movements[i], self.movements[j]);
+                    if a.node == b.node {
+                        continue; // same-node pairs are handled by build_interiors
+                    }
+                    if self.lane(a.from_lane).link == self.lane(b.from_lane).link
+                        || self.lane(a.to_lane).link == self.lane(b.to_lane).link
+                    {
+                        continue;
+                    }
+                    if a.to_lane == b.from_lane || b.to_lane == a.from_lane {
+                        continue; // sequential segments of one path — traversed in turn, never at once
+                    }
+                    if let Some((sa, sb)) = nearest_crossing(&polys[i], &polys[j], CONFLICT_CLEARANCE) {
+                        extra.push(ConflictPoint { node: a.node, a: MovementId(i as u32), sa, b: MovementId(j as u32), sb });
+                    }
                 }
             }
         }
@@ -547,6 +600,42 @@ impl Network {
 
     pub fn node_junction(&self, node: NodeId) -> Option<JunctionId> {
         self.node_junction.get(node.idx()).copied().flatten()
+    }
+
+    /// The external approach link a path entered a junction through, tracing back
+    /// across any interior links from `start`. For a lane outside a junction (or fed
+    /// straight from outside) this is just its own link. Signal grouping keys on it so
+    /// every movement of one through-path across a multi-node junction shares a group
+    /// and shows one colour — the vehicle never meets a red between the interior nodes.
+    pub(crate) fn entry_link(&self, start: LaneId, feeders_of: &[Vec<MovementId>]) -> LinkId {
+        let mut lane = start;
+        for _ in 0..8 {
+            let link = self.lane(lane).link;
+            let a = self.node_junction(self.link(link).from);
+            if a.is_none() || a != self.node_junction(self.link(link).to) {
+                return link;
+            }
+            let feeders = &feeders_of[lane.idx()];
+            let pred = feeders
+                .iter()
+                .copied()
+                .find(|&p| self.movement_turn(p) == TurnType::Through)
+                .or_else(|| feeders.first().copied());
+            match pred {
+                Some(p) => lane = self.movement(p).from_lane,
+                None => return link,
+            }
+        }
+        self.lane(lane).link
+    }
+
+    /// Index of the movements landing on each lane (`to_lane`), for [`entry_link`].
+    pub(crate) fn feeders_by_lane(&self) -> Vec<Vec<MovementId>> {
+        let mut feeders = vec![Vec::new(); self.lanes.len()];
+        for (m, mv) in self.movements.iter().enumerate() {
+            feeders[mv.to_lane.idx()].push(MovementId(m as u32));
+        }
+        feeders
     }
 
     /// A stable id for the whole intersection `node` belongs to: every node in a
@@ -664,10 +753,13 @@ impl Network {
             if ca.is_some() && ca == cb {
                 continue;
             }
+            let near_member = |m: [f64; 2], ci: usize| -> f64 {
+                members[ci].iter().map(|&nd| norm(sub(m, self.nodes[nd.idx()].position))).fold(f64::MAX, f64::min)
+            };
             if let Some(ci) = cb {
                 approaches[ci].push(LinkId(i));
                 let (m, o) = self.arm_mouth(LinkId(i), true);
-                if norm(sub(m, apex[ci])) < FOOTPRINT_RADIUS {
+                if near_member(m, ci) < FOOTPRINT_RADIUS {
                     arm_pts[ci].push(m);
                     arm_pts[ci].push(o);
                     arm_dirs[ci].push((self.arrival_dir(LinkId(i)), l.lane_count as f64));
@@ -676,7 +768,7 @@ impl Network {
             if let Some(ci) = ca {
                 exits[ci].push(LinkId(i));
                 let (m, o) = self.arm_mouth(LinkId(i), false);
-                if norm(sub(m, apex[ci])) < FOOTPRINT_RADIUS {
+                if near_member(m, ci) < FOOTPRINT_RADIUS {
                     arm_pts[ci].push(m);
                     arm_pts[ci].push(o);
                     arm_dirs[ci].push((self.departure_dir(LinkId(i)), l.lane_count as f64));
@@ -1061,6 +1153,104 @@ mod tests {
             (lo[0] - 1.0..=hi[0] + 1.0).contains(&j.center[0]) && (lo[1] - 1.0..=hi[1] + 1.0).contains(&j.center[1]),
             "the crossing centre sits inside its footprint",
         );
+    }
+
+    #[test]
+    #[cfg(feature = "import")]
+    fn multi_node_junctions_progress_through_movements_together() {
+        // Coordination check: at a junction modelled as several nodes, a through path
+        // that crosses one interior node and then the next must find both greens open
+        // at the same time — otherwise a vehicle would stop between them, inside the
+        // box. Verified purely from the signal schedule.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        let Ok(txt) = std::fs::read_to_string(path) else { return };
+        let net = OsmMap::from_json(&txt).unwrap().build();
+        let internal = |l: LinkId| {
+            let a = net.node_junction(net.link(l).from);
+            a.is_some() && a == net.node_junction(net.link(l).to)
+        };
+        let (mut checked, mut ok) = (0, 0);
+        for li in (0..net.links.len() as u32).map(LinkId).filter(|&l| internal(l)) {
+            let mut pair = None;
+            for a in (0..net.movements.len() as u32).map(MovementId) {
+                if net.lane(net.movement(a).to_lane).link != li || net.movement_turn(a) != TurnType::Through {
+                    continue;
+                }
+                for b in (0..net.movements.len() as u32).map(MovementId) {
+                    if net.movement(b).from_lane == net.movement(a).to_lane && net.movement_turn(b) == TurnType::Through {
+                        pair = Some((a, b));
+                    }
+                }
+            }
+            let Some((m_in, m_out)) = pair else { continue };
+            checked += 1;
+            let mut t = 0.0;
+            while t < 200.0 {
+                if net.movement_state(m_in, t) == SignalState::Green && net.movement_state(m_out, t) == SignalState::Green {
+                    ok += 1;
+                    break;
+                }
+                t += 0.5;
+            }
+        }
+        eprintln!("internal through-paths: {ok}/{checked} reach simultaneous green");
+        assert!(checked >= 3, "too few internal through-paths to test ({checked})");
+        assert!(ok == checked, "{}/{checked} internal through-paths never get simultaneous green — no progression", checked - ok);
+    }
+
+    #[test]
+    #[cfg(feature = "import")]
+    fn junction_footprints_are_angled_to_the_dominant_road_axis() {
+        // Static check on how each intersection rectangle is oriented: its long edge
+        // must run along the junction's dominant road axis (the lane-weighted heading
+        // of the arms that feed it), never skewed to a min-area diagonal that belongs
+        // to no road. Recomputes the axis from the public arm headings and compares it
+        // to the built footprint edge.
+        use std::f64::consts::PI;
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        let Ok(txt) = std::fs::read_to_string(path) else { return };
+        let net = OsmMap::from_json(&txt).unwrap().build();
+        let axis_deg = |d: [f64; 2]| d[1].atan2(d[0]).rem_euclid(PI).to_degrees();
+        let sep = |a: f64, b: f64| {
+            let d = (a - b).rem_euclid(180.0);
+            d.min(180.0 - d)
+        };
+        let (mut checked, mut worst, mut worst_wide) = (0, 0.0f64, 0.0f64);
+        for j in &net.junctions {
+            let node_pos: Vec<[f64; 2]> = j.nodes.iter().map(|&nd| net.nodes[nd.idx()].position).collect();
+            let near = |m: [f64; 2]| node_pos.iter().map(|&p| norm(sub(m, p))).fold(f64::MAX, f64::min);
+            // Reconstruct the arm set build_junctions used, in its link-index order (so
+            // dominant_axis breaks ties on the same arm the build did).
+            let mut indexed: Vec<(u32, [f64; 2], f64)> = Vec::new();
+            for &l in &j.approaches {
+                if near(net.arm_mouth(l, true).0) < FOOTPRINT_RADIUS {
+                    indexed.push((l.0, net.arrival_dir(l), net.link(l).lane_count as f64));
+                }
+            }
+            for &l in &j.exits {
+                if near(net.arm_mouth(l, false).0) < FOOTPRINT_RADIUS {
+                    indexed.push((l.0, net.departure_dir(l), net.link(l).lane_count as f64));
+                }
+            }
+            indexed.sort_by_key(|&(i, _, _)| i);
+            let arms: Vec<([f64; 2], f64)> = indexed.iter().map(|&(_, d, w)| (d, w)).collect();
+            if arms.len() < 2 {
+                continue; // fallback box, not arm-derived
+            }
+            let edge = axis_deg(sub(j.footprint[1], j.footprint[0]));
+            // Consistency: the built edge equals the dominant road axis it was oriented to.
+            let dev = sep(edge, axis_deg(dominant_axis(&arms)));
+            worst = worst.max(dev);
+            assert!(dev < 0.5, "junction footprint edge {edge:.1}° off its dominant road axis (Δ{dev:.1}°)");
+            // Method-independent anti-skew: the long edge runs along a real arm heading,
+            // never a bare corner-to-corner diagonal (the min-area failure mode).
+            let to_arm = arms.iter().map(|&(d, _)| sep(edge, axis_deg(d))).fold(f64::MAX, f64::min);
+            worst_wide = worst_wide.max(to_arm);
+            checked += 1;
+            assert!(to_arm < 1.0, "footprint edge {edge:.1}° matches no approach heading (nearest Δ{to_arm:.1}°) — skewed");
+        }
+        assert!(checked >= 20, "exercised only {checked} arm-derived footprints");
+        eprintln!("footprint angles: {checked} checked, worst axis Δ {worst:.3}°, worst edge-vs-arm Δ {worst_wide:.3}°");
     }
 
     #[test]

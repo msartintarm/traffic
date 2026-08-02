@@ -350,6 +350,38 @@ fn real_map_builds_and_renders_without_panicking() {
     let _ = engine::render::geometry::signal_head_placements(&net);
 }
 
+/// The whole-city San Francisco map (~10k nodes, ~66k movements) must build and
+/// render without panicking — the browser's load path, and the stress case the O(n)
+/// build passes and O(1) conflict lookup were added for. Skipped if `sf.json` isn't
+/// present. (A short sim run, gated behind `--ignored` since the full-city step is
+/// heavy, checks it also carries traffic without leaking.)
+#[test]
+fn san_francisco_map_builds_and_renders_without_panicking() {
+    let Some(net) = map_from("sf.json") else { return };
+    assert!(net.movements.len() > 20_000, "the SF extract is a whole-city map, got {} movements", net.movements.len());
+    let _ = engine::render::geometry::world_mesh(&net);
+    let _ = engine::render::geometry::marking_mesh(&net);
+    let _ = engine::render::geometry::signal_head_placements(&net);
+}
+
+#[test]
+#[ignore]
+fn san_francisco_map_flows_without_leaking() {
+    let Some(net) = map_from("sf.json") else { return };
+    let cfg = SimConfig::default_config();
+    let pairs = demand::od_pairs(&net, 0, 400, DemandSources::new(true, true));
+    let mut world = NetWorld::new(net, cfg);
+    let mut gen = DemandGenerator::new(&world, &pairs, 0);
+    world.install_router(&gen.destinations());
+    for _ in 0..200 {
+        gen.step(&mut world, cfg.dt);
+        world.step();
+    }
+    eprintln!("san francisco: {} vehicles, {} crashed, {} leaked", world.vehicles().len(), world.crashed(), world.leaked());
+    assert_eq!(world.leaked(), 0, "no vehicle vanishes at an SF intersection");
+    assert!(world.vehicles().len() > 0, "traffic spawns and routes on the SF map");
+}
+
 #[test]
 fn san_carlos_map_builds_renders_and_flows_without_panicking() {
     let Some(net) = map_from("sancarlos.json") else { return };
