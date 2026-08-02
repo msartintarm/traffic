@@ -409,6 +409,32 @@ fn san_carlos_map_builds_renders_and_flows_without_panicking() {
     );
 }
 
+/// The Bay Area peninsula freeway extract (motorway/trunk + ramps only): it should
+/// build, render, and carry mainline-and-ramp traffic to its exits without leaking.
+/// A freeways-only network exercises the interchange (free-flow merge/diverge) path
+/// rather than the signalized grid. Skipped if `peninsula.json` isn't present.
+#[test]
+fn peninsula_freeway_map_builds_renders_and_flows_without_panicking() {
+    let Some(net) = map_from("peninsula.json") else { return };
+    let _ = engine::render::geometry::world_mesh(&net);
+    let _ = engine::render::geometry::marking_mesh(&net);
+    let _ = engine::render::geometry::signal_head_placements(&net);
+
+    let cfg = SimConfig::default_config();
+    let pairs = demand::od_pairs(&net, 0, 600, DemandSources::new(true, true));
+    assert!(!pairs.is_empty(), "the freeway network yields routable OD demand");
+    let mut world = NetWorld::new(net, cfg);
+    let mut gen = DemandGenerator::new(&world, &pairs, 0);
+    world.install_router(&gen.destinations());
+    for _ in 0..1500 {
+        gen.step(&mut world, cfg.dt);
+        world.step();
+    }
+    eprintln!("peninsula: {} exited, {} crashed, {} leaked", world.exited(), world.crashed(), world.leaked());
+    assert!(world.exited() > 0, "the peninsula freeways carry traffic to their exits");
+    assert_eq!(world.leaked(), 0, "no vehicle vanishes at a peninsula interchange");
+}
+
 /// The routing field must be acyclic: following `next_hop` from any link toward
 /// any destination must reach it without revisiting a link. This is structural
 /// (`next_hop = argmin(cost+dist)` with positive costs strictly decreases the

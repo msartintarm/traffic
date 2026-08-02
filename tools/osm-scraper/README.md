@@ -1,8 +1,8 @@
 # osm-scraper
 
 Scrapes a drivable road graph from OpenStreetMap (Overpass API) and emits the
-JSON the Rust engine's `sim::map::OsmMap` consumes. The first target is
-**Millbrae, CA**.
+JSON the Rust engine's `sim::map::OsmMap` consumes. It backs every real-map
+scenario (Millbrae, San Carlos, San Francisco, the Bay Area peninsula).
 
 The bounding box is an **input, never checked in**. Supply it (highest
 precedence first) via `--bbox S W N E`, a gitignored `--bbox-file PATH`
@@ -11,6 +11,20 @@ containing `S W N E`, or the `TRAFFIC_BBOX` environment variable.
 ```
 python3 scrape_millbrae.py --bbox-file bbox.local --out millbrae.json
 TRAFFIC_BBOX="S W N E" python3 scrape_millbrae.py --out millbrae.json
+```
+
+### Freeways-only extracts (`--highways-only`)
+
+For a regional freeway scenario, keep only the grade-separated network and its
+ramps/exits (`motorway`/`trunk` + their `_link`s). The class filter runs
+server-side, so even a whole-region bbox stays a small download. This is how
+`web/public/peninsula.json` (US-101, I-280, CA-92, CA-84, CA-380 and their
+interchanges) is produced:
+
+```
+python3 scrape_millbrae.py --highways-only \
+  --bbox 37.42 -122.51 37.71 -122.08 \
+  --place "Bay Area Peninsula" --out ../../web/public/peninsula.json
 ```
 
 `*.json`, `bbox*`, and `*.local` are gitignored so extracts and coordinates stay

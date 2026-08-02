@@ -142,6 +142,7 @@ const REAL_MAPS: Record<string, { file: string; name: string }> = {
   millbrae: { file: "map.json", name: "Millbrae, CA" },
   sancarlos: { file: "sancarlos.json", name: "San Carlos, CA" },
   sf: { file: "sf.json", name: "San Francisco, CA" },
+  peninsula: { file: "peninsula.json", name: "Bay Area Peninsula" },
 };
 
 // Splash-screen scenario menu: the real maps followed by the synthetic test scenes,
@@ -151,6 +152,7 @@ const SCENARIOS: { key: string; name: string; kind: "Real map" | "Test" }[] = [
   { key: "millbrae", name: "Millbrae, CA", kind: "Real map" },
   { key: "sancarlos", name: "San Carlos, CA", kind: "Real map" },
   { key: "sf", name: "San Francisco, CA", kind: "Real map" },
+  { key: "peninsula", name: "Bay Area Peninsula", kind: "Real map" },
   { key: "arterial", name: "Arterial junction", kind: "Test" },
   { key: "corridor", name: "Signal corridor", kind: "Test" },
   { key: "gridlock", name: "Gridlock", kind: "Test" },
@@ -742,6 +744,7 @@ export default function EngineCanvas() {
               <option value="millbrae">Millbrae (real map)</option>
               <option value="sancarlos">San Carlos (real map)</option>
               <option value="sf">San Francisco (real map)</option>
+              <option value="peninsula">Bay Area Peninsula (real map)</option>
               <option value="arterial">Test: arterial junction</option>
               <option value="corridor">Test: signal corridor</option>
               <option value="gridlock">Test: gridlock (fast jam)</option>

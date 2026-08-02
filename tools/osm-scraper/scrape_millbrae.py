@@ -48,26 +48,37 @@ DRIVABLE = {
     "primary_link", "secondary_link", "tertiary_link", "living_street",
 }
 
+# `--highways-only`: just the grade-separated freeway network and its ramps (the
+# on/off-ramps are the "exits"). Everything a peninsula freeway scenario needs and
+# nothing else — a tiny download even over a large bbox.
+FREEWAY = {"motorway", "motorway_link", "trunk", "trunk_link"}
+
 DEFAULT_SPEED_MPH = {
     "motorway": 65, "trunk": 55, "primary": 35, "secondary": 35,
     "tertiary": 30, "residential": 25, "unclassified": 25, "living_street": 15,
 }
 
 
-def overpass_query(bbox):
+def overpass_query(bbox, classes=None):
     s, w, n, e = bbox
+    # Restricting to specific highway classes server-side keeps a large-area scrape
+    # (e.g. the whole peninsula's freeways) a small download instead of every street.
+    if classes:
+        selector = f'way["highway"~"^({"|".join(sorted(classes))})$"]({s},{w},{n},{e});'
+    else:
+        selector = f'way["highway"]({s},{w},{n},{e});'
     return f"""
-    [out:json][timeout:60];
+    [out:json][timeout:90];
     (
-      way["highway"]({s},{w},{n},{e});
+      {selector}
     );
     (._;>;);
     out body;
     """
 
 
-def fetch(bbox, attempts=6):
-    body = urllib.parse.urlencode({"data": overpass_query(bbox)}).encode()
+def fetch(bbox, classes=None, attempts=6):
+    body = urllib.parse.urlencode({"data": overpass_query(bbox, classes)}).encode()
     headers = {
         "User-Agent": "traffic-sim-osm-scraper/0.1 (github traffic sim)",
         "Content-Type": "application/x-www-form-urlencoded",
@@ -134,11 +145,11 @@ def project(lat, lon, lat0, lon0):
     return round(x, 2), round(y, 2)
 
 
-def build(raw, bbox, place):
+def build(raw, bbox, place, drivable=DRIVABLE):
     nodes = {e["id"]: e for e in raw["elements"] if e["type"] == "node"}
     ways = [
         e for e in raw["elements"]
-        if e["type"] == "way" and e.get("tags", {}).get("highway") in DRIVABLE
+        if e["type"] == "way" and e.get("tags", {}).get("highway") in drivable
     ]
 
     usage = defaultdict(int)
@@ -260,10 +271,15 @@ def main():
     ap.add_argument("--place", default="Millbrae, CA")
     ap.add_argument("--bbox", nargs=4, type=float, metavar=("S", "W", "N", "E"))
     ap.add_argument("--bbox-file", dest="bbox_file")
+    ap.add_argument(
+        "--highways-only", action="store_true",
+        help="keep only freeways and their ramps/exits (motorway/trunk + _link)",
+    )
     args = ap.parse_args()
 
     bbox = resolve_bbox(args)
-    graph = build(fetch(bbox), bbox, args.place)
+    classes = FREEWAY if args.highways_only else None
+    graph = build(fetch(bbox, classes), bbox, args.place, classes or DRIVABLE)
     with open(args.out, "w") as f:
         json.dump(graph, f, separators=(",", ":"))
     print(f"wrote {args.out}: {len(graph['nodes'])} nodes, {len(graph['links'])} links")
