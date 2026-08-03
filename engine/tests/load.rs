@@ -518,6 +518,44 @@ fn highway_runs_fast_offline_without_getting_stuck() {
     assert!(stalls <= 3, "freeway cars almost never get stuck with open road ahead, got {stalls}");
 }
 
+/// Every freeway off-ramp lane must start roughly where the mainline lane that feeds it
+/// ends — the exit peels off the highway's curb, aligned with its connecting segment,
+/// not offset onto the inner lanes. Regression for link 1391 on Millbrae, where the ramp
+/// was shifted by the *narrower* continuation's width instead of the wide mainline's.
+#[test]
+fn freeway_off_ramp_lanes_line_up_with_the_mainline_lanes_that_feed_them() {
+    use engine::sim::network::{LinkId, MovementId, RoadKind, LANE_WIDTH};
+    let Some(net) = map_from("map.json") else { return };
+    let mut worst = 0.0f64;
+    let mut worst_ramp = LinkId(0);
+    let mut checked = 0;
+    for m in 0..net.movements.len() as u32 {
+        let mv = net.movement(MovementId(m));
+        let from_link = net.lane(mv.from_lane).link;
+        let to_link = net.lane(mv.to_lane).link;
+        // A diverge off a wide freeway onto a narrower ramp is where the misalignment bit.
+        if net.link(from_link).kind == RoadKind::Freeway
+            && net.link(to_link).kind == RoadKind::Ramp
+            && net.link(from_link).lane_count > net.link(to_link).lane_count
+        {
+            let from_end = net.lane_point(mv.from_lane, net.lane(mv.from_lane).length);
+            let to_start = net.lane_point(mv.to_lane, 0.0);
+            let gap = (from_end[0] - to_start[0]).hypot(from_end[1] - to_start[1]);
+            if gap > worst {
+                worst = gap;
+                worst_ramp = to_link;
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "the Millbrae map has freeway off-ramps");
+    assert!(
+        worst < LANE_WIDTH * 1.5,
+        "off-ramp lanes align with the mainline lanes that feed them (worst {worst:.1} m at ramp L{})",
+        worst_ramp.0,
+    );
+}
+
 /// The routing field must be acyclic: following `next_hop` from any link toward
 /// any destination must reach it without revisiting a link. This is structural
 /// (`next_hop = argmin(cost+dist)` with positive costs strictly decreases the
@@ -595,4 +633,46 @@ fn real_map_traffic_does_not_circle() {
         "missed-turn recovery spiked: {recovered} of {} vehicles looped back once",
         hist.len(),
     );
+}
+
+/// Litmus test: under a rush-hour freeway load the network must move a *large, sustained*
+/// throughput — cars keep entering and, as their (long) trips complete, exiting at a rate
+/// that ramps up rather than collapsing into gridlock; the population stays bounded (the
+/// metered gateways shed the overflow), and it stays essentially collision-free with no
+/// leaks. Runs the peninsula freeways at over the free-flow rate. `#[ignore]`d (heavy);
+/// run with `--features import -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn peninsula_freeways_sustain_rush_hour_throughput() {
+    let Some(net) = map_from("peninsula.json") else { return };
+    let cfg = SimConfig::default_config();
+    let pairs = demand::od_pairs(&net, 0, 600, DemandSources::new(true, false));
+    let mut world = NetWorld::new(net, cfg);
+    let mut gen = DemandGenerator::new(&world, &pairs, 0);
+    gen.set_rate_scale(1.5); // rush hour: above free-flow, so the gateways meter the overflow
+    world.install_router(&gen.destinations());
+
+    let window = 2000;
+    for _ in 0..window {
+        gen.step(&mut world, cfg.dt);
+        world.step();
+    }
+    let out_first = world.exited();
+    let mut peak = 0usize;
+    for _ in 0..window {
+        gen.step(&mut world, cfg.dt);
+        world.step();
+        peak = peak.max(world.vehicles().len());
+    }
+    let out_second = world.exited() - out_first;
+    eprintln!("rush-hour: out_first {out_first}, out_second {out_second}, peak {peak}, crashed {}, leaked {}", world.crashed(), world.leaked());
+
+    // Outflow sustains and *grows* as trips complete — the network keeps moving, not gridlocking.
+    assert!(out_second > out_first, "freeway outflow ramps up, not collapses: {out_first} then {out_second}");
+    assert!(out_second > 400, "the freeways move a large throughput: {out_second} exits in the window");
+    // Bounded population — the metered gateways shed overflow instead of a runaway pile-up.
+    assert!(peak < 14000, "population stays bounded under rush hour, peaked {peak}");
+    // Crashes stay a small fraction of completed trips; nothing vanishes.
+    assert!(world.crashed() * 8 < world.exited(), "crashes stay a small fraction of throughput: {} vs {}", world.crashed(), world.exited());
+    assert_eq!(world.leaked(), 0, "no car vanishes under rush-hour load, leaked {}", world.leaked());
 }

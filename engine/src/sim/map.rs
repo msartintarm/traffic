@@ -360,24 +360,39 @@ impl OsmMap {
             if is_interchange && has_mainline {
                 let mains: Vec<usize> = (0..m).filter(|&i| !ramp_exit(i)).collect();
                 let mm = mains.len();
-                // Mainline continuation(s) keep every lane (a freeway split still
-                // fans left→right among the continuations).
-                for (j, &i) in mains.iter().enumerate() {
-                    lane_exits[nearest(j, mm - 1, n - 1)].insert(i);
-                }
-                for (k, exits) in lane_exits.iter_mut().enumerate() {
-                    exits.insert(mains[nearest(k, n - 1, mm - 1)]);
-                }
-                // Off-ramps hang off the curb lanes: a k-lane ramp takes the curb-most
-                // k freeway lanes, so a multi-lane exit is fed at full width instead of
-                // being funnelled through one lane and backing up onto the mainline. The
-                // curb lanes still carry the mainline too (option lanes, not exit-only).
+                // Off-ramps claim the curb-most lanes as their exit — and *only* their
+                // exit. Past the gore the ramp is physically separated from the mainline,
+                // so an exit lane no longer continues on the freeway: a k-lane ramp takes
+                // the curb-most k lanes, exit-only.
+                let mut exit_only = vec![false; n];
                 for i in 0..m {
                     if ramp_exit(i) {
                         let rl = net.links[onward[i].0].lane_count as usize;
                         for k in 0..rl.min(n) {
                             lane_exits[n - 1 - k].insert(i);
+                            exit_only[n - 1 - k] = true;
                         }
+                    }
+                }
+                // The mainline continuation(s) fan left→right across the *remaining*
+                // through lanes, so each continuation lane has exactly one feeder — no
+                // lane-drop choke. A through driver caught in an exit lane reaches the
+                // freeway by changing lanes upstream (a mandatory change before the gore),
+                // not by a movement that merges three lanes into one at the node.
+                let through: Vec<usize> = (0..n).filter(|&k| !exit_only[k]).collect();
+                let tn = through.len();
+                if tn == 0 {
+                    // The ramp(s) claimed every lane: keep them all continuing so no
+                    // through car is stranded.
+                    for (k, exits) in lane_exits.iter_mut().enumerate() {
+                        exits.insert(mains[nearest(k, n - 1, mm - 1)]);
+                    }
+                } else {
+                    for (j, &i) in mains.iter().enumerate() {
+                        lane_exits[through[nearest(j, mm - 1, tn - 1)]].insert(i);
+                    }
+                    for (idx, &k) in through.iter().enumerate() {
+                        lane_exits[k].insert(mains[nearest(idx, tn - 1, mm - 1)]);
                     }
                 }
             } else if m > 0 {
@@ -929,15 +944,25 @@ fn join_pass_through(
 /// from / merge onto the curb edge, matching how the lanes are wired.
 fn offset_ramps_to_curb(net: &mut Network) {
     const TRANSITION: f64 = 45.0;
-    // Freeway travel direction and width at each node it touches (through-direction).
+    // Freeway travel direction and width at each node it touches (through-direction). A
+    // node can have both a wide mainline and a narrower continuation; the ramp peels off
+    // the *widest* one it meets, so keep that — taking whichever freeway happened to be
+    // indexed first would under-shift the ramp onto the mainline's inner lanes.
     let mut freeway_at: HashMap<u32, ([f64; 2], f64)> = HashMap::new();
+    let widen = |map: &mut HashMap<u32, ([f64; 2], f64)>, node: u32, dir: [f64; 2], lanes: f64| {
+        let e = map.entry(node).or_insert((dir, lanes));
+        if lanes > e.1 {
+            *e = (dir, lanes);
+        }
+    };
     for fi in 0..net.links.len() {
         let f = net.links[fi];
         if f.kind != RoadKind::Freeway {
             continue;
         }
-        freeway_at.entry(f.to.0).or_insert((net.arrival_dir(LinkId(fi as u32)), f.lane_count as f64));
-        freeway_at.entry(f.from.0).or_insert((net.departure_dir(LinkId(fi as u32)), f.lane_count as f64));
+        let lanes = f.lane_count as f64;
+        widen(&mut freeway_at, f.to.0, net.arrival_dir(LinkId(fi as u32)), lanes);
+        widen(&mut freeway_at, f.from.0, net.departure_dir(LinkId(fi as u32)), lanes);
     }
     for li in 0..net.links.len() {
         if net.links[li].kind != RoadKind::Ramp {
@@ -1941,14 +1966,16 @@ mod tests {
             .collect();
         assert_eq!(ramp_froms, vec![5], "the off-ramp diverges from the curb lane only, got {ramp_froms:?}");
 
-        // The curb lane can continue OR exit (it is not forced onto the ramp), so a
-        // through car merges left instead of stopping; the inner lanes only continue.
+        // The curb lane is exit-only at the diverge: past the gore the ramp is physically
+        // separated from the mainline, so the curb lane feeds only the ramp. A through car
+        // reaches the freeway by changing lanes upstream, not by a merge at the node. The
+        // inner lanes only continue.
         let curb_lane = net.lanes_of(LinkId(0)).last().unwrap();
         let mut curb_dests: Vec<u32> = (0..net.lane(curb_lane).movement_count)
             .map(|j| net.lane(net.movement(MovementId(net.lane(curb_lane).movement_start.0 + j)).to_lane).link.0)
             .collect();
         curb_dests.sort();
-        assert_eq!(curb_dests, vec![1, 2], "the curb lane continues on the freeway and feeds the ramp, got {curb_dests:?}");
+        assert_eq!(curb_dests, vec![2], "the curb lane is exit-only (feeds the ramp, not the mainline), got {curb_dests:?}");
         for k in 0..5u32 {
             let lane = net.lanes_of(LinkId(0)).nth(k as usize).unwrap();
             let dests: Vec<u32> = (0..net.lane(lane).movement_count)
