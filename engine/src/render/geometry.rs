@@ -783,24 +783,44 @@ fn snap_to_footprint(p: [f64; 2], fp: &[[f64; 2]; 4]) -> [f64; 2] {
     best.0
 }
 
-/// Translucent congestion overlay: shade every polyline segment of a link busy
-/// enough to matter (`counts[link]` = vehicles on it). `light = 3` triggers the
-/// shader's translucent branch. Iterates *links* (a curved link is several
-/// segments), so it's independent of the strip count.
 /// Bright overlay colour for the user-selected link.
 pub const HIGHLIGHT_COLOR: [f32; 3] = [0.25, 0.85, 1.0];
+/// A segment carrying exactly one car: a dark blue that still reads brighter than the
+/// empty-road grey once the shader blends it at the overlay's translucency.
+pub const OCCUPIED_ONE_COLOR: [f32; 3] = [0.20, 0.40, 0.95];
+/// A segment carrying two or more cars: a lighter blue, so busier segments stand out.
+pub const OCCUPIED_MANY_COLOR: [f32; 3] = [0.50, 0.68, 1.0];
 
-pub fn congestion_mesh(net: &Network, counts: &[u32], selected: Option<usize>) -> StaticMesh {
+/// Occupancy ratio at/above which a link reads as *congested* and switches from the
+/// light-traffic blue tint to the percentage-driven congestion heatmap.
+const CONGESTED_RATIO: f64 = 0.2;
+
+/// Live traffic overlay per link (`counts[link]` = vehicles on it): empty links keep the
+/// base grey; a link with a car or two gets a blue presence tint (dark blue for one,
+/// lighter blue for more); and once it fills past [`CONGESTED_RATIO`] it takes the
+/// occupancy-percentage congestion colour, so heavier traffic still reads as congestion.
+/// `light = 3` triggers the shader's translucent branch. Iterates *links* (a curved link
+/// is several segments), so it's independent of the strip count.
+pub fn occupancy_mesh(net: &Network, counts: &[u32], selected: Option<usize>) -> StaticMesh {
     let mut mesh = StaticMesh::default();
     for i in 0..net.links.len() {
         let is_selected = selected == Some(i);
+        if !is_selected && counts[i] == 0 {
+            continue; // no cars: leave the base grey road showing through
+        }
         let link = net.link(LinkId(i as u32));
         let lane = net.lane(link.lane_start);
         let ratio = mass::occupancy_ratio(counts[i] as f64, (lane.length / 7.0 * link.lane_count as f64).max(1.0));
-        if !is_selected && ratio < 0.2 {
-            continue;
-        }
-        let color = if is_selected { HIGHLIGHT_COLOR } else { let c = mass::congestion_color(ratio); [c[0], c[1], c[2]] };
+        let color = if is_selected {
+            HIGHLIGHT_COLOR
+        } else if ratio >= CONGESTED_RATIO {
+            let c = mass::congestion_color(ratio); // percentage → congestion heatmap (preserved)
+            [c[0], c[1], c[2]]
+        } else if counts[i] >= 2 {
+            OCCUPIED_MANY_COLOR
+        } else {
+            OCCUPIED_ONE_COLOR
+        };
         let half = link.lane_count as f64 * LANE_WIDTH / 2.0;
         for seg in net.drivable_polyline(LinkId(i as u32)).windows(2) {
             let (a, b) = offset_right(seg[0], seg[1], half);
@@ -1049,20 +1069,24 @@ mod tests {
     }
 
     #[test]
-    fn congestion_mesh_handles_curved_links_with_valid_indices() {
-        // Regression: `road_strips` is per-segment, so density must iterate links,
+    fn occupancy_mesh_handles_curved_links_with_valid_indices() {
+        // Regression: `road_strips` is per-segment, so the overlay must iterate links,
         // not strips. A curved (multi-segment) link must produce in-range indices.
         let net = OsmMap {
             nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 200.0, 100.0)],
             links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 2, speed_limit: 20.0, geometry: vec![[100.0, 0.0], [150.0, 50.0]], layer: 0, name: String::new(), road_class: String::new(), highway_ref: String::new(), turn_lanes: String::new() }],
         }
         .build();
-        let mesh = congestion_mesh(&net, &[999], None); // link 0 heavily congested
+        let mesh = occupancy_mesh(&net, &[999], None); // link 0 heavily congested
         assert!(!mesh.is_empty(), "a congested curved link should shade");
         assert!(mesh.indices.iter().all(|&i| (i as usize) < mesh.vertices.len()), "indices in range");
         // an empty count → nothing shaded, unless selected
-        assert!(congestion_mesh(&net, &[0], None).is_empty());
-        assert!(!congestion_mesh(&net, &[0], Some(0)).is_empty(), "a selected link is highlighted even when empty");
+        assert!(occupancy_mesh(&net, &[0], None).is_empty());
+        assert!(!occupancy_mesh(&net, &[0], Some(0)).is_empty(), "a selected link is highlighted even when empty");
+        // a single car tints in blue (the light-traffic presence colour), not the heatmap
+        let one = occupancy_mesh(&net, &[1], None);
+        assert!(!one.is_empty(), "one car tints its segment");
+        assert!(one.vertices.iter().any(|v| v.color == OCCUPIED_ONE_COLOR), "one car uses the dark-blue presence tint");
     }
 
     #[test]

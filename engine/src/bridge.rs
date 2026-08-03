@@ -736,9 +736,10 @@ impl Simulation {
         self.signal_instance_vec().len() as u32
     }
 
-    /// Translucent congestion-overlay mesh for the far-LOD density view: per-link
-    /// carriageway quads coloured by live occupancy, emitted only for links busy
-    /// enough to matter. `StaticVertex` floats; pair with [`density_indices`].
+    /// Translucent per-link traffic overlay: carriageway quads tinted by live occupancy —
+    /// a blue presence tint for a car or two, the percentage congestion heatmap once a
+    /// link fills up — emitted for every link that has cars. `StaticVertex` floats; pair
+    /// with [`density_indices`].
     pub fn density_vertices(&self) -> Vec<f32> {
         bytemuck::cast_slice(&self.density_mesh().vertices).to_vec()
     }
@@ -753,7 +754,7 @@ impl Simulation {
         for v in self.world.vehicles() {
             counts[net.lane(v.lane).link.idx()] += 1;
         }
-        geometry::congestion_mesh(net, &counts, self.selected)
+        geometry::occupancy_mesh(net, &counts, self.selected)
     }
 
     fn signal_instance_vec(&self) -> Vec<Instance> {
