@@ -435,6 +435,34 @@ fn peninsula_freeway_map_builds_renders_and_flows_without_panicking() {
     assert_eq!(world.leaked(), 0, "no vehicle vanishes at a peninsula interchange");
 }
 
+/// The scraped Columbus, OH map — the *whole city* drivable network (freeways, arterials,
+/// and residential streets, ~150k links) — must build, render, and carry both freeway and
+/// surface traffic to their destinations without leaking, confirming the scraper and the
+/// scenario wiring work for a large city outside the original Bay-Area set. Big and slow,
+/// so it is `#[ignore]`d; run with `--features import -- --ignored`. Skipped if absent.
+#[test]
+#[ignore]
+fn columbus_city_map_builds_renders_and_flows_without_panicking() {
+    let Some(net) = map_from("columbus.json") else { return };
+    let _ = engine::render::geometry::world_mesh(&net);
+    let _ = engine::render::geometry::marking_mesh(&net);
+    let _ = engine::render::geometry::signal_head_placements(&net);
+
+    let cfg = SimConfig::default_config();
+    let pairs = demand::od_pairs(&net, 0, 2000, DemandSources::new(true, true));
+    assert!(!pairs.is_empty(), "the Columbus network yields routable OD demand");
+    let mut world = NetWorld::new(net, cfg);
+    let mut gen = DemandGenerator::new(&world, &pairs, 0);
+    world.install_router(&gen.destinations());
+    for _ in 0..1000 {
+        gen.step(&mut world, cfg.dt);
+        world.step();
+    }
+    eprintln!("columbus: {} exited, {} crashed, {} leaked", world.exited(), world.crashed(), world.leaked());
+    assert!(world.exited() > 0, "Columbus traffic completes trips");
+    assert_eq!(world.leaked(), 0, "no vehicle vanishes at a Columbus junction");
+}
+
 /// Headless highway harness: run the peninsula freeways offline and confirm (a) the step
 /// sustains ≥ 32× real time without a browser, and (b) with the freeways kept free-flowing
 /// (a quarter of capacity), cars don't get *stuck* on the highway. A freeway is split into

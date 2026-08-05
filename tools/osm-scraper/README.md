@@ -2,7 +2,8 @@
 
 Scrapes a drivable road graph from OpenStreetMap (Overpass API) and emits the
 JSON the Rust engine's `sim::map::OsmMap` consumes. It backs every real-map
-scenario (Millbrae, San Carlos, San Francisco, the Bay Area peninsula).
+scenario (Millbrae, San Carlos, San Francisco, the Bay Area peninsula, and the
+Columbus, OH freeway network) — the location is set purely by the bounding box.
 
 The bounding box is an **input, never checked in**. Supply it (highest
 precedence first) via `--bbox S W N E`, a gitignored `--bbox-file PATH`
@@ -25,6 +26,15 @@ interchanges) is produced:
 python3 scrape_millbrae.py --highways-only \
   --bbox 37.42 -122.51 37.71 -122.08 \
   --place "Bay Area Peninsula" --out ../../web/public/peninsula.json
+```
+
+The Columbus, OH freeway network (I-70/71/270 outerbelt + the US/SR radials) was
+produced the same way — only the bounding box differs:
+
+```
+python3 scrape_millbrae.py --highways-only \
+  --bbox 39.80 -83.25 40.18 -82.75 \
+  --place "Columbus, OH" --out ../../web/public/columbus.json
 ```
 
 `*.json`, `bbox*`, and `*.local` are gitignored so extracts and coordinates stay

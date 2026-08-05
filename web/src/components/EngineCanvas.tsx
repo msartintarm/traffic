@@ -143,6 +143,7 @@ const REAL_MAPS: Record<string, { file: string; name: string }> = {
   sancarlos: { file: "sancarlos.json", name: "San Carlos, CA" },
   sf: { file: "sf.json", name: "San Francisco, CA" },
   peninsula: { file: "peninsula.json", name: "Bay Area Peninsula" },
+  columbus: { file: "columbus.json", name: "Columbus, OH" },
 };
 
 // Splash-screen scenario menu: the real maps followed by the synthetic test scenes,
@@ -153,6 +154,7 @@ const SCENARIOS: { key: string; name: string; kind: "Real map" | "Test" }[] = [
   { key: "sancarlos", name: "San Carlos, CA", kind: "Real map" },
   { key: "sf", name: "San Francisco, CA", kind: "Real map" },
   { key: "peninsula", name: "Bay Area Peninsula", kind: "Real map" },
+  { key: "columbus", name: "Columbus, OH", kind: "Real map" },
   { key: "arterial", name: "Arterial junction", kind: "Test" },
   { key: "corridor", name: "Signal corridor", kind: "Test" },
   { key: "gridlock", name: "Gridlock", kind: "Test" },
@@ -200,12 +202,27 @@ export default function EngineCanvas() {
   const [units, setUnits] = useState<"mi" | "km">("mi");
   const unitsRef = useRef<"mi" | "km">("mi"); // read inside the rAF draw loop (avoids stale closure)
   const [isFullscreen, setIsFullscreen] = useState(false);
+  // iPhone Safari has no element Fullscreen API at all, so we fall back to a CSS overlay
+  // (`position: fixed` filling the viewport) tracked by this flag.
+  const [pseudoFs, setPseudoFs] = useState(false);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     setScenario(params.get("scenario") ?? "millbrae");
     setRoute(params.has("scenario") ? "sim" : "splash");
   }, []);
+
+  // Pseudo-fullscreen (iPhone Safari): the wrapper's CSS class changes the layout, so nudge
+  // the canvas to resize to the new viewport and stop the page behind it from scrolling.
+  useEffect(() => {
+    window.dispatchEvent(new Event("resize"));
+    if (!pseudoFs) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = prev;
+    };
+  }, [pseudoFs]);
 
   useEffect(() => {
     if (route !== "sim") return; // splash / undetermined: no sim to boot
@@ -520,13 +537,16 @@ export default function EngineCanvas() {
         window.addEventListener("resize", resizeCanvas);
         // Entering/leaving fullscreen resizes the canvas to (or from) the whole screen.
         const onFsChange = () => {
-          setIsFullscreen(!!document.fullscreenElement);
+          const doc = document as Document & { webkitFullscreenElement?: Element | null };
+          setIsFullscreen(!!(document.fullscreenElement ?? doc.webkitFullscreenElement));
           resizeCanvas();
         };
         document.addEventListener("fullscreenchange", onFsChange);
+        document.addEventListener("webkitfullscreenchange", onFsChange);
         removeResize = () => {
           window.removeEventListener("resize", resizeCanvas);
           document.removeEventListener("fullscreenchange", onFsChange);
+          document.removeEventListener("webkitfullscreenchange", onFsChange);
         };
 
         canvas.addEventListener("wheel", onWheel, { passive: false });
@@ -656,11 +676,25 @@ export default function EngineCanvas() {
   };
 
   const toggleFullscreen = async () => {
-    const el = wrapperRef.current;
+    const el = wrapperRef.current as
+      | (HTMLDivElement & { webkitRequestFullscreen?: () => Promise<void> | void })
+      | null;
     if (!el) return;
+    const doc = document as Document & {
+      webkitFullscreenElement?: Element | null;
+      webkitExitFullscreen?: () => Promise<void> | void;
+    };
+    const request = el.requestFullscreen?.bind(el) ?? el.webkitRequestFullscreen?.bind(el);
+    // No native Fullscreen API (iPhone Safari): toggle the CSS-overlay fallback instead.
+    if (!request) {
+      setPseudoFs((v) => !v);
+      return;
+    }
+    const active = document.fullscreenElement ?? doc.webkitFullscreenElement ?? null;
+    const exit = doc.exitFullscreen?.bind(doc) ?? doc.webkitExitFullscreen?.bind(doc);
     try {
-      if (!document.fullscreenElement) {
-        await el.requestFullscreen();
+      if (!active) {
+        await request();
         // Prefer landscape on devices that can rotate (phones/tablets); harmless
         // no-op / rejected promise on desktop, so swallow it.
         try {
@@ -670,7 +704,7 @@ export default function EngineCanvas() {
         try {
           (screen.orientation as unknown as { unlock?: () => void })?.unlock?.();
         } catch {}
-        await document.exitFullscreen();
+        await exit?.();
       }
     } catch {}
   };
@@ -682,7 +716,7 @@ export default function EngineCanvas() {
   if (route === null) return <div className={styles.wrapper} aria-busy="true" />;
 
   return (
-    <div ref={wrapperRef} className={styles.wrapper}>
+    <div ref={wrapperRef} className={`${styles.wrapper}${pseudoFs ? ` ${styles.pseudoFullscreen}` : ""}`}>
       <canvas ref={canvasRef} width={900} height={600} className={styles.canvas} />
 
       <div className={styles.topLeft}>
@@ -699,9 +733,9 @@ export default function EngineCanvas() {
             className={styles.button}
             onClick={toggleFullscreen}
             title="Toggle fullscreen (landscape on mobile)"
-            aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+            aria-label={isFullscreen || pseudoFs ? "Exit fullscreen" : "Enter fullscreen"}
           >
-            {isFullscreen ? "⛶ Exit" : "⛶"}
+            {isFullscreen || pseudoFs ? "⛶ Exit" : "⛶"}
           </button>
         </div>
         <Collapsible
@@ -745,6 +779,7 @@ export default function EngineCanvas() {
               <option value="sancarlos">San Carlos (real map)</option>
               <option value="sf">San Francisco (real map)</option>
               <option value="peninsula">Bay Area Peninsula (real map)</option>
+              <option value="columbus">Columbus, OH (real map)</option>
               <option value="arterial">Test: arterial junction</option>
               <option value="corridor">Test: signal corridor</option>
               <option value="gridlock">Test: gridlock (fast jam)</option>

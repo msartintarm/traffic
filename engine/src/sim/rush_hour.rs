@@ -102,6 +102,28 @@ pub fn per_lane(route_ref: &str, northbound: bool, seconds_into_day: f64) -> f64
     interp(profile_for(route_ref, northbound), seconds_into_day)
 }
 
+/// Per-lane volume (veh/h/lane) up to which a freeway still admits cars at its posted
+/// free-flow speed; below the morning build-up there is no congestion to slow entry.
+const FREE_FLOW_VOLUME: f64 = 700.0;
+/// Per-lane volume at which entry is fully in the congested rush-hour regime — around the
+/// real peninsula corridors' peak (I-280/US-101 crest ~1450–1500 veh/h/lane).
+const CONGESTED_VOLUME: f64 = 1400.0;
+/// Speed (m/s, ≈ 20 mph) cars enter a freeway at once it is fully congested: a dense crawl
+/// whose short safe following gap lets many pack onto the entry at once.
+const CONGESTED_ENTRY_SPEED: f64 = 9.0;
+
+/// The speed a car should enter a freeway at for the current per-lane volume. Off-peak it
+/// is the road's free-flow speed; as volume climbs toward the peak it eases down to a
+/// congested crawl. Because a vehicle is admitted only with `min_gap + speed·headway` of
+/// clearance, a lower entry speed means a much shorter entry gap — so rush hour enters
+/// slower *and* far more tightly packed, many more cars at once, the way a real freeway
+/// meters into a jam rather than injecting a fast, sparse trickle.
+pub fn congested_entry_speed(free_flow: f64, per_lane_volume: f64) -> f64 {
+    let floor = CONGESTED_ENTRY_SPEED.min(free_flow);
+    let t = ((per_lane_volume - FREE_FLOW_VOLUME) / (CONGESTED_VOLUME - FREE_FLOW_VOLUME)).clamp(0.0, 1.0);
+    free_flow + (floor - free_flow) * t
+}
+
 /// Time-of-day multiplier for surface-street demand: the [`ARTERIAL`] shape scaled
 /// so its *daily mean is 1.0*. So a surface stream's calibrated `base_rate` (which
 /// represents its average-day volume) breathes with the commute — ~2× at the PM
@@ -152,6 +174,23 @@ mod tests {
         // Peakiness matches the real Caltrans K-factor: peak hour ≈ 9% of the day.
         let k = *ARTERIAL.iter().max().unwrap() as f64 / ARTERIAL.iter().map(|&v| v as f64).sum::<f64>();
         assert!((k - 0.09).abs() < 0.01, "peak-hour share ≈ K=0.09, got {k:.3}");
+    }
+
+    #[test]
+    fn entry_speed_eases_down_and_tightens_toward_the_peak() {
+        let vf = 29.0;
+        // Off-peak volume: still free-flow entry.
+        assert_eq!(congested_entry_speed(vf, 300.0), vf);
+        // Peak volume: the congested crawl (clamped at the floor).
+        assert_eq!(congested_entry_speed(vf, 1600.0), CONGESTED_ENTRY_SPEED);
+        // Mid build-up sits strictly between and monotonically below free-flow.
+        let mid = congested_entry_speed(vf, 1050.0);
+        assert!(mid < vf && mid > CONGESTED_ENTRY_SPEED, "mid-volume entry is between: {mid}");
+        // A slow road whose free-flow is already below the congested floor never speeds up.
+        assert!(congested_entry_speed(6.0, 1600.0) <= 6.0);
+        // Lower entry speed ⇒ shorter admission gap ⇒ denser entry (min_gap 2, headway 1.5).
+        let gap = |v: f64| 2.0 + v * 1.5;
+        assert!(gap(congested_entry_speed(vf, 1600.0)) < gap(vf) * 0.5, "peak entry packs at least twice as dense");
     }
 
     #[test]

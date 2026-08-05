@@ -58,6 +58,13 @@ DEFAULT_SPEED_MPH = {
     "tertiary": 30, "residential": 25, "unclassified": 25, "living_street": 15,
 }
 
+# Bend-point simplification tolerance (metres). A whole-city drivable scrape is dominated by
+# way geometry (hundreds of thousands of bend points), most of them redundant on near-straight
+# runs. Douglas–Peucker at half a lane width thins those with no perceptible loss — the driven
+# path and the drawn ribbon are unchanged — and cuts both the file size and the engine's
+# per-link geometry cost. Junction endpoints are kept exactly (they carry the topology).
+SIMPLIFY_TOL_M = 0.5
+
 
 def overpass_query(bbox, classes=None):
     s, w, n, e = bbox
@@ -189,10 +196,50 @@ def build(raw, bbox, place, drivable=DRIVABLE):
     def geom_of(node_ids):
         return [list(project(nodes[nid]["lat"], nodes[nid]["lon"], lat0, lon0)) for nid in node_ids]
 
+    # Douglas–Peucker on a projected metre-space polyline: drop bend points that lie within
+    # SIMPLIFY_TOL_M of the chord they'd otherwise interrupt. Below half a lane width the
+    # thinned curve is indistinguishable when driven or drawn, so this shrinks the file (and
+    # the engine's per-link geometry work) with no perceptible loss of resolution. Iterative
+    # so a long straight way can't blow the recursion limit.
+    def simplify(pts, tol=SIMPLIFY_TOL_M):
+        if len(pts) < 3:
+            return pts
+        keep = [False] * len(pts)
+        keep[0] = keep[-1] = True
+        stack = [(0, len(pts) - 1)]
+        while stack:
+            lo, hi = stack.pop()
+            if hi <= lo + 1:
+                continue
+            x1, y1 = pts[lo]
+            x2, y2 = pts[hi]
+            dx, dy = x2 - x1, y2 - y1
+            dd = dx * dx + dy * dy
+            imax, dmax = lo, -1.0
+            for i in range(lo + 1, hi):
+                px, py = pts[i]
+                if dd == 0.0:
+                    d = math.hypot(px - x1, py - y1)
+                else:
+                    t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / dd))
+                    d = math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
+                if d > dmax:
+                    imax, dmax = i, d
+            if dmax > tol:
+                keep[imax] = True
+                stack.append((lo, imax))
+                stack.append((imax, hi))
+        return [p for p, k in zip(pts, keep) if k]
+
     def emit_link(a, b, lanes, speed, geometry, name, ref, layer, road_class, turn_lanes):
         if (a, b) in emitted:
             return
         emitted.add((a, b))
+        # Thin the bend points against the full chord (junction endpoints included so the
+        # deviation is measured correctly), then keep only the interior — the endpoints are
+        # the `from_osm`/`to_osm` nodes and are stored there, not in the geometry.
+        ea, eb = out_nodes[a], out_nodes[b]
+        geometry = simplify([[ea["x"], ea["y"]], *geometry, [eb["x"], eb["y"]]])[1:-1]
         link = {"from_osm": a, "to_osm": b, "lanes": lanes, "speed_limit": speed, "geometry": geometry}
         if name:
             link["name"] = name  # road name, e.g. "El Camino Real"

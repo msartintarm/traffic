@@ -305,7 +305,7 @@ impl DemandGenerator {
     fn launch(&self, world: &mut NetWorld, costs: &[u64], stream: usize, id: u32) -> bool {
         let (origin, dest) = (self.pairs[stream].origin, self.pairs[stream].dest);
         let driver = class_of(self.seed, id).driver().sample(self.seed, id);
-        let speed = entry_speed(&world.network, origin, &driver).min(self.entry_speed_cap);
+        let speed = self.launch_speed(&world.network, stream, origin, &driver);
         if world.router_knows(dest) {
             world.spawn_to(id, origin, dest, speed, driver)
         } else if let Some(route) = world.network.route_links_with_costs(origin, dest, costs) {
@@ -313,6 +313,22 @@ impl DemandGenerator {
         } else {
             false
         }
+    }
+
+    /// The speed a trip enters at: its origin road's free-flow speed off-peak, but eased
+    /// down to a congested crawl on a freeway gateway whose current per-lane volume is deep
+    /// in the rush-hour peak. The lower speed shrinks the admission gap (`spawn_to`), so
+    /// peak traffic packs onto the freeway densely — many slow cars at once — instead of a
+    /// fast, sparse stream. Always bounded by the UI start-speed cap.
+    fn launch_speed(&self, net: &Network, stream: usize, origin: LinkId, driver: &super::config::DriverConfig) -> f64 {
+        let free_flow = entry_speed(net, origin, driver);
+        let speed = match (self.rush_clock, self.pairs[stream].rush) {
+            (Some(t), Some(RushMode::Freeway(r))) => {
+                rush_hour::congested_entry_speed(free_flow, rush_hour::interp(r.profile, t))
+            }
+            _ => free_flow,
+        };
+        speed.min(self.entry_speed_cap)
     }
 }
 
@@ -886,6 +902,42 @@ mod tests {
         gen.set_rush_hour(&world.network, false);
         assert!(!gen.rush_hour_active());
         assert!(gen.pairs.iter().all(|s| s.rush.is_none()), "toggling off restores the generic rate");
+    }
+
+    #[test]
+    fn rush_hour_enters_the_freeway_slow_and_dense_at_the_peak() {
+        // At the AM peak a freeway gateway should inject a slow, tightly packed stream — not
+        // the off-peak fast, sparse trickle — because that is how a real congested freeway
+        // meters in. Since a car is admitted only with `min_gap + speed·headway` of room,
+        // the lower peak entry speed also shrinks the entry gap, so many more pack in at once.
+        let net = freeway_corridor_with_ref();
+        let world = NetWorld::new(net, SimConfig::default_config());
+        let mut pairs = Vec::new();
+        highway_od_pairs(&world.network, 7, 60, &mut pairs);
+        let mut gen = DemandGenerator::new(&world, &pairs, 7);
+        gen.set_rush_hour(&world.network, true);
+        let stream = gen
+            .pairs
+            .iter()
+            .position(|s| s.origin == LinkId(0) && matches!(s.rush, Some(RushMode::Freeway(_))))
+            .expect("a freeway rush stream leaves the gateway");
+        let driver = DriverConfig::car();
+        let free_flow = entry_speed(&world.network, LinkId(0), &driver);
+
+        gen.rush_clock = Some(3.0 * 3600.0); // pre-dawn trough
+        let night = gen.launch_speed(&world.network, stream, LinkId(0), &driver);
+        gen.rush_clock = Some(7.0 * 3600.0); // AM peak
+        let peak = gen.launch_speed(&world.network, stream, LinkId(0), &driver);
+
+        assert!((night - free_flow).abs() < 0.5, "off-peak enters at free-flow ({night} vs {free_flow})");
+        assert!(peak < free_flow * 0.6, "the peak enters far slower than free-flow ({peak} vs {free_flow})");
+        let gap = |v: f64| driver.min_gap + v * driver.time_headway;
+        assert!(
+            gap(peak) < gap(night) * 0.6,
+            "the peak entry gap is far tighter, so many more cars pack in at once ({:.1} m vs {:.1} m)",
+            gap(peak),
+            gap(night),
+        );
     }
 
     #[test]

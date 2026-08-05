@@ -12,8 +12,30 @@
   width: 100vw;
   height: 100vh;
 }
+/* Older WebKit (Safari) uses the vendor-prefixed pseudo-class; kept a separate rule so a
+   browser that doesn't understand one selector still applies the other. */
+.wrapper:-webkit-full-screen {
+  max-width: none;
+  width: 100vw;
+  height: 100vh;
+}
 
-.wrapper:fullscreen .canvas {
+/* iPhone Safari has no element Fullscreen API, so `toggleFullscreen` adds this class and we
+   fake it with a fixed overlay that fills the (dynamic) viewport. */
+.wrapper.pseudoFullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  max-width: none;
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  background: #0b0e13;
+}
+
+.wrapper:fullscreen .canvas,
+.wrapper:-webkit-full-screen .canvas,
+.wrapper.pseudoFullscreen .canvas {
   width: 100%;
   height: 100%;
   aspect-ratio: auto;
