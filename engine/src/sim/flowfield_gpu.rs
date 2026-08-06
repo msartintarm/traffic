@@ -301,7 +301,13 @@ impl GpuFlowField {
         let w = self.work.as_ref().unwrap();
         let total = l * k;
         let (gx, _) = dispatch_grid(total as u32, self.max_workgroups_per_dim);
-        let init: Vec<u32> = (0..total).map(|g| if (g % l) as u32 == dests[g / l] { 0 } else { u32::MAX }).collect();
+        // Every slot's field starts INF everywhere except its own destination link (distance
+        // 0): a fast fill + `k` targeted writes, not a per-element modulo/divide over all
+        // `link_count * slot_count` cells (5.2 M on Columbus) — this runs on every GPU reroute.
+        let mut init = vec![u32::MAX; total];
+        for (slot, &d) in dests.iter().enumerate() {
+            init[slot * l + d as usize] = 0;
+        }
         self.queue.write_buffer(&w.params, 0, bytemuck::bytes_of(&BatchParams { link_count: l as u32, slot_count: k as u32, row_stride: gx * RELAX_WG_SIZE, _pad1: 0 }));
         self.queue.write_buffer(&w.cost_buf, 0, cast_slice(cost));
         self.queue.write_buffer(&w.dests_buf, 0, cast_slice(dests));

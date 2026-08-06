@@ -29,8 +29,30 @@ pub struct FieldRouter {
     /// can fall back onto the *forward-most* movement it can take (nearest to the
     /// destination) instead of an arbitrary one. `u64::MAX` = unreachable.
     dist: Vec<Vec<u64>>,
-    /// Next slot for [`recompute_incremental`] to refresh — spreads the rebuild.
+    /// Next slot a recompute cycle starts from, so successive cycles round-robin the fields.
     cursor: usize,
+    /// An in-flight budgeted recompute: refresh every field once against a cost snapshot, one
+    /// bounded Dijkstra slice per [`advance_recompute`] call, so a whole-map rebuild spreads
+    /// across frames instead of stalling one. `None` when routing is up to date.
+    rc: Option<Recompute>,
+}
+
+struct Recompute {
+    /// Cost snapshot taken when the cycle began, so every field in it is mutually consistent.
+    cost: Vec<u64>,
+    /// How many fields to solve concurrently (the batch width): 1 serial, else one per core.
+    width: usize,
+    /// Slot the cycle started from; fields are `(base + i) % dests` for `i` in `0..total`.
+    base: usize,
+    /// Fields whose Dijkstra has been *started* (added to the batch) so far.
+    started: usize,
+    /// Fields *published* (swapped into the live buffers) so far; the cycle ends at `total`.
+    published: usize,
+    /// Fields in this cycle (= number of destinations).
+    total: usize,
+    /// The batch of in-flight fields `(slot, resumable Dijkstra)`, each advanced per tick —
+    /// concurrently across cores when `width > 1`.
+    batch: Vec<(usize, flowfield::PartialField)>,
 }
 
 impl FieldRouter {
@@ -49,7 +71,7 @@ impl FieldRouter {
         }
         let next_hop = vec![Vec::new(); unique.len()];
         let dist = vec![Vec::new(); unique.len()];
-        let mut router = Self { adj, pred, dests: unique, slot, next_hop, dist, cursor: 0 };
+        let mut router = Self { adj, pred, dests: unique, slot, next_hop, dist, cursor: 0, rc: None };
         router.recompute(cost);
         router
     }
@@ -59,34 +81,78 @@ impl FieldRouter {
         self.dests.len()
     }
 
-    /// Refresh only `count` destination fields this call, cycling through them, so
-    /// the full rebuild is spread across many ticks instead of a single spike (a
-    /// ~half-second freeze at city scale). Over `dests.len()/count` calls every
-    /// field is refreshed against the latest `cost`.
-    pub fn recompute_incremental(&mut self, cost: &[u64], count: usize) {
+    /// Whether a budgeted recompute cycle is in flight.
+    pub fn recompute_pending(&self) -> bool {
+        self.rc.is_some()
+    }
+
+    /// Begin a cycle that refreshes every field once against `cost` (snapshotted for
+    /// consistency), resumable via [`advance_recompute`]. `width` fields are solved
+    /// concurrently (1 = serial; set it to the core count to spread the rebuild across cores).
+    /// Continues from `cursor` so successive cycles round-robin. No-op with no destinations.
+    pub fn begin_recompute(&mut self, cost: Vec<u64>, width: usize) {
         let total = self.dests.len();
         if total == 0 {
             return;
         }
-        let count = count.min(total);
-        let slots: Vec<usize> = (0..count).map(|k| (self.cursor + k) % total).collect();
-        let (pred, adj, dests) = (&self.pred, &self.adj, &self.dests);
-        let field = |&s: &usize| {
-            let dist = flowfield::distances_to_with(pred, dests[s], cost);
-            (s, flowfield::next_hops(adj, &dist, cost), dist)
+        let width = width.clamp(1, total);
+        let base = self.cursor;
+        self.cursor = (self.cursor + 1) % total; // rotate the start so freshness spreads over cycles
+        let mut rc = Recompute { cost, width, base, started: 0, published: 0, total, batch: Vec::with_capacity(width) };
+        self.fill_batch(&mut rc);
+        self.rc = Some(rc);
+    }
+
+    /// Top the in-flight batch back up to its width with the next unstarted fields.
+    fn fill_batch(&self, rc: &mut Recompute) {
+        while rc.batch.len() < rc.width && rc.started < rc.total {
+            let slot = (rc.base + rc.started) % self.dests.len();
+            rc.batch.push((slot, flowfield::PartialField::new(self.pred.len(), self.dests[slot])));
+            rc.started += 1;
+        }
+    }
+
+    /// Advance the in-flight recompute by up to `total_budget` settled links this call, split
+    /// evenly across the batch — a bounded slice of each field's Dijkstra — so a whole-map
+    /// rebuild is spread across frames and no frame does the full O(links log links) sweep. The
+    /// batch's fields are independent Dijkstras, so with `width > 1` (and the `parallel`
+    /// feature) they advance **concurrently across cores**, cutting the per-frame wall time by
+    /// ~the core count at the same total work. A field is published (next-hop + distances
+    /// swapped into the live buffers) only once its Dijkstra completes — until then the previous
+    /// field stays live, so routing is never read mid-solve. No-op when nothing is pending.
+    pub fn advance_recompute(&mut self, total_budget: usize) {
+        let Some(mut rc) = self.rc.take() else {
+            return;
         };
+        let per_field = (total_budget / rc.batch.len().max(1)).max(1);
+        // Advance each in-flight field; concurrently when the batch is wide enough to be worth it.
+        let (pred, cost) = (&self.pred, &rc.cost);
         #[cfg(feature = "parallel")]
-        let fields: Vec<_> = {
+        let done: Vec<bool> = if rc.batch.len() > 1 {
             use rayon::prelude::*;
-            slots.par_iter().map(field).collect()
+            rc.batch.par_iter_mut().map(|(_, pf)| pf.advance(pred, cost, per_field)).collect()
+        } else {
+            rc.batch.iter_mut().map(|(_, pf)| pf.advance(pred, cost, per_field)).collect()
         };
         #[cfg(not(feature = "parallel"))]
-        let fields: Vec<_> = slots.iter().map(field).collect();
-        for (s, next_hop, dist) in fields {
-            self.next_hop[s] = next_hop;
-            self.dist[s] = dist;
+        let done: Vec<bool> = rc.batch.iter_mut().map(|(_, pf)| pf.advance(pred, cost, per_field)).collect();
+
+        // Publish every field that finished this tick, then refill the batch from the remaining
+        // slots. Iterate back-to-front so `swap_remove` doesn't skip an entry.
+        for i in (0..rc.batch.len()).rev() {
+            if done[i] {
+                let (slot, mut pf) = rc.batch.swap_remove(i);
+                let dist = pf.take_dist();
+                self.next_hop[slot] = flowfield::next_hops(&self.adj, &dist, &rc.cost);
+                self.dist[slot] = dist;
+                rc.published += 1;
+            }
         }
-        self.cursor = (self.cursor + count) % total;
+        if rc.published >= rc.total {
+            return; // cycle done — `rc` dropped, so `recompute_pending` is false
+        }
+        self.fill_batch(&mut rc);
+        self.rc = Some(rc);
     }
 
     /// The destinations this router routes to.

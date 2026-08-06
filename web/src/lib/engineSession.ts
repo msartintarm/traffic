@@ -283,6 +283,7 @@ export async function startEngineSession(
       case "sleepScheduler": sim.set_sleep_scheduler(c.value); break;
       case "schedulerThreadLimit": sim.set_scheduler_thread_limit(c.value); break;
       case "parThreshold": sim.set_par_threshold(c.value); break;
+      case "parallelRouting": sim.set_parallel_routing(c.value); break;
       case "entrySpeedCap": sim.set_entry_speed_cap(c.value); break;
       case "congestionEngage": sim.set_congestion_engage(c.value); break;
       case "congestionEnabled": sim.set_congestion_enabled(c.value); break;

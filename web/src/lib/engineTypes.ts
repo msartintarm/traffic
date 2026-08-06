@@ -50,6 +50,8 @@ export type Sim = {
   par_threshold(): number;
   set_scheduler_thread_limit(n: number): void;
   scheduler_thread_limit(): number;
+  set_parallel_routing(on: boolean): void;
+  parallel_routing(): boolean;
   set_demand_sources(highway: boolean, surface: boolean): void;
   demand_highway(): boolean;
   demand_surface(): boolean;

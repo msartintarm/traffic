@@ -84,8 +84,9 @@ export default function EngineCanvas() {
   const [rushHour, setRushHour] = useState(false);
   const rushClockRef = useRef<HTMLSpanElement>(null);
   const [accelBackend, setAccelBackend] = useState("serial");
-  const [parThreshold, setParThreshold] = useState(2000);
+  const [parThreshold, setParThreshold] = useState(500); // matches engine DEFAULT_PAR_THRESHOLD
   const [schedThreadLimit, setSchedThreadLimit] = useState(2000);
+  const [parallelRouting, setParallelRouting] = useState(true); // on by default (see net_world default)
   const [demandRate, setDemandRate] = useState(1);
   const [congestionEnabled, setCongestionEnabled] = useState(false);
   const [congestionEngage, setCongestionEngage] = useState(0.85);
@@ -656,6 +657,21 @@ export default function EngineCanvas() {
                     }}
                   />
                   cars
+                </label>
+                <label
+                  className={styles.zoomLabel}
+                  title="Solve several routing (flow-field) recompute destinations at once across the worker pool, instead of one at a time. Spreads a whole-map reroute over cores, cutting its per-frame cost by ~the core count. On by default; uncheck to A/B against serial routing. Only affects the CPU-threads build's routing path."
+                >
+                  <input
+                    type="checkbox"
+                    checked={parallelRouting}
+                    disabled={!ready}
+                    onChange={(e) => {
+                      sessionRef.current?.applyControl({ type: "parallelRouting", value: e.target.checked });
+                      setParallelRouting(e.target.checked);
+                    }}
+                  />
+                  Parallel routing
                 </label>
               </>
             )}

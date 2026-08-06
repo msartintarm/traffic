@@ -60,25 +60,61 @@ pub fn reverse(adj: &[Vec<u32>]) -> Vec<Vec<u32>> {
 
 /// [`distances_to`] with a prebuilt reverse index (see [`reverse`]).
 pub fn distances_to_with(pred: &[Vec<u32>], dest: LinkId, cost: &[u64]) -> Vec<u64> {
-    use std::cmp::Reverse;
-    use std::collections::BinaryHeap;
-    let mut dist = vec![UNREACHABLE; pred.len()];
-    dist[dest.idx()] = 0;
-    let mut heap = BinaryHeap::new();
-    heap.push(Reverse((0u64, dest.0)));
-    while let Some(Reverse((d, b))) = heap.pop() {
-        if d > dist[b as usize] {
-            continue; // a stale, superseded entry
-        }
-        let step = cost[b as usize].saturating_add(d);
-        for &a in &pred[b as usize] {
-            if step < dist[a as usize] {
-                dist[a as usize] = step;
-                heap.push(Reverse((step, a)));
+    let mut field = PartialField::new(pred.len(), dest);
+    field.advance(pred, cost, usize::MAX); // run to completion
+    field.dist
+}
+
+/// A resumable reverse-Dijkstra toward one destination, so a whole-map field solve can be
+/// **spread across frames** — advance a bounded number of settled links per call — instead of
+/// blocking one frame for the full O(links log links) sweep (~40 ms in wasm on a city map).
+/// Popped (settled) distances are final by the Dijkstra invariant, but a partial field is not
+/// yet a valid routing field, so callers keep the previous complete field live and swap the
+/// finished distances in only once [`advance`](Self::advance) reports completion.
+pub struct PartialField {
+    dist: Vec<u64>,
+    heap: std::collections::BinaryHeap<std::cmp::Reverse<(u64, u32)>>,
+}
+
+impl PartialField {
+    pub fn new(n: usize, dest: LinkId) -> Self {
+        let mut dist = vec![UNREACHABLE; n];
+        dist[dest.idx()] = 0;
+        let mut heap = std::collections::BinaryHeap::new();
+        heap.push(std::cmp::Reverse((0u64, dest.0)));
+        Self { dist, heap }
+    }
+
+    /// Settle up to `budget` links; returns `true` once the field is complete (heap drained).
+    pub fn advance(&mut self, pred: &[Vec<u32>], cost: &[u64], budget: usize) -> bool {
+        let mut settled = 0usize;
+        while settled < budget {
+            let Some(std::cmp::Reverse((d, b))) = self.heap.pop() else {
+                return true;
+            };
+            if d > self.dist[b as usize] {
+                continue; // a stale, superseded entry — not a settle
+            }
+            settled += 1;
+            let step = cost[b as usize].saturating_add(d);
+            for &a in &pred[b as usize] {
+                if step < self.dist[a as usize] {
+                    self.dist[a as usize] = step;
+                    self.heap.push(std::cmp::Reverse((step, a)));
+                }
             }
         }
+        self.heap.is_empty() // budget spent; done iff nothing is left to settle
     }
-    dist
+
+    pub fn dist(&self) -> &[u64] {
+        &self.dist
+    }
+
+    /// Move the settled distances out (leaving the field empty), to publish into a live buffer.
+    pub fn take_dist(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.dist)
+    }
 }
 
 /// The next link to take from each link toward the destination whose distances

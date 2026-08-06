@@ -197,6 +197,19 @@ pub struct NetWorld {
     /// When set, an external driver (the browser GPU flow-field) owns the routing
     /// recompute and feeds fresh fields in; the internal CPU recompute stands down.
     external_reroute: bool,
+    /// Congestion fingerprint (which links carry enough traffic to shift routing costs) at
+    /// the last route recompute. Routing recomputes only when this fingerprint moves — under
+    /// light or static traffic the free-flow fields from `install_router` stay optimal, so the
+    /// whole-map O(links) rebuild is skipped and routing cost tracks congestion, not map size.
+    route_fingerprint: u64,
+    /// Tick the current reroute cycle started, so a new one can't begin until the reroute
+    /// interval elapses — churny traffic can't chain whole-map rebuilds. The per-field spread
+    /// itself lives in the router (`advance_recompute`).
+    route_cycle_tick: u64,
+    /// Solve several destination fields per reroute across cores (one per thread) vs. one at a
+    /// time. On by default; a UI toggle so the parallel speed-up is observable. No effect on
+    /// the single-threaded build or when the browser GPU flow-field owns the recompute.
+    parallel_routing: bool,
     /// Per-node index of movements and conflict points.
     junctions: Junctions,
     /// Executor requested for the per-vehicle accel passes (see [`AccelBackend`]).
@@ -322,9 +335,15 @@ fn threads_available() -> bool {
 
 /// Default for [`NetWorld::par_threshold`]: below this vehicle count rayon's per-task
 /// overhead outweighs the win (measured crossover on the Millbrae step is ~4–5k, but the
-/// default is set lower so threads engage sooner under climbing load), so [`map_collect`]
-/// stays serial even on the `Threads` backend below it. Adjustable at runtime.
-pub const DEFAULT_PAR_THRESHOLD: usize = 2000;
+/// default is set well under it so threads engage sooner under climbing load — in the
+/// browser choppy maps lock to a smooth speed once this trips), so [`map_collect`] stays
+/// serial even on the `Threads` backend below it. Adjustable at runtime.
+pub const DEFAULT_PAR_THRESHOLD: usize = 500;
+
+/// Default for [`NetWorld::scheduler_thread_limit`]: the idle-car scheduler stands down at or
+/// above this count on the `Threads` backend (the parallel step subsumes it). Kept at its own
+/// tuned point rather than following [`DEFAULT_PAR_THRESHOLD`], which trips earlier.
+pub const DEFAULT_SCHEDULER_THREAD_LIMIT: usize = 2000;
 
 /// Map `0..n` through `f` on the given `backend`. On `Threads`, runs serially when
 /// `n < threshold` (rayon overhead isn't worth it below the crossover). Order-preserving
@@ -802,7 +821,8 @@ impl NetWorld {
         let congestion = CongestionLod::new(network.links.len());
         Self {
             network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0,
-            merges, link_straight, merge_feeder_lane, through_next, corridor_of, corridor_offset, signals, link_entries, router: None, external_reroute: false, junctions,
+            merges, link_straight, merge_feeder_lane, through_next, corridor_of, corridor_offset, signals, link_entries, router: None, external_reroute: false,
+            route_fingerprint: 0, route_cycle_tick: 0, parallel_routing: true, junctions,
             accel_backend: AccelBackend::Serial,
             #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
             gpu_accel: None,
@@ -810,7 +830,7 @@ impl NetWorld {
             par_threshold: DEFAULT_PAR_THRESHOLD,
             congestion, congestion_cfg: CongestionConfig::disabled(),
             asleep_last: 0,
-            scheduler_thread_limit: DEFAULT_PAR_THRESHOLD,
+            scheduler_thread_limit: DEFAULT_SCHEDULER_THREAD_LIMIT,
         }
     }
 
@@ -1729,25 +1749,86 @@ impl NetWorld {
         self.signals.advance(&self.network, &demand, dt);
     }
 
+    /// Order-independent hash of the links carrying enough traffic to shift routing costs —
+    /// the only thing a flow-field recompute reacts to. O(cars): tally cars per occupied link
+    /// (light traffic touches few links), keep those whose density crosses into a congestion
+    /// band, and fold their `(link, band)` into the hash. Empty and stable under light or
+    /// static traffic, so [`refresh_routes`] (and the browser GPU router) skip the rebuild.
+    pub fn congestion_fingerprint(&self) -> u64 {
+        let mut count: IntMap<u32> = IntMap::default();
+        for v in &self.fleet.rows {
+            *count.entry(self.network.lane(v.lane).link.0).or_default() += 1;
+        }
+        let mut h = 0u64;
+        for (&link, &c) in &count {
+            let l = self.network.link(LinkId(link));
+            let jam = (self.network.lane(l.lane_start).length / 7.0 * l.lane_count as f64).max(1.0);
+            // Quarter-jam bands: a tiny density change doesn't churn the fingerprint (and so
+            // doesn't trigger a rebuild); a link crossing into a busier band does.
+            let band = ((c as f64 / jam) * 4.0) as u64;
+            if band > 0 {
+                h = h.wrapping_add((link as u64).wrapping_mul(0x9e3779b97f4a7c15) ^ (band + 1).wrapping_mul(0x100000001b3));
+            }
+        }
+        h
+    }
+
+    /// Toggle solving several routing fields per reroute across cores. Off falls back to one
+    /// field at a time (still frame-spread, just serial) so the parallel win is observable.
+    pub fn set_parallel_routing(&mut self, on: bool) {
+        self.parallel_routing = on;
+    }
+
+    pub fn parallel_routing(&self) -> bool {
+        self.parallel_routing
+    }
+
+    /// How many destination fields to solve concurrently in a recompute: one per pool thread
+    /// when parallel routing is on (and the threaded build is linked), else 1.
+    fn route_field_width(&self) -> usize {
+        if !self.parallel_routing {
+            return 1;
+        }
+        #[cfg(feature = "parallel")]
+        {
+            rayon::current_num_threads().max(1)
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            1
+        }
+    }
+
     fn refresh_routes(&mut self) {
         if self.router.is_none() || self.external_reroute {
             return;
         }
-        // Spread the flow-field rebuild across the reroute interval: refresh a slice
-        // of destinations each tick so every field is current within the interval,
-        // without the whole-graph recompute landing on one tick (a visible freeze).
-        // Also bound the per-tick work by a link budget so this CPU fallback (no GPU
-        // routing) stays interactive on a whole-city map: a field costs ~O(links), so a
-        // big graph refreshes fewer fields per tick (staler routing) rather than
-        // stalling the frame. Small maps stay under the budget and are unaffected.
-        const REROUTE_LINK_BUDGET: usize = 120_000;
-        let interval_ticks = (REROUTE_INTERVAL_SECS / self.cfg.dt).max(1.0);
-        let budget_fields = (REROUTE_LINK_BUDGET / self.network.links.len().max(1)).max(1);
-        let costs = self.live_link_costs();
+        // Recompute routing only when the cost landscape actually moves. The fields from
+        // `install_router` are optimal for free-flow; while traffic stays light or static the
+        // congestion fingerprint doesn't change, so we skip the O(links) rebuild entirely —
+        // this is why a near-empty city map costs almost nothing.
+        let fp = self.congestion_fingerprint();
+        let interval_ticks = (REROUTE_INTERVAL_SECS / self.cfg.dt).max(1.0) as u64;
+        // Start a new reroute cycle only when congestion has moved, none is in flight, and the
+        // interval has elapsed since the last — so constantly-churning traffic can't chain
+        // back-to-back whole-map rebuilds.
+        let pending = self.router.as_ref().is_some_and(|r| r.recompute_pending());
+        if fp != self.route_fingerprint && !pending && self.tick.saturating_sub(self.route_cycle_tick) >= interval_ticks {
+            self.route_fingerprint = fp;
+            self.route_cycle_tick = self.tick;
+            let costs = self.live_link_costs();
+            let width = self.route_field_width();
+            if let Some(r) = self.router.as_mut() {
+                r.begin_recompute(costs, width);
+            }
+        }
+        // Advance any in-flight recompute by a bounded per-tick budget: each field's whole-map
+        // Dijkstra is spread across frames, so no frame ever does the full ~O(links log links)
+        // sweep (~40 ms in wasm on a city map). Sized so a 116k-link field settles over ~15
+        // ticks at a few ms each; a small map's field finishes in a single call (no overhead).
+        const ROUTE_SETTLE_BUDGET: usize = 8_000;
         if let Some(r) = self.router.as_mut() {
-            let per_tick =
-                ((r.destination_count() as f64 / interval_ticks).ceil().max(1.0) as usize).min(budget_fields);
-            r.recompute_incremental(&costs, per_tick);
+            r.advance_recompute(ROUTE_SETTLE_BUDGET);
         }
     }
 

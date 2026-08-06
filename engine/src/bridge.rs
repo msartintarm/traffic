@@ -101,6 +101,8 @@ pub struct Simulation {
     gpu_generation: u64,
     gpu_cost: Vec<u64>,
     gpu_last: f64,
+    /// Congestion fingerprint at the last GPU solve; a solve is kicked off only when it moves.
+    gpu_fingerprint: u64,
     /// Achieved sim-time / wall-time over the last window — the speed the sim is
     /// *actually* running at (see [`Simulation::meter_speed`]).
     effective_speed: f64,
@@ -166,7 +168,7 @@ impl Simulation {
         Simulation {
             world, clock, seed: cfg.seed, demand, demand_sources, demand_rate, entry_speed_cap, camera,
             prev: PoseMap::default(), prev_lane: IntMap::default(), prev_crossing: IntMap::default(), selected: None, signal_heads,
-            gpu: None, gpu_pending: None, gpu_relax: None, gpu_generation: 0, gpu_cost: Vec::new(), gpu_last: 0.0,
+            gpu: None, gpu_pending: None, gpu_relax: None, gpu_generation: 0, gpu_cost: Vec::new(), gpu_last: 0.0, gpu_fingerprint: 0,
             effective_speed: 0.0, throttled: false, last_advance_ms: 0.0,
             speed_sim_accum: 0.0, speed_wall_accum: 0.0, speed_dropped: false,
             frame_budget: true,
@@ -515,6 +517,17 @@ impl Simulation {
         self.world.scheduler_thread_limit() as u32
     }
 
+    /// Toggle solving several routing (flow-field) recompute destinations at once across the
+    /// worker pool vs. one at a time. On by default; exposed so the parallel routing speed-up
+    /// is observable. No effect on the single-threaded build or the browser-GPU routing path.
+    pub fn set_parallel_routing(&mut self, on: bool) {
+        self.world.set_parallel_routing(on);
+    }
+
+    pub fn parallel_routing(&self) -> bool {
+        self.world.parallel_routing()
+    }
+
     /// Toggle the active-set scheduler: queued-behind-a-stopped-car vehicles skip the
     /// full per-tick gather, so step cost tracks the *deciding* fraction rather than the
     /// whole fleet. Safe live toggle (non-destructive; changes work distribution only).
@@ -782,9 +795,26 @@ impl Simulation {
     }
 
     fn signal_instance_vec(&self) -> Vec<Instance> {
-        self.signal_head_slots()
-            .into_iter()
-            .flat_map(|(pos, heading, state, is_left)| signal_head_instances(pos, heading, state, is_left))
+        // This buffer is rebuilt and re-uploaded to the GPU every frame, and a whole city has
+        // tens of thousands of signal heads (Columbus: ~10k heads → 40k instances, ~2.4 MB).
+        // Signals are ~5 m across, so past a couple of metres per pixel they're sub-pixel:
+        // skip them entirely when zoomed out, and otherwise cull to the viewport, so the
+        // per-frame cost (and the alloc/upload churn that stalls the render loop) scales with
+        // *visible* signals, not the whole map. The marking mesh is zoom-gated the same way.
+        const SIGNAL_MAX_MPP: f64 = 2.0;
+        const SIGNAL_CULL_MARGIN_M: f64 = 40.0;
+        let mpp = self.camera.meters_per_pixel;
+        if mpp > SIGNAL_MAX_MPP {
+            return Vec::new();
+        }
+        let c = self.camera.center;
+        let hx = self.camera.viewport[0] * mpp * 0.5 + SIGNAL_CULL_MARGIN_M;
+        let hy = self.camera.viewport[1] * mpp * 0.5 + SIGNAL_CULL_MARGIN_M;
+        let states = self.world.signal_states();
+        self.signal_heads
+            .iter()
+            .filter(|&&(_, pos, _, _)| (pos[0] as f64 - c[0]).abs() <= hx && (pos[1] as f64 - c[1]).abs() <= hy)
+            .flat_map(|&(gi, pos, heading, is_left)| signal_head_instances(pos, heading, states[gi], is_left))
             .collect()
     }
 
@@ -892,10 +922,20 @@ impl Simulation {
             }
             return; // one GPU action per frame
         }
-        // Phase C — idle: begin a fresh solve when the field is due for a refresh.
+        // Phase C — idle: begin a fresh solve, but only when it will change anything. The 3 s
+        // timer bounds how often we check; the congestion fingerprint then gates the actual
+        // solve — under light or static traffic the installed free-flow fields stay optimal,
+        // so a whole-map GPU solve every 3 s (which competes with rendering for the GPU) is
+        // skipped and routing tracks congestion, not map size.
         if self.world.time() - self.gpu_last < GPU_REROUTE_SECS {
             return;
         }
+        let fp = self.world.congestion_fingerprint();
+        if fp == self.gpu_fingerprint {
+            self.gpu_last = self.world.time(); // nothing moved — re-check after another interval
+            return;
+        }
+        self.gpu_fingerprint = fp;
         let dests: Vec<u32> = self.world.router_dest_links().iter().map(|d| d.0).collect();
         if dests.is_empty() {
             return;
