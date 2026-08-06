@@ -384,3 +384,105 @@
   background: rgba(148, 163, 184, 0.12);
   color: #94a3b8;
 }
+
+/* Loading overlay: covers the canvas while a scene boots (download → parse → renderer).
+   Matches the splash's dark ground + sky accent. The 0.15s animation delay with `both`
+   fill means a fast scene (test scenes, cached maps) never visibly flashes it. */
+.loading {
+  position: absolute;
+  inset: 0;
+  z-index: 20; /* cover the (disabled) control chips for a clean loading screen */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: radial-gradient(120% 120% at 50% 0%, #121826 0%, #0b0e13 60%);
+  color: #e2e8f0;
+  font-family: ui-monospace, monospace;
+  animation: loadingFadeIn 0.25s ease 0.15s both;
+}
+
+.wrapper:fullscreen .loading,
+.wrapper:-webkit-full-screen .loading,
+.wrapper.pseudoFullscreen .loading {
+  border-radius: 0;
+}
+
+.loadingInner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.7rem;
+  width: 100%;
+  max-width: 320px;
+  padding: 1.5rem;
+}
+
+.loadingName {
+  font-size: 1.1rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: #e0f2fe;
+  text-align: center;
+}
+
+.loadingTrack {
+  width: 100%;
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.16);
+  overflow: hidden;
+}
+
+.loadingFill {
+  height: 100%;
+  min-width: 0;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #38bdf8, #7dd3fc);
+  transition: width 0.25s ease;
+  position: relative;
+  overflow: hidden;
+}
+
+/* A highlight sweeping across the filled portion, so the bar reads as "still working"
+   even while it sits at a fixed width during the single blocking parse step. */
+.loadingFill::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.35), transparent);
+  transform: translateX(-100%);
+  animation: loadingShimmer 1.1s ease-in-out infinite;
+}
+
+.loadingStage {
+  min-height: 1em;
+  font-size: 0.72rem;
+  color: #94a3b8;
+  letter-spacing: 0.04em;
+}
+
+@keyframes loadingFadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes loadingShimmer {
+  to {
+    transform: translateX(100%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .loading {
+    animation-duration: 0.01ms;
+    animation-delay: 0s;
+  }
+  .loadingFill::after {
+    animation: none;
+  }
+}

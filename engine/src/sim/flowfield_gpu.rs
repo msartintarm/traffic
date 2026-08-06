@@ -131,8 +131,20 @@ pub fn distances_to_gpu(offsets: &[u32], targets: &[u32], cost: &[u32], dest: u3
 struct BatchParams {
     link_count: u32,
     slot_count: u32,
-    _pad0: u32,
+    row_stride: u32, // threads per y-row of the 2-D dispatch (x_workgroups * 64)
     _pad1: u32,
+}
+
+/// WebGPU guarantees only 65535 workgroups per dimension, so a whole-city solve
+/// (`slot_count * link_count` threads over a 152k-link map) overflows a 1-D dispatch.
+/// Fold the required workgroup count into a 2-D (x, y) grid under that limit; the shader
+/// reflattens with `gid.y * (x * 64) + gid.x`. `y` is 1 for maps small enough to fit 1-D.
+const RELAX_WG_SIZE: u32 = 64; // must match @workgroup_size in flowfield_batch.wgsl
+const MAX_WORKGROUPS_PER_DIM: u32 = 65535;
+fn dispatch_grid(total_threads: u32, max_dim: u32) -> (u32, u32) {
+    let groups = total_threads.div_ceil(RELAX_WG_SIZE).max(1);
+    let gx = groups.min(max_dim.max(1));
+    (gx, groups.div_ceil(gx))
 }
 
 /// Persistent GPU solver for many flow fields at once. Holds the device, pipelines
@@ -157,6 +169,9 @@ pub struct GpuFlowField {
     /// [`run_chunk`](Self::run_chunk). Only the wasm async path reads it.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     passes_done: usize,
+    /// WebGPU per-dimension workgroup cap the 2-D dispatch stays under. The real limit
+    /// (65535); overridable in tests to force the multi-row path on a tiny graph.
+    max_workgroups_per_dim: u32,
 }
 
 /// The per-recompute buffers, sized for `slot_count` destinations. Persisted so a
@@ -240,7 +255,10 @@ impl GpuFlowField {
             cache: None,
         });
         let (relax, gate) = (compute("relax"), compute("gate"));
-        Self { device, queue, relax, gate, layout, offsets_buf, targets_buf, link_count, work: None, passes_done: 0 }
+        Self {
+            device, queue, relax, gate, layout, offsets_buf, targets_buf, link_count,
+            work: None, passes_done: 0, max_workgroups_per_dim: MAX_WORKGROUPS_PER_DIM,
+        }
     }
 
     /// (Re)allocate the working buffers when the destination count changes.
@@ -282,8 +300,9 @@ impl GpuFlowField {
         self.ensure_work(k);
         let w = self.work.as_ref().unwrap();
         let total = l * k;
+        let (gx, _) = dispatch_grid(total as u32, self.max_workgroups_per_dim);
         let init: Vec<u32> = (0..total).map(|g| if (g % l) as u32 == dests[g / l] { 0 } else { u32::MAX }).collect();
-        self.queue.write_buffer(&w.params, 0, bytemuck::bytes_of(&BatchParams { link_count: l as u32, slot_count: k as u32, _pad0: 0, _pad1: 0 }));
+        self.queue.write_buffer(&w.params, 0, bytemuck::bytes_of(&BatchParams { link_count: l as u32, slot_count: k as u32, row_stride: gx * RELAX_WG_SIZE, _pad1: 0 }));
         self.queue.write_buffer(&w.cost_buf, 0, cast_slice(cost));
         self.queue.write_buffer(&w.dests_buf, 0, cast_slice(dests));
         self.queue.write_buffer(&w.dist, 0, cast_slice(&init));
@@ -296,13 +315,13 @@ impl GpuFlowField {
     fn encode_relax_passes(&self, encoder: &mut wgpu::CommandEncoder, count: usize) {
         let w = self.work.as_ref().unwrap();
         let total = self.link_count * w.slot_count;
-        let groups = (total as u32).div_ceil(64).max(1);
+        let (gx, gy) = dispatch_grid(total as u32, self.max_workgroups_per_dim);
         for _ in 0..count.max(1) {
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
                 pass.set_pipeline(&self.relax);
                 pass.set_bind_group(0, &w.bind, &[]);
-                pass.dispatch_workgroups(groups, 1, 1);
+                pass.dispatch_workgroups(gx, gy, 1);
             }
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
@@ -580,6 +599,55 @@ mod tests {
             for (i, &g) in batched[slot].iter().enumerate() {
                 let c32 = if cpu[i] == UNREACHABLE { u32::MAX } else { cpu[i] as u32 };
                 assert_eq!(g, c32, "dest {dest} link {i}: batched gpu {g} != cpu {c32}");
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_grid_stays_within_the_per_dimension_limit() {
+        // Columbus (152k links × its dest count) overflows a 1-D dispatch; the grid must
+        // cover every thread while keeping each dimension within WebGPU's 65535 cap.
+        for &total in &[1u32, 12, 80, 4_194_240, 4_194_241, 7_318_272, 33_000_000] {
+            let (gx, gy) = dispatch_grid(total, MAX_WORKGROUPS_PER_DIM);
+            assert!(gx >= 1 && gy >= 1, "total {total}: empty grid ({gx}, {gy})");
+            assert!(gx <= MAX_WORKGROUPS_PER_DIM, "total {total}: gx {gx} over the per-dim cap");
+            assert!(gy <= MAX_WORKGROUPS_PER_DIM, "total {total}: gy {gy} over the per-dim cap");
+            // The (gx·64) × gy thread grid covers every one of `total` threads.
+            assert!(
+                (gx as u64) * (RELAX_WG_SIZE as u64) * (gy as u64) >= total as u64,
+                "total {total}: grid ({gx}, {gy}) leaves threads uncovered",
+            );
+        }
+    }
+
+    #[test]
+    fn batched_gpu_distances_match_cpu_under_2d_dispatch() {
+        // A chain long enough that (links × dests) spans several workgroups, with the
+        // per-dimension cap forced to 1 so the solve dispatches a multi-row (gy > 1) grid —
+        // the whole-city path a 152k-link map takes. Validates the shader's 2-D → linear
+        // index reflattening against the CPU reference on real (software) hardware.
+        const N: i64 = 80;
+        let nodes: Vec<NodeSpec> = (0..=N).map(|i| NodeSpec::uncontrolled(i, i as f64 * 100.0, 0.0)).collect();
+        let links: Vec<LinkSpec> = (0..N).map(|i| LinkSpec::oneway(i, i + 1, 1, 20.0)).collect();
+        let net = OsmMap { nodes, links }.build();
+        let adj = adjacency(&net);
+        let (offsets, targets) = csr(&adj);
+        let cost64: Vec<u64> = (0..net.links.len() as u32).map(|i| net.link_travel_time_ms(LinkId(i))).collect();
+        let cost32: Vec<u32> = cost64.iter().map(|&c| c as u32).collect();
+        let ll = net.links.len() as u32;
+        let dests = [ll - 1, ll / 2];
+
+        let Some(mut solver) = GpuFlowField::new(&offsets, &targets) else {
+            eprintln!("no GPU adapter; skipping 2-D dispatch test");
+            return;
+        };
+        solver.max_workgroups_per_dim = 1; // force gy = groups (multi-row) on this small graph
+        let batched = solver.distances(&cost32, &dests);
+        for (slot, &dest) in dests.iter().enumerate() {
+            let cpu = distances_to(&adj, LinkId(dest), &cost64);
+            for (i, &g) in batched[slot].iter().enumerate() {
+                let c32 = if cpu[i] == UNREACHABLE { u32::MAX } else { cpu[i] as u32 };
+                assert_eq!(g, c32, "dest {dest} link {i}: 2-D gpu {g} != cpu {c32}");
             }
         }
     }

@@ -186,6 +186,7 @@ name = "engine"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "js-sys",
  "naga",
  "png",
  "pollster",

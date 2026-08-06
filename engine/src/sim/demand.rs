@@ -6,12 +6,56 @@
 //! world's flow field (rerouting around jams), falling back to a precomputed
 //! route when the world has no router for that destination.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use super::boundary;
 use super::config::VehicleClass;
+use super::hash::IntMap;
 use super::net_world::NetWorld;
 use super::network::{LinkId, Network};
 use super::rng::{self, Stream};
 use super::rush_hour;
+
+/// Memoized forward reachability over the link graph. Demand generation asks "can this
+/// origin reach this destination?" thousands of times while sampling OD pairs; answering
+/// each with a fresh `route_links` (a Dijkstra over `std::HashMap` that, for an *unreachable*
+/// pair, scans the whole component) dominated city-map load — ~66 s of the Columbus hang.
+/// One BFS per distinct origin (dense `Vec<bool>`, O(links)), cached; each check is then O(1).
+/// Membership only, so the result is order-independent (no reproducibility concern).
+struct Reachability<'a> {
+    net: &'a Network,
+    from: RefCell<IntMap<Rc<Vec<bool>>>>,
+}
+
+impl<'a> Reachability<'a> {
+    fn new(net: &'a Network) -> Self {
+        Self { net, from: RefCell::new(IntMap::default()) }
+    }
+
+    fn reachable(&self, from: LinkId, to: LinkId) -> bool {
+        if from == to {
+            return true;
+        }
+        if let Some(set) = self.from.borrow().get(&from.0) {
+            return set[to.idx()];
+        }
+        let mut seen = vec![false; self.net.links.len()];
+        let mut stack = vec![from.0];
+        seen[from.idx()] = true;
+        while let Some(l) = stack.pop() {
+            for n in self.net.outgoing_links(LinkId(l)) {
+                if !seen[n.idx()] {
+                    seen[n.idx()] = true;
+                    stack.push(n.0);
+                }
+            }
+        }
+        let hit = seen[to.idx()];
+        self.from.borrow_mut().insert(from.0, Rc::new(seen));
+        hit
+    }
+}
 
 #[derive(Debug)]
 pub struct OdPair {
@@ -149,9 +193,10 @@ const MAX_QUEUE: usize = 400;
 
 impl DemandGenerator {
     pub fn new(world: &NetWorld, pairs: &[OdPair], seed: u64) -> Self {
+        let reach = Reachability::new(&world.network);
         let pairs = pairs
             .iter()
-            .filter(|p| world.network.route_links(p.origin, p.dest).is_some())
+            .filter(|p| reach.reachable(p.origin, p.dest))
             .map(|p| OdStream { origin: p.origin, dest: p.dest, base_rate: p.rate_per_sec, rush: None })
             .collect();
         Self {
@@ -337,6 +382,7 @@ impl DemandGenerator {
 /// (interior→interior). Deterministic in `seed`; falls back to any-link pairs
 /// when the map has no gateways to anchor the categories.
 pub fn boundary_od_pairs(net: &Network, seed: u64, target: usize) -> Vec<OdPair> {
+    let reach = Reachability::new(net);
     let entries = boundary::entry_links(net);
     let exits = boundary::exit_links(net);
     let interior = boundary::interior_links(net);
@@ -353,11 +399,11 @@ pub fn boundary_od_pairs(net: &Network, seed: u64, target: usize) -> Vec<OdPair>
             continue;
         }
         let want = ((target as f64 * share).round() as usize).max(1);
-        sample_pairs(net, seed, cat as u32, origins, dests, want, &mut pairs);
+        sample_pairs(net, &reach, seed, cat as u32, origins, dests, want, &mut pairs);
     }
     if pairs.is_empty() {
         let all: Vec<LinkId> = (0..net.links.len() as u32).map(LinkId).collect();
-        sample_pairs(net, seed, 99, &all, &all, target, &mut pairs);
+        sample_pairs(net, &reach, seed, 99, &all, &all, target, &mut pairs);
     }
     pairs
 }
@@ -368,6 +414,7 @@ pub fn boundary_od_pairs(net: &Network, seed: u64, target: usize) -> Vec<OdPair>
 /// for. Never a mid-freeway segment. Same-highway matching uses the OSM route `ref`;
 /// a map without refs or freeway gateways contributes nothing (the caller falls back).
 pub fn highway_od_pairs(net: &Network, seed: u64, target: usize, out: &mut Vec<OdPair>) {
+    let reach = Reachability::new(net);
     let hw_in = boundary::highway_entry_links(net);
     if hw_in.is_empty() {
         return;
@@ -384,7 +431,7 @@ pub fn highway_od_pairs(net: &Network, seed: u64, target: usize, out: &mut Vec<O
             let r = net.link_ref(e);
             let (mut same, mut other) = (Vec::new(), Vec::new());
             for &d in &hw_out {
-                if d == e || net.route_links(e, d).is_none() {
+                if d == e || !reach.reachable(e, d) {
                     continue;
                 }
                 if !r.is_empty() && same_highway(net.link_ref(d), r) {
@@ -415,13 +462,13 @@ pub fn highway_od_pairs(net: &Network, seed: u64, target: usize, out: &mut Vec<O
         let dest = if r < 0.60 {
             pick(same, seed, attempt)
                 .or_else(|| pick(other, seed, attempt))
-                .or_else(|| pick_routable(net, *e, &surface, seed, attempt))
+                .or_else(|| pick_routable(net, &reach, *e, &surface, seed, attempt))
         } else if r < 0.75 {
             pick(other, seed, attempt)
                 .or_else(|| pick(same, seed, attempt))
-                .or_else(|| pick_routable(net, *e, &surface, seed, attempt))
+                .or_else(|| pick_routable(net, &reach, *e, &surface, seed, attempt))
         } else {
-            pick_routable(net, *e, &surface, seed, attempt)
+            pick_routable(net, &reach, *e, &surface, seed, attempt)
                 .or_else(|| pick(same, seed, attempt))
                 .or_else(|| pick(other, seed, attempt))
         };
@@ -438,6 +485,7 @@ pub fn highway_od_pairs(net: &Network, seed: u64, target: usize, out: &mut Vec<O
 /// Surface (local/arterial) traffic: the boundary mix over non-freeway gateways and
 /// interior streets — through the city, inbound, outbound, and internal trips.
 pub fn surface_od_pairs(net: &Network, seed: u64, target: usize, out: &mut Vec<OdPair>) {
+    let reach = Reachability::new(net);
     let entries = boundary::surface_entry_links(net);
     let exits = boundary::surface_exit_links(net);
     let interior = boundary::surface_interior_links(net);
@@ -452,7 +500,7 @@ pub fn surface_od_pairs(net: &Network, seed: u64, target: usize, out: &mut Vec<O
             continue;
         }
         let want = ((target as f64 * share).round() as usize).max(1);
-        sample_pairs(net, seed, 80 + cat as u32, origins, dests, want, out);
+        sample_pairs(net, &reach, seed, 80 + cat as u32, origins, dests, want, out);
     }
 }
 
@@ -501,10 +549,10 @@ fn gravity_pick(net: &Network, o: LinkId, pool: &[LinkId], seed: u64, salt: u32,
 }
 
 /// Gravity-weighted pick from `pool` that is routable from `e` (a few candidate tries).
-fn pick_routable(net: &Network, e: LinkId, pool: &[LinkId], seed: u64, attempt: u64) -> Option<LinkId> {
+fn pick_routable(net: &Network, reach: &Reachability, e: LinkId, pool: &[LinkId], seed: u64, attempt: u64) -> Option<LinkId> {
     for k in 0..8u64 {
         let d = gravity_pick(net, e, pool, seed, 62, attempt.wrapping_mul(8).wrapping_add(k))?;
-        if d != e && net.route_links(e, d).is_some() {
+        if d != e && reach.reachable(e, d) {
             return Some(d);
         }
     }
@@ -539,6 +587,7 @@ fn continues_forward(net: &Network, entry: LinkId, exit: LinkId) -> bool {
 
 fn sample_pairs(
     net: &Network,
+    reach: &Reachability,
     seed: u64,
     salt: u32,
     origins: &[LinkId],
@@ -554,7 +603,9 @@ fn sample_pairs(
         let d = gravity_pick(net, o, dests, seed, salt * 2 + 1, attempt);
         attempt += 1;
         if let Some(d) = d {
-            if o != d && net.route_links(o, d).is_some_and(|r| r.len() >= 2) {
+            // `o != d` reachable ⟺ a route of ≥ 2 links exists, so this matches the old
+            // `route_links(o, d).is_some_and(|r| r.len() >= 2)` gate without the search.
+            if o != d && reach.reachable(o, d) {
                 out.push(OdPair { origin: o, dest: d, rate_per_sec: capacity_rate(net, o) });
                 found += 1;
             }

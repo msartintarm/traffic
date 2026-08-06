@@ -38,38 +38,52 @@ pub fn is_gateway(net: &Network, node: NodeId) -> bool {
     neighbours(net, node).len() == 1
 }
 
+/// Gateway flag per node — a gateway has exactly one distinct neighbour (a stub where a road
+/// leaves the clipped map). Computed in one O(links) pass, so the list filters below are
+/// O(links) rather than O(links²): a per-node `is_gateway` re-scans every link, which on a
+/// whole-city map (152k links) was ~50 s — the dominant Columbus demand-build cost in wasm.
+fn gateway_mask(net: &Network) -> Vec<bool> {
+    let mut nbrs: Vec<Vec<u32>> = vec![Vec::new(); net.nodes.len()];
+    for link in &net.links {
+        nbrs[link.from.idx()].push(link.to.0);
+        nbrs[link.to.idx()].push(link.from.0);
+    }
+    nbrs.iter_mut()
+        .map(|v| {
+            v.sort_unstable();
+            v.dedup();
+            v.len() == 1
+        })
+        .collect()
+}
+
 /// Every gateway node in the network.
 pub fn gateways(net: &Network) -> Vec<NodeId> {
-    (0..net.nodes.len() as u32)
-        .map(NodeId)
-        .filter(|&n| is_gateway(net, n))
-        .collect()
+    let g = gateway_mask(net);
+    (0..net.nodes.len() as u32).map(NodeId).filter(|&n| g[n.idx()]).collect()
 }
 
 /// Links leaving a gateway (`from` is a gateway): where external traffic *enters*
 /// the map.
 pub fn entry_links(net: &Network) -> Vec<LinkId> {
-    (0..net.links.len() as u32)
-        .map(LinkId)
-        .filter(|&l| is_gateway(net, net.link(l).from))
-        .collect()
+    let g = gateway_mask(net);
+    (0..net.links.len() as u32).map(LinkId).filter(|&l| g[net.link(l).from.idx()]).collect()
 }
 
 /// Links arriving at a gateway (`to` is a gateway): where traffic *leaves* the
 /// map.
 pub fn exit_links(net: &Network) -> Vec<LinkId> {
-    (0..net.links.len() as u32)
-        .map(LinkId)
-        .filter(|&l| is_gateway(net, net.link(l).to))
-        .collect()
+    let g = gateway_mask(net);
+    (0..net.links.len() as u32).map(LinkId).filter(|&l| g[net.link(l).to.idx()]).collect()
 }
 
 /// Links that neither leave nor arrive at a gateway — the genuinely internal
 /// segments, the candidate interior origins/destinations.
 pub fn interior_links(net: &Network) -> Vec<LinkId> {
+    let g = gateway_mask(net);
     (0..net.links.len() as u32)
         .map(LinkId)
-        .filter(|&l| !is_gateway(net, net.link(l).from) && !is_gateway(net, net.link(l).to))
+        .filter(|&l| !g[net.link(l).from.idx()] && !g[net.link(l).to.idx()])
         .collect()
 }
 

@@ -63,9 +63,33 @@ impl Renderer {
             backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
             ..Default::default()
         });
-        let surface = instance
-            .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
-            .map_err(err)?;
+        let surface = instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas)).map_err(err)?;
+        from_surface(instance, surface, width, height).await
+    }
+
+    /// The same renderer on an `OffscreenCanvas` — usable from a Web Worker (the page canvas is
+    /// `transferControlToOffscreen`ed to it), so the map build and the render loop run off the
+    /// main thread and never freeze the page.
+    pub async fn create_offscreen(canvas: web_sys::OffscreenCanvas) -> Result<Renderer, JsValue> {
+        let (width, height) = (canvas.width().max(1), canvas.height().max(1));
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
+            ..Default::default()
+        });
+        let surface = instance.create_surface(wgpu::SurfaceTarget::OffscreenCanvas(canvas)).map_err(err)?;
+        from_surface(instance, surface, width, height).await
+    }
+}
+
+/// Device/pipeline setup shared by [`Renderer::create`] and [`Renderer::create_offscreen`] —
+/// everything after the surface, which is the only part that differs between a page canvas and
+/// an offscreen one.
+async fn from_surface(
+    instance: wgpu::Instance,
+    surface: wgpu::Surface<'static>,
+    width: u32,
+    height: u32,
+) -> Result<Renderer, JsValue> {
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -227,8 +251,10 @@ impl Renderer {
             world: None,
             markings: None,
         })
-    }
+}
 
+#[wasm_bindgen]
+impl Renderer {
     /// Upload the baked static geometry once. Roads+junctions (`world_*`) draw at
     /// every zoom; markings (`mark_*`) only when zoomed in. Both are flat
     /// `StaticVertex` arrays (center.xy, offset.xy, color.rgb, light).

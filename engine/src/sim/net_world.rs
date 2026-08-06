@@ -2121,7 +2121,7 @@ impl NetWorld {
             // position is in this frame; across a corridor seam (different lane, or either car
             // mid-crossing) fall back to the true current gap so the delayed read never
             // phantom-brakes the car at a boundary.
-            let (gap, speed) = if lead.lane == veh.lane
+            if lead.lane == veh.lane
                 && veh.crossing.is_none()
                 && lead.crossing.is_none()
                 && self.fleet.settled(i, delay)
@@ -2129,11 +2129,24 @@ impl NetWorld {
             {
                 let (my_p, _) = self.fleet.delayed(i, delay);
                 let (lead_p, lead_v) = self.fleet.delayed(li, delay);
-                ((lead_p - my_p - lead.driver.vehicle_length).min(current_gap), lead_v)
+                let gap = (lead_p - my_p - lead.driver.vehicle_length).min(current_gap);
+                Some(Obstacle { gap, speed: lead_v })
             } else {
-                (current_gap, lead.speed)
-            };
-            Some(Obstacle { gap, speed })
+                let ob = Obstacle { gap: current_gap, speed: lead.speed };
+                // A corridor leader a *segment ahead* (a different lane in the same grade-
+                // separated 1:1 chain): the gap is continuous, but at the instant of a seam
+                // hand-off it can momentarily collapse below the physical stopping gap. Cap it
+                // so following across the seam eases down at a physical rate instead of
+                // commanding an impossible brake — the continuous corridor following (like the
+                // crossing gate elsewhere) guarantees the car cannot actually land on it. A
+                // same-lane leader here (this car mid-crossing, or either just spawned/landed)
+                // is a genuine collision risk and keeps its true gap so IDM can brake for it.
+                if lead.lane != veh.lane {
+                    Some(self.cap_leader_brake(&driver, veh.speed, ob))
+                } else {
+                    Some(ob)
+                }
+            }
         } else {
             // No leader on this lane: follow the nearest car ahead across the coming
             // segment boundaries, so approaching a boundary the car keeps its gap and
@@ -2600,11 +2613,12 @@ impl NetWorld {
     }
 
     /// Floor an obstacle's gap so IDM cannot demand a harder-than-physical deceleration for
-    /// it. Used only for *gate-protected* leaders — one across a segment seam, or still
-    /// crossing the node — where the crossing gate guarantees this car cannot actually reach
-    /// the leader. There the gap collapses momentarily in the discrete boundary hand-off, and
-    /// unbounded IDM would slam the car dead at freeway speed; capped, it eases down behind
-    /// flowing traffic instead. Invert IDM `a·(free − (s*/s)²) ≥ −MAX_BRAKE_DECEL` for `s`.
+    /// it. Used only for leaders this car cannot actually land on — one across a segment seam
+    /// (same corridor or gate-protected) or still crossing the node — where continuous
+    /// corridor following (or the crossing gate) already prevents the collision. There the gap
+    /// collapses momentarily in the boundary hand-off, and unbounded IDM would slam the car
+    /// dead at freeway speed; capped, it eases down behind flowing traffic instead. Invert IDM
+    /// `a·(free − (s*/s)²) ≥ −MAX_BRAKE_DECEL` for `s`.
     fn cap_leader_brake(&self, driver: &DriverConfig, speed: f64, ob: Obstacle) -> Obstacle {
         let s_star = driver.min_gap
             + speed * driver.time_headway
@@ -4352,6 +4366,26 @@ mod tests {
             assert!(world.exited() > 0, "vehicles complete boundary trips (seed {seed}), got {}", world.exited());
             assert_eq!(world.leaked(), 0, "no car disappears at an intersection (seed {seed}), leaked {}", world.leaked());
         }
+    }
+
+    #[test]
+    fn map_build_is_deterministic_across_runs() {
+        // A std `HashMap`'s iteration order is randomly seeded per instance, so any build step
+        // that emits network structure from one (node clustering, signal phasing) makes the
+        // whole sim non-reproducible run to run — and intermittently collide. Two builds of the
+        // same map, each with freshly seeded hash maps, must produce identical node/link order
+        // and identical signal green masks (the subtle path that keyed off node order).
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let build = || super::super::map::OsmMap::from_json(&text).expect("map json").build();
+        let (a, b) = (build(), build());
+        let poses = |net: &Network| net.nodes.iter().map(|n| n.position).collect::<Vec<_>>();
+        assert_eq!(poses(&a), poses(&b), "node order is deterministic across builds");
+        let link_ends = |net: &Network| net.links.iter().map(|l| (l.from.0, l.to.0)).collect::<Vec<_>>();
+        assert_eq!(link_ends(&a), link_ends(&b), "link topology is deterministic across builds");
+        let masks =
+            |net: &Network| net.programs.iter().flat_map(|p| p.phases.iter().map(|ph| ph.green_mask)).collect::<Vec<_>>();
+        assert_eq!(masks(&a), masks(&b), "signal green masks are deterministic across builds");
     }
 
     #[test]

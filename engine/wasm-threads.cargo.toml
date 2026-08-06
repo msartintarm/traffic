@@ -3,7 +3,14 @@ rustflags = [
   "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",
   "-C", "link-arg=--shared-memory",
   "-C", "link-arg=--import-memory",
-  "-C", "link-arg=--max-memory=1073741824",
+  # Shared memory can't grow past this ceiling (unlike the single-threaded build, whose
+  # memory grows on demand toward the 4 GiB wasm32 limit). Sized for the largest map:
+  # Columbus (66k nodes / 152k links) peaks at ~750 MB in wasm — the network plus the
+  # transient mesh-marshaling spike, measured; runtime with vehicles stays under it — so
+  # 1.5 GiB is ~2× headroom. (Was 1 GiB, which Columbus just overran; then 3 GiB before the
+  # mesh spike was halved.) A device that can't reserve this throws at memory creation and
+  # `loadEngine` falls back to the single-threaded build, which loads the map anyway.
+  "-C", "link-arg=--max-memory=1610612736",
   "-C", "link-arg=--export=__heap_base",
   "-C", "link-arg=--export=__wasm_init_tls",
   "-C", "link-arg=--export=__tls_base",

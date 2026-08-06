@@ -201,6 +201,10 @@ impl OsmMap {
         // endpoints' degree or lane count — otherwise it renders as a stray nub.
         const INTERIOR_MAX: f64 = 12.0;
         let pos: HashMap<i64, [f64; 2]> = self.nodes.iter().map(|n| (n.osm_id, [n.x, n.y])).collect();
+        // Control by osm id, so the cluster loop looks up each member's control in O(1)
+        // instead of a linear `self.nodes.iter().find` — an O(nodes²) scan (≈3 billion on a
+        // whole-city map) that native's cache hides but wasm runs ~20× slower, dominating load.
+        let control_of: HashMap<i64, MapControl> = self.nodes.iter().map(|n| (n.osm_id, n.control)).collect();
         let mut neigh: HashMap<i64, BTreeSet<i64>> = HashMap::new();
         for l in &self.links {
             neigh.entry(l.from_osm).or_default().insert(l.to_osm);
@@ -236,7 +240,7 @@ impl OsmMap {
                 rep_of.insert(m, rep_id);
                 cx += pos[&m][0];
                 cy += pos[&m][1];
-                let c = self.nodes.iter().find(|n| n.osm_id == m).unwrap().control;
+                let c = control_of[&m];
                 if control_rank(c) > control_rank(control) {
                     control = c;
                 }
@@ -244,6 +248,11 @@ impl OsmMap {
             let k = members.len() as f64;
             nodes.push(NodeSpec { osm_id: rep_id, x: cx / k, y: cy / k, control });
         }
+        // `clusters` is a std HashMap, so its `.values()` order is randomly seeded per
+        // process. The output node order fixes every NodeId (and downstream: junction cluster
+        // ids, signal phase/green-mask assignment), so an unsorted emit makes the whole build
+        // — and thus the sim — non-reproducible run to run. Sort by the stable rep osm_id.
+        nodes.sort_by_key(|n| n.osm_id);
 
         let mut links = Vec::new();
         for l in &self.links {
@@ -469,9 +478,15 @@ impl OsmMap {
 fn relocate_signals_to_junctions(net: &Network, specs: &[NodeSpec]) -> Vec<Option<SignalPlan>> {
     let n = net.nodes.len();
     let (mut indeg, mut outdeg) = (vec![0u32; n], vec![0u32; n]);
+    // The single onward / incoming node, captured in the degree pass so a pass-through node
+    // (in/out-degree 1) resolves its neighbours in O(1) instead of scanning every link — an
+    // O(nodes · links) walk on a city map.
+    let (mut down_of, mut up_of) = (vec![usize::MAX; n], vec![usize::MAX; n]);
     for link in &net.links {
         outdeg[link.from.idx()] += 1;
         indeg[link.to.idx()] += 1;
+        down_of[link.from.idx()] = link.to.idx();
+        up_of[link.to.idx()] = link.from.idx();
     }
     let is_junction = |node: usize| indeg[node] + outdeg[node] >= 3;
     let mut plans: Vec<Option<SignalPlan>> = specs
@@ -485,8 +500,8 @@ fn relocate_signals_to_junctions(net: &Network, specs: &[NodeSpec]) -> Vec<Optio
         if is_junction(i) || indeg[i] != 1 || outdeg[i] != 1 {
             continue;
         }
-        let downstream = net.links.iter().find(|l| l.from == NodeId(i as u32)).map(|l| l.to.idx());
-        let upstream = net.links.iter().find(|l| l.to == NodeId(i as u32)).map(|l| l.from.idx());
+        let downstream = (down_of[i] != usize::MAX).then_some(down_of[i]);
+        let upstream = (up_of[i] != usize::MAX).then_some(up_of[i]);
         if let Some(j) = downstream.filter(|&j| is_junction(j)).or(upstream.filter(|&j| is_junction(j))) {
             plans[j].get_or_insert(plan);
             plans[i] = None;

@@ -5,6 +5,12 @@ web/out/
 web/public/wasm-pkg/
 web/public/wasm-pkg-threads/
 web/*.tsbuildinfo
+# Scraped maps: the browser fetches the committed `.gz` (inflated in-page via
+# DecompressionStream), so the uncompressed `.json` is dead weight in git (Columbus alone is
+# 32 MB) and in the static export. It's regenerable — `gunzip -k web/public/<map>.json.gz` —
+# and only feeds the native map tests, which skip gracefully when it's absent (add that
+# gunzip before `cargo test` in CI to run them). Track the `.gz`, ignore the `.json`.
+web/public/*.json
 __pycache__/
 *.pyc
 # Golden-image regression writes this only on a mismatch, for inspection.

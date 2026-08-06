@@ -17,7 +17,10 @@
 struct Params {
     link_count: u32,
     slot_count: u32,
-    _pad0: u32,
+    // Threads per y-row (x_workgroups * 64). The host dispatches a 2-D workgroup grid so a
+    // whole-city solve (slot_count * link_count threads) never exceeds WebGPU's 65535
+    // per-dimension limit; the shader reflattens (x, y) back to the linear index `g`.
+    row_stride: u32,
     _pad1: u32,
 };
 
@@ -36,7 +39,7 @@ fn relax(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (atomicLoad(&flags[1]) == 1u) {
         return; // already converged — no memory touched
     }
-    let g = gid.x;
+    let g = gid.y * p.row_stride + gid.x;
     let total = p.slot_count * p.link_count;
     if (g >= total) {
         return;

@@ -3,6 +3,19 @@
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { basePath } from "../lib/basePath";
 import { isDrag, panDelta, pinch, type Scale } from "../lib/gestures";
+import {
+  backingSize,
+  type Camera,
+  cameraFromParams,
+  clientToBacking,
+  clientToWorld,
+  sliderToMpp,
+  wheelZoomFactor,
+} from "../lib/camera";
+import { panelText, startSpeedLabel } from "../lib/hud";
+import { type Control, type InitConfig, overlayFromSnapshot } from "../lib/protocol";
+import { createSession, type Session } from "../lib/session";
+import { SCENARIOS, scenarioName } from "../lib/maps";
 import styles from "./EngineCanvas.module.css";
 
 /** A show/hide panel: an emoji (optionally labelled) header that toggles a vertically
@@ -41,144 +54,23 @@ function Collapsible({
   );
 }
 
-type Sim = {
-  advance(dtSecs: number): number;
-  vehicle_instances(): Float32Array;
-  signal_heads(): Float32Array;
-  junctions(): Float32Array;
-  road_strips(): Float32Array;
-  lane_dividers(): Float32Array;
-  world_bounds(): Float32Array;
-  link_names(): string[];
-  link_polylines(): Float32Array;
-  world_mesh_vertices(): Float32Array;
-  world_mesh_indices(): Uint32Array;
-  marking_mesh_vertices(): Float32Array;
-  marking_mesh_indices(): Uint32Array;
-  view_proj(): Float32Array;
-  alpha(): number;
-  render_instances(): Uint8Array;
-  render_instance_count(): number;
-  signal_instances(): Uint8Array;
-  signal_instance_count(): number;
-  density_vertices(): Float32Array;
-  density_indices(): Uint32Array;
-  set_viewport(w: number, h: number): void;
-  fit(): void;
-  pan_pixels(dx: number, dy: number): void;
-  zoom_at(factor: number, sx: number, sy: number): void;
-  set_meters_per_pixel(mpp: number): void;
-  meters_per_pixel(): number;
-  camera_params(): Float32Array;
-  vehicle_count(): number;
-  crashed(): number;
-  set_selected_link(i: number): void;
-  link_stats(i: number): Float32Array;
-  play(): void;
-  pause(): void;
-  set_speed(s: number): void;
-  effective_speed(): number;
-  selected_speed(): number;
-  is_throttled(): boolean;
-  set_accel_backend(name: string): void;
-  accel_backend(): string;
-  set_threads_ready(ready: boolean): void;
-  set_par_threshold(n: number): void;
-  par_threshold(): number;
-  set_scheduler_thread_limit(n: number): void;
-  scheduler_thread_limit(): number;
-  set_demand_sources(highway: boolean, surface: boolean): void;
-  demand_highway(): boolean;
-  demand_surface(): boolean;
-  set_rush_hour(enabled: boolean): void;
-  demand_rush_hour(): boolean;
-  rush_hour_time(): number;
-  rush_hour_flows(): Float32Array;
-  demand_queued(): number;
-  set_demand_rate(scale: number): void;
-  set_entry_speed_cap(mps: number): void;
-  set_congestion_enabled(enabled: boolean): void;
-  set_congestion_engage(occ: number): void;
-  congestion_active_links(): number;
-  set_sleep_scheduler(on: boolean): void;
-  asleep_count(): number;
-  enable_gpu_routing(renderer: Renderer): void;
-};
-
-type Renderer = {
-  set_world_mesh(wv: Float32Array, wi: Uint32Array, mv: Float32Array, mi: Uint32Array): void;
-  render(
-    vp: Float32Array,
-    alpha: number,
-    mpp: number,
-    inst: Uint8Array,
-    count: number,
-    signals: Uint8Array,
-    signalCount: number,
-    densityV: Float32Array,
-    densityI: Uint32Array,
-  ): void;
-  resize(width: number, height: number): void;
-};
-
-// The wasm-bindgen module namespace we consume from the generated `engine.js`. The
-// threaded build additionally exports `initThreadPool` (the rayon worker pool).
-type EngineModule = {
-  default: (input?: unknown) => Promise<unknown>;
-  Simulation: {
-    new (seed: number): Sim;
-    scenario(name: string, seed: number): Sim;
-    from_map_json?(json: string, seed: number): Sim;
-  };
-  Renderer: { create(canvas: HTMLCanvasElement): Promise<Renderer> };
-};
-type ThreadedEngineModule = EngineModule & { initThreadPool(numThreads: number): Promise<void> };
-
 const ZOOM_RANGE = 60; // fit-out … max-in ratio driving the slider
-
-// Selectable real (OSM-scraped) maps: scenario key → the public map file and its
-// display name. Add a city by scraping it to `web/public/<file>` and listing it here.
-const REAL_MAPS: Record<string, { file: string; name: string }> = {
-  millbrae: { file: "map.json", name: "Millbrae, CA" },
-  sancarlos: { file: "sancarlos.json", name: "San Carlos, CA" },
-  sf: { file: "sf.json", name: "San Francisco, CA" },
-  peninsula: { file: "peninsula.json", name: "Bay Area Peninsula" },
-  columbus: { file: "columbus.json", name: "Columbus, OH" },
-};
-
-// Splash-screen scenario menu: the real maps followed by the synthetic test scenes,
-// in the order they're offered. Picking one navigates to `?scenario=<key>`, which boots
-// that scene — already cross-origin isolated, so the threaded build loads with no reload.
-const SCENARIOS: { key: string; name: string; kind: "Real map" | "Test" }[] = [
-  { key: "millbrae", name: "Millbrae, CA", kind: "Real map" },
-  { key: "sancarlos", name: "San Carlos, CA", kind: "Real map" },
-  { key: "sf", name: "San Francisco, CA", kind: "Real map" },
-  { key: "peninsula", name: "Bay Area Peninsula", kind: "Real map" },
-  { key: "columbus", name: "Columbus, OH", kind: "Real map" },
-  { key: "arterial", name: "Arterial junction", kind: "Test" },
-  { key: "corridor", name: "Signal corridor", kind: "Test" },
-  { key: "gridlock", name: "Gridlock", kind: "Test" },
-];
-
-// Speed unit display: m/s → the shown unit, and its label.
-const MPS_TO = { mi: 2.23694, km: 3.6 } as const;
-const UNIT_LABEL = { mi: "mph", km: "km/h" } as const;
 
 export default function EngineCanvas() {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const simRef = useRef<Sim | null>(null);
-  const sceneRef = useRef<Scene | null>(null);
+  const sessionRef = useRef<Session | null>(null);
+  const bootedRef = useRef(false); // boot the engine once even under React StrictMode's double-mount
+  const cameraRef = useRef<Camera | null>(null); // last frame's camera, for client→world input transforms
   const sliderRef = useRef<HTMLInputElement>(null);
   const statsRef = useRef<HTMLSpanElement>(null);
   const perfStatusRef = useRef<HTMLSpanElement>(null); // live "what's running" line in the Performance panel
-  const gpuRoutingRef = useRef(false); // whether GPU flow-field routing engaged (read in the rAF loop)
   const tipRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
-  const roadsRef = useRef<{ name: string; pts: number[][] }[]>([]);
-  const selectedRef = useRef<number>(-1);
   const fitMppRef = useRef(1);
   const [ready, setReady] = useState(false);
+  const [loadingFraction, setLoadingFraction] = useState(0); // boot progress 0→1 for the loading bar
+  const [loadingStage, setLoadingStage] = useState("Starting…");
   const [playing, setPlaying] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [backend, setBackend] = useState("");
@@ -198,9 +90,10 @@ export default function EngineCanvas() {
   const [congestionEnabled, setCongestionEnabled] = useState(false);
   const [congestionEngage, setCongestionEngage] = useState(0.85);
   const [sleepScheduler, setSleepScheduler] = useState(true); // on by default (see bridge assemble)
+  const [smoothPlayback, setSmoothPlayback] = useState(true); // frame budget on: smooth view, sim slows under load
   const [startSpeedMps, setStartSpeedMps] = useState(36); // ≥ every road limit ⇒ "enter at limit"
   const [units, setUnits] = useState<"mi" | "km">("mi");
-  const unitsRef = useRef<"mi" | "km">("mi"); // read inside the rAF draw loop (avoids stale closure)
+  const unitsRef = useRef<"mi" | "km">("mi"); // read inside the per-frame HUD update (avoids stale closure)
   const [isFullscreen, setIsFullscreen] = useState(false);
   // iPhone Safari has no element Fullscreen API at all, so we fall back to a CSS overlay
   // (`position: fixed` filling the viewport) tracked by this flag.
@@ -225,11 +118,8 @@ export default function EngineCanvas() {
   }, [pseudoFs]);
 
   useEffect(() => {
-    if (route !== "sim") return; // splash / undetermined: no sim to boot
-    let raf = 0;
-    let last = performance.now();
-    let disposed = false;
-    let removeResize = () => {};
+    if (route !== "sim") return; // splash / undetermined: no scene to boot
+    const canvas = canvasRef.current!;
     // Any-button drag pans; a press that never moves past the threshold is a click
     // (road selection). Touch mirrors this: one-finger drag pans, a tap selects.
     const DRAG_THRESHOLD = 5; // CSS px before a press becomes a drag rather than a click
@@ -242,36 +132,24 @@ export default function EngineCanvas() {
       a: { x: 0, y: 0 }, // last two-finger points, for pinch
       b: { x: 0, y: 0 },
     };
-    const canvas = canvasRef.current!;
 
-    const canvasScale = () => {
+    const apply = (c: Control) => sessionRef.current?.applyControl(c);
+
+    // The current client→backing/world transform, from the on-screen rect and the last
+    // frame's camera. Null until the first frame arrives (then input becomes live).
+    const frame = (): { rect: DOMRect; cam: Camera; scale: Scale } | null => {
+      const cam = cameraRef.current;
+      if (!cam) return null;
       const rect = canvas.getBoundingClientRect();
-      return { sx: canvas.width / rect.width, sy: canvas.height / rect.height, rect };
+      return { rect, cam, scale: { sx: cam.vw / rect.width, sy: cam.vh / rect.height, left: rect.left, top: rect.top } };
     };
-    // Client→backing-store mapping the pure gesture helpers consume.
-    const scale = (): Scale => {
-      const rect = canvas.getBoundingClientRect();
-      return { sx: canvas.width / rect.width, sy: canvas.height / rect.height, left: rect.left, top: rect.top };
-    };
-    // Map a client point to world coords and select the nearest road under it.
-    const selectAt = (clientX: number, clientY: number, radius: number) => {
-      const sim = simRef.current;
-      if (!sim) return;
-      const { sx, sy, rect } = canvasScale();
-      const [cx, cy, mpp, vw, vh] = sim.camera_params();
-      const wx = cx + ((clientX - rect.left) * sx - vw / 2) * mpp;
-      const wy = cy - ((clientY - rect.top) * sy - vh / 2) * mpp;
-      const i = nearestLink(roadsRef.current, wx, wy, radius);
-      selectedRef.current = i;
-      sim.set_selected_link(i);
-    };
+
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
-      const sim = simRef.current;
-      if (!sim) return;
-      const { sx, sy, rect } = canvasScale();
-      const factor = e.deltaY > 0 ? 1.1 : 1 / 1.1;
-      sim.zoom_at(factor, (e.clientX - rect.left) * sx, (e.clientY - rect.top) * sy);
+      const f = frame();
+      if (!f) return;
+      const { bx, by } = clientToBacking(e.clientX, e.clientY, f.rect, f.scale);
+      apply({ type: "zoomAt", factor: wheelZoomFactor(e.deltaY), bx, by });
     };
     const onContext = (e: MouseEvent) => e.preventDefault();
     const onDown = (e: MouseEvent) => {
@@ -280,43 +158,21 @@ export default function EngineCanvas() {
       pointer.down = { x: e.clientX, y: e.clientY };
     };
     const onMove = (e: MouseEvent) => {
-      const sim = simRef.current;
-      if (!sim) return;
-      const { sx, sy, rect } = canvasScale();
+      const f = frame();
+      if (!f) return;
       if (pointer.pressed) {
         if (!pointer.dragged && isDrag(pointer.down, { x: e.clientX, y: e.clientY }, DRAG_THRESHOLD)) {
           pointer.dragged = true;
           if (tipRef.current) tipRef.current.style.display = "none";
         }
         if (pointer.dragged) {
-          sim.pan_pixels(e.movementX * sx, e.movementY * sy);
+          apply({ type: "panBy", dx: e.movementX * f.scale.sx, dy: e.movementY * f.scale.sy });
           return;
         }
       }
-      // Hover: map the cursor to world space and name the nearest road.
-      const tip = tipRef.current;
-      if (!tip || roadsRef.current.length === 0) return;
-      const [cx, cy, mpp, vw, vh] = sim.camera_params();
-      const wx = cx + ((e.clientX - rect.left) * sx - vw / 2) * mpp;
-      const wy = cy - ((e.clientY - rect.top) * sy - vh / 2) * mpp;
-      let best = "";
-      let bestD = 12; // world metres; ~a lane-and-a-half
-      for (const road of roadsRef.current) {
-        if (!road.name || road.pts.length < 2) continue;
-        const d = distToPolyline(wx, wy, road.pts);
-        if (d < bestD) {
-          bestD = d;
-          best = road.name;
-        }
-      }
-      if (best) {
-        tip.textContent = best;
-        tip.style.left = `${e.clientX + 12}px`;
-        tip.style.top = `${e.clientY + 12}px`;
-        tip.style.display = "block";
-      } else {
-        tip.style.display = "none";
-      }
+      // Hover: map the cursor to world space; the worker names the nearest road.
+      const { wx, wy } = clientToWorld(e.clientX, e.clientY, f.rect, f.scale, f.cam);
+      apply({ type: "hover", wx, wy, x: e.clientX, y: e.clientY });
     };
     const onLeave = () => {
       if (tipRef.current) tipRef.current.style.display = "none";
@@ -324,7 +180,10 @@ export default function EngineCanvas() {
     const onClick = (e: MouseEvent) => {
       // Suppress selection when the press was a drag (a pan), not a click.
       if (e.button !== 0 || pointer.dragged) return;
-      selectAt(e.clientX, e.clientY, 12);
+      const f = frame();
+      if (!f) return;
+      const { wx, wy } = clientToWorld(e.clientX, e.clientY, f.rect, f.scale, f.cam);
+      apply({ type: "select", wx, wy, radius: 12 });
     };
     const onUp = () => {
       pointer.pressed = false;
@@ -348,29 +207,32 @@ export default function EngineCanvas() {
     };
     const onTouchMove = (e: TouchEvent) => {
       e.preventDefault();
-      const sim = simRef.current;
-      if (!sim) return;
-      const s = scale();
+      const f = frame();
+      if (!f) return;
       if (touch.mode === "pan" && e.touches.length === 1) {
         const cur = { x: e.touches[0].clientX, y: e.touches[0].clientY };
-        const d = panDelta(touch.prev, cur, s);
-        sim.pan_pixels(d.x, d.y);
+        const d = panDelta(touch.prev, cur, f.scale);
+        apply({ type: "panBy", dx: d.x, dy: d.y });
         touch.prev = cur;
         if (isDrag(touch.tap, cur, DRAG_THRESHOLD)) touch.dragged = true;
       } else if (e.touches.length >= 2) {
         touch.mode = "pinch";
         const curA = { x: e.touches[0].clientX, y: e.touches[0].clientY };
         const curB = { x: e.touches[1].clientX, y: e.touches[1].clientY };
-        const g = pinch(touch.a, touch.b, curA, curB, s);
-        sim.zoom_at(g.factor, g.focusX, g.focusY); // zoom toward the pinch midpoint
-        sim.pan_pixels(g.panX, g.panY); // and follow the midpoint's drag
+        const g = pinch(touch.a, touch.b, curA, curB, f.scale);
+        apply({ type: "zoomAt", factor: g.factor, bx: g.focusX, by: g.focusY }); // zoom toward the pinch midpoint
+        apply({ type: "panBy", dx: g.panX, dy: g.panY }); // and follow the midpoint's drag
         touch.a = curA;
         touch.b = curB;
       }
     };
     const onTouchEnd = (e: TouchEvent) => {
       if (touch.mode === "pan" && !touch.dragged) {
-        selectAt(touch.tap.x, touch.tap.y, 20); // a more forgiving tap radius on touch
+        const f = frame();
+        if (f) {
+          const { wx, wy } = clientToWorld(touch.tap.x, touch.tap.y, f.rect, f.scale, f.cam);
+          apply({ type: "select", wx, wy, radius: 20 }); // a more forgiving tap radius on touch
+        }
       }
       if (e.touches.length === 0) {
         touch.mode = "none";
@@ -381,277 +243,109 @@ export default function EngineCanvas() {
         touch.prev = { x: e.touches[0].clientX, y: e.touches[0].clientY };
       }
     };
-    const onSlider = () => {
-      const sim = simRef.current;
-      const slider = sliderRef.current;
-      if (!sim || !slider) return;
-      const t = Number(slider.value) / 1000;
-      sim.set_meters_per_pixel(fitMppRef.current * Math.pow(1 / ZOOM_RANGE, t));
+
+    // Size the backing store to the displayed CSS size × devicePixelRatio (capped), so the
+    // canvas stays crisp on HiDPI and under browser zoom. The worker owns the backing store
+    // (it may be a transferred OffscreenCanvas), so we post the target size, not set it here.
+    const resizeCanvas = () => {
+      const { w, h } = backingSize(canvas.clientWidth || 900, canvas.clientHeight || 600, window.devicePixelRatio || 1);
+      apply({ type: "resize", w, h });
+    };
+    const onFsChange = () => {
+      const doc = document as Document & { webkitFullscreenElement?: Element | null };
+      setIsFullscreen(!!(document.fullscreenElement ?? doc.webkitFullscreenElement));
+      resizeCanvas();
     };
 
-    (async () => {
-      try {
-        // The compute backend is decided at page load because it dictates *which* wasm
-        // module loads — the CPU-threads build (rayon + SharedArrayBuffer) is a separate
-        // artifact from the single-threaded one, so it can't be switched at runtime. The
-        // dropdown reloads with `?compute=<serial|threads|gpu>`; we honour it here.
-        // Every map defaults to the parallel (CPU-threads) build — the browser's most
-        // performant config (GPU per-vehicle accel is native-only) — and falls back to
-        // serial if the threaded build or cross-origin isolation isn't available. The
-        // splash establishes isolation first, so booting a scene needs no further reload.
-        const params0 = new URLSearchParams(window.location.search);
-        const scenario0 = params0.get("scenario") ?? "millbrae";
-        const compute = params0.get("compute") ?? "threads";
-        setAccelBackend(compute);
-        const wantThreads = compute === "threads";
-        // Threads need cross-origin isolation (COOP/COEP via the shim SW, which reloads
-        // once) — only bother when threads are actually requested.
-        if (wantThreads) await ensureCrossOriginIsolation();
-        if (disposed) return;
-        const isolated = typeof window !== "undefined" && window.crossOriginIsolated;
-        // Fingerprint the build (`version.txt`, never cached) and stamp it onto the glue
-        // and wasm URLs, so a new build always beats the browser cache while an unchanged
-        // one keeps it — no stale wasm crashing the app after a rebuild.
-        const fingerprint = async (dir: string) => {
-          try {
-            const r = await fetch(`${basePath()}/${dir}/version.txt`, { cache: "no-store" });
-            if (r.ok) return `?v=${(await r.text()).trim()}`;
-          } catch {}
-          return "";
+    canvas.addEventListener("wheel", onWheel, { passive: false });
+    canvas.addEventListener("contextmenu", onContext);
+    canvas.addEventListener("mousedown", onDown);
+    canvas.addEventListener("mouseleave", onLeave);
+    canvas.addEventListener("click", onClick);
+    canvas.addEventListener("touchstart", onTouchStart, { passive: false });
+    canvas.addEventListener("touchmove", onTouchMove, { passive: false });
+    canvas.addEventListener("touchend", onTouchEnd);
+    canvas.addEventListener("touchcancel", onTouchEnd);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    window.addEventListener("resize", resizeCanvas);
+    document.addEventListener("fullscreenchange", onFsChange);
+    document.addEventListener("webkitfullscreenchange", onFsChange);
+
+    // Boot the engine session exactly once. StrictMode mounts → cleans up → mounts again on
+    // the same instance; the OffscreenCanvas transfer is one-shot, so guard it. Every
+    // scenario/compute change is a full page navigation, so cleanup only detaches listeners.
+    if (!bootedRef.current) {
+      bootedRef.current = true;
+      const params = new URLSearchParams(window.location.search);
+      const scenarioKey = params.get("scenario") ?? "millbrae";
+      // The compute backend dictates which wasm module the worker loads (CPU-threads is a
+      // separate atomics-enabled artifact), chosen at page load via `?compute=`.
+      const compute = params.get("compute") ?? "threads";
+      setAccelBackend(compute);
+      const gpu = new URLSearchParams(window.location.search).get("gpu") !== "0";
+      (async () => {
+        // Threads need cross-origin isolation (COOP/COEP via the shim SW, which reloads once).
+        // Establish it here, before the worker boots and checks `crossOriginIsolated`.
+        if (compute === "threads") await ensureCrossOriginIsolation();
+        const { w, h } = backingSize(canvas.clientWidth || 900, canvas.clientHeight || 600, window.devicePixelRatio || 1);
+        const config: InitConfig = {
+          scenario: scenarioKey,
+          compute,
+          gpu,
+          basePath: basePath(),
+          width: w,
+          height: h,
+          congestionEngage,
+          zoomRange: ZOOM_RANGE,
         };
-        let mod: EngineModule | null = null;
-        let threadsReady = false;
-        if (wantThreads && isolated) {
-          try {
-            const q = await fingerprint("wasm-pkg-threads");
-            const t = (await import(/* webpackIgnore: true */ `${basePath()}/wasm-pkg-threads/engine.js${q}`)) as ThreadedEngineModule;
-            await t.default({ module_or_path: `${basePath()}/wasm-pkg-threads/engine_bg.wasm${q}` });
-            // Bound the pool init so a build whose workers can't boot degrades instead of hanging.
-            await Promise.race([
-              t.initThreadPool(navigator.hardwareConcurrency || 4),
-              new Promise((_, reject) => setTimeout(() => reject(new Error("initThreadPool timed out")), 10000)),
-            ]);
-            mod = t;
-            threadsReady = true;
-          } catch (e) {
-            console.warn("CPU-threads build unavailable; using single-threaded:", e);
-          }
-        }
-        if (!mod) {
-          const q = await fingerprint("wasm-pkg");
-          mod = (await import(/* webpackIgnore: true */ `${basePath()}/wasm-pkg/engine.js${q}`)) as EngineModule;
-          await mod.default({ module_or_path: `${basePath()}/wasm-pkg/engine_bg.wasm${q}` });
-        }
-        if (disposed) return;
-
-        const scenario = scenario0;
-        let loaded: Sim | null = null;
-        let label = "sample map";
-        const realMap = REAL_MAPS[scenario];
-        if (realMap) {
-          try {
-            const res = await fetch(`${basePath()}/${realMap.file}`);
-            if (res.ok && mod.Simulation.from_map_json) {
-              const text = await res.text();
-              loaded = mod.Simulation.from_map_json(text, 0xc0ffee);
-              label = realMap.name;
+        sessionRef.current = createSession(canvas, config, {
+          onReady: (r) => {
+            setBackend(r.backend);
+            setMapLabel(r.mapLabel);
+            fitMppRef.current = r.fitMpp;
+            setCongestionEnabled(r.congestionEnabled);
+            setReady(true);
+          },
+          onFrame: (f) => {
+            fitMppRef.current = f.fitMpp;
+            cameraRef.current = cameraFromParams(f.snapshot.camera);
+            const o = overlayFromSnapshot(f.snapshot, { fitMpp: f.fitMpp, zoomRange: ZOOM_RANGE });
+            if (statsRef.current) statsRef.current.textContent = o.stats;
+            if (perfStatusRef.current) perfStatusRef.current.textContent = o.perf;
+            if (rushClockRef.current) rushClockRef.current.textContent = o.rushClock ?? "";
+            if (sliderRef.current) sliderRef.current.value = String(o.sliderValue);
+            if (panelRef.current) {
+              if (f.selected) {
+                panelRef.current.textContent = panelText(f.selected.name, f.selected.stats, unitsRef.current);
+                panelRef.current.style.display = "block";
+              } else {
+                panelRef.current.style.display = "none";
+              }
             }
-          } catch {
-            loaded = null;
-          }
-        } else {
-          loaded = mod.Simulation.scenario(scenario, 0xc0ffee);
-          label = `${scenario} scenario`;
-        }
-        const sim: Sim = loaded ?? new mod.Simulation(0xc0ffee);
-        simRef.current = sim;
-        if (threadsReady) sim.set_threads_ready(true); // CPU-threads pool usable
-        sim.set_accel_backend(compute); // honour ?compute= (falls back to serial if unavailable)
-        // Active-set scheduler: queued/idle cars skip the full per-vehicle gather, so the
-        // step cost tracks the *deciding* cars, not the whole fleet — the difference
-        // between a smooth and a stalling city. Safe (matches the all-cars step) and a
-        // pure win, so it's on for every map.
-        sim.set_sleep_scheduler(true);
-        // The gridlock scenario exists to show the congestion LOD, so engage it by
-        // default there; elsewhere it stays off (full per-car detail is the default).
-        const congestionOn = scenario === "gridlock";
-        setCongestionEnabled(congestionOn);
-        sim.set_congestion_engage(congestionEngage);
-        sim.set_congestion_enabled(congestionOn);
-        setMapLabel(label);
-        // Hover/click hit-test against the engine's own links (post collapse/merge),
-        // index-aligned with link ids, so selection can't deviate from the engine.
-        roadsRef.current = linksFromSim(sim);
-
-        sim.set_viewport(canvas.width, canvas.height);
-        sim.fit();
-        fitMppRef.current = sim.meters_per_pixel();
-
-        let renderer: Renderer | null = null;
-        try {
-          renderer = await mod.Renderer.create(canvas);
-          renderer!.set_world_mesh(
-            sim.world_mesh_vertices(),
-            sim.world_mesh_indices(),
-            sim.marking_mesh_vertices(),
-            sim.marking_mesh_indices(),
-          );
-          // Route recomputes run on the renderer's WebGPU device by default (it
-          // removes the flow-field recompute from the CPU step). Pass `?gpu=0` to
-          // fall back to the CPU amortized path.
-          if (new URLSearchParams(window.location.search).get("gpu") !== "0") {
-            try {
-              sim.enable_gpu_routing(renderer!);
-              gpuRoutingRef.current = true;
-              setBackend("WebGPU / WebGL2 · GPU routing");
-            } catch {
-              setBackend("WebGPU / WebGL2");
-            }
-          } else {
-            setBackend("WebGPU / WebGL2");
-          }
-        } catch {
-          renderer = null;
-          sceneRef.current = buildScene(sim);
-          setBackend("2D canvas (fallback)");
-        }
-        setReady(true);
-
-        // Size the backing store to the displayed CSS size × devicePixelRatio, so
-        // the canvas stays crisp on HiDPI and under browser zoom (which raises the
-        // pixel ratio). Preserve the world span so the view/zoom is unaffected.
-        const resizeCanvas = () => {
-          const dpr = Math.min(window.devicePixelRatio || 1, 2);
-          const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
-          const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
-          if (canvas.width === w && canvas.height === h) return;
-          const scale = canvas.width / w;
-          canvas.width = w;
-          canvas.height = h;
-          sim.set_meters_per_pixel(sim.meters_per_pixel() * scale);
-          fitMppRef.current *= scale;
-          sim.set_viewport(w, h);
-          renderer?.resize(w, h);
-        };
-        resizeCanvas();
-        window.addEventListener("resize", resizeCanvas);
-        // Entering/leaving fullscreen resizes the canvas to (or from) the whole screen.
-        const onFsChange = () => {
-          const doc = document as Document & { webkitFullscreenElement?: Element | null };
-          setIsFullscreen(!!(document.fullscreenElement ?? doc.webkitFullscreenElement));
-          resizeCanvas();
-        };
-        document.addEventListener("fullscreenchange", onFsChange);
-        document.addEventListener("webkitfullscreenchange", onFsChange);
-        removeResize = () => {
-          window.removeEventListener("resize", resizeCanvas);
-          document.removeEventListener("fullscreenchange", onFsChange);
-          document.removeEventListener("webkitfullscreenchange", onFsChange);
-        };
-
-        canvas.addEventListener("wheel", onWheel, { passive: false });
-        canvas.addEventListener("contextmenu", onContext);
-        canvas.addEventListener("mousedown", onDown);
-        canvas.addEventListener("mouseleave", onLeave);
-        canvas.addEventListener("click", onClick);
-        canvas.addEventListener("touchstart", onTouchStart, { passive: false });
-        canvas.addEventListener("touchmove", onTouchMove, { passive: false });
-        canvas.addEventListener("touchend", onTouchEnd);
-        canvas.addEventListener("touchcancel", onTouchEnd);
-        window.addEventListener("mousemove", onMove);
-        window.addEventListener("mouseup", onUp);
-
-        const draw = (now: number) => {
-          const dt = Math.min((now - last) / 1000, 0.1);
-          last = now;
-          sim.advance(dt);
-          if (renderer) {
-            renderer.render(
-              sim.view_proj(),
-              sim.alpha(),
-              sim.meters_per_pixel(),
-              sim.render_instances(),
-              sim.render_instance_count(),
-              sim.signal_instances(),
-              sim.signal_instance_count(),
-              sim.density_vertices(),
-              sim.density_indices(),
-            );
-          } else {
-            render2d(canvas, sim, sceneRef.current);
-          }
-          if (sliderRef.current) {
-            const t = Math.log(sim.meters_per_pixel() / fitMppRef.current) / Math.log(1 / ZOOM_RANGE);
-            sliderRef.current.value = String(Math.round(Math.min(1, Math.max(0, t)) * 1000));
-          }
-          if (statsRef.current || perfStatusRef.current) {
-            const sel = sim.selected_speed();
-            // Show the selected multiplier while the sim keeps up; only when the frame
-            // budget is actually dropping ticks show the achieved speed alongside it.
-            const speedStr = sim.is_throttled()
-              ? `${sim.effective_speed().toFixed(1)}×/${sel}× (throttled)`
-              : `${sel}×`;
-            const count = sim.vehicle_count();
-            // Effective per-frame executor. `accel_backend()` is the active backend after
-            // availability fallback, but the Threads backend only parallelizes at/above
-            // the crossover — below it the step still runs serial — so surface which is
-            // actually in use right now, and the count where threads kick in.
-            const backendName = sim.accel_backend();
-            let execStr = backendName;
-            if (backendName === "threads") {
-              const thr = sim.par_threshold();
-              execStr = count >= thr ? `threads ▸ parallel (≥${thr})` : `threads ▸ serial (<${thr})`;
-            }
-            // Active-set scheduler diagnostic: how many cars skipped the full step this
-            // frame (parked in queues / cruising open road). 0 when the toggle is off.
-            const idle = sim.asleep_count();
-            const lines = [`${count} vehicles`, `${sim.crashed()} crashed`, speedStr, execStr];
-            if (idle > 0) lines.push(`${idle} idle-skipped`);
-            const queued = sim.congestion_active_links();
-            if (queued > 0) lines.push(`${queued} links queued`);
-            const waiting = sim.demand_queued();
-            if (waiting > 0) lines.push(`${waiting} waiting to enter`);
-            // One metric per line as bullets (the container renders `\n` as line breaks).
-            if (statsRef.current) statsRef.current.textContent = lines.map((l) => `• ${l}`).join("\n");
-            // Compact live readout for the Performance panel: what's actually running.
-            if (perfStatusRef.current) {
-              const idleStr = idle > 0 ? ` · ${idle} idle-skipped` : "";
-              const routing = gpuRoutingRef.current ? "GPU" : "CPU";
-              perfStatusRef.current.textContent = `▶ ${execStr}${idleStr} · routing ${routing}`;
-            }
-          }
-          if (rushClockRef.current && sim.demand_rush_hour()) {
-            const h = sim.rush_hour_time();
-            const hh = Math.floor(h);
-            const mm = Math.floor((h - hh) * 60);
-            const [n101, s101, n280, s280] = sim.rush_hour_flows();
-            const dir = (n: number, s: number) => `N${Math.round(n)}/S${Math.round(s)}`;
-            rushClockRef.current.textContent =
-              ` ${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")} · US-101 ${dir(n101, s101)} · I-280 ${dir(n280, s280)} veh/h/ln`;
-          }
-          if (panelRef.current) {
-            const i = selectedRef.current;
-            if (i >= 0) {
-              const st = sim.link_stats(i);
-              const name = roadsRef.current[i]?.name || `link ${i}`;
-              panelRef.current.textContent =
-                `${name} — ${st[0] | 0} veh · ${Math.round(st[1] * MPS_TO[unitsRef.current])} ${UNIT_LABEL[unitsRef.current]} · ${Math.round(st[2])} veh/h · ${Math.round(st[3] * 100)}% full`;
-              panelRef.current.style.display = "block";
+          },
+          onProgress: (fraction, stage) => {
+            setLoadingFraction(fraction);
+            setLoadingStage(stage);
+          },
+          onHover: (name, x, y) => {
+            const tip = tipRef.current;
+            if (!tip) return;
+            if (name) {
+              tip.textContent = name;
+              tip.style.left = `${x + 12}px`;
+              tip.style.top = `${y + 12}px`;
+              tip.style.display = "block";
             } else {
-              panelRef.current.style.display = "none";
+              tip.style.display = "none";
             }
-          }
-          raf = requestAnimationFrame(draw);
-        };
-        raf = requestAnimationFrame(draw);
-      } catch (e) {
-        setError(String(e));
-      }
-    })();
+          },
+          onFatal: (message) => setError(message),
+        });
+      })();
+    }
 
     return () => {
-      disposed = true;
-      cancelAnimationFrame(raf);
       canvas.removeEventListener("wheel", onWheel);
       canvas.removeEventListener("contextmenu", onContext);
       canvas.removeEventListener("mousedown", onDown);
@@ -663,15 +357,16 @@ export default function EngineCanvas() {
       canvas.removeEventListener("touchcancel", onTouchEnd);
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
-      removeResize();
+      window.removeEventListener("resize", resizeCanvas);
+      document.removeEventListener("fullscreenchange", onFsChange);
+      document.removeEventListener("webkitfullscreenchange", onFsChange);
     };
   }, [route]);
 
   const toggle = () => {
-    const sim = simRef.current;
-    if (!sim) return;
-    if (playing) sim.pause();
-    else sim.play();
+    const s = sessionRef.current;
+    if (!s) return;
+    s.applyControl({ type: playing ? "pause" : "play" });
     setPlaying(!playing);
   };
 
@@ -719,13 +414,30 @@ export default function EngineCanvas() {
     <div ref={wrapperRef} className={`${styles.wrapper}${pseudoFs ? ` ${styles.pseudoFullscreen}` : ""}`}>
       <canvas ref={canvasRef} width={900} height={600} className={styles.canvas} />
 
+      {!ready && !error && (
+        <div className={styles.loading} role="status" aria-live="polite">
+          <div className={styles.loadingInner}>
+            <div className={styles.loadingName}>{scenarioName(scenario)}</div>
+            <div className={styles.loadingTrack}>
+              <div className={styles.loadingFill} style={{ width: `${Math.round(loadingFraction * 100)}%` }} />
+            </div>
+            <div className={styles.loadingStage}>{loadingStage}</div>
+          </div>
+        </div>
+      )}
+
       <div className={styles.topLeft}>
         <div className={styles.controls}>
           <button className={styles.button} onClick={toggle} disabled={!ready}>
             {playing ? "Pause" : "Play"}
           </button>
           {[1, 2, 8, 16, 32].map((s) => (
-            <button key={s} className={styles.button} disabled={!ready} onClick={() => simRef.current?.set_speed(s)}>
+            <button
+              key={s}
+              className={styles.button}
+              disabled={!ready}
+              onClick={() => sessionRef.current?.applyControl({ type: "speed", value: s })}
+            >
               {s}×
             </button>
           ))}
@@ -756,14 +468,20 @@ export default function EngineCanvas() {
                 defaultValue={0}
                 disabled={!ready}
                 onInput={() => {
-                  const sim = simRef.current;
                   const slider = sliderRef.current;
-                  if (!sim || !slider) return;
-                  sim.set_meters_per_pixel(fitMppRef.current * Math.pow(1 / ZOOM_RANGE, Number(slider.value) / 1000));
+                  if (!slider) return;
+                  sessionRef.current?.applyControl({
+                    type: "metersPerPixel",
+                    value: sliderToMpp(Number(slider.value) / 1000, fitMppRef.current, ZOOM_RANGE),
+                  });
                 }}
               />
             </label>
-            <button className={styles.button} disabled={!ready} onClick={() => simRef.current?.fit()}>
+            <button
+              className={styles.button}
+              disabled={!ready}
+              onClick={() => sessionRef.current?.applyControl({ type: "fit" })}
+            >
               Fit
             </button>
             <select
@@ -790,7 +508,7 @@ export default function EngineCanvas() {
                 checked={highwayTraffic}
                 disabled={!ready}
                 onChange={(e) => {
-                  simRef.current?.set_demand_sources(e.target.checked, surfaceTraffic);
+                  sessionRef.current?.applyControl({ type: "demandSources", north: e.target.checked, south: surfaceTraffic });
                   setHighwayTraffic(e.target.checked);
                 }}
               />
@@ -802,7 +520,7 @@ export default function EngineCanvas() {
                 checked={surfaceTraffic}
                 disabled={!ready}
                 onChange={(e) => {
-                  simRef.current?.set_demand_sources(highwayTraffic, e.target.checked);
+                  sessionRef.current?.applyControl({ type: "demandSources", north: highwayTraffic, south: e.target.checked });
                   setSurfaceTraffic(e.target.checked);
                 }}
               />
@@ -817,7 +535,7 @@ export default function EngineCanvas() {
                 checked={rushHour}
                 disabled={!ready || (!highwayTraffic && !surfaceTraffic)}
                 onChange={(e) => {
-                  simRef.current?.set_rush_hour(e.target.checked);
+                  sessionRef.current?.applyControl({ type: "rushHour", value: e.target.checked });
                   setRushHour(e.target.checked);
                 }}
               />
@@ -835,13 +553,13 @@ export default function EngineCanvas() {
                 disabled={!ready}
                 onChange={(e) => {
                   const v = Number(e.target.value);
-                  simRef.current?.set_demand_rate(v);
+                  sessionRef.current?.applyControl({ type: "demandRate", value: v });
                   setDemandRate(v);
                 }}
               />
             </label>
             <label className={styles.zoomLabel} title="Cap on the speed vehicles enter the map at — still never above the origin road's own speed limit.">
-              Start ≤ {Math.round(startSpeedMps * MPS_TO[units])} {UNIT_LABEL[units]}
+              {startSpeedLabel(startSpeedMps, units)}
               <input
                 type="range"
                 min={0}
@@ -851,7 +569,7 @@ export default function EngineCanvas() {
                 disabled={!ready}
                 onChange={(e) => {
                   const v = Number(e.target.value);
-                  simRef.current?.set_entry_speed_cap(v);
+                  sessionRef.current?.applyControl({ type: "entrySpeedCap", value: v });
                   setStartSpeedMps(v);
                 }}
               />
@@ -912,7 +630,7 @@ export default function EngineCanvas() {
                     style={{ width: "5.5em" }}
                     onChange={(e) => {
                       const v = Math.max(0, Math.floor(Number(e.target.value) || 0));
-                      simRef.current?.set_par_threshold(v);
+                      sessionRef.current?.applyControl({ type: "parThreshold", value: v });
                       setParThreshold(v);
                     }}
                   />
@@ -933,7 +651,7 @@ export default function EngineCanvas() {
                     style={{ width: "5.5em" }}
                     onChange={(e) => {
                       const v = Math.max(0, Math.floor(Number(e.target.value) || 0));
-                      simRef.current?.set_scheduler_thread_limit(v);
+                      sessionRef.current?.applyControl({ type: "schedulerThreadLimit", value: v });
                       setSchedThreadLimit(v);
                     }}
                   />
@@ -943,6 +661,21 @@ export default function EngineCanvas() {
             )}
             <label
               className={styles.zoomLabel}
+              title="Under heavy load, cap the simulation to a per-frame time budget so the view stays smooth — the sim then runs slower than the selected speed (it shows as 'throttled'). Uncheck to run the simulation at the full selected speed instead, letting the frame rate drop when a step can't finish in time."
+            >
+              <input
+                type="checkbox"
+                checked={smoothPlayback}
+                disabled={!ready}
+                onChange={(e) => {
+                  sessionRef.current?.applyControl({ type: "frameBudget", value: e.target.checked });
+                  setSmoothPlayback(e.target.checked);
+                }}
+              />
+              Smooth playback
+            </label>
+            <label
+              className={styles.zoomLabel}
               title="Congestion level-of-detail: while a link stays saturated, its queued cars use cheap leader-only car-following instead of the full model, and skip lane-change checks. Cars stay individual and keep their positions — this only cuts per-car cost in jams. Off by default (full detail everywhere)."
             >
               <input
@@ -950,7 +683,7 @@ export default function EngineCanvas() {
                 checked={congestionEnabled}
                 disabled={!ready}
                 onChange={(e) => {
-                  simRef.current?.set_congestion_enabled(e.target.checked);
+                  sessionRef.current?.applyControl({ type: "congestionEnabled", value: e.target.checked });
                   setCongestionEnabled(e.target.checked);
                 }}
               />
@@ -965,7 +698,7 @@ export default function EngineCanvas() {
                 checked={sleepScheduler}
                 disabled={!ready}
                 onChange={(e) => {
-                  simRef.current?.set_sleep_scheduler(e.target.checked);
+                  sessionRef.current?.applyControl({ type: "sleepScheduler", value: e.target.checked });
                   setSleepScheduler(e.target.checked);
                 }}
               />
@@ -986,7 +719,7 @@ export default function EngineCanvas() {
                   disabled={!ready}
                   onChange={(e) => {
                     const v = Number(e.target.value);
-                    simRef.current?.set_congestion_engage(v);
+                    sessionRef.current?.applyControl({ type: "congestionEngage", value: v });
                     setCongestionEngage(v);
                   }}
                 />
@@ -1067,151 +800,5 @@ async function ensureCrossOriginIsolation(): Promise<void> {
     }
   } catch (e) {
     console.warn("COOP/COEP shim registration failed:", e);
-  }
-}
-
-// ---- road-name hover --------------------------------------------------------
-
-/** The engine's own links as polylines (world coords), index-aligned with link
- * ids, so a click maps to the exact link the engine selects. Built from the
- * engine's post-transform geometry — never the raw import — so they can't drift.
- * `link_polylines` is a self-describing flat buffer: per link `[n, x0,y0,…]`. */
-function linksFromSim(sim: Sim): { name: string; pts: number[][] }[] {
-  const names = sim.link_names();
-  const flat = sim.link_polylines();
-  const out: { name: string; pts: number[][] }[] = [];
-  let i = 0;
-  for (let link = 0; link < names.length; link++) {
-    const n = flat[i++];
-    const pts: number[][] = [];
-    for (let k = 0; k < n; k++) pts.push([flat[i++], flat[i++]]);
-    out.push({ name: names[link], pts });
-  }
-  return out;
-}
-
-/** Nearest link index to a world point within `maxD` metres, or -1. */
-function nearestLink(links: { pts: number[][] }[], wx: number, wy: number, maxD: number): number {
-  let best = -1;
-  let bestD = maxD;
-  for (let i = 0; i < links.length; i++) {
-    if (links[i].pts.length < 2) continue;
-    const d = distToPolyline(wx, wy, links[i].pts);
-    if (d < bestD) {
-      bestD = d;
-      best = i;
-    }
-  }
-  return best;
-}
-
-function distToPolyline(px: number, py: number, pts: number[][]): number {
-  let best = Infinity;
-  for (let i = 1; i < pts.length; i++) {
-    best = Math.min(best, distToSegment(px, py, pts[i - 1], pts[i]));
-  }
-  return best;
-}
-
-function distToSegment(px: number, py: number, a: number[], b: number[]): number {
-  const dx = b[0] - a[0];
-  const dy = b[1] - a[1];
-  const len2 = dx * dx + dy * dy;
-  const t = len2 > 0 ? Math.max(0, Math.min(1, ((px - a[0]) * dx + (py - a[1]) * dy) / len2)) : 0;
-  return Math.hypot(px - (a[0] + t * dx), py - (a[1] + t * dy));
-}
-
-// ---- 2D canvas fallback -----------------------------------------------------
-
-type Scene = { roads: Float32Array; dividers: Float32Array; junctions: Float32Array };
-
-function buildScene(sim: Sim): Scene {
-  return { roads: sim.road_strips(), dividers: sim.lane_dividers(), junctions: sim.junctions() };
-}
-
-function render2d(canvas: HTMLCanvasElement, sim: Sim, scene: Scene | null) {
-  if (!scene) return;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-  const [cx, cy, mpp, vw, vh] = sim.camera_params();
-  const sx = (x: number) => vw / 2 + (x - cx) / mpp;
-  const sy = (y: number) => vh / 2 - (y - cy) / mpp;
-  const scale = 1 / mpp;
-
-  ctx.fillStyle = "#0b0e13";
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-  ctx.strokeStyle = "#2b313a";
-  ctx.lineCap = "butt";
-  for (let i = 0; i < scene.roads.length; i += 5) {
-    ctx.lineWidth = Math.max(1, scene.roads[i + 4] * scale);
-    ctx.beginPath();
-    ctx.moveTo(sx(scene.roads[i]), sy(scene.roads[i + 1]));
-    ctx.lineTo(sx(scene.roads[i + 2]), sy(scene.roads[i + 3]));
-    ctx.stroke();
-  }
-
-  ctx.fillStyle = "#31373f";
-  for (let i = 0; i < scene.junctions.length; i += 3) {
-    ctx.beginPath();
-    ctx.arc(sx(scene.junctions[i]), sy(scene.junctions[i + 1]), scene.junctions[i + 2] * scale, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
-  const inst = sim.vehicle_instances();
-  const len = 4.6 * scale;
-  const wid = 2.0 * scale;
-  for (let i = 0; i < inst.length; i += 5) {
-    const brake = inst[i + 3];
-    const blink = inst[i + 4]; // -1 left, +1 right, 0 none (already blink-gated)
-    ctx.save();
-    ctx.translate(sx(inst[i]), sy(inst[i + 1]));
-    ctx.rotate(-inst[i + 2]);
-    ctx.fillStyle = "#cdd3da";
-    ctx.fillRect(-len / 2, -wid / 2, len, wid);
-    if (brake > 0.01) {
-      ctx.fillStyle = `rgba(255,40,30,${(0.3 + 0.7 * brake).toFixed(3)})`;
-      ctx.fillRect(-len / 2, -wid / 2, len * 0.18, wid);
-    }
-    if (blink !== 0) {
-      // Front-corner amber lamp; world-left is local −y after the sy() flip.
-      const bw = len * 0.16;
-      const bh = wid * 0.42;
-      const by = blink < 0 ? -wid / 2 : wid / 2 - bh;
-      ctx.fillStyle = "#ff9e00";
-      ctx.fillRect(len / 2 - bw, by, bw, bh);
-    }
-    ctx.restore();
-  }
-
-  const heads = sim.signal_heads();
-  const hh = Math.max(2.5, 1.6 * scale); // half-size in px
-  for (let i = 0; i < heads.length; i += 7) {
-    ctx.fillStyle = `rgb(${(heads[i + 2] * 255) | 0},${(heads[i + 3] * 255) | 0},${(heads[i + 4] * 255) | 0})`;
-    const heading = heads[i + 5];
-    const isLeft = heads[i + 6] > 0.5;
-    ctx.save();
-    ctx.translate(sx(heads[i]), sy(heads[i + 1]));
-    ctx.rotate(-heading); // world heading → screen frame (sy flips y); local −y is world-left
-    if (isLeft) {
-      // A left-turn arrow pointing to the driver's left (local −y): shaft + barbs.
-      const a = hh * 1.6;
-      const bw = hh * 1.15; // barb half-width
-      const sw = hh * 0.42; // shaft half-width
-      const bh = hh * 0.95; // barb depth from the tip
-      ctx.beginPath();
-      ctx.moveTo(0, -a); // tip
-      ctx.lineTo(bw, -a + bh);
-      ctx.lineTo(sw, -a + bh);
-      ctx.lineTo(sw, a);
-      ctx.lineTo(-sw, a);
-      ctx.lineTo(-sw, -a + bh);
-      ctx.lineTo(-bw, -a + bh);
-      ctx.closePath();
-      ctx.fill();
-    } else {
-      ctx.fillRect(-hh, -hh, hh * 2, hh * 2);
-    }
-    ctx.restore();
   }
 }

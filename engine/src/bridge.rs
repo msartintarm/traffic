@@ -14,7 +14,7 @@ use crate::render::camera::Camera;
 use crate::render::interp;
 use crate::render::scene::{brake_intensity, class_color, class_dims, signal_color, signal_head_instances};
 use crate::render::gpu::Renderer;
-use crate::render::{geometry, Instance, StaticMesh};
+use crate::render::{geometry, Instance, StaticMesh, StaticVertex};
 use crate::sim::clock::SimClock;
 use crate::sim::flowfield;
 use crate::sim::flowfield_gpu::{GpuFlowField, PendingFlag, PendingReadback};
@@ -37,13 +37,20 @@ const MAX_CATCHUP_TICKS: u32 = 240;
 const SPEED_WINDOW_SECS: f64 = 0.5;
 
 /// Monotonic wall-clock milliseconds from the browser's high-resolution timer.
-/// Returns 0.0 if unavailable, which disables the budget (falling back to the tick
-/// ceiling) rather than erroring.
+/// Resolves `performance` from whichever global is current — the `Window` on the main
+/// thread or the `WorkerGlobalScope` inside the engine worker (where `window()` is
+/// `None`) — so the frame budget and speed meter work in both. Returns 0.0 if truly
+/// unavailable, which disables the budget (falling back to the tick ceiling).
 fn now_ms() -> f64 {
-    web_sys::window()
-        .and_then(|w| w.performance())
-        .map(|p| p.now())
-        .unwrap_or(0.0)
+    use wasm_bindgen::JsCast;
+    let global = js_sys::global();
+    if let Some(perf) = global.dyn_ref::<web_sys::WorkerGlobalScope>().and_then(|s| s.performance()) {
+        return perf.now();
+    }
+    if let Some(perf) = global.dyn_ref::<web_sys::Window>().and_then(|w| w.performance()) {
+        return perf.now();
+    }
+    0.0
 }
 
 /// Turn-signal blink phase: `true` during the lit half of a ~1.4 Hz cycle, off the
@@ -107,6 +114,11 @@ pub struct Simulation {
     speed_sim_accum: f64,
     speed_wall_accum: f64,
     speed_dropped: bool,
+    /// Whether the per-frame wall-clock budget caps catch-up stepping. On (default): an
+    /// overloaded frame drops backlog so the view stays smooth and the sim runs slower
+    /// than the selected speed. Off: run the full catch-up (to the tick ceiling) so the
+    /// sim holds the selected speed and the frame rate drops instead.
+    frame_budget: bool,
 }
 
 #[wasm_bindgen]
@@ -157,6 +169,7 @@ impl Simulation {
             gpu: None, gpu_pending: None, gpu_relax: None, gpu_generation: 0, gpu_cost: Vec::new(), gpu_last: 0.0,
             effective_speed: 0.0, throttled: false, last_advance_ms: 0.0,
             speed_sim_accum: 0.0, speed_wall_accum: 0.0, speed_dropped: false,
+            frame_budget: true,
         }
     }
 
@@ -377,7 +390,7 @@ impl Simulation {
                 // render the result and drop the remaining backlog so a heavy step
                 // degrades to slow-motion instead of freezing the main thread. (Always
                 // run at least one tick, hence `ran > 0`.)
-                let over_budget = ran > 0 && now_ms() - loop_start > FRAME_BUDGET_MS;
+                let over_budget = self.frame_budget && ran > 0 && now_ms() - loop_start > FRAME_BUDGET_MS;
                 let last = over_budget || ran + 1 == ticks;
                 // The render interpolates between `prev` and the post-step state, so
                 // only the snapshot taken right before the *final* committed tick is
@@ -448,6 +461,17 @@ impl Simulation {
     /// frames legitimately run no tick at all).
     pub fn is_throttled(&self) -> bool {
         self.throttled
+    }
+
+    /// Toggle the per-frame wall-clock budget. On (default): cap catch-up to keep the view
+    /// smooth, letting the sim fall behind the selected speed under load. Off: run the full
+    /// catch-up so the sim holds the selected speed and the frame rate drops instead.
+    pub fn set_frame_budget(&mut self, enabled: bool) {
+        self.frame_budget = enabled;
+    }
+
+    pub fn frame_budget(&self) -> bool {
+        self.frame_budget
     }
 
     /// Choose the accel executor: `"serial"`, `"threads"`, or `"gpu"`. The sim falls
@@ -664,7 +688,7 @@ impl Simulation {
 
     /// Roads + junctions as flat `StaticVertex` floats (drawn at all zooms).
     pub fn world_mesh_vertices(&self) -> Vec<f32> {
-        bytemuck::cast_slice(&self.world_mesh().vertices).to_vec()
+        flatten_static_vertices(self.world_mesh().vertices)
     }
 
     pub fn world_mesh_indices(&self) -> Vec<u32> {
@@ -673,7 +697,7 @@ impl Simulation {
 
     /// Lane markings as flat `StaticVertex` floats (drawn only when zoomed in).
     pub fn marking_mesh_vertices(&self) -> Vec<f32> {
-        bytemuck::cast_slice(&geometry::marking_mesh(&self.world.network).vertices).to_vec()
+        flatten_static_vertices(geometry::marking_mesh(&self.world.network).vertices)
     }
 
     pub fn marking_mesh_indices(&self) -> Vec<u32> {
@@ -883,6 +907,22 @@ impl Simulation {
         let flag = gpu.run_chunk();
         self.gpu_relax = Some((flag, self.gpu_generation));
     }
+}
+
+/// Reinterpret a `Vec<StaticVertex>` as its flat `Vec<f32>` in place — no copy. Marshaling
+/// the world/marking meshes for the GPU is the peak wasm-memory moment when loading a city
+/// map (the marking mesh alone is ~220 MB), and the old `cast_slice(..).to_vec()` doubled
+/// that transiently — and since wasm memory never shrinks, the spike became permanent
+/// high-water. `StaticVertex` is `#[repr(C)]` of exactly 8 `f32` with no padding, so its
+/// buffer *is* a valid `[f32; 8·len]` with `8·cap` capacity and identical alignment.
+fn flatten_static_vertices(mut v: Vec<StaticVertex>) -> Vec<f32> {
+    const _: () = assert!(std::mem::size_of::<StaticVertex>() == 8 * std::mem::size_of::<f32>());
+    let (ptr, len, cap) = (v.as_mut_ptr() as *mut f32, v.len() * 8, v.capacity() * 8);
+    std::mem::forget(v);
+    // SAFETY: layout-compatible per the doc comment; the original allocation size
+    // (cap · size_of::<StaticVertex>()) equals 8·cap · size_of::<f32>() with the same 4-byte
+    // alignment, so the reconstructed Vec owns exactly that buffer and frees it correctly.
+    unsafe { Vec::from_raw_parts(ptr, len, cap) }
 }
 
 fn build_demand(world: &NetWorld, seed: u64, sources: DemandSources, rate: f64, entry_cap: f64) -> DemandGenerator {
