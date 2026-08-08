@@ -249,6 +249,8 @@ export async function startEngineSession(
         sim.render_instance_count(),
         sim.signal_instances(),
         sim.signal_instance_count(),
+        sim.crash_instances(),
+        sim.crash_instance_count(),
         sim.density_vertices(),
         sim.density_indices(),
       );
@@ -284,6 +286,9 @@ export async function startEngineSession(
       case "schedulerThreadLimit": sim.set_scheduler_thread_limit(c.value); break;
       case "parThreshold": sim.set_par_threshold(c.value); break;
       case "parallelRouting": sim.set_parallel_routing(c.value); break;
+      case "cacheSort": sim.set_cache_sort(c.value); break;
+      case "showCrashes": sim.set_show_crashes(c.value); break;
+      case "clearCrashes": sim.clear_crashes(); break;
       case "entrySpeedCap": sim.set_entry_speed_cap(c.value); break;
       case "congestionEngage": sim.set_congestion_engage(c.value); break;
       case "congestionEnabled": sim.set_congestion_enabled(c.value); break;

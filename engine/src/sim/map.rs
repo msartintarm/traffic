@@ -304,6 +304,7 @@ impl OsmMap {
                 lane_count: spec.lanes,
                 layer: spec.layer,
                 kind: RoadKind::from_osm(&spec.road_class),
+                motorway: matches!(spec.road_class.as_str(), "motorway" | "motorway_link"),
             });
             net.polylines.push(polyline);
             net.link_names.push(spec.name.clone());

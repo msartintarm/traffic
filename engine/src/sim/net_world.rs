@@ -88,10 +88,6 @@ struct Fleet {
 }
 
 impl Fleet {
-    fn len(&self) -> usize {
-        self.rows.len()
-    }
-
     fn push(&mut self, v: NetVehicle) {
         let mut h = [(0.0, 0.0); HISTORY_LEN];
         h[0] = (v.position, v.speed);
@@ -160,6 +156,10 @@ pub struct NetWorld {
     exited: u32,
     leaked: u32,
     crashed: u32,
+    /// World positions where vehicles crashed, oldest first, capped at
+    /// [`MAX_CRASH_SITES`] (the newest evict the oldest). Accumulated for the optional
+    /// crash-location overlay; independent of the `crashed` tally.
+    crash_sites: Vec<[f32; 2]>,
     /// Downstream lanes fed by more than one lane — the merge points; value is
     /// the list of feeding (from) lane ids.
     merges: HashMap<u32, Vec<u32>>,
@@ -210,6 +210,10 @@ pub struct NetWorld {
     /// time. On by default; a UI toggle so the parallel speed-up is observable. No effect on
     /// the single-threaded build or when the browser GPU flow-field owns the recompute.
     parallel_routing: bool,
+    /// Sort the per-lane / per-corridor vehicle groups against a precomputed flat position key
+    /// (contiguous, cache-friendly) rather than reading a full vehicle row per comparison. On by
+    /// default; a UI toggle so the win is measurable in the browser (bit-for-bit either way).
+    cache_sort: bool,
     /// Per-node index of movements and conflict points.
     junctions: Junctions,
     /// Executor requested for the per-vehicle accel passes (see [`AccelBackend`]).
@@ -345,6 +349,10 @@ pub const DEFAULT_PAR_THRESHOLD: usize = 500;
 /// tuned point rather than following [`DEFAULT_PAR_THRESHOLD`], which trips earlier.
 pub const DEFAULT_SCHEDULER_THREAD_LIMIT: usize = 2000;
 
+/// Cap on retained crash-site positions (for the overlay). A long run can accumulate many
+/// wrecks; keep the most recent so the overlay stays bounded in memory and upload size.
+pub const MAX_CRASH_SITES: usize = 8192;
+
 /// Map `0..n` through `f` on the given `backend`. On `Threads`, runs serially when
 /// `n < threshold` (rayon overhead isn't worth it below the crossover). Order-preserving
 /// on every backend, so the collected result is bit-for-bit the serial one — the
@@ -364,6 +372,15 @@ where
         }
         _ => (0..n).map(f).collect(),
     }
+}
+
+/// Sort a lane/corridor index group by a precomputed flat key (position or corridor position).
+/// Each comparison then reads an 8-byte key from a contiguous array rather than chasing a
+/// ~200-byte vehicle row — the pointer-chase into the fat fleet is what made these per-group
+/// sorts cache-bound and superlinear on a big map. Positions within a group are distinct
+/// (vehicles can't overlap), so this total order is the same result the row-chasing sort gave.
+fn sort_group_by(members: &mut [usize], key: &[f64]) {
+    members.sort_by(|&a, &b| key[a].total_cmp(&key[b]));
 }
 
 /// The `Gpu` backend's evaluate pass: the binding fold in `accel.wgsl` (f32) with the
@@ -820,9 +837,9 @@ impl NetWorld {
         let junctions = Junctions::build(&network);
         let congestion = CongestionLod::new(network.links.len());
         Self {
-            network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0,
+            network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0, crash_sites: Vec::new(),
             merges, link_straight, merge_feeder_lane, through_next, corridor_of, corridor_offset, signals, link_entries, router: None, external_reroute: false,
-            route_fingerprint: 0, route_cycle_tick: 0, parallel_routing: true, junctions,
+            route_fingerprint: 0, route_cycle_tick: 0, parallel_routing: true, cache_sort: true, junctions,
             accel_backend: AccelBackend::Serial,
             #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
             gpu_accel: None,
@@ -893,6 +910,61 @@ impl NetWorld {
             }
         }
         map_collect(backend, par_threshold, inputs.len(), |i| inputs[i].evaluate(seed, tick))
+    }
+
+    /// Gather one vehicle's accel-decision context — the graph, neighbor, signal and router
+    /// lookups a GPU evaluate kernel can't chase. In-node crossers carry their bespoke
+    /// `crossing_accel`; queued sleepers and congested-link followers take the leader-only
+    /// `queue_context`; isolated free cars the bare `free_context`; everyone else the full
+    /// gather. The single source of truth for both the fused CPU path and the GPU path's
+    /// materialized inputs.
+    fn gather_input(&self, i: usize, nb: &Neighbors, cross_by_mv: &IntMap<Vec<usize>>, sleep: Sleep, intended: Option<MovementId>) -> AccelInput {
+        if self.fleet.rows[i].crossing.is_some() {
+            AccelInput::Crossing(self.crossing_accel(i, nb, cross_by_mv))
+        } else {
+            match sleep {
+                Sleep::Queued(leader) => AccelInput::Rolling(self.queue_context(i, leader)),
+                Sleep::Free => AccelInput::Rolling(self.free_context(i)),
+                Sleep::Awake => match self.queue_follower(i, nb) {
+                    Some(leader) => AccelInput::Rolling(self.queue_context(i, leader)),
+                    None => AccelInput::Rolling(self.gather_context(i, nb, intended)),
+                },
+            }
+        }
+    }
+
+    /// A vehicle's intended movement plus its sleep classification (the active-set scheduler's
+    /// verdict): a crosser or an awake car carries its movement; a car queued behind a stopped
+    /// leader or cruising free of any junction sleeps and drops the movement. Reads only this
+    /// car's state and committed neighbours, so it fuses into the per-car decision pass.
+    fn decide_intent(&self, i: usize, sleep_on: bool, nb: &Neighbors) -> (Option<MovementId>, Sleep) {
+        let v = &self.fleet.rows[i];
+        if v.crossing.is_some() {
+            return (None, Sleep::Awake);
+        }
+        if sleep_on {
+            if let Some(l) = self.sleep_leader(i, nb) {
+                return (None, Sleep::Queued(l));
+            }
+        }
+        let intended = self.intended_movement(v);
+        if sleep_on && self.is_free_sleeper(i, nb, intended) {
+            return (None, Sleep::Free);
+        }
+        (intended, Sleep::Awake)
+    }
+
+    /// The hard don't-enter-the-box gate for one car: never begin crossing while a conflicting
+    /// movement still occupies the node. Free-flow interchange movements never hard-block (the
+    /// merge is a zipper); only at-grade crossings gate on box occupancy.
+    fn box_entry_blocked(&self, i: usize, intended: Option<MovementId>, nb: &Neighbors) -> bool {
+        intended.is_some_and(|mid| {
+            if self.network.is_interchange_movement(mid) {
+                return false;
+            }
+            let node = self.network.link(self.network.lane(self.fleet.rows[i].lane).link).to;
+            self.box_conflict(mid, node, nb) || (self.is_permissive(mid) && self.permissive_must_yield(i, mid, node, nb))
+        })
     }
 
     /// Install a flow-field router covering `dests`; vehicles spawned via
@@ -1204,6 +1276,16 @@ impl NetWorld {
         self.crashed
     }
 
+    /// World positions of recent crashes, for the crash-location overlay.
+    pub fn crash_sites(&self) -> &[[f32; 2]] {
+        &self.crash_sites
+    }
+
+    /// Forget the recorded crash sites (the overlay clears); the `crashed` tally is untouched.
+    pub fn clear_crash_sites(&mut self) {
+        self.crash_sites.clear();
+    }
+
     /// Vehicles that disappeared at an interior intersection despite having a
     /// routable next hop. A correct engine never leaks — this stays zero.
     pub fn leaked(&self) -> u32 {
@@ -1469,11 +1551,14 @@ impl NetWorld {
             by_lane.entry(v.lane.0).or_default().push(i);
             approaching.entry(self.network.intersection_key(self.downstream_node(v.lane))).or_default().push(i);
         }
+        // Flat sort keys (contiguous, cache-friendly) precomputed once when the cache-sort
+        // option is on; empty when off, so the helpers read each vehicle row instead.
+        let (pos, cpos) = (self.position_keys(), self.corridor_keys());
         // The leader chain runs along the whole corridor (grade-separated 1:1 through-lanes
         // coalesced), so `leader_of` never loses the car ahead at a segment boundary.
         let mut leader_of = vec![None; self.fleet.rows.len()];
         for members in by_corridor.values_mut() {
-            members.sort_by(|&a, &b| self.corridor_pos(&self.fleet.rows[a]).total_cmp(&self.corridor_pos(&self.fleet.rows[b])));
+            self.sort_corridor_members(members, &cpos);
             for w in members.windows(2) {
                 leader_of[w[0]] = Some(w[1]);
             }
@@ -1482,7 +1567,7 @@ impl NetWorld {
         // which stay per-lane (a lane change targets a physical lane, not a corridor).
         let mut lane_front: IntMap<usize> = IntMap::default();
         for members in by_lane.values_mut() {
-            members.sort_by(|&a, &b| self.fleet.rows[a].position.total_cmp(&self.fleet.rows[b].position));
+            self.sort_lane_members(members, &pos);
             let front = *members.first().unwrap();
             lane_front.insert(self.fleet.rows[front].lane.0, front);
         }
@@ -1513,24 +1598,28 @@ impl NetWorld {
             }
             by_lane.entry(v.lane.0).or_default().push(i);
         }
+        let pos = self.position_keys();
         for m in by_lane.values_mut() {
-            m.sort_by(|&a, &b| self.fleet.rows[a].position.total_cmp(&self.fleet.rows[b].position));
+            self.sort_lane_members(m, &pos);
         }
-        let mut changes: Vec<(usize, LaneId)> = Vec::new();
-        for i in 0..self.fleet.rows.len() {
-            // Cars on a congested (queue-mode) link skip lane-change evaluation — the
-            // expensive MOBIL scan, for negligible movement in a jam.
+        // Decide each car's best lane change. This is the expensive MOBIL scan and it reads only
+        // committed state (positions + the sorted `by_lane`), so it parallelizes across cores
+        // bit-for-bit: `map_collect` is order-preserving, so the flattened decisions match the
+        // serial order exactly. The apply below stays serial — a slot-clear check reads state the
+        // earlier applies mutate, so two cars can't be cleared into the same gap.
+        let (backend, threshold, n) = (self.active_backend(), self.par_threshold, self.fleet.rows.len());
+        let decided: Vec<Option<(usize, LaneId)>> = map_collect(backend, threshold, n, |i| {
+            // Cars on a congested (queue-mode) link skip lane-change evaluation — negligible
+            // movement in a jam for a costly scan.
             if self.congestion_cfg.enabled {
                 let link = self.network.lane(self.fleet.rows[i].lane).link;
                 if self.congestion.is_queue(link.idx()) {
-                    continue;
+                    return None;
                 }
             }
-            if let Some(t) = self.best_lane_change(i, &by_lane) {
-                changes.push((i, t));
-            }
-        }
-        for (i, target) in changes {
+            self.best_lane_change(i, &by_lane).map(|t| (i, t))
+        });
+        for (i, target) in decided.into_iter().flatten() {
             // Preserve arc-length along the link across the change. Lanes normally
             // share a start offset (a no-op remap), but a turn-*pocket* lane begins
             // partway down the link, so a car can only move into it once it is
@@ -1783,6 +1872,55 @@ impl NetWorld {
         self.parallel_routing
     }
 
+    /// Toggle the cache-friendly per-group sort (flat position-key array vs. reading a vehicle
+    /// row per comparison). Same total order either way; purely a performance option.
+    pub fn set_cache_sort(&mut self, on: bool) {
+        self.cache_sort = on;
+    }
+
+    pub fn cache_sort(&self) -> bool {
+        self.cache_sort
+    }
+
+    /// The flat position key array for the cache-friendly sort, or empty when the option is off
+    /// (the sort helpers then read each vehicle row instead).
+    fn position_keys(&self) -> Vec<f64> {
+        if self.cache_sort {
+            self.fleet.rows.iter().map(|v| v.position).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Sort a per-lane group by vehicle position. `keys` is the flat position array when the
+    /// cache-sort option is on (contiguous, cache-friendly); empty falls back to chasing each
+    /// vehicle row. The order is identical — positions within a lane are distinct.
+    fn sort_lane_members(&self, members: &mut [usize], keys: &[f64]) {
+        if keys.is_empty() {
+            members.sort_by(|&a, &b| self.fleet.rows[a].position.total_cmp(&self.fleet.rows[b].position));
+        } else {
+            sort_group_by(members, keys);
+        }
+    }
+
+    /// The flat corridor-position key array for the cache-friendly sort, or empty when off.
+    fn corridor_keys(&self) -> Vec<f64> {
+        if self.cache_sort {
+            self.fleet.rows.iter().map(|v| self.corridor_pos(v)).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Sort a per-corridor group by corridor position; `keys` empty falls back to reading rows.
+    fn sort_corridor_members(&self, members: &mut [usize], keys: &[f64]) {
+        if keys.is_empty() {
+            members.sort_by(|&a, &b| self.corridor_pos(&self.fleet.rows[a]).total_cmp(&self.corridor_pos(&self.fleet.rows[b])));
+        } else {
+            sort_group_by(members, keys);
+        }
+    }
+
     /// How many destination fields to solve concurrently in a recompute: one per pool thread
     /// when parallel routing is on (and the threaded build is linked), else 1.
     fn route_field_width(&self) -> usize {
@@ -1871,58 +2009,48 @@ impl NetWorld {
         let sleep_on = self.cfg.sleep_scheduler
             && !(matches!(backend, AccelBackend::Threads) && n >= self.scheduler_thread_limit);
 
-        // Fused pass: each vehicle's intended movement *and* its sleep decision, in one
-        // sweep of the fleet — then unzipped into the two slices the rest of the step needs
-        // (the unzip is cheap: small values, not the fat rows). Threading them separately
-        // would re-sweep the whole fleet, which on a bandwidth-bound parallel step is the
-        // dominant cost. Queued sleepers skip the router next-hop (they can't reach a stop
-        // line); free-flow cars still resolve it (cheaply) to confirm they're going
-        // straight, then drop it (they too can't reach the line this tick).
-        let (intended_mv, sleeping): (Vec<Option<MovementId>>, Vec<Sleep>) =
-            map_collect(backend, par_threshold, n, |i| {
-                let v = &self.fleet.rows[i];
-                if v.crossing.is_some() {
-                    return (None, Sleep::Awake);
-                }
-                if sleep_on {
-                    if let Some(l) = self.sleep_leader(i, &nb) {
-                        return (None, Sleep::Queued(l));
-                    }
-                }
-                let intended = self.intended_movement(v);
-                if sleep_on && self.is_free_sleeper(i, &nb, intended) {
-                    return (None, Sleep::Free);
-                }
-                (intended, Sleep::Awake)
-            })
-            .into_iter()
-            .unzip();
-        self.asleep_last = sleeping.iter().filter(|s| !matches!(s, Sleep::Awake)).count();
-
-        // Phase 4a — gather each vehicle's accel-decision inputs. Every graph, neighbor,
-        // signal and router lookup lives here (CPU-only; a GPU kernel can't chase these
-        // pointers). In-node crossers carry their bespoke `crossing_accel`; queued sleepers
-        // and congested-link followers take the leader-only `queue_context`; isolated free
-        // cars take the bare `free_context`; everyone else runs the full gather.
-        let inputs: Vec<AccelInput> = map_collect(backend, par_threshold, self.fleet.rows.len(), |i| {
-            if self.fleet.rows[i].crossing.is_some() {
-                AccelInput::Crossing(self.crossing_accel(i, &nb, &cross_by_mv))
-            } else {
-                match sleeping[i] {
-                    Sleep::Queued(leader) => AccelInput::Rolling(self.queue_context(i, leader)),
-                    Sleep::Free => AccelInput::Rolling(self.free_context(i)),
-                    Sleep::Awake => match self.queue_follower(i, &nb) {
-                        Some(leader) => AccelInput::Rolling(self.queue_context(i, leader)),
-                        None => AccelInput::Rolling(self.gather_context(i, &nb, &intended_mv)),
-                    },
-                }
-            }
-        });
-        // Phase 4b — evaluate: the pure constraint fold + reproducible noise over the
-        // flat context. No graph access — this half runs on the CPU (serial/threads) or,
-        // on the `Gpu` backend, the `accel.wgsl` kernel with noise re-added CPU-side.
+        // Phase 4 — one fused per-car pass does what were four separate parallel sweeps of the
+        // fleet: intended movement, sleep classification, the box-entry gate, and the accel
+        // gather+evaluate. Collapsing them to a single fork-join is the win on a threaded step —
+        // each extra dispatch has fixed overhead and re-sweeps the whole (bandwidth-bound) fleet.
+        // The CPU path evaluates the accel inline, so the fat per-car `AccelInput` (~150 B) is
+        // never materialized into a Vec; the `Gpu` backend keeps the inputs to ship to its kernel
+        // (its evaluate half runs in `accel.wgsl`). Every per-car datum read is this car's own, so
+        // the fusion is order-preserving and bit-for-bit identical to the separate passes.
         let (seed, tick) = (self.cfg.seed, self.tick);
-        let accels: Vec<f64> = self.evaluate_accels(backend, par_threshold, &inputs, seed, tick);
+        let (mut intended_mv, mut sleeping, mut block_entry) =
+            (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+        let accels: Vec<f64> = if matches!(backend, AccelBackend::Gpu) {
+            let rows: Vec<(Option<MovementId>, Sleep, bool, AccelInput)> = map_collect(backend, par_threshold, n, |i| {
+                let (intended, sleep) = self.decide_intent(i, sleep_on, &nb);
+                let block = self.box_entry_blocked(i, intended, &nb);
+                (intended, sleep, block, self.gather_input(i, &nb, &cross_by_mv, sleep, intended))
+            });
+            let mut inputs = Vec::with_capacity(n);
+            for (m, s, b, inp) in rows {
+                intended_mv.push(m);
+                sleeping.push(s);
+                block_entry.push(b);
+                inputs.push(inp);
+            }
+            self.evaluate_accels(backend, par_threshold, &inputs, seed, tick)
+        } else {
+            let rows: Vec<(Option<MovementId>, Sleep, bool, f64)> = map_collect(backend, par_threshold, n, |i| {
+                let (intended, sleep) = self.decide_intent(i, sleep_on, &nb);
+                let block = self.box_entry_blocked(i, intended, &nb);
+                let accel = self.gather_input(i, &nb, &cross_by_mv, sleep, intended).evaluate(seed, tick);
+                (intended, sleep, block, accel)
+            });
+            let mut a = Vec::with_capacity(n);
+            for (m, s, b, ac) in rows {
+                intended_mv.push(m);
+                sleeping.push(s);
+                block_entry.push(b);
+                a.push(ac);
+            }
+            a
+        };
+        self.asleep_last = sleeping.iter().filter(|s| !matches!(s, Sleep::Awake)).count();
         prof.lap(4);
 
         // Destination-lane occupancy (nearest-to-entrance rear, and that car's speed), so a
@@ -1942,42 +2070,62 @@ impl NetWorld {
             }
         }
 
-        // A hard don't-enter-the-box gate: never begin crossing while a conflicting
-        // movement still occupies the node (a straggler from the previous phase),
-        // which the soft box-yield can't guarantee under momentum. Precomputed here
-        // while committed state and `nb` are valid, since the advance pass empties
-        // `self.fleet.rows`.
-        let block_entry: Vec<bool> = map_collect(backend, par_threshold, self.fleet.rows.len(), |i| {
-            let veh = &self.fleet.rows[i];
-            intended_mv[i].is_some_and(|mid| {
-                // Free-flow freeway movements never hard-block on a box conflict (the
-                // merge is a zipper); only at-grade crossings gate on box occupancy.
-                if self.network.is_interchange_movement(mid) {
-                    return false;
-                }
-                let node = self.network.link(self.network.lane(veh.lane).link).to;
-                self.box_conflict(mid, node, &nb)
-                    || (self.is_permissive(mid) && self.permissive_must_yield(i, mid, node, &nb))
-            })
-        });
+        let mut taken = std::mem::take(&mut self.fleet.rows);
+        let taken_h = std::mem::take(&mut self.fleet.hist);
+        let taken_hl = std::mem::take(&mut self.fleet.hist_len);
+        let n = taken.len();
 
-        let n = self.fleet.len();
+        // Phase 5a — integrate every non-crossing car within its lane. This half reads no
+        // shared occupancy, so it runs across cores (like the accel gather). It returns, per
+        // car, whether the serial boundary resolution still has to run for it: crossers (they
+        // touch `front` on landing) and cars that reached a lane end (they consult and advance
+        // the shared occupancy). `front`/`front_speed` were built from committed positions
+        // above, so integrating here doesn't disturb them.
+        let deferred: Vec<bool> = {
+            let this: &NetWorld = self;
+            let integrate_one = |veh: &mut NetVehicle, a: f64, intended: Option<MovementId>| -> bool {
+                veh.crossing.is_some() || this.integrate_in_lane(veh, a, dt, intended)
+            };
+            #[cfg(feature = "parallel")]
+            let out: Vec<bool> = if matches!(backend, AccelBackend::Threads) && n >= par_threshold {
+                use rayon::prelude::*;
+                taken
+                    .par_iter_mut()
+                    .zip(accels.par_iter())
+                    .zip(intended_mv.par_iter())
+                    .map(|((veh, &a), &intended)| integrate_one(veh, a, intended))
+                    .collect()
+            } else {
+                taken.iter_mut().zip(&accels).zip(&intended_mv).map(|((veh, &a), &intended)| integrate_one(veh, a, intended)).collect()
+            };
+            #[cfg(not(feature = "parallel"))]
+            let out: Vec<bool> = taken.iter_mut().zip(&accels).zip(&intended_mv).map(|((veh, &a), &intended)| integrate_one(veh, a, intended)).collect();
+            out
+        };
+
+        // Phase 5b — resolve the deferred cars serially in index order, so the shared `front`
+        // occupancy evolves exactly as a single-threaded pass would (independent cars never
+        // touch it, so skipping them here is invisible to `front`). Each car's fate is recorded;
+        // an undeferred car simply stayed in its lane (`Alive`).
+        let mut fates: Vec<Fate> = Vec::with_capacity(n);
+        for i in 0..n {
+            let fate = if !deferred[i] {
+                Fate::Alive
+            } else if taken[i].crossing.is_some() {
+                self.advance_crossing(&mut taken[i], accels[i], dt, &mut front, &mut front_speed)
+            } else {
+                self.resolve_boundary(&mut taken[i], dt, &mut front, &mut front_speed, block_entry[i], intended_mv[i])
+            };
+            fates.push(fate);
+        }
+
+        // Assembly — apply each fate's bookkeeping and keep/drop in index order, identical to
+        // the former single-pass loop.
         let mut rows = Vec::with_capacity(n);
         let mut hist = Vec::with_capacity(n);
         let mut hist_len = Vec::with_capacity(n);
         let mut exited = 0u32;
-        let taken = std::mem::take(&mut self.fleet.rows);
-        let taken_h = std::mem::take(&mut self.fleet.hist);
-        let taken_hl = std::mem::take(&mut self.fleet.hist_len);
-        for (((((mut veh, a), block), intended), mut h), mut hl) in taken
-            .into_iter()
-            .zip(accels)
-            .zip(block_entry)
-            .zip(intended_mv)
-            .zip(taken_h)
-            .zip(taken_hl)
-        {
-            let fate = self.advance_vehicle(&mut veh, a, dt, &mut front, &mut front_speed, block, intended);
+        for (((mut veh, fate), mut h), mut hl) in taken.into_iter().zip(fates).zip(taken_h).zip(taken_hl) {
             let keep = match fate {
                 Fate::Alive => {
                     veh.wait_ticks = if veh.speed < 0.5 { veh.wait_ticks + 1 } else { 0 };
@@ -2025,17 +2173,24 @@ impl NetWorld {
     /// Advance one vehicle: integrate its longitudinal state, drive the
     /// lane→interior→lane transitions, and report whether it stayed on the road,
     /// entered a new link, or left the network.
-    fn advance_vehicle(&self, veh: &mut NetVehicle, accel: f64, dt: f64, front: &mut IntMap<f64>, front_speed: &mut IntMap<f64>, block_entry: bool, intended: Option<MovementId>) -> Fate {
-        if veh.crossing.is_some() {
-            // Position keeps counting past the from-lane's end; the interior arc is
-            // that overrun. The car flows through the node as one continuous move,
-            // advanced exactly as before (semi-implicit: step by the post-accel speed)
-            // so the in-node conflict-avoidance margins are unchanged.
-            veh.speed = (veh.speed + accel * dt).max(0.0);
-            veh.position += veh.speed * dt;
-            return self.land_or_hold(veh, front, front_speed, dt);
-        }
+    /// Advance a vehicle already crossing a node interior. Touches the shared `front`/
+    /// `front_speed` occupancy (via [`land_or_hold`]), so it runs serially.
+    fn advance_crossing(&self, veh: &mut NetVehicle, accel: f64, dt: f64, front: &mut IntMap<f64>, front_speed: &mut IntMap<f64>) -> Fate {
+        // Position keeps counting past the from-lane's end; the interior arc is
+        // that overrun. The car flows through the node as one continuous move,
+        // advanced exactly as before (semi-implicit: step by the post-accel speed)
+        // so the in-node conflict-avoidance margins are unchanged.
+        veh.speed = (veh.speed + accel * dt).max(0.0);
+        veh.position += veh.speed * dt;
+        self.land_or_hold(veh, front, front_speed, dt)
+    }
 
+    /// Integrate a non-crossing vehicle's longitudinal state (and lane-change progress and
+    /// stop-line arming) within its current lane. Reads no shared occupancy — depends only on
+    /// this vehicle, its precomputed `accel`, and the committed network — so it **parallelizes
+    /// across the fleet**. Returns whether the car reached the lane end (`position >=
+    /// lane.length`), i.e. whether [`resolve_boundary`] must run for it this tick.
+    fn integrate_in_lane(&self, veh: &mut NetVehicle, accel: f64, dt: f64, intended: Option<MovementId>) -> bool {
         integrate(veh, accel, dt);
         if let Some(lc) = veh.lane_change.as_mut() {
             lc.progress += dt / LANE_CHANGE_DURATION;
@@ -2053,9 +2208,15 @@ impl NetWorld {
         {
             veh.stopped_at = Some(node);
         }
-        if veh.position < lane.length {
-            return Fate::Alive;
-        }
+        veh.position >= lane.length
+    }
+
+    /// Resolve a non-crossing vehicle that reached its lane end: enter the node interior,
+    /// hold at the line, exit, or leak. Reads/writes the shared `front`/`front_speed`
+    /// occupancy (admission gate + landing), so it runs serially after the parallel integrate.
+    fn resolve_boundary(&self, veh: &mut NetVehicle, dt: f64, front: &mut IntMap<f64>, front_speed: &mut IntMap<f64>, block_entry: bool, intended: Option<MovementId>) -> Fate {
+        let lane = *self.network.lane(veh.lane);
+        let node = self.network.link(lane.link).to;
         // Reached the stop line. A sleeping car carries no intended movement (the
         // scheduler suppresses the router lookup for cars it expects to stay put),
         // but a queued sleeper can now follow its leader continuously across the
@@ -2179,12 +2340,11 @@ impl NetWorld {
     /// owned [`VehicleContext`]; [`VehicleContext::evaluate`] turns it into an
     /// acceleration with no further graph access. Behaviour is identical to the old
     /// fused accel loop; this is purely the gather/evaluate split.
-    fn gather_context(&self, i: usize, nb: &Neighbors, intended_mv: &[Option<MovementId>]) -> VehicleContext {
+    fn gather_context(&self, i: usize, nb: &Neighbors, intended: Option<MovementId>) -> VehicleContext {
         let dt = self.cfg.dt;
         let veh = &self.fleet.rows[i];
         let lane = *self.network.lane(veh.lane);
         let driver = veh.driver.capped_to(lane.speed_limit);
-        let intended = intended_mv[i];
         let node = self.downstream_node(veh.lane);
         let control = self.network.node(node).control;
         let to_line = (lane.length - veh.position).max(0.05);
@@ -2281,15 +2441,7 @@ impl NetWorld {
         // has no cross street to block, and continuous leader-following already keeps the
         // car off the one ahead. Applying it there braked the car abruptly to a dead stop
         // at every segment seam — the phantom freeway standstill.
-        let downstream_blocked = intended.is_some_and(|mid| {
-            if self.network.is_interchange_movement(mid) {
-                return false;
-            }
-            let to_lane = self.network.movement(mid).to_lane;
-            nb.lane_front
-                .get(&to_lane.0)
-                .is_some_and(|&f| self.fleet.rows[f].position < driver.vehicle_length + driver.min_gap)
-        });
+        let downstream_blocked = intended.is_some_and(|mid| self.movement_downstream_blocked(mid, &driver, nb));
         // A multi-node junction acts as one signal at its entrances: once a vehicle
         // is on an internal link (both endpoints in the same junction) it has already
         // been admitted and commits through the interior nodes rather than stopping at
@@ -2480,9 +2632,10 @@ impl NetWorld {
             }
             by_lane.entry(v.lane.0).or_default().push(i);
         }
+        let pos = self.position_keys();
         let mut crashed = vec![false; self.fleet.rows.len()];
         for members in by_lane.values_mut() {
-            members.sort_by(|&a, &b| self.fleet.rows[a].position.total_cmp(&self.fleet.rows[b].position));
+            self.sort_lane_members(members, &pos);
             for w in members.windows(2) {
                 let (rear, front) = (&self.fleet.rows[w[0]], &self.fleet.rows[w[1]]);
                 let gap = front.position - rear.position - front.driver.vehicle_length;
@@ -2570,6 +2723,17 @@ impl NetWorld {
         if !crashed.iter().any(|&c| c) {
             return;
         }
+        // Record where each crash happened (world pose) before the wreck is removed, so the
+        // overlay can show a persistent map of collision hot-spots. Bounded: newest evict oldest.
+        for (i, &c) in crashed.iter().enumerate() {
+            if c {
+                let p = self.vehicle_world_pose(&self.fleet.rows[i]);
+                self.crash_sites.push([p[0] as f32, p[1] as f32]);
+            }
+        }
+        if self.crash_sites.len() > MAX_CRASH_SITES {
+            self.crash_sites.drain(..self.crash_sites.len() - MAX_CRASH_SITES);
+        }
         let mut keep = crashed.iter().map(|&c| !c);
         self.fleet.rows.retain(|_| keep.next().unwrap());
         let mut keep = crashed.iter().map(|&c| !c);
@@ -2649,6 +2813,19 @@ impl NetWorld {
         }
     }
 
+    /// Whether the lane a movement feeds into is occupied right at its entrance, so a vehicle
+    /// taking it couldn't land and must hold at the line. Shared by the stop-line gate and the
+    /// all-way-stop FIFO (which must not keep yielding to a car that itself can't move).
+    fn movement_downstream_blocked(&self, mid: MovementId, driver: &DriverConfig, nb: &Neighbors) -> bool {
+        if self.network.is_interchange_movement(mid) {
+            return false;
+        }
+        let to_lane = self.network.movement(mid).to_lane;
+        nb.lane_front
+            .get(&to_lane.0)
+            .is_some_and(|&f| self.fleet.rows[f].position < driver.vehicle_length + driver.min_gap)
+    }
+
     fn earlier_stopped_conflict(&self, i: usize, mid: MovementId, node: NodeId, nb: &Neighbors) -> bool {
         let me = &self.fleet.rows[i];
         nb.approaching.get(&self.network.intersection_key(node)).into_iter().flatten().any(|&j| {
@@ -2660,10 +2837,14 @@ impl NetWorld {
                 return false;
             }
             let stopped_earlier = o.wait_ticks > me.wait_ticks || (o.wait_ticks == me.wait_ticks && o.id < me.id);
+            // Don't keep waiting on an earlier-stopped car that can't move anyway — its own exit
+            // lane is blocked. Skipping it lets this car take its turn once its own path is clear,
+            // which breaks the all-way-stop deadlock where everyone defers to a stuck leader. The
+            // hard box-occupancy and approaching-priority gates still apply, so this stays safe.
             stopped_earlier
-                && self
-                    .intended_movement(o)
-                    .is_some_and(|o_mid| self.network.movements_conflict(mid, o_mid))
+                && self.intended_movement(o).is_some_and(|o_mid| {
+                    self.network.movements_conflict(mid, o_mid) && !self.movement_downstream_blocked(o_mid, &o.driver, nb)
+                })
         })
     }
 
@@ -2937,7 +3118,7 @@ mod tests {
             let intended: Vec<Option<MovementId>> =
                 world.fleet.rows.iter().map(|v| if v.crossing.is_some() { None } else { world.intended_movement(v) }).collect();
             for i in newly_stuck {
-                let cx = world.gather_context(i, &nb, &intended);
+                let cx = world.gather_context(i, &nb, intended[i]);
                 if cx.leader_gap < 12.0 {
                     continue; // genuinely behind a close leader — a queue, not a phantom stall
                 }
@@ -3140,7 +3321,7 @@ mod tests {
                 .collect();
             for i in 0..w.fleet.rows.len() {
                 if w.fleet.rows[i].id == 2 && w.fleet.rows[i].crossing.is_none() {
-                    worst_brake = worst_brake.min(w.gather_context(i, &nb, &intended).binding());
+                    worst_brake = worst_brake.min(w.gather_context(i, &nb, intended[i]).binding());
                 }
             }
             w.step();
@@ -3188,7 +3369,7 @@ mod tests {
                 .collect();
             for i in 0..w.fleet.rows.len() {
                 if w.fleet.rows[i].crossing.is_none() {
-                    worst_brake = worst_brake.min(w.gather_context(i, &nb, &intended).binding());
+                    worst_brake = worst_brake.min(w.gather_context(i, &nb, intended[i]).binding());
                 }
             }
             w.step();
@@ -3286,7 +3467,7 @@ mod tests {
                 .collect();
             for i in 0..w.fleet.rows.len() {
                 if w.fleet.rows[i].id == 2 && !w.fleet.rows[i].is_crossing() {
-                    worst_brake = worst_brake.min(w.gather_context(i, &nb, &intended).binding());
+                    worst_brake = worst_brake.min(w.gather_context(i, &nb, intended[i]).binding());
                 }
             }
             w.step();
@@ -3320,6 +3501,50 @@ mod tests {
         for backend in [AccelBackend::Serial, AccelBackend::Threads, AccelBackend::Gpu] {
             assert_eq!(map_collect(backend, 0, n, |i| i * i + 7), serial, "backend {backend:?}");
         }
+    }
+
+    /// The whole `Threads` step must reproduce the serial one bit-for-bit. The passes it
+    /// parallelizes — the accel gather/evaluate (fused on the CPU path), the in-lane integrate,
+    /// and the MOBIL lane-change *decision* — are order-preserving pure maps over committed
+    /// state; the front-dependent boundary landing stays serial in index order. So threading
+    /// moves only *where* the work runs, never the outcome. This is the guard for the
+    /// gather/evaluate fusion and the parallel-integrate / serial-resolve advance split. It has
+    /// teeth only under `--features parallel` (otherwise `Threads` is itself serial).
+    #[test]
+    fn threads_backend_matches_serial_bit_for_bit() {
+        use super::super::demand::{self, DemandGenerator, DemandSources};
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/peninsula.json");
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let net = super::super::map::OsmMap::from_json(&text).expect("map json").build();
+        let pairs = demand::od_pairs(&net, 0, 600, DemandSources::new(true, true));
+
+        let run = |backend: AccelBackend, cache_sort: bool| {
+            let mut world = NetWorld::new(net.clone(), cfg());
+            world.set_accel_backend(backend);
+            world.set_par_threshold(0); // engage rayon from the first car (under `parallel`)
+            world.set_cache_sort(cache_sort);
+            let mut gen = DemandGenerator::new(&world, &pairs, 0);
+            world.install_router(&gen.destinations());
+            for _ in 0..600 {
+                gen.step(&mut world, cfg().dt);
+                world.step();
+            }
+            // Exact f64 equality via the raw bits — a threading divergence is never a rounding
+            // artifact here (the arithmetic is identical), so any drift must show.
+            let fleet: Vec<(u32, u64, u64, bool, bool, usize)> = world
+                .fleet
+                .rows
+                .iter()
+                .map(|v| (v.lane.0, v.position.to_bits(), v.speed.to_bits(), v.crossing.is_some(), v.lane_change.is_some(), v.route_idx))
+                .collect();
+            (fleet, world.exited, world.leaked, world.crashed)
+        };
+        let serial = run(AccelBackend::Serial, true);
+        assert!(!serial.0.is_empty(), "the scenario must actually build a fleet to compare");
+        assert_eq!(serial, run(AccelBackend::Threads, true), "Threads must match Serial bit-for-bit");
+        // The cache-friendly sort is a pure performance option: same total order, same result.
+        assert_eq!(serial, run(AccelBackend::Serial, false), "cache-sort off must match cache-sort on");
+        assert_eq!(serial, run(AccelBackend::Threads, false), "cache-sort off under threads too");
     }
 
     #[test]
@@ -3853,6 +4078,56 @@ mod tests {
         let (a, b) = (a_cross.expect("A crosses"), b_cross.expect("B crosses"));
         assert!(a < b, "the first vehicle to stop is served first: A@{a} B@{b}");
         assert_eq!(world.crashed(), 0, "arrival-order service stays collision-free");
+    }
+
+    #[test]
+    fn all_way_stop_does_not_deadlock_when_the_first_car_is_blocked() {
+        // A stops first, but a stalled car sits at the entrance of A's exit lane, so A can't
+        // move. B, whose own exit is clear, must eventually take its turn rather than deferring
+        // to the stuck A forever — the real-world "if your lane is clear, you go" behaviour.
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, -200.0, 0.0),
+                NodeSpec { osm_id: 2, x: 0.0, y: 0.0, control: MapControl::Stop },
+                NodeSpec::uncontrolled(3, 200.0, 0.0),
+                NodeSpec::uncontrolled(4, 0.0, -200.0),
+                NodeSpec::uncontrolled(5, 0.0, 200.0),
+            ],
+            links: vec![
+                LinkSpec::oneway(1, 2, 1, 12.0), // A approach (west→east through), exits on link (2→3)
+                LinkSpec::oneway(2, 3, 1, 12.0),
+                LinkSpec::oneway(4, 2, 1, 12.0), // B approach (south→north through), exits on the clear (2→5)
+                LinkSpec::oneway(2, 5, 1, 12.0),
+            ],
+        }
+        .build();
+        let mut world = NetWorld::new(net, cfg());
+        world.install_router(&[LinkId(1), LinkId(3)]);
+        let d = DriverConfig { accel_noise: 0.0, ..DriverConfig::car() };
+        let a_lane = world.network.lanes_of(LinkId(0)).next().unwrap();
+        let a_len = world.network.lane(a_lane).length;
+        world.spawn_to_in_lane(1, a_lane, a_len - 8.0, LinkId(1), 6.0, d.clone()); // A stops first
+        // A stalled crawler parked at the entrance of A's exit link (2→3) blocks A's landing.
+        let block_lane = world.network.lanes_of(LinkId(1)).next().unwrap();
+        let stalled = DriverConfig { accel_noise: 0.0, desired_speed: 0.15, ..DriverConfig::car() };
+        world.spawn_to_in_lane(3, block_lane, 2.0, LinkId(1), 0.0, stalled);
+        let b_lane = world.network.lanes_of(LinkId(2)).next().unwrap();
+        world.spawn_to_in_lane(2, b_lane, 5.0, LinkId(3), 6.0, d); // B arrives later, exit clear
+
+        let mut b_cross = None;
+        for t in 0..500 {
+            world.step();
+            if b_cross.is_none() && world.vehicle(2).is_some_and(|v| v.is_crossing()) {
+                b_cross = Some(t);
+            }
+        }
+        // B is served promptly because it stops deferring to the blocked A. Without the fix B
+        // waits until A finally clears (only once the obstruction crawls off, ~t400), so a well-
+        // separated early bound is what gives this test teeth. The run is deterministic
+        // (`accel_noise: 0.0`), so the crossing tick is stable.
+        assert!(b_cross.is_some_and(|t| t < 250), "B takes its turn early despite the earlier-stopped A being blocked, got {b_cross:?}");
+        assert_eq!(world.crashed(), 0, "breaking the deadlock stays collision-free");
+        assert_eq!(world.leaked(), 0, "and no vehicle vanishes");
     }
 
     fn signalized_four_way() -> OsmMap {

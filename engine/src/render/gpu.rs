@@ -47,6 +47,8 @@ pub struct Renderer {
     signal_index_count: u32,
     signal_inst_buf: wgpu::Buffer,
     signal_inst_capacity: u64,
+    crash_inst_buf: wgpu::Buffer,
+    crash_inst_capacity: u64,
     density_vbuf: wgpu::Buffer,
     density_ibuf: wgpu::Buffer,
     density_vcap: u64,
@@ -219,6 +221,8 @@ async fn from_surface(
         let signal_ibuf = buffer_init(&device, "sig-i", bytemuck::cast_slice(&signal.indices), wgpu::BufferUsages::INDEX);
         let signal_inst_capacity = 256 * inst_stride;
         let signal_inst_buf = instance_buffer(&device, signal_inst_capacity);
+        let crash_inst_capacity = 256 * inst_stride;
+        let crash_inst_buf = instance_buffer(&device, crash_inst_capacity);
 
         let density_vcap = 8192 * std::mem::size_of::<StaticVertex>() as u64;
         let density_vbuf = instance_buffer(&device, density_vcap);
@@ -244,6 +248,8 @@ async fn from_surface(
             signal_index_count: signal.indices.len() as u32,
             signal_inst_buf,
             signal_inst_capacity,
+            crash_inst_buf,
+            crash_inst_capacity,
             density_vbuf,
             density_ibuf,
             density_vcap,
@@ -289,6 +295,8 @@ impl Renderer {
         count: u32,
         signals: Vec<u8>,
         signal_count: u32,
+        crashes: Vec<u8>,
+        crash_count: u32,
         density_v: Vec<f32>,
         density_i: Vec<u32>,
     ) {
@@ -311,6 +319,13 @@ impl Renderer {
                 self.signal_inst_buf = instance_buffer(&self.device, self.signal_inst_capacity);
             }
             self.queue.write_buffer(&self.signal_inst_buf, 0, &signals);
+        }
+        if !crashes.is_empty() {
+            if crashes.len() as u64 > self.crash_inst_capacity {
+                self.crash_inst_capacity = (crashes.len() as u64).next_power_of_two();
+                self.crash_inst_buf = instance_buffer(&self.device, self.crash_inst_capacity);
+            }
+            self.queue.write_buffer(&self.crash_inst_buf, 0, &crashes);
         }
         let density_count = density_i.len() as u32;
         if density_count > 0 {
@@ -387,6 +402,16 @@ impl Renderer {
                 pass.set_vertex_buffer(1, self.signal_inst_buf.slice(..));
                 pass.set_index_buffer(self.signal_ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..self.signal_index_count, 0, 0..signal_count);
+            }
+
+            // Crash markers reuse the signal emissive-square mesh (a diamond via per-instance
+            // rotation) but are drawn at every zoom — collision hot-spots stay visible fitted out.
+            if crash_count > 0 {
+                pass.set_pipeline(&self.instanced_pipeline);
+                pass.set_vertex_buffer(0, self.signal_vbuf.slice(..));
+                pass.set_vertex_buffer(1, self.crash_inst_buf.slice(..));
+                pass.set_index_buffer(self.signal_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.signal_index_count, 0, 0..crash_count);
             }
         }
         self.queue.submit([encoder.finish()]);

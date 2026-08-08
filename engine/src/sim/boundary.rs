@@ -92,9 +92,14 @@ pub fn interior_links(net: &Network) -> Vec<LinkId> {
 /// near 18; anything faster than this threshold is one of the freeways.
 pub const HIGHWAY_SPEED: f64 = 22.0;
 
-/// Whether `link` is a freeway/highway (by its posted speed).
+/// Whether `link` is a freeway/highway: an OSM `motorway`/`motorway_link` (a true freeway
+/// whatever its posted speed — the Golden Gate Bridge is signed 45 mph, below the speed
+/// cutoff, yet is US-101 mainline), or any road at or above [`HIGHWAY_SPEED`]. `trunk` is
+/// intentionally not promoted by class — in a city it's frequently a signalized surface
+/// arterial (Van Ness, 19th Ave), so it only counts here if it's actually freeway-fast.
 pub fn is_highway_link(net: &Network, link: LinkId) -> bool {
-    net.lane(net.link(link).lane_start).speed_limit >= HIGHWAY_SPEED
+    let l = net.link(link);
+    l.motorway || net.lane(l.lane_start).speed_limit >= HIGHWAY_SPEED
 }
 
 /// Entry links (leaving a gateway) that are freeways — where highway traffic
@@ -181,6 +186,27 @@ mod tests {
         assert!(is_highway_link(&net, LinkId(0)) && !is_highway_link(&net, LinkId(1)));
         assert_eq!(highway_entry_links(&net), vec![LinkId(0)], "only the freeway is a highway entry");
         assert!(highway_exit_links(&net).is_empty(), "the surface exit is not a highway exit");
+    }
+
+    #[test]
+    fn a_slow_motorway_is_a_highway_but_a_slow_trunk_is_not() {
+        // The Golden Gate Bridge is US-101 mainline (OSM `motorway`) posted 45 mph — under the
+        // speed cutoff — yet it must be a highway gateway. A city `trunk` at the same low speed
+        // (Van Ness, 19th Ave) must stay surface, so it isn't handed freeway through-traffic.
+        let motorway = |a, b| LinkSpec { road_class: "motorway".into(), ..LinkSpec::oneway(a, b, 3, 20.0) };
+        let trunk = |a, b| LinkSpec { road_class: "trunk".into(), ..LinkSpec::oneway(a, b, 3, 20.0) };
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, -400.0, 0.0),
+                NodeSpec::uncontrolled(2, 0.0, 0.0),
+                NodeSpec::uncontrolled(3, 0.0, 300.0),
+            ],
+            links: vec![motorway(1, 2), trunk(2, 3)],
+        }
+        .build();
+        assert!(is_highway_link(&net, LinkId(0)), "a slow motorway is still a highway");
+        assert!(!is_highway_link(&net, LinkId(1)), "a slow trunk stays a surface street");
+        assert_eq!(highway_entry_links(&net), vec![LinkId(0)], "the motorway gateway is a highway entry");
     }
 
     #[test]

@@ -12,7 +12,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::render::camera::Camera;
 use crate::render::interp;
-use crate::render::scene::{brake_intensity, class_color, class_dims, signal_color, signal_head_instances};
+use crate::render::scene::{brake_intensity, class_color, class_dims, crash_instance, signal_color, signal_head_instances};
 use crate::render::gpu::Renderer;
 use crate::render::{geometry, Instance, StaticMesh, StaticVertex};
 use crate::sim::clock::SimClock;
@@ -29,6 +29,13 @@ use crate::sim::network::{LinkId, Network, LANE_WIDTH};
 /// frame stops advancing the sim and renders, dropping the backlog so a heavy step
 /// degrades to slow-motion instead of locking the main thread.
 const FRAME_BUDGET_MS: f64 = 8.0;
+/// Catch-up budget (ms) when the frame budget is *off* and the camera is idle: a big batch of
+/// steps amortizes the per-frame render/marshal cost (the reason "off" runs so much faster),
+/// while still capping any single frame so it can't lock the worker for seconds.
+const IDLE_BURST_MS: f64 = 100.0;
+/// After a pan/zoom, keep advancing at the responsive `FRAME_BUDGET_MS` for this long even with
+/// the frame budget off, so a heavy catch-up batch never starves the interaction.
+const CAMERA_ACTIVE_MS: f64 = 250.0;
 /// Hard ceiling on catch-up ticks per frame. The wall-clock budget is the real
 /// limiter; this only bounds the loop if no monotonic clock is available.
 const MAX_CATCHUP_TICKS: u32 = 240;
@@ -111,6 +118,9 @@ pub struct Simulation {
     throttled: bool,
     /// `now_ms()` at the previous `advance`, for the inter-frame wall delta.
     last_advance_ms: f64,
+    /// `now_ms()` of the last camera move (pan/zoom/fit). While recent, `advance` renders at
+    /// display rate even with the frame budget off, so interaction stays smooth mid-burst.
+    last_camera_ms: f64,
     /// Rolling accumulators for the speed meter: sim- and wall-seconds since the last
     /// window flush, plus whether any backlog was dropped within it.
     speed_sim_accum: f64,
@@ -121,6 +131,8 @@ pub struct Simulation {
     /// than the selected speed. Off: run the full catch-up (to the tick ceiling) so the
     /// sim holds the selected speed and the frame rate drops instead.
     frame_budget: bool,
+    /// Whether to emit the crash-location overlay markers. Off by default.
+    show_crashes: bool,
 }
 
 #[wasm_bindgen]
@@ -169,9 +181,10 @@ impl Simulation {
             world, clock, seed: cfg.seed, demand, demand_sources, demand_rate, entry_speed_cap, camera,
             prev: PoseMap::default(), prev_lane: IntMap::default(), prev_crossing: IntMap::default(), selected: None, signal_heads,
             gpu: None, gpu_pending: None, gpu_relax: None, gpu_generation: 0, gpu_cost: Vec::new(), gpu_last: 0.0, gpu_fingerprint: 0,
-            effective_speed: 0.0, throttled: false, last_advance_ms: 0.0,
+            effective_speed: 0.0, throttled: false, last_advance_ms: 0.0, last_camera_ms: 0.0,
             speed_sim_accum: 0.0, speed_wall_accum: 0.0, speed_dropped: false,
             frame_budget: true,
+            show_crashes: false,
         }
     }
 
@@ -312,20 +325,30 @@ impl Simulation {
     /// Reset to a whole-network fit for the current viewport.
     pub fn fit(&mut self) {
         self.camera = Camera::fit_bounds(self.world.network.bounds(), self.camera.viewport, 24.0);
+        self.touch_camera();
     }
 
     /// Pan by a drag delta in canvas pixels.
     pub fn pan_pixels(&mut self, dx: f32, dy: f32) {
         self.camera.pan_pixels(dx as f64, dy as f64);
+        self.touch_camera();
     }
 
     /// Zoom by `factor` (<1 zooms in) about a canvas pixel (mouse wheel).
     pub fn zoom_at(&mut self, factor: f32, sx: f32, sy: f32) {
         self.camera.zoom_at(factor as f64, [sx as f64, sy as f64]);
+        self.touch_camera();
     }
 
     pub fn set_meters_per_pixel(&mut self, mpp: f32) {
         self.camera.meters_per_pixel = (mpp as f64).clamp(0.02, 10_000.0);
+        self.touch_camera();
+    }
+
+    /// Note that the camera just moved, so [`advance`](Self::advance) keeps rendering at display
+    /// rate for a short window afterwards — a heavy catch-up batch never starves a pan/zoom.
+    fn touch_camera(&mut self) {
+        self.last_camera_ms = now_ms();
     }
 
     pub fn meters_per_pixel(&self) -> f32 {
@@ -384,15 +407,24 @@ impl Simulation {
         let ticks = self.clock.advance(real_elapsed_secs, MAX_CATCHUP_TICKS);
         let dt = self.clock.dt();
 
+        // How long this frame may spend catching up before it renders. Frame budget on → the
+        // tight `FRAME_BUDGET_MS` (smooth 60 fps, drop the rest). Off → a big `IDLE_BURST_MS`
+        // batch that amortizes the per-frame render/marshal cost (why "off" runs so much
+        // faster), *except* for a short window after a pan/zoom, where it drops back to the
+        // tight budget so the interaction renders at display rate instead of waiting out the
+        // whole batch. Either way a single frame is bounded, so it never locks the worker.
+        let camera_active = frame_ms - self.last_camera_ms < CAMERA_ACTIVE_MS;
+        let budget = if self.frame_budget || camera_active { FRAME_BUDGET_MS } else { IDLE_BURST_MS };
+
         let mut ran = 0u32;
         if ticks > 0 {
             let loop_start = now_ms();
             while ran < ticks {
-                // Once catch-up blows the frame budget, treat this tick as the last:
-                // render the result and drop the remaining backlog so a heavy step
-                // degrades to slow-motion instead of freezing the main thread. (Always
-                // run at least one tick, hence `ran > 0`.)
-                let over_budget = self.frame_budget && ran > 0 && now_ms() - loop_start > FRAME_BUDGET_MS;
+                // Once catch-up blows the frame's budget, treat this tick as the last: render
+                // the result and drop the remaining backlog so a heavy step degrades to
+                // slow-motion instead of freezing the worker. (Always run at least one tick,
+                // hence `ran > 0`.)
+                let over_budget = ran > 0 && now_ms() - loop_start > budget;
                 let last = over_budget || ran + 1 == ticks;
                 // The render interpolates between `prev` and the post-step state, so
                 // only the snapshot taken right before the *final* committed tick is
@@ -526,6 +558,17 @@ impl Simulation {
 
     pub fn parallel_routing(&self) -> bool {
         self.world.parallel_routing()
+    }
+
+    /// Toggle the cache-friendly per-lane/per-corridor sort (a flat position-key array instead
+    /// of reading a vehicle row per comparison). On by default; a display-neutral performance
+    /// option — the simulation result is identical either way.
+    pub fn set_cache_sort(&mut self, on: bool) {
+        self.world.set_cache_sort(on);
+    }
+
+    pub fn cache_sort(&self) -> bool {
+        self.world.cache_sort()
     }
 
     /// Toggle the active-set scheduler: queued-behind-a-stopped-car vehicles skip the
@@ -771,6 +814,52 @@ impl Simulation {
 
     pub fn signal_instance_count(&self) -> u32 {
         self.signal_instance_vec().len() as u32
+    }
+
+    /// Crash-site markers as raw `Instance` bytes (empty when the overlay is off). Drawn at
+    /// every zoom, so each marker is sized in world metres to hold a constant on-screen size.
+    pub fn crash_instances(&self) -> Vec<u8> {
+        bytemuck::cast_slice(&self.crash_instance_vec()).to_vec()
+    }
+
+    pub fn crash_instance_count(&self) -> u32 {
+        self.crash_instance_vec().len() as u32
+    }
+
+    /// Toggle the crash-location overlay. Independent of the sim; purely a display option.
+    pub fn set_show_crashes(&mut self, on: bool) {
+        self.show_crashes = on;
+    }
+
+    pub fn show_crashes(&self) -> bool {
+        self.show_crashes
+    }
+
+    /// Forget the recorded crash sites — the overlay clears immediately.
+    pub fn clear_crashes(&mut self) {
+        self.world.clear_crash_sites();
+    }
+
+    fn crash_instance_vec(&self) -> Vec<Instance> {
+        if !self.show_crashes {
+            return Vec::new();
+        }
+        // Constant ~9 px marker regardless of zoom (world size = pixels · metres-per-pixel), so
+        // collision hot-spots are visible fitted to the whole city and up close alike. Culled to
+        // the viewport with a margin; the site list is already capped in the sim.
+        const CRASH_MARKER_PX: f64 = 9.0;
+        const CRASH_CULL_MARGIN_M: f64 = 60.0;
+        let mpp = self.camera.meters_per_pixel;
+        let size = (CRASH_MARKER_PX * mpp) as f32;
+        let c = self.camera.center;
+        let hx = self.camera.viewport[0] * mpp * 0.5 + CRASH_CULL_MARGIN_M;
+        let hy = self.camera.viewport[1] * mpp * 0.5 + CRASH_CULL_MARGIN_M;
+        self.world
+            .crash_sites()
+            .iter()
+            .filter(|&&p| (p[0] as f64 - c[0]).abs() <= hx && (p[1] as f64 - c[1]).abs() <= hy)
+            .map(|&p| crash_instance(p, size))
+            .collect()
     }
 
     /// Translucent per-link traffic overlay: carriageway quads tinted by live occupancy —

@@ -22,6 +22,11 @@ export type Sim = {
   render_instance_count(): number;
   signal_instances(): Uint8Array;
   signal_instance_count(): number;
+  crash_instances(): Uint8Array;
+  crash_instance_count(): number;
+  set_show_crashes(on: boolean): void;
+  show_crashes(): boolean;
+  clear_crashes(): void;
   density_vertices(): Float32Array;
   density_indices(): Uint32Array;
   set_viewport(w: number, h: number): void;
@@ -52,6 +57,8 @@ export type Sim = {
   scheduler_thread_limit(): number;
   set_parallel_routing(on: boolean): void;
   parallel_routing(): boolean;
+  set_cache_sort(on: boolean): void;
+  cache_sort(): boolean;
   set_demand_sources(highway: boolean, surface: boolean): void;
   demand_highway(): boolean;
   demand_surface(): boolean;
@@ -80,6 +87,8 @@ export type Renderer = {
     count: number,
     signals: Uint8Array,
     signalCount: number,
+    crashes: Uint8Array,
+    crashCount: number,
     densityV: Float32Array,
     densityI: Uint32Array,
   ): void;

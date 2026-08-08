@@ -92,6 +92,8 @@ export default function EngineCanvas() {
   const [congestionEngage, setCongestionEngage] = useState(0.85);
   const [sleepScheduler, setSleepScheduler] = useState(true); // on by default (see bridge assemble)
   const [smoothPlayback, setSmoothPlayback] = useState(true); // frame budget on: smooth view, sim slows under load
+  const [showCrashes, setShowCrashes] = useState(false); // crash-location overlay, off by default
+  const [cacheSort, setCacheSort] = useState(true); // cache-friendly sort, on by default (see net_world default)
   const [startSpeedMps, setStartSpeedMps] = useState(36); // ≥ every road limit ⇒ "enter at limit"
   const [units, setUnits] = useState<"mi" | "km">("mi");
   const unitsRef = useRef<"mi" | "km">("mi"); // read inside the per-frame HUD update (avoids stale closure)
@@ -689,6 +691,47 @@ export default function EngineCanvas() {
                 }}
               />
               Smooth playback
+            </label>
+            <label
+              className={styles.zoomLabel}
+              title="Cache-friendly sort: order the per-lane vehicle groups (for following, lane changes, and crash checks) against a compact position array instead of reading a full vehicle record per comparison. The simulation result is identical; this is purely a speed option. On by default — uncheck to compare."
+            >
+              <input
+                type="checkbox"
+                checked={cacheSort}
+                disabled={!ready}
+                onChange={(e) => {
+                  sessionRef.current?.applyControl({ type: "cacheSort", value: e.target.checked });
+                  setCacheSort(e.target.checked);
+                }}
+              />
+              Cache-friendly sort
+            </label>
+            <label
+              className={styles.zoomLabel}
+              title="Mark where collisions happen with a persistent amber diamond at each crash site (visible at every zoom), so you can spot problem intersections. Off by default. Use Clear to reset the markers."
+            >
+              <input
+                type="checkbox"
+                checked={showCrashes}
+                disabled={!ready}
+                onChange={(e) => {
+                  sessionRef.current?.applyControl({ type: "showCrashes", value: e.target.checked });
+                  setShowCrashes(e.target.checked);
+                }}
+              />
+              Show crashes
+              {showCrashes && (
+                <button
+                  type="button"
+                  className={styles.button}
+                  disabled={!ready}
+                  style={{ marginLeft: "0.5em" }}
+                  onClick={() => sessionRef.current?.applyControl({ type: "clearCrashes" })}
+                >
+                  Clear
+                </button>
+              )}
             </label>
             <label
               className={styles.zoomLabel}

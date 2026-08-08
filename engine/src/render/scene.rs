@@ -108,6 +108,17 @@ fn emissive(pos: [f32; 2], scale: [f32; 2], color: [f32; 3], heading: f32) -> In
     Instance { pos, prev_pos: pos, control: pos, scale, color, heading, prev_heading: heading, brake: 1.0, blinker: 0.0 }
 }
 
+/// Hazard colour of a crash-site marker — a saturated amber-orange distinct from the
+/// red/yellow/green of signals so a wreck reads unambiguously.
+pub const CRASH_COLOR: [f32; 3] = [1.0, 0.32, 0.05];
+
+/// A crash-site marker at `pos`: an emissive square rotated 45° into a diamond (so it
+/// never reads as a signal lamp), `size` metres across the diagonal. Reuses the signal
+/// emissive-square mesh; the caller sizes it in world metres to hold a constant pixel size.
+pub fn crash_instance(pos: [f32; 2], size: f32) -> Instance {
+    emissive(pos, [size, size], CRASH_COLOR, std::f32::consts::FRAC_PI_4)
+}
+
 /// A miniature signal head at `pos`, aligned to the approach `heading` — a dark
 /// housing with square lamps. A through/right head shows the three red/yellow/green
 /// squares (current state lit, others dark); a protected-left group shows a single
