@@ -158,8 +158,8 @@ impl Simulation {
     /// Load a network scraped by `tools/osm-scraper` (its JSON schema) and drive
     /// origin–destination demand across it. Requires the `import` feature.
     #[cfg(feature = "import")]
-    pub fn from_map_json(json: &str, seed: u32) -> Result<Simulation, JsValue> {
-        let map = map::OsmMap::from_json(json).map_err(|e| JsValue::from_str(&e))?;
+    pub fn from_map_json(json: &str, seed: u32, split_junctions: bool) -> Result<Simulation, JsValue> {
+        let map = map::OsmMap::from_json_opts(json, split_junctions).map_err(|e| JsValue::from_str(&e))?;
         Ok(Self::assemble(map.build(), seed))
     }
 

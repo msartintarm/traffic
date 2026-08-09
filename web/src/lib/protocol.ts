@@ -134,6 +134,7 @@ export type InitConfig = {
   scenario: string;
   compute: string; // "serial" | "threads" | "gpu"
   gpu: boolean; // GPU flow-field routing (the `?gpu=0` opt-out)
+  splitJunctions: boolean; // experimental: split large surface junctions for aligned geometry (`?split=1`)
   basePath: string;
   width: number;
   height: number;

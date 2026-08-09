@@ -287,6 +287,7 @@ export default function EngineCanvas() {
       const compute = params.get("compute") ?? "threads";
       setAccelBackend(compute);
       const gpu = new URLSearchParams(window.location.search).get("gpu") !== "0";
+      const splitJunctions = params.get("split") !== "0"; // on by default; opt out with ?split=0
       (async () => {
         // Threads need cross-origin isolation (COOP/COEP via the shim SW, which reloads once).
         // Establish it here, before the worker boots and checks `crossOriginIsolated`.
@@ -296,6 +297,7 @@ export default function EngineCanvas() {
           scenario: scenarioKey,
           compute,
           gpu,
+          splitJunctions,
           basePath: basePath(),
           width: w,
           height: h,
@@ -817,12 +819,16 @@ export default function EngineCanvas() {
  * happens *here*, before any map loads — then a card's navigation boots the scene
  * already-isolated, and the threaded wasm loads with no further reload. */
 function SplashScreen() {
+  const [splitJunctions, setSplitJunctions] = useState(true);
   useEffect(() => {
     void ensureCrossOriginIsolation();
   }, []);
   const pick = (key: string) => {
     const url = new URL(window.location.href);
     url.searchParams.set("scenario", key);
+    // Junction alignment is the default; opt out with `?split=0`. Chosen before the map loads.
+    if (splitJunctions) url.searchParams.delete("split");
+    else url.searchParams.set("split", "0");
     window.location.href = url.toString();
   };
   return (
@@ -830,6 +836,14 @@ function SplashScreen() {
       <div className={styles.splashInner}>
         <h1 className={styles.splashTitle}>Traffic</h1>
         <p className={styles.splashSubtitle}>Pick a map to simulate</p>
+        <label
+          className={styles.splashSubtitle}
+          style={{ display: "flex", alignItems: "center", gap: "0.5em", cursor: "pointer", marginBottom: "0.5em" }}
+          title="Split large divided-road junctions (e.g. Geary Blvd / Webster St) into separate, aligned nodes so the carriageways run straight through instead of fanning out. On by default; uncheck to see the original merged geometry."
+        >
+          <input type="checkbox" checked={splitJunctions} onChange={(e) => setSplitJunctions(e.target.checked)} />
+          Align large junctions
+        </label>
         <div className={styles.splashGrid}>
           {SCENARIOS.map((s) => (
             <button key={s.key} className={styles.splashCard} onClick={() => pick(s.key)}>

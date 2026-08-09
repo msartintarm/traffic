@@ -140,7 +140,7 @@ export async function startEngineSession(
         cb.onProgress(0.1 + 0.5 * f, "Downloading map…"),
       );
       cb.onProgress(0.6, "Building road network…");
-      sim = mod.Simulation.from_map_json(text, 0xc0ffee);
+      sim = mod.Simulation.from_map_json(text, 0xc0ffee, config.splitJunctions);
       mapLabel = realMap.name;
     } catch {
       sim = new mod.Simulation(0xc0ffee);

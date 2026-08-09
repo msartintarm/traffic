@@ -194,12 +194,18 @@ impl OsmMap {
     /// junction nodes joined by a short stub, collapse each cluster to its centroid,
     /// drop the now-internal stubs, and re-point the external approaches. `build`
     /// then forms a single box with one coordinated signal instead of two.
-    pub fn merge_split_intersections(&self) -> OsmMap {
+    pub fn merge_split_intersections(&self, cap_extent: bool) -> OsmMap {
         const STUB_MAX: f64 = 25.0;
         // A link this short is junction interior (a turn slot, median crossing or
         // lane-change fragment), so merge it into the junction whatever its
         // endpoints' degree or lane count — otherwise it renders as a stray nub.
         const INTERIOR_MAX: f64 = 12.0;
+        // `cap_extent` (experimental) bounds how far a merged *surface* junction may span from
+        // its centre, so a divided boulevard's carriageways stay separate and aligned instead of
+        // collapsing to one off-centre point that kinks every approach. It fixes the geometry but
+        // disrupts flow (the movement model wants complex junctions merged), so it's opt-in.
+        // Grade-separated (freeway/ramp) junctions are exempt — splitting those breaks freeways.
+        const MAX_RADIUS: f64 = 15.0;
         let pos: HashMap<i64, [f64; 2]> = self.nodes.iter().map(|n| (n.osm_id, [n.x, n.y])).collect();
         // Control by osm id, so the cluster loop looks up each member's control in O(1)
         // instead of a linear `self.nodes.iter().find` — an O(nodes²) scan (≈3 billion on a
@@ -213,13 +219,62 @@ impl OsmMap {
         let degree = |id: i64| neigh.get(&id).map_or(0, BTreeSet::len);
 
         let mut parent: HashMap<i64, i64> = self.nodes.iter().map(|n| (n.osm_id, n.osm_id)).collect();
-        for l in &self.links {
-            let d = distance(pos[&l.from_osm], pos[&l.to_osm]);
-            let junctions = degree(l.from_osm) >= 3 && degree(l.to_osm) >= 3;
-            if d < INTERIOR_MAX || (d < STUB_MAX && junctions) {
-                let (ra, rb) = (uf_find(&mut parent, l.from_osm), uf_find(&mut parent, l.to_osm));
-                if ra != rb {
+        if cap_extent {
+            // Nodes on a grade-separated road (motorway/trunk/ramp) — exempt from the cap so
+            // freeway interchanges keep merging freely.
+            let mut grade_sep: std::collections::HashSet<i64> = std::collections::HashSet::new();
+            for l in &self.links {
+                if RoadKind::from_osm(&l.road_class).is_grade_separated() {
+                    grade_sep.insert(l.from_osm);
+                    grade_sep.insert(l.to_osm);
+                }
+            }
+            // Mergeable links, shortest first with a stable tie-break so the greedy is deterministic.
+            let mut cand: Vec<(f64, i64, i64)> = self
+                .links
+                .iter()
+                .filter_map(|l| {
+                    let d = distance(pos[&l.from_osm], pos[&l.to_osm]);
+                    let junctions = degree(l.from_osm) >= 3 && degree(l.to_osm) >= 3;
+                    (d < INTERIOR_MAX || (d < STUB_MAX && junctions)).then_some((d, l.from_osm, l.to_osm))
+                })
+                .collect();
+            cand.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+            // Merge two clusters only if the union still fits within `MAX_RADIUS` of its centroid
+            // (unless a grade-separated node is involved, which merges freely).
+            let mut members: HashMap<i64, Vec<i64>> = self.nodes.iter().map(|n| (n.osm_id, vec![n.osm_id])).collect();
+            for (_, a, b) in cand {
+                let (ra, rb) = (uf_find(&mut parent, a), uf_find(&mut parent, b));
+                if ra == rb {
+                    continue;
+                }
+                let capped = !grade_sep.contains(&a) && !grade_sep.contains(&b);
+                let within = !capped || {
+                    let (ma, mb) = (&members[&ra], &members[&rb]);
+                    let n = (ma.len() + mb.len()) as f64;
+                    let (mut cx, mut cy) = (0.0, 0.0);
+                    for &m in ma.iter().chain(mb) {
+                        cx += pos[&m][0];
+                        cy += pos[&m][1];
+                    }
+                    let centre = [cx / n, cy / n];
+                    ma.iter().chain(mb).all(|&m| distance(centre, pos[&m]) <= MAX_RADIUS)
+                };
+                if within {
                     parent.insert(ra, rb);
+                    let moved = members.remove(&ra).unwrap();
+                    members.get_mut(&rb).unwrap().extend(moved);
+                }
+            }
+        } else {
+            for l in &self.links {
+                let d = distance(pos[&l.from_osm], pos[&l.to_osm]);
+                let junctions = degree(l.from_osm) >= 3 && degree(l.to_osm) >= 3;
+                if d < INTERIOR_MAX || (d < STUB_MAX && junctions) {
+                    let (ra, rb) = (uf_find(&mut parent, l.from_osm), uf_find(&mut parent, l.to_osm));
+                    if ra != rb {
+                        parent.insert(ra, rb);
+                    }
                 }
             }
         }
@@ -276,7 +331,134 @@ impl OsmMap {
             });
         }
 
-        for spec in &self.links {
+        // Cap "lane fans": a link far wider than every road it connects to isn't real capacity
+        // but an artifact — a toll plaza modelled as many lanes (the Golden Gate toll plaza is
+        // 8 lanes between 1-lane segments). Left alone it collapses 8→1 downstream and dog-piles
+        // the merge. Pull such an outlier to its neighbours' width + a small margin; a genuinely
+        // wide road (whose neighbours are also wide, e.g. a 6-lane arterial) is untouched.
+        const FAN_MARGIN: u32 = 2;
+        let mut incident: HashMap<i64, Vec<(u32, usize)>> = HashMap::new();
+        for (i, l) in self.links.iter().enumerate() {
+            incident.entry(l.from_osm).or_default().push((l.lanes, i));
+            incident.entry(l.to_osm).or_default().push((l.lanes, i));
+        }
+        let capped: Vec<u32> = self
+            .links
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let others_max = incident[&l.from_osm]
+                    .iter()
+                    .chain(&incident[&l.to_osm])
+                    .filter(|&&(_, j)| j != i)
+                    .map(|&(ln, _)| ln)
+                    .max()
+                    .unwrap_or(l.lanes);
+                l.lanes.min(others_max + FAN_MARGIN).max(1)
+            })
+            .collect();
+
+        // Fill lane "pinches" on the freeway mainline. OSM splits a motorway into segments and
+        // often drops the lane tag on some (defaulting to 1), so a wide freeway funnels through
+        // 1-lane artifacts — the Golden Gate toll approach runs 3->1->1->1->8->1->1->4. Follow
+        // each mainline link's *straightest* continuation up- and downstream (across the toll's
+        // fan-out/fan-in, which a strict single-successor chain would stop at) and take the
+        // widest segment reached on each side; a link narrower than both flanks is a wedged
+        // artifact, widened to the narrower flank. A genuine lane drop reaches nothing wider on
+        // one side, so it stays. Ramps (motorway_link) are excluded — a 1-lane ramp is real.
+        let mainline: Vec<bool> =
+            self.links.iter().map(|l| RoadKind::from_osm(&l.road_class) == RoadKind::Freeway).collect();
+        let pos: HashMap<i64, [f64; 2]> = self.nodes.iter().map(|n| (n.osm_id, [n.x, n.y])).collect();
+        let dir = |a: [f64; 2], b: [f64; 2]| {
+            let d = [b[0] - a[0], b[1] - a[1]];
+            let n = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-9);
+            [d[0] / n, d[1] / n]
+        };
+        let mut dep = vec![[0.0; 2]; self.links.len()];
+        let mut arr = vec![[0.0; 2]; self.links.len()];
+        for (i, l) in self.links.iter().enumerate() {
+            let (fp, tp) = (pos[&l.from_osm], pos[&l.to_osm]);
+            dep[i] = dir(fp, *l.geometry.first().unwrap_or(&tp));
+            arr[i] = dir(*l.geometry.last().unwrap_or(&fp), tp);
+        }
+        let mut leaving: HashMap<i64, Vec<usize>> = HashMap::new();
+        let mut arriving: HashMap<i64, Vec<usize>> = HashMap::new();
+        for (i, l) in self.links.iter().enumerate() {
+            leaving.entry(l.from_osm).or_default().push(i);
+            arriving.entry(l.to_osm).or_default().push(i);
+        }
+        // The straightest mainline continuation downstream (tnext) and upstream (tprev) of each
+        // link. Straightest, not single: at the toll's diverge/merge this stays on the mainline
+        // (a >45° turn onto a ramp is rejected) instead of dead-ending at the fan.
+        let straightest = |cands: &[usize], into: [f64; 2], reverse_of: i64, forward: bool| {
+            let mut best: Option<(f64, usize)> = None;
+            for &j in cands {
+                if !mainline[j] {
+                    continue;
+                }
+                let other = if forward { self.links[j].to_osm } else { self.links[j].from_osm };
+                if other == reverse_of {
+                    continue;
+                }
+                let out = if forward { dep[j] } else { arr[j] };
+                let d = into[0] * out[0] + into[1] * out[1];
+                if d > 0.7 && best.is_none_or(|(b, _)| d > b) {
+                    best = Some((d, j));
+                }
+            }
+            best.map(|(_, j)| j)
+        };
+        let tnext: Vec<Option<usize>> = (0..self.links.len())
+            .map(|i| {
+                if !mainline[i] {
+                    return None;
+                }
+                let l = &self.links[i];
+                straightest(leaving.get(&l.to_osm).map_or(&[][..], |v| v), arr[i], l.from_osm, true)
+            })
+            .collect();
+        let tprev: Vec<Option<usize>> = (0..self.links.len())
+            .map(|i| {
+                if !mainline[i] {
+                    return None;
+                }
+                let l = &self.links[i];
+                straightest(arriving.get(&l.from_osm).map_or(&[][..], |v| v), dep[i], l.to_osm, false)
+            })
+            .collect();
+        const MAX_HOPS: usize = 16;
+        let flank_max = |start: usize, chain: &[Option<usize>]| {
+            let (mut cur, mut m) = (start, 0u32);
+            for _ in 0..MAX_HOPS {
+                match chain[cur] {
+                    Some(n) if n != start => {
+                        m = m.max(capped[n]);
+                        cur = n;
+                    }
+                    _ => break,
+                }
+            }
+            m
+        };
+        // Only fill a *dramatic* pinch — at most half the surrounding width. A 6->5 lane drop
+        // where a ramp genuinely consumes the lane is left alone; a 3->1 collapse with no ramp
+        // to explain it (the toll) is the artifact we widen.
+        let eff_lanes: Vec<u32> = (0..self.links.len())
+            .map(|i| {
+                if !mainline[i] {
+                    return capped[i];
+                }
+                let fill = flank_max(i, &tprev).min(flank_max(i, &tnext));
+                if fill >= capped[i] * 2 {
+                    fill
+                } else {
+                    capped[i]
+                }
+            })
+            .collect();
+
+        for (li, spec) in self.links.iter().enumerate() {
+            let lanes = eff_lanes[li];
             let from = id_of[&spec.from_osm];
             let to = id_of[&spec.to_osm];
             let mut polyline = vec![net.nodes[from.idx()].position];
@@ -285,7 +467,7 @@ impl OsmMap {
             let length = polyline.windows(2).map(|w| distance(w[0], w[1])).sum();
             let link_id = LinkId(net.links.len() as u32);
             let lane_start = LaneId(net.lanes.len() as u32);
-            for i in 0..spec.lanes {
+            for i in 0..lanes {
                 net.lanes.push(Lane {
                     link: link_id,
                     index_in_link: i,
@@ -301,10 +483,10 @@ impl OsmMap {
                 from,
                 to,
                 lane_start,
-                lane_count: spec.lanes,
+                lane_count: lanes,
                 layer: spec.layer,
                 kind: RoadKind::from_osm(&spec.road_class),
-                motorway: matches!(spec.road_class.as_str(), "motorway" | "motorway_link"),
+                motorway: spec.road_class == "motorway",
             });
             net.polylines.push(polyline);
             net.link_names.push(spec.name.clone());
@@ -429,6 +611,10 @@ impl OsmMap {
                         let from_curb = (link.lane_count - 1).saturating_sub(k as u32); // 0 at the curb lane
                         (out.lane_count - 1).saturating_sub(from_curb)
                     } else {
+                        // A lane drop maps excess lanes onto the curb (the rightmost exit lane
+                        // ends and merges left — a realistic single-lane drop). The pathological
+                        // *multi*-lane drop is the toll-plaza fan, which the lane-fan cap in
+                        // `build` pulls down first, so it never reaches here as an 8→1 dog-pile.
                         (k as u32).min(out.lane_count - 1)
                     };
                     movements.push(Movement {
@@ -443,6 +629,7 @@ impl OsmMap {
             }
         }
         net.movements = movements;
+        spread_merge_feeders(&mut net);
         assign_turn_pockets(&mut net);
         net.build_interiors();
 
@@ -958,6 +1145,55 @@ fn join_pass_through(
 /// outside. Shifting the ramp end laterally by the freeway's remaining width
 /// (tapered back to its own alignment over `TRANSITION` m) makes the ramp diverge
 /// from / merge onto the curb edge, matching how the lanes are wired.
+/// Spread the feeders of a grade-separated merge across the exit link's lanes by their lateral
+/// order, so N parallel feeders — toll-booth lanes, a freeway on-ramp beside the mainline —
+/// land in N distinct lanes (left-to-right) instead of every mainline feeder independently
+/// mapping onto lane 0 (the median). That per-link `min(k, out-1)` mapping was what made the
+/// Golden Gate toll plaza's lanes all converge onto one lane. Scoped to freeway/ramp exits;
+/// surface intersections keep their turn-angle channelisation (feeders there come from different
+/// directions, where a lateral spread would be wrong).
+fn spread_merge_feeders(net: &mut Network) {
+    let mut by_exit: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (mi, m) in net.movements.iter().enumerate() {
+        by_exit.entry(net.lane(m.to_lane).link.0).or_default().push(mi);
+    }
+    for (elid, mvs) in by_exit {
+        let exit = *net.link(LinkId(elid));
+        if !exit.kind.is_grade_separated() || exit.lane_count <= 1 {
+            continue;
+        }
+        // Distinct feeder lanes converging into this exit link.
+        let mut feeders: Vec<u32> = mvs.iter().map(|&mi| net.movements[mi].from_lane.0).collect();
+        feeders.sort_unstable();
+        feeders.dedup();
+        if feeders.len() <= 1 {
+            continue; // a single feeder isn't a merge
+        }
+        // Order the feeders left→right by their lateral position at the node (their lane end
+        // projected onto the perpendicular of the exit's direction of travel).
+        let dep = net.departure_dir(LinkId(elid));
+        let right = [dep[1], -dep[0]];
+        let mut ordered: Vec<(f64, u32)> = feeders
+            .iter()
+            .map(|&fl| {
+                let p = net.lane_point(LaneId(fl), net.lane(LaneId(fl)).length);
+                (p[0] * right[0] + p[1] * right[1], fl)
+            })
+            .collect();
+        ordered.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let f = ordered.len();
+        let mut lane_of: HashMap<u32, u32> = HashMap::new();
+        for (rank, &(_, fl)) in ordered.iter().enumerate() {
+            let idx = ((rank as f64) * (exit.lane_count - 1) as f64 / (f - 1) as f64).round() as u32;
+            lane_of.insert(fl, idx);
+        }
+        for &mi in &mvs {
+            let fl = net.movements[mi].from_lane.0;
+            net.movements[mi].to_lane = LaneId(exit.lane_start.0 + lane_of[&fl]);
+        }
+    }
+}
+
 fn offset_ramps_to_curb(net: &mut Network) {
     const TRANSITION: f64 = 45.0;
     // Freeway travel direction and width at each node it touches (through-direction). A
@@ -1156,7 +1392,13 @@ impl OsmMap {
     /// simplifying spurious pass-through nodes. Requires the `import` feature.
     #[cfg(feature = "import")]
     pub fn from_json(s: &str) -> Result<OsmMap, String> {
-        Ok(json::parse(s)?.collapse_pass_through_nodes().merge_split_intersections())
+        Self::from_json_opts(s, true)
+    }
+
+    /// [`from_json`] with the experimental extent-capped junction merge (`split_junctions`):
+    /// large surface junctions stay split into aligned sub-nodes (see `merge_split_intersections`).
+    pub fn from_json_opts(s: &str, split_junctions: bool) -> Result<OsmMap, String> {
+        Ok(json::parse(s)?.collapse_pass_through_nodes().merge_split_intersections(split_junctions))
     }
 }
 
@@ -2010,6 +2252,39 @@ mod tests {
     }
 
     #[test]
+    fn mainline_lane_pinch_is_widened_but_a_ramp_drop_is_not() {
+        // OSM sometimes drops the lane tag on a mainline segment (defaulting to 1), pinching a
+        // wide freeway to a single lane between full-width segments — the Golden Gate toll
+        // approach runs 3->1->1->1->8. A wedged 1-lane artifact with no ramp to explain the
+        // drop is widened back to the through width; a modest drop where a ramp takes the lane
+        // (covered by `freeway_ramps_wire_to_the_curb_lane`) is left alone.
+        let hw = |a, b, lanes| LinkSpec { road_class: "motorway".into(), ..LinkSpec::oneway(a, b, lanes, 29.0) };
+        let ramp = |a, b, lanes| LinkSpec { road_class: "motorway_link".into(), ..LinkSpec::oneway(a, b, lanes, 25.0) };
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, 0.0, 0.0),
+                NodeSpec::uncontrolled(2, 200.0, 0.0),
+                NodeSpec::uncontrolled(3, 300.0, 0.0),
+                NodeSpec::uncontrolled(4, 500.0, 0.0),
+                NodeSpec::uncontrolled(5, 250.0, -200.0), // off-ramp exit, well clear of the mainline
+            ],
+            links: vec![
+                hw(1, 2, 3),   // 0: 3-lane freeway
+                hw(2, 3, 1),   // 1: 1-lane artifact — the lanes vanish, no ramp explains it
+                hw(3, 4, 3),   // 2: 3-lane freeway
+                ramp(2, 5, 1), // 3: a real 1-lane off-ramp diverging at node 2
+            ],
+        }
+        .build();
+        assert_eq!(
+            net.link(LinkId(1)).lane_count,
+            3,
+            "the wedged 1-lane mainline artifact is widened to the through width"
+        );
+        assert_eq!(net.link(LinkId(3)).lane_count, 1, "the real off-ramp stays one lane");
+    }
+
+    #[test]
     fn an_off_ramp_peels_off_the_freeway_curb_edge() {
         // A 6-lane freeway heading +x; its curb (right) side is -y. A diverging
         // off-ramp's start must be slid out toward that curb edge, not left sitting
@@ -2138,7 +2413,7 @@ mod tests {
 
     #[test]
     fn merge_collapses_a_split_crossing_into_one_junction() {
-        let merged = split_crossing().merge_split_intersections();
+        let merged = split_crossing().merge_split_intersections(false);
         assert_eq!(merged.nodes.len(), 5, "the two halves become one node (plus the four arm ends)");
         assert!(!merged.links.iter().any(|l| (l.from_osm, l.to_osm) == (1, 2) || (l.from_osm, l.to_osm) == (2, 1)),
             "the internal stub is dropped");
@@ -2155,7 +2430,7 @@ mod tests {
         let plan = SignalPlan { green_secs: 20.0, yellow_secs: 4.0, offset: 0.0 };
         let mut map = split_crossing();
         map.nodes[1].control = MapControl::Signal(plan); // signalize the east half only
-        let net = map.merge_split_intersections().build();
+        let net = map.merge_split_intersections(false).build();
         assert_eq!(net.programs.len(), 1, "the merged junction has a single coordinated signal program");
         assert!(!net.conflicts.is_empty(), "the merged 4-way has crossing conflict points");
     }
@@ -2163,7 +2438,7 @@ mod tests {
     #[test]
     fn merge_leaves_ordinary_blocks_untouched() {
         // Nodes a normal block apart (>STUB_MAX) are not merged.
-        let net_nodes = signalized_cross_map().merge_split_intersections();
+        let net_nodes = signalized_cross_map().merge_split_intersections(false);
         assert_eq!(net_nodes.nodes.len(), 5, "a real 100 m four-way is left alone");
     }
 

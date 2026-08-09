@@ -351,7 +351,7 @@ mod tests {
             ],
             links,
         }
-        .merge_split_intersections()
+        .merge_split_intersections(false)
         .build()
     }
 

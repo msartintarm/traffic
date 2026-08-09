@@ -103,7 +103,7 @@ export type EngineModule = {
   Simulation: {
     new (seed: number): Sim;
     scenario(name: string, seed: number): Sim;
-    from_map_json?(json: string, seed: number): Sim;
+    from_map_json?(json: string, seed: number, splitJunctions: boolean): Sim;
   };
   Renderer: {
     create(canvas: HTMLCanvasElement): Promise<Renderer>;

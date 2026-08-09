@@ -116,10 +116,11 @@ pub struct Link {
     pub layer: i32,
     /// Road class from OSM, so freeway ramps read as free-flow interchanges.
     pub kind: RoadKind,
-    /// OSM `motorway`/`motorway_link` — a true freeway regardless of posted speed, so a
-    /// slow-signed motorway (the Golden Gate Bridge, 45 mph) still counts as a highway for
-    /// boundary demand. `trunk` is deliberately excluded: in a city it's often a signalized
-    /// surface arterial (Van Ness, 19th Ave). See `boundary::is_highway_link`.
+    /// OSM `motorway` *mainline* — a true freeway regardless of posted speed, so a slow-signed
+    /// motorway (the Golden Gate Bridge, 45 mph) still counts as a highway for boundary demand.
+    /// `motorway_link` (ramps) is deliberately excluded: ramps are slow (~11 m/s) and treating
+    /// them as highway gateways floods the demand generator. `trunk` is excluded too — in a city
+    /// it's often a signalized surface arterial (Van Ness, 19th Ave). See `boundary::is_highway_link`.
     pub motorway: bool,
 }
 
