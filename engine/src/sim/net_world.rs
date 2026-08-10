@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use super::config::{DriverConfig, SimConfig};
+use super::config::{DriverConfig, SimConfig, VehicleClass};
 use super::rng::{self, Stream};
 use super::constraint::{self, LongContext, Obstacle, SpeedTarget};
 use super::congestion::{CongestionConfig, CongestionLod};
@@ -44,11 +44,19 @@ pub struct NetVehicle {
     /// destination lane (`position` rebased to the new lane's frame).
     crossing: Option<Crossing>,
     lane_change: Option<LaneChange>,
+    /// Ticks until this wreck is cleared from the road. `None` = not crashed. A
+    /// wreck holds its pose at speed 0 and blocks traffic like any stopped car
+    /// (leader chains, box occupancy) until the timer removes it.
+    wreck: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Crossing {
     movement: MovementId,
+    /// Lateral metres (right-positive) the car sat off its lane line when it hit
+    /// the boundary — a lane-change blend still in flight. Carried through the
+    /// crossing so the seam-landing blend starts from where the car actually is.
+    lat_shift: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -145,6 +153,32 @@ impl NetVehicle {
     pub fn is_crossing(&self) -> bool {
         self.crossing.is_some()
     }
+
+    /// Whether this vehicle is a crashed wreck awaiting clearance.
+    pub fn is_wrecked(&self) -> bool {
+        self.wreck.is_some()
+    }
+}
+
+/// Which detector took a vehicle off the road — the *nature* of a crash, so
+/// artifact hunting and realism tuning can tell rear-end chains from junction
+/// impacts instead of staring at one undifferentiated tally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrashKind {
+    /// A follower's front overran its corridor leader's rear (in-lane or across
+    /// a seam, tunnelling included).
+    RearEnd,
+    /// Two bodies on distinct crossing paths genuinely intersected inside a node.
+    Junction,
+}
+
+/// One crashed vehicle: where it wrecked, how, and how fast the pair was still
+/// closing at impact (a severity proxy). Bounded by [`MAX_CRASH_SITES`].
+#[derive(Clone, Copy, Debug)]
+pub struct CrashRecord {
+    pub pos: [f32; 2],
+    pub kind: CrashKind,
+    pub closing_speed: f32,
 }
 
 pub struct NetWorld {
@@ -156,10 +190,13 @@ pub struct NetWorld {
     exited: u32,
     leaked: u32,
     crashed: u32,
-    /// World positions where vehicles crashed, oldest first, capped at
-    /// [`MAX_CRASH_SITES`] (the newest evict the oldest). Accumulated for the optional
-    /// crash-location overlay; independent of the `crashed` tally.
-    crash_sites: Vec<[f32; 2]>,
+    /// Vehicles crashed per [`CrashKind`], indexed by the kind's discriminant —
+    /// the artifact-vs-realism breakdown the flat `crashed` tally can't give.
+    crashed_by: [u32; 2],
+    /// One record per crashed vehicle, oldest first, capped at [`MAX_CRASH_SITES`]
+    /// (the newest evict the oldest). Feeds the crash-location overlay and the
+    /// cause breakdown; independent of the `crashed` tally.
+    crash_log: Vec<CrashRecord>,
     /// Downstream lanes fed by more than one lane — the merge points; value is
     /// the list of feeding (from) lane ids.
     merges: HashMap<u32, Vec<u32>>,
@@ -171,6 +208,11 @@ pub struct NetWorld {
     /// (`merge_conflict`) that the synthesized sleeper contexts don't see, so the free-car
     /// path excludes it (e.g. freeway mainline lanes an on-ramp merges into).
     merge_feeder_lane: Vec<bool>,
+    /// Per-node: the id-free road rank (speed, lanes — `priority_key >> 24`) of the
+    /// *major* road at the node when the roads meeting it rank differently, else 0.
+    /// Drives [`Self::approach_must_stop`]: MUTCD assigns stop signs to the minor
+    /// street, so a node-wide `Stop` between unequal roads is a two-way stop.
+    stop_major_rank: Vec<u64>,
     /// Per-lane through-continuation: the lane a straight-through car flows onto next and
     /// the interior length to reach it. Lets car-following see a leader across segment
     /// boundaries by walking this chain, instead of losing sight of it at every node (the
@@ -186,6 +228,12 @@ pub struct NetWorld {
     /// merges, diverges, lane-drops, and at-grade nodes.
     corridor_of: Vec<u32>,
     corridor_offset: Vec<f64>,
+    /// Per-movement: a continuation seam taken by its exit link's *through approach* —
+    /// the freeway mainline at a merge, the ramp itself on a ramp-to-ramp chain. These
+    /// cross ungated like corridor seams (a freeway never brake-checks at a segment
+    /// boundary), even where a lane remap breaks the 1:1 corridor chain; every other
+    /// feeder (the merging ramp) keeps the admission gate — it yields.
+    seam_primary: Vec<bool>,
     /// Actuated signal timing (see [`SignalController`]).
     signals: SignalController,
     /// Cumulative vehicles that have entered each link (spawned onto it or
@@ -648,11 +696,12 @@ const DECISION_HORIZON: f64 = 180.0;
 const A_LAT: f64 = 3.0;
 const CURVE_LOOKAHEAD: f64 = 45.0;
 /// Maximum physical deceleration (m/s², ~0.9 g of tyre grip). IDM's interaction term is
-/// unbounded as the gap shrinks, so a car that lands a segment behind a slower leader can
-/// compute a deceleration of hundreds of m/s² — teleporting from highway speed to a dead
-/// stop in a single tick (the "cars stop on the highway" report). Clamping every applied
-/// acceleration to this bound turns that into a hard-but-physical brake spread over a few
-/// ticks; it also caps the ease-down at a segment boundary the car can't cross yet.
+/// unbounded as the gap shrinks, so an unclamped car could compute hundreds of m/s² and
+/// teleport from highway speed to a dead stop in one tick. `integrate`/`advance_crossing`
+/// clamp every applied acceleration to this bound, so an over-committed driver physically
+/// cannot always stop — which is exactly what lets reaction delay and misjudged gaps end
+/// in a detectable crash instead of a superhuman save. It also caps the ease-down at a
+/// segment boundary the car can't cross yet.
 const MAX_BRAKE_DECEL: f64 = 9.0;
 
 /// How close to a merge point a car begins cooperatively yielding to a cross-merger
@@ -683,6 +732,7 @@ const LANE_POSITION_LEAD: f64 = 8.5;
 /// Floor on that distance so a near-stopped car still starts positioning.
 const LANE_POSITION_MIN: f64 = 40.0;
 const YELLOW_RUN_SALT: u64 = 0x59_4c_57;
+const RED_RUN_SALT: u64 = 0x52_45_44;
 const LANE_CHANGE_DURATION: f64 = 2.0;
 
 /// A vehicle's decision state for the active-set scheduler. `Free` and `Frozen` are the
@@ -832,13 +882,56 @@ impl NetWorld {
             })
             .collect();
 
+        // The through approach of each link: of the links feeding it, the one that
+        // continues most directly — same road kind first (mainline over ramp), then
+        // straightest, then widest, then lowest id for determinism.
+        let mut primary: HashMap<u32, ((u8, f64, u32), u32)> = HashMap::new();
+        for m in &network.movements {
+            let fl = network.lane(m.from_lane).link;
+            let tl = network.lane(m.to_lane).link;
+            let a = network.arrival_dir(fl);
+            let b = network.departure_dir(tl);
+            let cand = (
+                ((network.link(fl).kind == network.link(tl).kind) as u8, a[0] * b[0] + a[1] * b[1], network.link(fl).lane_count),
+                fl.0,
+            );
+            let e = primary.entry(tl.0).or_insert(cand);
+            let ord = cand.0.0.cmp(&e.0.0).then(cand.0.1.total_cmp(&e.0.1)).then(cand.0.2.cmp(&e.0.2)).then(e.1.cmp(&cand.1));
+            if ord == std::cmp::Ordering::Greater {
+                *e = cand;
+            }
+        }
+        let seam_primary: Vec<bool> = (0..network.movements.len() as u32)
+            .map(|m| {
+                let mid = MovementId(m);
+                let mv = network.movement(mid);
+                let fl = network.lane(mv.from_lane).link;
+                let tl = network.lane(mv.to_lane).link;
+                network.is_continuation_seam(mid) && primary.get(&tl.0).is_some_and(|&(_, f)| f == fl.0)
+            })
+            .collect();
+
+        // Min/max road rank per node (the id-free `priority_key` prefix: speed then
+        // lanes). Where they differ, the max is the major road a stop node protects.
+        let mut node_ranks: Vec<(u64, u64)> = vec![(u64::MAX, 0); network.nodes.len()];
+        for l in &network.links {
+            let lane = network.lane(l.lane_start);
+            let rank = ((lane.speed_limit * 1000.0) as u64) << 16 | l.lane_count as u64;
+            for nd in [l.from, l.to] {
+                let e = &mut node_ranks[nd.idx()];
+                e.0 = e.0.min(rank);
+                e.1 = e.1.max(rank);
+            }
+        }
+        let stop_major_rank = node_ranks.iter().map(|&(lo, hi)| if lo < hi { hi } else { 0 }).collect();
+
         let signals = SignalController::build(&network);
         let link_entries = vec![0u32; network.links.len()];
         let junctions = Junctions::build(&network);
         let congestion = CongestionLod::new(network.links.len());
         Self {
-            network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0, crash_sites: Vec::new(),
-            merges, link_straight, merge_feeder_lane, through_next, corridor_of, corridor_offset, signals, link_entries, router: None, external_reroute: false,
+            network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0, crashed_by: [0; 2], crash_log: Vec::new(),
+            merges, link_straight, merge_feeder_lane, stop_major_rank, through_next, corridor_of, corridor_offset, seam_primary, signals, link_entries, router: None, external_reroute: false,
             route_fingerprint: 0, route_cycle_tick: 0, parallel_routing: true, cache_sort: true, junctions,
             accel_backend: AccelBackend::Serial,
             #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
@@ -919,8 +1012,15 @@ impl NetWorld {
     /// gather. The single source of truth for both the fused CPU path and the GPU path's
     /// materialized inputs.
     fn gather_input(&self, i: usize, nb: &Neighbors, cross_by_mv: &IntMap<Vec<usize>>, sleep: Sleep, intended: Option<MovementId>) -> AccelInput {
-        if self.fleet.rows[i].crossing.is_some() {
-            AccelInput::Crossing(self.crossing_accel(i, nb, cross_by_mv))
+        let veh = &self.fleet.rows[i];
+        if veh.wreck.is_some() {
+            AccelInput::Crossing(0.0) // a wreck decides nothing; integration pins it
+        } else if veh.crossing.is_some() {
+            // In-box driving carries the same throttle imperfection as the open road
+            // — the crossing kernel must not be *more* precise than the driver is
+            // everywhere else.
+            let noise = constraint::accel_noise(veh.driver.accel_noise, self.cfg.seed, veh.id, self.tick);
+            AccelInput::Crossing(self.crossing_accel(i, nb, cross_by_mv) + noise)
         } else {
             match sleep {
                 Sleep::Queued(leader) => AccelInput::Rolling(self.queue_context(i, leader)),
@@ -939,7 +1039,7 @@ impl NetWorld {
     /// car's state and committed neighbours, so it fuses into the per-car decision pass.
     fn decide_intent(&self, i: usize, sleep_on: bool, nb: &Neighbors) -> (Option<MovementId>, Sleep) {
         let v = &self.fleet.rows[i];
-        if v.crossing.is_some() {
+        if v.crossing.is_some() || v.wreck.is_some() {
             return (None, Sleep::Awake);
         }
         if sleep_on {
@@ -962,8 +1062,14 @@ impl NetWorld {
             if self.network.is_interchange_movement(mid) {
                 return false;
             }
-            let node = self.network.link(self.network.lane(self.fleet.rows[i].lane).link).to;
-            self.box_conflict(mid, node, nb) || (self.is_permissive(mid) && self.permissive_must_yield(i, mid, node, nb))
+            let veh = &self.fleet.rows[i];
+            let node = self.network.link(self.network.lane(veh.lane).link).to;
+            // The cluster-exit gate binds the *admission* too, not just the approach
+            // braking: a car that still reaches the line (creep, hot arrival) must
+            // hold there rather than enter a junction it cannot clear.
+            self.box_conflict(mid, node, nb)
+                || (self.is_permissive(mid) && self.permissive_must_yield(i, mid, node, nb))
+                || self.junction_exit_blocked(veh, mid, node, nb)
         })
     }
 
@@ -1190,7 +1296,7 @@ impl NetWorld {
         self.link_entries[self.network.lane(lane).link.idx()] += 1;
         self.fleet.push(NetVehicle {
             id, lane, position, speed, driver, route: Vec::new(), route_idx: 0, dest: None,
-            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None,
+            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None,
         });
     }
 
@@ -1201,10 +1307,11 @@ impl NetWorld {
     pub fn spawn_routed(&mut self, id: u32, route: Vec<LinkId>, speed: f64, driver: DriverConfig) -> bool {
         let Some(&first) = route.first() else { return false };
         let Some(lane) = self.entry_lane(first, driver.min_gap, id) else { return false };
+        let speed = self.safe_entry_speed(lane, speed, &driver);
         self.link_entries[first.idx()] += 1;
         self.fleet.push(NetVehicle {
             id, lane, position: 0.0, speed, driver, route, route_idx: 0, dest: None,
-            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None,
+            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None,
         });
         true
     }
@@ -1219,12 +1326,32 @@ impl NetWorld {
         // report. Excess demand waits at the gateway (metered), as it already does.
         let admit_gap = driver.min_gap + speed * driver.time_headway;
         let Some(lane) = self.entry_lane(entry_link, admit_gap, id) else { return false };
+        let speed = self.safe_entry_speed(lane, speed, &driver);
         self.link_entries[entry_link.idx()] += 1;
         self.fleet.push(NetVehicle {
             id, lane, position: 0.0, speed, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
-            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None,
+            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None,
         });
         true
+    }
+
+    /// The speed a driver actually enters `lane` with: their requested speed, capped
+    /// so that comfortable braking can settle them behind the current tail-of-queue
+    /// (`√(v_tail² + 2·b·gap)`). A driver joining a road matches the traffic they can
+    /// see — entering hot 12 m from a stopping queue is a teleport artifact, and with
+    /// braking now physically bounded it produced a stream of phantom gateway
+    /// rear-ends. A free entrance (no tail in sight) keeps the requested speed.
+    fn safe_entry_speed(&self, lane: LaneId, speed: f64, driver: &DriverConfig) -> f64 {
+        let mut tail: Option<(f64, f64)> = None; // (rear position, speed) nearest the entrance
+        for v in self.fleet.rows.iter().filter(|v| v.lane == lane && v.crossing.is_none()) {
+            let rear = v.position - v.driver.vehicle_length;
+            if tail.is_none_or(|(r, _)| rear < r) {
+                tail = Some((rear, v.speed));
+            }
+        }
+        let Some((rear, v_tail)) = tail else { return speed };
+        let gap = (rear - driver.min_gap).max(0.0);
+        speed.min((v_tail * v_tail + 2.0 * driver.comfort_decel * gap).sqrt())
     }
 
     /// Choose an entry lane on `link` whose start is clear, spreading successive
@@ -1249,7 +1376,7 @@ impl NetWorld {
         self.link_entries[self.network.lane(lane).link.idx()] += 1;
         self.fleet.push(NetVehicle {
             id, lane, position, speed, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
-            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None,
+            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None,
         });
     }
 
@@ -1271,19 +1398,38 @@ impl NetWorld {
         self.exited
     }
 
-    /// Vehicles removed from the road after a collision.
+    /// Vehicles wrecked in a collision (tallied at impact; wrecks may still be
+    /// on the road awaiting clearance).
     pub fn crashed(&self) -> u32 {
         self.crashed
     }
 
-    /// World positions of recent crashes, for the crash-location overlay.
-    pub fn crash_sites(&self) -> &[[f32; 2]] {
-        &self.crash_sites
+    /// The `crashed` tally split by [`CrashKind`]: `[rear_end, junction]`.
+    pub fn crash_counts(&self) -> [u32; 2] {
+        self.crashed_by
     }
 
-    /// Forget the recorded crash sites (the overlay clears); the `crashed` tally is untouched.
+    /// Recent crashes with their nature (kind, closing speed, position) — for the
+    /// overlay and for judging artifact vs plausible collision.
+    pub fn crash_log(&self) -> &[CrashRecord] {
+        &self.crash_log
+    }
+
+    /// Forget the recorded crash log (the overlay clears); the `crashed` tallies
+    /// are untouched.
     pub fn clear_crash_sites(&mut self) {
-        self.crash_sites.clear();
+        self.crash_log.clear();
+    }
+
+    /// Live toggle for wreck persistence: how long a crashed vehicle stays on the
+    /// road as an obstruction (0 = removed instantly, the default). Applies to
+    /// crashes from the next step on; existing wrecks keep their timers.
+    pub fn set_wreck_clear_secs(&mut self, secs: f64) {
+        self.cfg.wreck_clear_secs = secs.max(0.0);
+    }
+
+    pub fn wreck_clear_secs(&self) -> f64 {
+        self.cfg.wreck_clear_secs
     }
 
     /// Vehicles that disappeared at an interior intersection despite having a
@@ -1343,6 +1489,13 @@ impl NetWorld {
     fn is_intra_corridor(&self, mid: MovementId) -> bool {
         let m = self.network.movement(mid);
         self.corridor_of[m.from_lane.0 as usize] == self.corridor_of[m.to_lane.0 as usize]
+    }
+
+    /// A boundary crossed with no admission gate: a within-corridor seam, or a
+    /// continuation seam taken by the exit link's through approach (see
+    /// `seam_primary`). Only the landing-overrun guard applies at these.
+    fn free_flow_seam(&self, mid: MovementId) -> bool {
+        self.is_intra_corridor(mid) || self.seam_primary[mid.idx()]
     }
 
 
@@ -1503,24 +1656,69 @@ impl NetWorld {
     fn junction_exit_blocked(&self, veh: &NetVehicle, mid: MovementId, node: NodeId, nb: &Neighbors) -> bool {
         let Some(jid) = self.network.node_junction(node) else { return false };
         let mut mv = mid;
-        for _ in 0..4 {
+        // Deep enough to cross the biggest split junction's sliver chains — a walk
+        // that gives up early admits cars into a cluster whose far side is jammed.
+        for _ in 0..8 {
             let to_lane = self.network.movement(mv).to_lane;
             let to_link = self.network.lane(to_lane).link;
             if self.network.node_junction(self.network.link(to_link).to) != Some(jid) {
-                return false; // this hop leaves the junction — the car can clear it
+                // This hop leaves the junction — but the car only truly clears it if
+                // the exit street can receive its whole body, with spare-car slack:
+                // the exit queue can advance during the traversal and trap late
+                // entrants on the internal slivers for the rest of its red.
+                return nb.lane_front.get(&to_lane.0).is_some_and(|&f| {
+                    let o = &self.fleet.rows[f];
+                    let unit = veh.driver.vehicle_length + veh.driver.min_gap;
+                    o.position - o.driver.vehicle_length < self.commit_room_needed(to_lane, unit)
+                });
+            }
+            // The internal lane must have a free slot for this car — counting the
+            // crossers already in flight toward it, who are still indexed on their
+            // approach lane. Without them, several approaches admit into the same
+            // one-car internal stub in the same window, the interior overfills, and
+            // the junction's internal ring can gridlock permanently.
+            if self.internal_lane_full(to_lane, veh, nb) {
+                return true;
             }
             let Some(next) = self.intended_movement_from(veh, to_lane) else { return false };
             let onward = self.network.movement(next).to_lane;
-            let blocked = nb
-                .lane_front
-                .get(&onward.0)
-                .is_some_and(|&f| self.fleet.rows[f].position < veh.driver.vehicle_length + veh.driver.min_gap);
+            let blocked = nb.lane_front.get(&onward.0).is_some_and(|&f| {
+                let o = &self.fleet.rows[f];
+                o.position - o.driver.vehicle_length < veh.driver.vehicle_length + veh.driver.min_gap
+            });
             if blocked {
                 return true; // the far side of the internal node is occupied
             }
             mv = next;
         }
         false
+    }
+
+    /// Whether a junction-internal lane has no room for one more `veh`-sized car:
+    /// its landed occupants plus crossers currently in flight toward it fill every
+    /// `vehicle_length + min_gap` slot the lane's drivable span holds (always at
+    /// least one — internal stubs are often shorter than a car).
+    fn internal_lane_full(&self, lane: LaneId, veh: &NetVehicle, nb: &Neighbors) -> bool {
+        let unit = veh.driver.vehicle_length + veh.driver.min_gap;
+        let slots = (self.network.lane(lane).length / unit).floor().max(1.0) as usize;
+        let landed = nb
+            .by_lane
+            .get(&lane.0)
+            .map_or(0, |v| v.iter().filter(|&&i| self.fleet.rows[i].crossing.is_none()).count());
+        let entry = self.network.link(self.network.lane(lane).link).from;
+        let inbound = nb
+            .crossing_at
+            .get(&self.network.intersection_key(entry))
+            .map_or(0, |v| {
+                v.iter()
+                    .filter(|&&i| {
+                        self.fleet.rows[i]
+                            .crossing
+                            .is_some_and(|c| self.network.movement(c.movement).to_lane == lane)
+                    })
+                    .count()
+            });
+        landed + inbound >= slots
     }
 
     /// The movement from `from_lane` onto `next_link`, if one exists.
@@ -1609,6 +1807,9 @@ impl NetWorld {
         // earlier applies mutate, so two cars can't be cleared into the same gap.
         let (backend, threshold, n) = (self.active_backend(), self.par_threshold, self.fleet.rows.len());
         let decided: Vec<Option<(usize, LaneId)>> = map_collect(backend, threshold, n, |i| {
+            if self.fleet.rows[i].wreck.is_some() {
+                return None; // wrecks don't change lanes
+            }
             // Cars on a congested (queue-mode) link skip lane-change evaluation — negligible
             // movement in a jam for a costly scan.
             if self.congestion_cfg.enabled {
@@ -2057,11 +2258,15 @@ impl NetWorld {
         // crosser finishing its interior path never lands on top of a queued vehicle — it
         // holds at the far edge of the node — and, when it does land, only sheds enough
         // speed to safely follow whatever is ahead rather than braking as if it were stopped.
+        // A *departing* crosser still counts while its rear hangs over the lane it left:
+        // on a junction-internal stub shorter than a car, that tail is exactly what the
+        // next landing must not be admitted into (`position` is continuous past the lane
+        // end, so its rear is directly comparable).
         let mut front: IntMap<f64> = IntMap::default();
         let mut front_speed: IntMap<f64> = IntMap::default();
         for v in &self.fleet.rows {
-            if v.crossing.is_none() && v.position < self.network.lane(v.lane).length {
-                let rear = v.position - v.driver.vehicle_length;
+            let rear = v.position - v.driver.vehicle_length;
+            if rear < self.network.lane(v.lane).length {
                 let e = front.entry(v.lane.0).or_insert(f64::MAX);
                 if rear < *e {
                     *e = rear;
@@ -2084,6 +2289,10 @@ impl NetWorld {
         let deferred: Vec<bool> = {
             let this: &NetWorld = self;
             let integrate_one = |veh: &mut NetVehicle, a: f64, intended: Option<MovementId>| -> bool {
+                if veh.wreck.is_some() {
+                    veh.speed = 0.0; // a wreck holds its pose; no boundary to resolve
+                    return false;
+                }
                 veh.crossing.is_some() || this.integrate_in_lane(veh, a, dt, intended)
             };
             #[cfg(feature = "parallel")]
@@ -2103,29 +2312,87 @@ impl NetWorld {
             out
         };
 
+        // Slot occupancy of junction-internal lanes: landed cars plus crossers in
+        // flight toward each, in one combined count per lane. Admission into a
+        // junction interior is then capacity-checked race-free in the serial pass —
+        // several approaches can no longer commit crossers toward the same one-car
+        // internal stub before the first lands, which stranded the extras mid-box
+        // (a permanent `box_conflict` for everyone else) and let a big split
+        // junction's internal ring gridlock for good.
+        let mut interior_occ: IntMap<u32> = IntMap::default();
+        for v in taken.iter() {
+            let lane = match v.crossing {
+                Some(c) => self.network.movement(c.movement).to_lane,
+                None => v.lane,
+            };
+            if self.junction_internal_lane(lane) {
+                *interior_occ.entry(lane.0).or_insert(0) += 1;
+            }
+        }
+
+        // In-flight reservations per receiving lane (metres of entrance space each
+        // unlanded crosser will consume). Admission subtracts them, so two approaches
+        // can no longer bank on the *same* room in different ticks — the double-booking
+        // that stranded the loser mid-box behind a tail that materialized while it
+        // crossed. Free-flow seams are exempt (corridor following spaces those).
+        let mut inbound: IntMap<f64> = IntMap::default();
+        for v in taken.iter() {
+            if let Some(c) = v.crossing {
+                if !self.free_flow_seam(c.movement) {
+                    let to_lane = self.network.movement(c.movement).to_lane;
+                    *inbound.entry(to_lane.0).or_insert(0.0) += v.driver.vehicle_length + v.driver.min_gap;
+                }
+            }
+        }
+
         // Phase 5b — resolve the deferred cars serially in index order, so the shared `front`
         // occupancy evolves exactly as a single-threaded pass would (independent cars never
         // touch it, so skipping them here is invisible to `front`). Each car's fate is recorded;
-        // an undeferred car simply stayed in its lane (`Alive`).
+        // an undeferred car simply stayed in its lane (`Alive`). `entered_at` accumulates the
+        // at-grade movements committed earlier in this same pass, closing the same-tick
+        // double-entry race the pre-step box gate can't see.
+        let mut entered_at: IntMap<Vec<MovementId>> = IntMap::default();
         let mut fates: Vec<Fate> = Vec::with_capacity(n);
         for i in 0..n {
             let fate = if !deferred[i] {
                 Fate::Alive
             } else if taken[i].crossing.is_some() {
-                self.advance_crossing(&mut taken[i], accels[i], dt, &mut front, &mut front_speed)
+                self.advance_crossing(&mut taken[i], accels[i], dt, &mut front, &mut front_speed, &mut inbound)
             } else {
-                self.resolve_boundary(&mut taken[i], dt, &mut front, &mut front_speed, block_entry[i], intended_mv[i])
+                self.resolve_boundary(&mut taken[i], dt, &mut front, &mut front_speed, block_entry[i], intended_mv[i], &mut interior_occ, &mut entered_at, &mut inbound)
             };
             fates.push(fate);
         }
+        prof.lap(5);
+
+        // Crash detection on the fully-advanced positions, before assembly drops any row
+        // (indices still align with the pre-step fleet and `nb`).
+        let crashes = self.detect_crashes(&taken, &fates, &nb);
 
         // Assembly — apply each fate's bookkeeping and keep/drop in index order, identical to
-        // the former single-pass loop.
+        // the former single-pass loop; freshly crashed cars become wrecks (or are cleared
+        // instantly when `wreck_clear_secs` is zero) and existing wrecks count down.
+        let wreck_ticks = (self.cfg.wreck_clear_secs / dt).ceil().clamp(0.0, u16::MAX as f64) as u16;
         let mut rows = Vec::with_capacity(n);
         let mut hist = Vec::with_capacity(n);
         let mut hist_len = Vec::with_capacity(n);
         let mut exited = 0u32;
-        for (((mut veh, fate), mut h), mut hl) in taken.into_iter().zip(fates).zip(taken_h).zip(taken_hl) {
+        for ((((mut veh, fate), mut h), mut hl), hit) in
+            taken.into_iter().zip(fates).zip(taken_h).zip(taken_hl).zip(crashes)
+        {
+            if let Some((kind, closing)) = hit {
+                self.record_crash(&veh, kind, closing);
+                if wreck_ticks == 0 {
+                    continue;
+                }
+                veh.wreck = Some(wreck_ticks);
+                veh.speed = 0.0;
+            } else if let Some(t) = veh.wreck {
+                if t <= 1 {
+                    continue; // wreck cleared; already tallied at impact
+                }
+                veh.wreck = Some(t - 1);
+            }
             let keep = match fate {
                 Fate::Alive => {
                     veh.wait_ticks = if veh.speed < 0.5 { veh.wait_ticks + 1 } else { 0 };
@@ -2161,10 +2428,6 @@ impl NetWorld {
         self.fleet.hist = hist;
         self.fleet.hist_len = hist_len;
         self.exited += exited;
-        prof.lap(5);
-        self.remove_crashes();
-        self.remove_conflict_crashes();
-        self.remove_overlap_crashes();
         prof.lap(6);
         self.time += dt;
         self.tick += 1;
@@ -2175,14 +2438,15 @@ impl NetWorld {
     /// entered a new link, or left the network.
     /// Advance a vehicle already crossing a node interior. Touches the shared `front`/
     /// `front_speed` occupancy (via [`land_or_hold`]), so it runs serially.
-    fn advance_crossing(&self, veh: &mut NetVehicle, accel: f64, dt: f64, front: &mut IntMap<f64>, front_speed: &mut IntMap<f64>) -> Fate {
+    fn advance_crossing(&self, veh: &mut NetVehicle, accel: f64, dt: f64, front: &mut IntMap<f64>, front_speed: &mut IntMap<f64>, inbound: &mut IntMap<f64>) -> Fate {
         // Position keeps counting past the from-lane's end; the interior arc is
         // that overrun. The car flows through the node as one continuous move,
         // advanced exactly as before (semi-implicit: step by the post-accel speed)
-        // so the in-node conflict-avoidance margins are unchanged.
-        veh.speed = (veh.speed + accel * dt).max(0.0);
+        // so the in-node conflict-avoidance margins are unchanged. The same grip
+        // bound as `integrate` applies: in-box avoidance cannot brake beyond physics.
+        veh.speed = (veh.speed + accel.max(-MAX_BRAKE_DECEL) * dt).max(0.0);
         veh.position += veh.speed * dt;
-        self.land_or_hold(veh, front, front_speed, dt)
+        self.land_or_hold(veh, front, front_speed, dt, inbound)
     }
 
     /// Integrate a non-crossing vehicle's longitudinal state (and lane-change progress and
@@ -2200,10 +2464,11 @@ impl NetWorld {
         }
         let lane = *self.network.lane(veh.lane);
         let node = self.network.link(lane.link).to;
-        let must_stop_here = matches!(self.network.node(node).control, NodeControl::Stop)
+        let must_stop_here = (matches!(self.network.node(node).control, NodeControl::Stop)
+            && self.approach_must_stop(lane.link, node))
             || intended.is_some_and(|mid| self.is_rtor(mid));
         if must_stop_here
-            && veh.speed < 0.3
+            && veh.speed < Self::stop_roll_speed(&veh.driver)
             && (lane.length - veh.position) < veh.driver.vehicle_length + veh.driver.min_gap + 1.0
         {
             veh.stopped_at = Some(node);
@@ -2211,10 +2476,32 @@ impl NetWorld {
         veh.position >= lane.length
     }
 
+    /// Whether `lane` lies on a junction-internal link (both endpoints inside one
+    /// junction cluster) — the crossing pavement of a big merged intersection.
+    fn junction_internal_lane(&self, lane: LaneId) -> bool {
+        let l = self.network.link(self.network.lane(lane).link);
+        let j = self.network.node_junction(l.from);
+        j.is_some() && j == self.network.node_junction(l.to)
+    }
+
+    /// Whether a junction-internal receiving lane still has a free `veh`-sized slot
+    /// under the combined landed + in-flight count. Non-internal lanes always have
+    /// room here (the ordinary entrance gate covers them).
+    fn interior_has_room(&self, mid: MovementId, veh: &NetVehicle, occ: &IntMap<u32>) -> bool {
+        let to_lane = self.network.movement(mid).to_lane;
+        if !self.junction_internal_lane(to_lane) {
+            return true;
+        }
+        let unit = veh.driver.vehicle_length + veh.driver.min_gap;
+        let slots = (self.network.lane(to_lane).length / unit).floor().max(1.0) as u32;
+        occ.get(&to_lane.0).copied().unwrap_or(0) < slots
+    }
+
     /// Resolve a non-crossing vehicle that reached its lane end: enter the node interior,
     /// hold at the line, exit, or leak. Reads/writes the shared `front`/`front_speed`
-    /// occupancy (admission gate + landing), so it runs serially after the parallel integrate.
-    fn resolve_boundary(&self, veh: &mut NetVehicle, dt: f64, front: &mut IntMap<f64>, front_speed: &mut IntMap<f64>, block_entry: bool, intended: Option<MovementId>) -> Fate {
+    /// occupancy (admission gate + landing) and the junction-interior slot counts, so it
+    /// runs serially after the parallel integrate.
+    fn resolve_boundary(&self, veh: &mut NetVehicle, dt: f64, front: &mut IntMap<f64>, front_speed: &mut IntMap<f64>, block_entry: bool, intended: Option<MovementId>, interior_occ: &mut IntMap<u32>, entered_at: &mut IntMap<Vec<MovementId>>, inbound: &mut IntMap<f64>) -> Fate {
         let lane = *self.network.lane(veh.lane);
         let node = self.network.link(lane.link).to;
         // Reached the stop line. A sleeping car carries no intended movement (the
@@ -2223,26 +2510,82 @@ impl NetWorld {
         // seam and actually arrive here — resolve its hop on the fly so it crosses
         // normally instead of being mistaken for a car that vanished at the node.
         let intended = intended.or_else(|| self.intended_movement(veh));
-        // A within-corridor seam (a grade-separated 1:1 continuation) is not a junction —
-        // cross it with no gate at all, so the freeway never stalls a car at a segment
+        // A free-flow seam (a within-corridor continuation, or any continuation seam
+        // taken by the exit link's through approach) is not a junction — cross it with
+        // no gate at all, so the freeway never stalls a car at a segment
         // boundary. At a real junction, enter only when the movement is served (green/yellow)
         // *and* the receiving lane can accept the vehicle — don't block the box, so a
         // spillback holds at the line rather than stalling inside the node.
+        // A car already inside a multi-node junction (its link is cluster-internal)
+        // was admitted at the cluster boundary: it commits through the interior
+        // nodes' signals rather than stopping at a red on a few metres of box
+        // pavement. Occupancy gates (receiving lane, interior slots) still apply.
+        let internal_commit = self.junction_internal_lane(veh.lane);
         match intended {
             Some(mid)
-                if self.is_intra_corridor(mid)
-                    || ((self.movement_state(mid) != SignalState::Red
-                        || (self.is_rtor(mid) && veh.stopped_at == Some(node)))
-                        && self.receiving_lane_clear(mid, front, veh.driver.min_gap)
-                        && !block_entry) =>
+                if {
+                    // A car reaching the line so fast that even maximum braking would
+                    // carry it well into the box (over ~2 m of encroachment) cannot
+                    // physically hold there. It is committed — the dilemma-zone
+                    // overrun — and the in-box conflict avoidance plus the body-
+                    // overlap detector decide what happens, instead of an omniscient
+                    // gate teleport-stopping it at the paint. A slow roll-past still
+                    // pins (a bumper over the line, as real drivers do). Spillback
+                    // gates stay hard: a full receiving lane was visible all the way
+                    // in, so ordinary braking already held the car short.
+                    let committed = veh.speed * veh.speed > 2.0 * MAX_BRAKE_DECEL * 2.0;
+                    let signal_ok = self.movement_state(mid) != SignalState::Red
+                        || internal_commit
+                        || (self.is_rtor(mid) && veh.stopped_at == Some(node))
+                        || self.runs_red(veh, node);
+                    let conflict_free = !block_entry && !self.entered_conflicting(mid, node, entered_at);
+                    // Don't-block-the-box, in full: commit into the interior only when the
+                    // receiving lane has room for this *whole vehicle* past the box —
+                    // net of the space every crosser already in flight toward it will
+                    // consume — not merely a bumper's clearance at the entrance.
+                    // Entering on 2 m of space (or on room another approach's crosser
+                    // was about to take) parked cars mid-box behind spillback tails for
+                    // minutes. Landing itself (already committed) needs only the bumper gap.
+                    self.free_flow_seam(mid)
+                        || (((signal_ok && conflict_free) || committed)
+                            && self.receiving_room(mid, veh, front, inbound)
+                            && self.interior_has_room(mid, veh, interior_occ))
+                } =>
             {
                 // Enter the interior but keep `position` continuous — it already
                 // counts past `lane.length`, and that overrun is the interior arc.
                 // Land in this same tick if it already overran the whole interior (a
                 // node shorter than one step), so it never dwells with a clamped pose.
-                veh.crossing = Some(Crossing { movement: mid });
+                let lat_shift = veh.lane_change.as_ref().map_or(0.0, |lc| {
+                    let own = self.network.lane_offset_at(&lane, 0.0);
+                    let from = self.network.lane_offset_at(self.network.lane(lc.from), 0.0);
+                    (1.0 - lc.progress.clamp(0.0, 1.0)) * (from - own)
+                });
+                // The car leaves its lane and is now in flight toward the movement's
+                // receiver: move its interior slot accounting accordingly (landing
+                // later is count-neutral — in-flight becomes landed on the same lane).
+                if self.junction_internal_lane(veh.lane) {
+                    if let Some(c) = interior_occ.get_mut(&veh.lane.0) {
+                        *c = c.saturating_sub(1);
+                    }
+                }
+                let to_lane = self.network.movement(mid).to_lane;
+                if self.junction_internal_lane(to_lane) {
+                    *interior_occ.entry(to_lane.0).or_insert(0) += 1;
+                }
+                // Register this at-grade commitment so a later car in this same serial
+                // pass can't accept the same box on a conflicting movement, and reserve
+                // the entrance space this body will consume on the receiving lane
+                // (free-flow seams have no cross traffic and skip the bookkeeping).
+                if !self.free_flow_seam(mid) {
+                    if !self.network.is_interchange_movement(mid) {
+                        entered_at.entry(self.network.intersection_key(node)).or_default().push(mid);
+                    }
+                    *inbound.entry(to_lane.0).or_insert(0.0) += veh.driver.vehicle_length + veh.driver.min_gap;
+                }
+                veh.crossing = Some(Crossing { movement: mid, lat_shift });
                 veh.lane_change = None;
-                self.land_or_hold(veh, front, front_speed, dt)
+                self.land_or_hold(veh, front, front_speed, dt, inbound)
             }
             Some(_) => {
                 veh.position = lane.length;
@@ -2262,7 +2605,7 @@ impl NetWorld {
     /// otherwise stay in the interior — or hold at its far edge when the exit is blocked.
     /// Called both while crossing and the instant a car enters at a boundary, so a node
     /// shorter than one step is entered and cleared in the same tick.
-    fn land_or_hold(&self, veh: &mut NetVehicle, front: &mut IntMap<f64>, front_speed: &mut IntMap<f64>, dt: f64) -> Fate {
+    fn land_or_hold(&self, veh: &mut NetVehicle, front: &mut IntMap<f64>, front_speed: &mut IntMap<f64>, dt: f64, inbound: &mut IntMap<f64>) -> Fate {
         let c = veh.crossing.unwrap();
         let it = *self.network.interior(c.movement);
         let lane_len = self.network.lane(veh.lane).length;
@@ -2271,27 +2614,32 @@ impl NetWorld {
             return Fate::Alive;
         }
         // Reached the far edge: land on the destination lane. A real junction holds at the
-        // far edge whenever the entrance is occupied (don't rear-end onto a queue). A within-
-        // corridor seam has no admission gate — corridor following already spaced the car —
-        // but a discrete landing can still overrun the car ahead by a hair, so hold only in
-        // that last-resort case (would land *inside* it), which corridor following makes rare.
+        // far edge whenever the entrance is occupied (don't rear-end onto a queue), and —
+        // like a free-flow seam — also when the discrete landing overrun would put the car
+        // *inside* the occupant ahead (a fast crosser can overrun metres in one tick).
         let to_lane = self.network.movement(c.movement).to_lane;
         let land_pos = (s - it.len).min(self.network.lane(to_lane).length);
-        let blocked = if self.is_intra_corridor(c.movement) {
-            front.get(&to_lane.0).is_some_and(|&rear| land_pos > rear - veh.driver.min_gap)
-        } else {
-            !self.receiving_lane_clear(c.movement, front, veh.driver.min_gap)
-        };
+        let overrun = front.get(&to_lane.0).is_some_and(|&rear| land_pos > rear - veh.driver.min_gap);
+        let blocked = overrun
+            || (!self.free_flow_seam(c.movement) && !self.receiving_lane_clear(c.movement, front, veh.driver.min_gap));
         if blocked {
             veh.position = lane_len + it.len;
             veh.speed = (veh.speed - MAX_BRAKE_DECEL * dt).max(0.0);
             return Fate::Alive;
+        }
+        // Landed: the in-flight reservation converts into real occupancy (the `front`
+        // update below), so release it for the approaches still deciding.
+        if !self.free_flow_seam(c.movement) {
+            if let Some(r) = inbound.get_mut(&to_lane.0) {
+                *r = (*r - (veh.driver.vehicle_length + veh.driver.min_gap)).max(0.0);
+            }
         }
         veh.crossing = None;
         veh.lane = to_lane;
         // Rebase the overrun into the new lane's frame (never skip a whole sub-tick segment).
         veh.position = land_pos;
         veh.stopped_at = None;
+        veh.lane_change = self.seam_landing_blend(c.movement, c.lat_shift);
         // Land no faster than the car can safely follow whatever is already on the new
         // lane: braking at the physical max, it must not out-run the leader's own speed.
         // The safe landing speed is `sqrt(v_lead^2 + 2*b*gap)` — for a *stopped* leader this
@@ -2316,6 +2664,40 @@ impl NetWorld {
         Fate::Entered(to_link)
     }
 
+    /// The pose blend a car lands with after a continuation seam whose movement put it
+    /// on a different lateral line than it arrived on. `from` is the new link's lane
+    /// nearest the geometric arrival point (shifted by any blend still in flight at the
+    /// boundary) and `progress` the arrival's fraction of the way from that lane to the
+    /// target, so the pose is continuous at the seam and eases over at the standard
+    /// lane-change rate — a lane remap reads as a normal merge, never a sideways snap.
+    fn seam_landing_blend(&self, mid: MovementId, lat_shift: f64) -> Option<LaneChange> {
+        if !self.network.is_continuation_seam(mid) {
+            return None;
+        }
+        let mv = self.network.movement(mid);
+        let link = *self.network.link(self.network.lane(mv.to_lane).link);
+        if link.lane_count <= 1 {
+            return None;
+        }
+        let it = self.network.interior(mid);
+        let arr = self.network.arrival_dir(self.network.lane(mv.from_lane).link);
+        let p = [it.exit[0] + arr[1] * lat_shift, it.exit[1] - arr[0] * lat_shift];
+        let d2 = |l: LaneId| {
+            let q = self.network.lane_point(l, 0.0);
+            (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2)
+        };
+        let from = (0..link.lane_count)
+            .map(|i| LaneId(link.lane_start.0 + i))
+            .filter(|&l| l != mv.to_lane)
+            .min_by(|&a, &b| d2(a).total_cmp(&d2(b)))?;
+        let a = self.network.lane_point(from, 0.0);
+        let b = self.network.lane_point(mv.to_lane, 0.0);
+        let ab = [b[0] - a[0], b[1] - a[1]];
+        let len2 = (ab[0] * ab[0] + ab[1] * ab[1]).max(1e-9);
+        let t = (((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / len2).clamp(0.0, 1.0);
+        (t < 0.97).then_some(LaneChange { from, progress: t })
+    }
+
     /// Whether the vehicle still has an onward hop it hasn't taken — a routed next
     /// link or an unfinished explicit route. Used to tell a genuine exit from a leak.
     fn still_has_a_route(&self, veh: &NetVehicle, from: LinkId) -> bool {
@@ -2330,6 +2712,29 @@ impl NetWorld {
     fn receiving_lane_clear(&self, mid: MovementId, front: &IntMap<f64>, min_gap: f64) -> bool {
         let to_lane = self.network.movement(mid).to_lane;
         front.get(&to_lane.0).is_none_or(|&rear| rear >= min_gap)
+    }
+
+    /// The entrance space a car needs on a receiving lane before committing into the
+    /// box in front of it: its own body + gap, plus a second body's worth of slack —
+    /// the queue on the far side can advance during the multi-second box traversal
+    /// and trap the car inside, so a driver waits for clearly-more-than-one-car room
+    /// (capped so a short exit lane can still ever be entered).
+    fn commit_room_needed(&self, to_lane: LaneId, unit: f64) -> f64 {
+        unit + unit.min((self.network.lane(to_lane).length - unit).max(0.0))
+    }
+
+    /// Whether the receiving lane can take this *whole vehicle* past the box, net of
+    /// the space already promised to crossers in flight toward it. An empty lane with
+    /// no reservations always can (even a stub shorter than the body — the car lands
+    /// and straddles, and the occupancy map holds followers off it).
+    fn receiving_room(&self, mid: MovementId, veh: &NetVehicle, front: &IntMap<f64>, inbound: &IntMap<f64>) -> bool {
+        let to_lane = self.network.movement(mid).to_lane;
+        let unit = veh.driver.vehicle_length + veh.driver.min_gap;
+        let reserved = inbound.get(&to_lane.0).copied().unwrap_or(0.0);
+        match front.get(&to_lane.0) {
+            Some(&rear) => rear - reserved >= self.commit_room_needed(to_lane, unit),
+            None => reserved <= 0.0 || self.network.lane(to_lane).length - reserved >= unit,
+        }
     }
 
     /// IDM acceleration for a vehicle traversing a node interior: capped to the
@@ -2349,15 +2754,18 @@ impl NetWorld {
         let control = self.network.node(node).control;
         let to_line = (lane.length - veh.position).max(0.05);
 
-        // Perceive the leader as of `reaction_time` ago, but cap the gap by the true
-        // current gap so IDM can never under-brake (collision-free in-lane); the
-        // delay only adds start-up lag.
+        // Human perception of the leader (Treiber's human-driver formulation): the
+        // driver's last *observation* of the leader is `reaction_time` old, and they
+        // extrapolate it forward at its observed speed; their own position is always
+        // current. A stopped or steady leader is therefore perceived exactly (no
+        // phantom braking), but for `reaction_time` after a leader starts braking
+        // the driver still acts on the old speed — under-braking that, with the
+        // applied deceleration clamped to `MAX_BRAKE_DECEL`, can genuinely rear-end.
+        // That is the physical crash mechanism, deliberately no longer floored away
+        // by the true current gap.
         let leader = if let Some(li) = nb.leader_of[i] {
             let lead = &self.fleet.rows[li];
             let delay = (driver.reaction_time / dt).round() as usize;
-            // The leader chain spans the corridor, so the true gap is the corridor-coordinate
-            // gap — correct whether the leader shares this lane or is a segment ahead.
-            let current_gap = self.corridor_gap(veh, lead);
             // The reaction-delay lookup only makes sense for a same-lane leader whose delayed
             // position is in this frame; across a corridor seam (different lane, or either car
             // mid-crossing) fall back to the true current gap so the delayed read never
@@ -2368,12 +2776,15 @@ impl NetWorld {
                 && self.fleet.settled(i, delay)
                 && self.fleet.settled(li, delay)
             {
-                let (my_p, _) = self.fleet.delayed(i, delay);
                 let (lead_p, lead_v) = self.fleet.delayed(li, delay);
-                let gap = (lead_p - my_p - lead.driver.vehicle_length).min(current_gap);
+                let ahead = lead_p + lead_v * (delay as f64 * dt);
+                let gap = ahead - veh.position - lead.driver.vehicle_length;
                 Some(Obstacle { gap, speed: lead_v })
             } else {
-                let ob = Obstacle { gap: current_gap, speed: lead.speed };
+                // The leader chain spans the corridor, so the true gap is the corridor-
+                // coordinate gap — correct whether the leader shares this lane or is a
+                // segment ahead.
+                let ob = Obstacle { gap: self.corridor_gap(veh, lead), speed: lead.speed };
                 // A corridor leader a *segment ahead* (a different lane in the same grade-
                 // separated 1:1 chain): the gap is continuous, but at the instant of a seam
                 // hand-off it can momentarily collapse below the physical stopping gap. Cap it
@@ -2451,13 +2862,14 @@ impl NetWorld {
             let j = self.network.node_junction(from);
             j.is_some() && j == self.network.node_junction(node)
         };
-        // Signal: red always stops; yellow stops only if the vehicle can brake
-        // comfortably before the line (dilemma zone) — otherwise it proceeds and
-        // clears on yellow.
+        // Signal: red stops (unless this driver is blind to this light — the rare
+        // distraction that runs it outright); yellow stops only if the vehicle can
+        // brake comfortably before the line (dilemma zone) — otherwise it proceeds
+        // and clears on yellow.
         let signal_stop = !on_internal_link
             && intended.is_some_and(|mid| match self.movement_state(mid) {
                 SignalState::Green => veh.speed < 2.0 && self.signal_green_elapsed(mid) < driver.reaction_time,
-                SignalState::Red => !self.is_rtor(mid),
+                SignalState::Red => !self.is_rtor(mid) && !self.runs_red(veh, node),
                 SignalState::Yellow => {
                     let committed = veh.speed > 3.0 && to_line < veh.speed * 3.0;
                     let runs_it = committed
@@ -2484,7 +2896,7 @@ impl NetWorld {
 
         let rtor = intended.is_some_and(|mid| self.is_rtor(mid));
         let stop_sign = (!on_internal_link
-            && (matches!(control, NodeControl::Stop) || rtor)
+            && ((matches!(control, NodeControl::Stop) && self.approach_must_stop(lane.link, node)) || rtor)
             && veh.stopped_at != Some(node))
         .then_some(to_line);
 
@@ -2619,128 +3031,122 @@ impl NetWorld {
         accel
     }
 
-    /// Detect rear-end overlaps within a lane (a follower's front past the
-    /// leader's rear) and take the crashed vehicles off the road, counting them.
-    /// Reaction delay makes this physically possible; behaviour should minimize
-    /// it over time. Crashes are resolved deterministically (scan by position).
-    fn remove_crashes(&mut self) {
+    /// Detect this tick's collisions on the fully-advanced positions, before assembly
+    /// drops any row (`taken`/`fates` are index-aligned with the pre-step fleet and
+    /// `nb`). Returns, per vehicle, the crash it was in and the pair's closing speed.
+    ///
+    /// Two ground-truth checks, no tolerance bands:
+    /// - **Rear-end**: sweep the pre-step corridor leader chain — a follower whose
+    ///   front passed its leader's rear collided, including a full pass-through in
+    ///   one tick (the re-sorted order the old scan used made tunnelling invisible)
+    ///   and overlaps across a segment seam (the chain spans the corridor). Reaction
+    ///   delay plus the physical brake clamp is what makes these reachable.
+    /// - **Junction**: exact oriented-body intersection between co-node crossers on
+    ///   distinct paths — what makes running a red or misjudging a gap actually
+    ///   crash. Cost is Σ k² over nodes with k = that node's simultaneous crossers;
+    ///   nothing scans the network-wide conflict list.
+    ///
+    /// A live car hitting an existing wreck is a fresh crash for the live car only;
+    /// wreck–wreck contact in a pileup is not re-counted.
+    fn detect_crashes(&self, taken: &[NetVehicle], fates: &[Fate], nb: &Neighbors) -> Vec<Option<(CrashKind, f32)>> {
         const OVERLAP_TOL: f64 = 0.5;
-        let mut by_lane: IntMap<Vec<usize>> = IntMap::default();
-        for (i, v) in self.fleet.rows.iter().enumerate() {
-            if v.crossing.is_some() {
-                continue; // crossers are pinned at the line; handled by conflict crashes
-            }
-            by_lane.entry(v.lane.0).or_default().push(i);
-        }
-        let pos = self.position_keys();
-        let mut crashed = vec![false; self.fleet.rows.len()];
-        for members in by_lane.values_mut() {
-            self.sort_lane_members(members, &pos);
-            for w in members.windows(2) {
-                let (rear, front) = (&self.fleet.rows[w[0]], &self.fleet.rows[w[1]]);
-                let gap = front.position - rear.position - front.driver.vehicle_length;
-                if gap < -OVERLAP_TOL {
-                    crashed[w[0]] = true;
-                    crashed[w[1]] = true;
-                }
-            }
-        }
-        self.take_crashed(crashed);
-    }
+        let mut hit: Vec<Option<(CrashKind, f32)>> = vec![None; taken.len()];
+        let on_road = |i: usize| matches!(fates[i], Fate::Alive | Fate::Entered(_));
 
-    /// Detect collisions inside intersections: two vehicles traversing different
-    /// movements that both occupy a precomputed conflict point this tick. This is
-    /// what makes running a red/misjudging a gap actually crash. Cost is linear —
-    /// only vehicles currently crossing are indexed, against static conflicts.
-    fn remove_conflict_crashes(&mut self) {
-        const CROSS_TOL: f64 = 3.0;
-        let mut at: IntMap<Vec<(usize, f64)>> = IntMap::default();
-        for (i, v) in self.fleet.rows.iter().enumerate() {
-            if let Some(c) = v.crossing {
-                at.entry(c.movement.0).or_default().push((i, self.crossing_arc(v)));
+        for i in 0..taken.len() {
+            let Some(li) = nb.leader_of[i] else { continue };
+            if !on_road(i) || !on_road(li) || taken[i].wreck.is_some() {
+                continue;
             }
-        }
-        if at.is_empty() {
-            return;
-        }
-        let mut crashed = vec![false; self.fleet.rows.len()];
-        for cp in &self.network.conflicts {
-            let (Some(a), Some(b)) = (at.get(&cp.a.0), at.get(&cp.b.0)) else { continue };
-            for &(i, sa) in a {
-                if (sa - cp.sa).abs() >= CROSS_TOL {
+            let (f, l) = (&taken[i], &taken[li]);
+            // The chain was built per corridor; a leader that has since landed on a
+            // different corridor left this coordinate frame (the landing gates kept
+            // the entrance clear behind it).
+            if self.corridor_of[f.lane.0 as usize] != self.corridor_of[l.lane.0 as usize] {
+                continue;
+            }
+            // Two in-node crossers share the scalar coordinate only on the *same*
+            // interior path; on movements fanning out from one lane the arcs diverge
+            // in the world, so an arc "overlap" there is not a touch (their genuine
+            // collisions are the body-overlap detector's concern).
+            if let (Some(cf), Some(cl)) = (f.crossing, l.crossing) {
+                if cf.movement != cl.movement {
                     continue;
                 }
-                for &(j, sb) in b {
-                    if (sb - cp.sb).abs() < CROSS_TOL {
-                        crashed[i] = true;
-                        crashed[j] = true;
-                    }
+            }
+            if self.corridor_gap(f, l) < -OVERLAP_TOL {
+                let closing = (f.speed - l.speed).abs() as f32;
+                if std::env::var_os("CRASH_DEBUG").is_some() {
+                    eprintln!(
+                        "RE tick={} gap={:.2} f=(id{} lane{} pos{:.1} v{:.1} cross{} fate{:?}) l=(id{} lane{} pos{:.1} v{:.1} cross{} wreck{})",
+                        self.tick,
+                        self.corridor_gap(f, l),
+                        f.id, f.lane.0, f.position, f.speed, f.crossing.is_some(), matches!(fates[i], Fate::Entered(_)),
+                        l.id, l.lane.0, l.position, l.speed, l.crossing.is_some(), l.wreck.is_some(),
+                    );
+                }
+                hit[i] = Some((CrashKind::RearEnd, closing));
+                if l.wreck.is_none() {
+                    hit[li] = Some((CrashKind::RearEnd, closing));
                 }
             }
         }
-        self.take_crashed(crashed);
-    }
 
-    /// General in-box collision detection: any two vehicles traversing the *same
-    /// node* on *different* movements whose actual bodies overlap have collided —
-    /// a real-time check on true positions, catching overlaps the precomputed
-    /// conflict points miss (e.g. where merged geometry runs two paths together).
-    /// Pruned to co-node crossers (collision-imminent only), so cost is the sum
-    /// over nodes of k² with k = that node's handful of simultaneous crossers.
-    fn remove_overlap_crashes(&mut self) {
-        // (index, world position, heading, from-link, to-link)
-        let mut by_node: IntMap<Vec<(usize, [f64; 2], f64, u32, u32)>> = IntMap::default();
-        for (i, v) in self.fleet.rows.iter().enumerate() {
+        let mut by_node: IntMap<Vec<usize>> = IntMap::default();
+        for (i, v) in taken.iter().enumerate() {
             if let Some(c) = v.crossing {
-                let mv = self.network.movement(c.movement);
-                let p = self.vehicle_world_pose(v);
-                let (from_link, to_link) = (self.network.lane(mv.from_lane).link.0, self.network.lane(mv.to_lane).link.0);
-                by_node.entry(mv.node.0).or_default().push((i, [p[0], p[1]], p[2], from_link, to_link));
+                if on_road(i) {
+                    let node = self.network.movement(c.movement).node;
+                    by_node.entry(self.network.intersection_key(node)).or_default().push(i);
+                }
             }
         }
-        let mut crashed = vec![false; self.fleet.rows.len()];
         for group in by_node.values() {
             for a in 0..group.len() {
                 for b in a + 1..group.len() {
-                    let ((i, pi, hi, fi, ti), (j, pj, hj, fj, tj)) = (group[a], group[b]);
-                    // Mirror the conflict builder: same approach fans out and same
-                    // exit merges — both run parallel/zipper, not a crossing.
-                    if fi == fj || ti == tj {
+                    let (i, j) = (group[a], group[b]);
+                    let (vi, vj) = (&taken[i], &taken[j]);
+                    if vi.wreck.is_some() && vj.wreck.is_some() {
                         continue;
                     }
-                    if crossing_overlap(pi, hi, pj, hj) {
-                        crashed[i] = true;
-                        crashed[j] = true;
+                    let (idi, idj) = (vi.crossing.unwrap().movement, vj.crossing.unwrap().movement);
+                    // Only conflict-graph pairs can collide: the interior Béziers are
+                    // schematic, so non-conflicting paths (opposing lefts, shallow
+                    // near-parallel passes) may legitimately graze in the compressed
+                    // box the way real offset paths don't — that's geometry, not a
+                    // collision. Same-approach fan-outs and same-exit zippers are
+                    // excluded by the same rule (the builder never pairs them).
+                    if !self.network.movements_conflict(idi, idj) {
+                        continue;
+                    }
+                    let (pi, pj) = (self.vehicle_world_pose(vi), self.vehicle_world_pose(vj));
+                    let width = |v: &NetVehicle| VehicleClass::from_length(v.driver.vehicle_length).width();
+                    if body_overlap(pi, vi.driver.vehicle_length, width(vi), pj, vj.driver.vehicle_length, width(vj)) {
+                        let closing = (vi.speed.max(vj.speed)) as f32;
+                        if vi.wreck.is_none() {
+                            hit[i] = Some((CrashKind::Junction, closing));
+                        }
+                        if vj.wreck.is_none() {
+                            hit[j] = Some((CrashKind::Junction, closing));
+                        }
                     }
                 }
             }
         }
-        self.take_crashed(crashed);
+        hit
     }
 
-    /// Remove the flagged vehicles (compacting every column) and count the crashes.
-    fn take_crashed(&mut self, crashed: Vec<bool>) {
-        if !crashed.iter().any(|&c| c) {
-            return;
+    /// Tally one crashed vehicle and append its bounded log record (kind, closing
+    /// speed, world position) for the overlay and the cause breakdown.
+    fn record_crash(&mut self, veh: &NetVehicle, kind: CrashKind, closing_speed: f32) {
+        let p = self.vehicle_world_pose(veh);
+        self.crash_log.push(CrashRecord { pos: [p[0] as f32, p[1] as f32], kind, closing_speed });
+        if self.crash_log.len() > MAX_CRASH_SITES {
+            let excess = self.crash_log.len() - MAX_CRASH_SITES;
+            self.crash_log.drain(..excess);
         }
-        // Record where each crash happened (world pose) before the wreck is removed, so the
-        // overlay can show a persistent map of collision hot-spots. Bounded: newest evict oldest.
-        for (i, &c) in crashed.iter().enumerate() {
-            if c {
-                let p = self.vehicle_world_pose(&self.fleet.rows[i]);
-                self.crash_sites.push([p[0] as f32, p[1] as f32]);
-            }
-        }
-        if self.crash_sites.len() > MAX_CRASH_SITES {
-            self.crash_sites.drain(..self.crash_sites.len() - MAX_CRASH_SITES);
-        }
-        let mut keep = crashed.iter().map(|&c| !c);
-        self.fleet.rows.retain(|_| keep.next().unwrap());
-        let mut keep = crashed.iter().map(|&c| !c);
-        self.fleet.hist.retain(|_| keep.next().unwrap());
-        let mut keep = crashed.iter().map(|&c| !c);
-        self.fleet.hist_len.retain(|_| keep.next().unwrap());
-        self.crashed += crashed.iter().filter(|&&c| c).count() as u32;
+        self.crashed += 1;
+        self.crashed_by[kind as usize] += 1;
     }
 
     /// Whether `mid`'s interior path conflicts with a vehicle already crossing
@@ -2789,6 +3195,58 @@ impl NetWorld {
             && self.movement_state(mid) == SignalState::Red
     }
 
+    /// Whether this approach faces a stop line at a stop-controlled node. MUTCD
+    /// assigns stop signs to the *minor* street: where the roads meeting the node
+    /// rank differently (speed, lanes), the top-rank road is the arterial the
+    /// control protects — its approaches flow through (a two-way stop) and only
+    /// the lower-rank approaches stop. Uniform ranks are a genuine all-way stop.
+    /// Without this, a node-wide `Stop` full-stopped a 35 mph arterial at every
+    /// side street, and the all-way FIFO's capacity gridlocked the corridor.
+    fn approach_must_stop(&self, link: LinkId, node: NodeId) -> bool {
+        match self.stop_major_rank[node.idx()] {
+            0 => true,
+            major => self.priority_key(link) >> 24 < major,
+        }
+    }
+
+    /// The speed below which this driver treats a stop sign as served. Observed
+    /// compliance is famously partial — across observational studies a minority
+    /// of drivers come to a complete stop at clear stop signs; most roll through
+    /// at a walking pace (the "California stop"). Cautious drivers still plant
+    /// the wheel; the aggressive end rolls at up to ~1.3 m/s (3 mph). Yielding to
+    /// actual traffic is unaffected — the priority gates hold regardless.
+    fn stop_roll_speed(driver: &DriverConfig) -> f64 {
+        let aggression = ((driver.desired_speed / 30.0 - 0.85) / 0.30).clamp(0.0, 1.0);
+        0.3 + aggression
+    }
+
+    /// Whether this driver is blind to `node`'s signal — the rare distraction that
+    /// runs a red outright. Decided once per vehicle–node pair (a stateless hash),
+    /// so the stop-line constraint and the boundary admission agree, and scaled by
+    /// the same speed appetite that drives yellow-running. The box-occupancy gates
+    /// still apply: the driver misses the light, not the cars in front of it.
+    fn runs_red(&self, veh: &NetVehicle, node: NodeId) -> bool {
+        if self.cfg.red_run_prob <= 0.0 {
+            return false;
+        }
+        let aggression = ((veh.driver.desired_speed / 30.0 - 0.85) / 0.30).clamp(0.0, 1.0);
+        let p = self.cfg.red_run_prob * (0.5 + aggression);
+        rng::uniform01(self.cfg.seed, veh.id, RED_RUN_SALT ^ node.0 as u64, Stream::GapAcceptance) < p
+    }
+
+    /// Whether a conflicting movement at `node`'s intersection was already committed
+    /// by an earlier car in this tick's serial boundary pass. The pre-step
+    /// `box_conflict` gate can't see same-tick entries, so without this two cars on
+    /// conflicting approaches could accept the same box simultaneously — a crash
+    /// rate set by the tick length rather than by driver gap acceptance.
+    fn entered_conflicting(&self, mid: MovementId, node: NodeId, entered_at: &IntMap<Vec<MovementId>>) -> bool {
+        entered_at
+            .get(&self.network.intersection_key(node))
+            .into_iter()
+            .flatten()
+            .any(|&o| self.network.movements_conflict(mid, o))
+    }
+
     fn left_is_permissive(&self, mid: MovementId) -> bool {
         let node = self.network.movement(mid).node;
         self.junctions.conflict_ids(node).iter().any(|&ci| {
@@ -2821,9 +3279,13 @@ impl NetWorld {
             return false;
         }
         let to_lane = self.network.movement(mid).to_lane;
-        nb.lane_front
-            .get(&to_lane.0)
-            .is_some_and(|&f| self.fleet.rows[f].position < driver.vehicle_length + driver.min_gap)
+        nb.lane_front.get(&to_lane.0).is_some_and(|&f| {
+            let o = &self.fleet.rows[f];
+            // Occupant *rear* vs the room this whole vehicle needs to clear the box —
+            // mirrors the serial admission gate, spare-car slack included.
+            let unit = driver.vehicle_length + driver.min_gap;
+            o.position - o.driver.vehicle_length < self.commit_room_needed(to_lane, unit)
+        })
     }
 
     fn earlier_stopped_conflict(&self, i: usize, mid: MovementId, node: NodeId, nb: &Neighbors) -> bool {
@@ -2946,7 +3408,8 @@ impl NetWorld {
             if from == veh.lane.0 {
                 continue;
             }
-            let from_kind = self.network.link(self.network.lane(LaneId(from)).link).kind;
+            let from_link = self.network.lane(LaneId(from)).link;
+            let from_kind = self.network.link(from_link).kind;
             for &j in nb.by_lane.get(&from).into_iter().flatten() {
                 let o = &self.fleet.rows[j];
                 if o.speed < 0.5 {
@@ -2955,12 +3418,26 @@ impl NetWorld {
                 let o_dist = self.network.lane(o.lane).length - o.position;
                 // Right-of-way at the merge: an on-ramp yields to the mainline it joins,
                 // never the reverse — mainline through-traffic must not brake for a
-                // merger (the phantom highway stops). Between equal roads (a lane drop,
-                // ramp-to-ramp) the car closer to the merge point has priority.
+                // merger (the phantom highway stops). A higher-priority road (faster,
+                // wider) likewise never cooperatively yields to a minor-approach merger:
+                // the minor faces the give-way, the major holds speed — without this a
+                // through car on the major brake-checked for a car creeping at a yield
+                // triangle, collapsing its speed until the minor "legitimately" took the
+                // gap. Only between genuinely equal roads (a lane drop, ramp-to-ramp)
+                // does the car closer to the merge point go first.
                 let yield_to_o = match (my_kind, from_kind) {
                     (RoadKind::Freeway, RoadKind::Ramp) => false,
                     (RoadKind::Ramp, RoadKind::Freeway) => true,
-                    _ => o_dist < my_dist,
+                    _ => {
+                        // Rank = the id-free prefix of the priority key (speed, lanes).
+                        let my_link = self.network.lane(veh.lane).link;
+                        let (my_rank, o_rank) = (self.priority_key(my_link) >> 24, self.priority_key(from_link) >> 24);
+                        if my_rank != o_rank {
+                            o_rank > my_rank
+                        } else {
+                            o_dist < my_dist
+                        }
+                    }
                 };
                 if !yield_to_o {
                     continue;
@@ -3032,19 +3509,28 @@ fn yellow_run_prob(driver: &DriverConfig) -> f64 {
     (0.08 + aggression * 1.5).clamp(0.0, 0.35)
 }
 
-/// Whether two crossing vehicles' bodies genuinely collide. A collision is a
-/// *crossing* — near-perpendicular headings within [`OVERLAP`] of each other. Two
-/// vehicles running roughly parallel or anti-parallel (e.g. opposing protected
-/// lefts diverging to opposite corners, or offset oncoming through lanes) are
-/// passing, not colliding, even when their bodies momentarily come close.
-fn crossing_overlap(pi: [f64; 2], hi: f64, pj: [f64; 2], hj: f64) -> bool {
-    // Centre distance below which two ~2 m-wide bodies genuinely overlap;
-    // conservative once vehicle length is accounted for.
-    const OVERLAP: f64 = 2.4;
-    if (hi - hj).cos().abs() > 0.7 {
-        return false;
+/// Whether two vehicle bodies genuinely intersect. Each body is the oriented
+/// rectangle behind its pose (`[x, y, heading]` at the *front bumper*), `len` long
+/// and `width` wide; the test is the exact separating-axis check on the two
+/// rectangles. Ground truth replaces the old centre-distance + heading heuristics,
+/// which missed strikes into a body's rear half and flagged close parallel passes.
+fn body_overlap(pa: [f64; 3], la: f64, wa: f64, pb: [f64; 3], lb: f64, wb: f64) -> bool {
+    let dot = |p: [f64; 2], q: [f64; 2]| p[0] * q[0] + p[1] * q[1];
+    let ua = [pa[2].cos(), pa[2].sin()];
+    let va = [-ua[1], ua[0]];
+    let ub = [pb[2].cos(), pb[2].sin()];
+    let vb = [-ub[1], ub[0]];
+    let ca = [pa[0] - ua[0] * la * 0.5, pa[1] - ua[1] * la * 0.5];
+    let cb = [pb[0] - ub[0] * lb * 0.5, pb[1] - ub[1] * lb * 0.5];
+    let d = [cb[0] - ca[0], cb[1] - ca[1]];
+    for axis in [ua, va, ub, vb] {
+        let ra = la * 0.5 * dot(ua, axis).abs() + wa * 0.5 * dot(va, axis).abs();
+        let rb = lb * 0.5 * dot(ub, axis).abs() + wb * 0.5 * dot(vb, axis).abs();
+        if dot(d, axis).abs() > ra + rb {
+            return false;
+        }
     }
-    (pi[0] - pj[0]).hypot(pi[1] - pj[1]) < OVERLAP
+    true
 }
 
 /// The gap a driver will accept, shrinking from `base` as `waited` grows
@@ -3062,6 +3548,10 @@ fn idm_follow(follower: &NetVehicle, lane_speed_limit: f64, pos: f64, speed: f64
 }
 
 fn integrate(v: &mut NetVehicle, accel: f64, dt: f64) {
+    // Grip bound: IDM's interaction term is unbounded as the gap shrinks, but a real
+    // car cannot shed speed faster than [`MAX_BRAKE_DECEL`]. Anything the fold demands
+    // beyond it is a crash for the detector to find, not a teleport-stop.
+    let accel = accel.max(-MAX_BRAKE_DECEL);
     if v.speed + accel * dt < 0.0 {
         v.position += -0.5 * v.speed * v.speed / accel;
         v.speed = 0.0;
@@ -3076,6 +3566,7 @@ mod tests {
     use super::super::boundary;
     use super::super::map::*;
     use super::super::network::{LaneId, LinkId};
+    use super::super::rush_hour::SurfaceClass;
     use super::*;
 
 
@@ -3300,13 +3791,13 @@ mod tests {
         let mut w = NetWorld::new(net, cfg());
         w.install_router(&[LinkId(4)]); // everyone bound for the last segment
         // Two cars queued nose-to-tail across a segment boundary: the leader has just
-        // crossed onto the short overpass segment (barely past its start) while the follower
-        // sits right at the boundary a link back. In continuous road coordinates the leader's
-        // body reaches back across the seam into the follower's space, so the cross-boundary
-        // gap is deeply negative — the exact state that produced the ~-2000 m/s^2 slam.
+        // crossed onto the short overpass segment while the follower sits right at the
+        // boundary a link back, the continuous-coordinate gap between them a hair above
+        // zero — the state whose floored (0.05 m) gap fed IDM the ~-2000 m/s^2 slam.
+        // (The bodies must not overlap: an overlap is now a detected rear-end crash.)
         let crawl = DriverConfig { desired_speed: 2.0, ..DriverConfig::car() };
         let lead_lane = w.network.lanes_of(LinkId(2)).next().unwrap();
-        w.spawn_to_in_lane(1, lead_lane, 0.5, LinkId(4), 0.3, crawl);
+        w.spawn_to_in_lane(1, lead_lane, 4.3, LinkId(4), 0.3, crawl);
         let chase_lane = w.network.lanes_of(LinkId(1)).next().unwrap();
         let chase_len = w.network.lane(chase_lane).length;
         w.spawn_to_in_lane(2, chase_lane, chase_len - 1.0, LinkId(4), 0.3, crawl);
@@ -3488,6 +3979,157 @@ mod tests {
 
     fn cfg() -> SimConfig {
         SimConfig::default_config()
+    }
+
+    /// Behavioral regression for the "cars stop in the middle of complex
+    /// intersections" report (El Camino Real × Millbrae Avenue): drive boundary
+    /// demand through the real junction fixture and require that no vehicle sits
+    /// stationary inside the junction footprint for longer than a signal phase.
+    /// Brief in-box waits are real (a left-turner yielding, spillback backpressure);
+    /// camping there was the broken-setback artifact.
+    #[cfg(feature = "import")]
+    #[test]
+    #[ignore] // diagnostic: categorize stopped-in-box car-time; run with -- --ignored
+    fn diag_where_cars_stop_inside_boxes() {
+        use super::super::demand::{self, DemandGenerator};
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let net = super::super::map::OsmMap::from_json(&text).expect("map json").build();
+        let mut world = NetWorld::new(net, cfg());
+        let pairs = demand::od_pairs(&world.network, 0, 600, super::super::demand::DemandSources::new(true, true));
+        let mut gen = DemandGenerator::new(&world, &pairs, 0);
+        world.install_router(&gen.destinations());
+        if std::env::var_os("DIAG_RUSH").is_some() { gen.set_rush_hour(&world.network, true); }
+        let dt = cfg().dt;
+        // car-seconds stopped, per category
+        let (mut far_edge, mut mid_interior, mut internal_lane) = (0.0f64, 0.0f64, 0.0f64);
+        let mut worst: std::collections::HashMap<u32, (f64, &'static str)> = Default::default();
+        let mut streak: std::collections::HashMap<u32, f64> = Default::default();
+        for _ in 0..1500 {
+            gen.step(&mut world, dt);
+            world.step();
+            let mut still: std::collections::HashMap<u32, f64> = Default::default();
+            for v in world.vehicles() {
+                if v.speed >= 0.3 {
+                    continue;
+                }
+                let cat = if let Some(c) = v.crossing {
+                    let arc = world.crossing_arc(v);
+                    let len = world.network.interior(c.movement).len;
+                    if arc >= len - 0.3 {
+                        far_edge += dt;
+                        "far_edge"
+                    } else {
+                        mid_interior += dt;
+                        "mid_interior"
+                    }
+                } else if world.junction_internal_lane(v.lane) {
+                    internal_lane += dt;
+                    "internal_lane"
+                } else {
+                    continue;
+                };
+                let t = streak.get(&v.id).copied().unwrap_or(0.0) + dt;
+                still.insert(v.id, t);
+                let w = worst.entry(v.id).or_insert((0.0, cat));
+                if t > w.0 {
+                    *w = (t, cat);
+                }
+                if (t - 30.0).abs() < dt / 2.0 {
+                    if let Some(c) = v.crossing {
+                        let mv = world.network.movement(c.movement);
+                        let to_lane = mv.to_lane;
+                        let tail = world
+                            .fleet
+                            .rows
+                            .iter()
+                            .filter(|o| o.lane == to_lane && o.crossing.is_none())
+                            .map(|o| (o.position - o.driver.vehicle_length, o.speed))
+                            .fold(None::<(f64, f64)>, |m, r| Some(m.map_or(r, |m| if r.0 < m.0 { r } else { m })));
+                        let co_crossers = world
+                            .fleet
+                            .rows
+                            .iter()
+                            .filter(|o| o.crossing.is_some_and(|oc| world.network.movement(oc.movement).node == mv.node))
+                            .count();
+                        eprintln!(
+                            "CAMP id{} mv{} node{} arc {:.1}/{:.1} to_lane{} tail {:?} co-crossers {} internal_to {}",
+                            v.id, c.movement.0, mv.node.0,
+                            world.crossing_arc(v), world.network.interior(c.movement).len,
+                            to_lane.0, tail, co_crossers,
+                            world.junction_internal_lane(to_lane),
+                        );
+                    } else {
+                        let nb = world.neighbors();
+                        let gates = world.intended_movement(v).map(|mid| {
+                            let node = world.downstream_node(v.lane);
+                            let i = world.fleet.rows.iter().position(|o| o.id == v.id).unwrap();
+                            let front: IntMap<f64> = Default::default();
+                            (
+                                mid.0,
+                                world.movement_state(mid),
+                                world.box_conflict(mid, node, &nb),
+                                world.junction_exit_blocked(v, mid, node, &nb),
+                                world.movement_downstream_blocked(mid, &v.driver, &nb),
+                                world.box_entry_blocked(i, Some(mid), &nb),
+                                front.len(),
+                            )
+                        });
+                        eprintln!(
+                            "CAMP id{} internal lane{} pos {:.1} len {:.1} gates {:?}",
+                            v.id, v.lane.0, v.position, world.network.lane(v.lane).length, gates
+                        );
+                    }
+                }
+            }
+            streak = still;
+        }
+        let mut tops: Vec<(u32, f64, &str)> = worst.iter().map(|(&id, &(t, c))| (id, t, c)).collect();
+        tops.sort_by(|a, b| b.1.total_cmp(&a.1));
+        eprintln!("in-box stopped car-seconds: far_edge {far_edge:.0}, mid_interior {mid_interior:.0}, internal_lane {internal_lane:.0}");
+        eprintln!("cars with any in-box stop: {}", worst.len());
+        for (id, t, c) in tops.iter().take(12) {
+            eprintln!("  id{id}: {t:.1}s stopped ({c})");
+        }
+    }
+
+    #[test]
+    fn traffic_does_not_camp_inside_the_complex_junction() {
+        use super::super::demand::{self, DemandGenerator};
+        let net = super::super::map::millbrae_junction(0);
+        let mut world = NetWorld::new(net, cfg());
+        let pairs = demand::boundary_od_pairs(&world.network, 9, 8);
+        assert!(!pairs.is_empty(), "the fixture's clipped arms are gateways");
+        let mut gen = DemandGenerator::new(&world, &pairs, 9);
+        world.install_router(&gen.destinations());
+        gen.set_rate_scale(0.5);
+
+        let dt = cfg().dt;
+        let mut stopped_for: std::collections::HashMap<u32, f64> = Default::default();
+        let mut worst = 0.0f64;
+        for _ in 0..3000 {
+            gen.step(&mut world, dt);
+            world.step();
+            // "Inside the box" = physically on junction pavement: mid-crossing in a
+            // node interior, or on a cluster-internal link. A car at a boundary stop
+            // line is at the edge by construction — waiting out a red there is fine.
+            let mut still: std::collections::HashMap<u32, f64> = Default::default();
+            for v in world.vehicles() {
+                let in_box = v.is_crossing() || world.junction_internal_lane(v.lane);
+                if v.speed < 0.3 && in_box {
+                    let t = stopped_for.get(&v.id).copied().unwrap_or(0.0) + dt;
+                    worst = worst.max(t);
+                    still.insert(v.id, t);
+                }
+            }
+            stopped_for = still;
+        }
+        assert!(world.exited() > 20, "traffic actually flows through the junction: {}", world.exited());
+        assert!(
+            worst < 30.0,
+            "a vehicle camped stationary inside the junction box for {worst:.0} s — \
+             stop lines belong at the box edge, not within it",
+        );
     }
 
     #[test]
@@ -4011,31 +4653,45 @@ mod tests {
     }
 
     #[test]
-    fn a_vehicle_fully_stops_at_a_stop_sign_then_proceeds() {
-        let net = OsmMap {
-            nodes: vec![
-                NodeSpec::uncontrolled(1, 0.0, 0.0),
-                NodeSpec { osm_id: 2, x: 150.0, y: 0.0, control: MapControl::Stop },
-                NodeSpec::uncontrolled(3, 300.0, 0.0),
-            ],
-            links: vec![LinkSpec::oneway(1, 2, 1, 15.0), LinkSpec::oneway(2, 3, 1, 15.0)],
-        }
-        .build();
-        let approach = net.lanes_of(LinkId(0)).next().unwrap();
-        let mut world = NetWorld::new(net, cfg());
-        world.spawn(1, approach, 0.0, 14.0, DriverConfig::car());
-
-        let mut min_speed_on_approach = f64::MAX;
-        for _ in 0..250 {
-            world.step();
-            if let Some(v) = world.vehicle(1) {
-                if v.lane == approach {
-                    min_speed_on_approach = min_speed_on_approach.min(v.speed);
+    fn a_vehicle_serves_a_clear_stop_sign_with_at_most_a_rolling_stop() {
+        // Observed stop-sign compliance is famously partial: with no conflicting
+        // traffic, most drivers roll through at a walking pace and only the
+        // cautious end plants the wheel. The sign still binds — every driver
+        // brakes to at most the ~3 mph roll — and then proceeds.
+        let stop_line_net = || {
+            OsmMap {
+                nodes: vec![
+                    NodeSpec::uncontrolled(1, 0.0, 0.0),
+                    NodeSpec { osm_id: 2, x: 150.0, y: 0.0, control: MapControl::Stop },
+                    NodeSpec::uncontrolled(3, 300.0, 0.0),
+                ],
+                links: vec![LinkSpec::oneway(1, 2, 1, 15.0), LinkSpec::oneway(2, 3, 1, 15.0)],
+            }
+            .build()
+        };
+        // (driver, the roll speed the sign is served at)
+        let cautious = DriverConfig { desired_speed: 25.0, ..DriverConfig::car() }; // aggression 0 → full stop
+        let default = DriverConfig::car(); // mid aggression → ~0.8 m/s roll
+        for (driver, max_roll, label) in [(cautious, 0.31, "cautious"), (default, 1.31, "default")] {
+            let net = stop_line_net();
+            let approach = net.lanes_of(LinkId(0)).next().unwrap();
+            let mut world = NetWorld::new(net, cfg());
+            world.spawn(1, approach, 0.0, 14.0, driver);
+            let mut min_speed_on_approach = f64::MAX;
+            for _ in 0..250 {
+                world.step();
+                if let Some(v) = world.vehicle(1) {
+                    if v.lane == approach {
+                        min_speed_on_approach = min_speed_on_approach.min(v.speed);
+                    }
                 }
             }
+            assert!(
+                min_speed_on_approach < max_roll,
+                "{label}: serves the sign at no faster than a rolling stop, min {min_speed_on_approach}"
+            );
+            assert_eq!(world.exited(), 1, "{label}: and then continues through");
         }
-        assert!(min_speed_on_approach < 0.5, "must come to a full stop, min {min_speed_on_approach}");
-        assert_eq!(world.exited(), 1, "and then continue through");
     }
 
     #[test]
@@ -4246,8 +4902,11 @@ mod tests {
         }
         .build();
         let mut world = NetWorld::new(net, cfg());
-        world.spawn_routed(10, vec![LinkId(0), LinkId(1)], 20.0, DriverConfig::car()); // major through
-        world.spawn_routed(20, vec![LinkId(2), LinkId(3)], 9.0, DriverConfig::car()); // minor straight across
+        // Noise-free drivers: the test asserts arrival-order logic, and sustained
+        // throttle wander would shift the tuned arrival timing it depends on.
+        let d = DriverConfig { accel_noise: 0.0, ..DriverConfig::car() };
+        world.spawn_routed(10, vec![LinkId(0), LinkId(1)], 20.0, d.clone()); // major through
+        world.spawn_routed(20, vec![LinkId(2), LinkId(3)], 9.0, d); // minor straight across
 
         // Record the tick each vehicle first enters the intersection interior.
         let (mut major_enter, mut minor_enter) = (None, None);
@@ -4282,8 +4941,9 @@ mod tests {
         }
         .build();
         let mut world = NetWorld::new(net, cfg());
-        world.spawn_routed(10, vec![LinkId(0), LinkId(1)], 20.0, DriverConfig::car()); // major through W→E
-        world.spawn_routed(20, vec![LinkId(2), LinkId(1)], 9.0, DriverConfig::car()); // minor right turn S→E
+        let d = DriverConfig { accel_noise: 0.0, ..DriverConfig::car() };
+        world.spawn_routed(10, vec![LinkId(0), LinkId(1)], 20.0, d.clone()); // major through W→E
+        world.spawn_routed(20, vec![LinkId(2), LinkId(1)], 9.0, d); // minor right turn S→E
 
         let (mut major_enter, mut minor_enter) = (None, None);
         for t in 0..400 {
@@ -4589,7 +5249,7 @@ mod tests {
         for o in (0..n).step_by(7) {
             for d in (0..n).step_by(11) {
                 if o != d && w.network.route_links(LinkId(o), LinkId(d)).is_some_and(|r| r.len() >= 5) {
-                    pairs.push(OdPair { origin: LinkId(o), dest: LinkId(d), rate_per_sec: 0.3 });
+                    pairs.push(OdPair { origin: LinkId(o), dest: LinkId(d), rate_per_sec: 0.3, class: SurfaceClass::Through, anchored: false });
                     if pairs.len() >= 20 {
                         break;
                     }
@@ -4718,7 +5378,15 @@ mod tests {
                 gen.step(&mut world, cfg().dt);
                 world.step();
             }
-            assert_eq!(world.crashed(), 0, "flow-field-routed traffic stays collision-free (seed {seed})");
+            // Crash mechanisms (reaction delay, bounded braking, red-running) are on by
+            // design, so the envelope bound is *rarity*, not zero: a handful of plausible
+            // low-speed collisions per run, never a systemic storm.
+            assert!(
+                world.crashed() <= 4,
+                "flow-field-routed traffic stays near collision-free (seed {seed}): {} crashed ({:?})",
+                world.crashed(),
+                world.crash_counts()
+            );
             assert!(world.exited() > 0, "vehicles complete boundary trips (seed {seed}), got {}", world.exited());
             assert_eq!(world.leaked(), 0, "no car disappears at an intersection (seed {seed}), leaked {}", world.leaked());
         }
@@ -4848,7 +5516,14 @@ mod tests {
                 world.step();
                 peak_asleep = peak_asleep.max(world.asleep_count());
             }
-            assert_eq!(world.crashed(), 0, "scheduler stays collision-free on the real map (seed {seed})");
+            // Same rarity envelope as the all-cars reference run above: the scheduler
+            // must not add crashes beyond the model's own rare plausible collisions.
+            assert!(
+                world.crashed() <= 4,
+                "scheduler stays near collision-free on the real map (seed {seed}): {} crashed ({:?})",
+                world.crashed(),
+                world.crash_counts()
+            );
             assert_eq!(world.leaked(), 0, "scheduler leaks no car at a node (seed {seed})");
             assert!(world.exited() > 0, "scheduled traffic completes trips (seed {seed})");
             assert!(peak_asleep > 0, "the scheduler sleeps queued cars on the real map (seed {seed})");
@@ -5424,29 +6099,97 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_vehicles_crash_and_leave_the_road() {
+    fn overlapping_vehicles_crash_and_leave_the_road_by_default() {
+        // Default config: wreck persistence is off, so crashed vehicles are
+        // removed the tick they collide (but are still tallied and logged).
         let mut w = NetWorld::new(straight_link(1000.0), cfg());
         w.spawn(1, LaneId(0), 100.0, 5.0, DriverConfig::car());
         w.spawn(2, LaneId(0), 99.0, 5.0, DriverConfig::car()); // deep overlap into the leader
         w.step();
         assert_eq!(w.crashed(), 2);
+        assert_eq!(w.crash_counts(), [2, 0], "both tallied as rear-end");
+        assert_eq!(w.crash_log().len(), 2);
         assert_eq!(w.vehicles().len(), 0);
     }
 
     #[test]
-    fn crossing_overlap_flags_t_bones_not_close_passes() {
+    fn opting_into_wreck_persistence_leaves_the_wreck_until_cleared() {
+        let secs = 30.0;
+        let mut w = NetWorld::new(straight_link(1000.0), SimConfig { wreck_clear_secs: secs, ..cfg() });
+        w.spawn(1, LaneId(0), 100.0, 5.0, DriverConfig::car());
+        w.spawn(2, LaneId(0), 99.0, 5.0, DriverConfig::car());
+        w.step();
+        assert_eq!(w.crashed(), 2);
+        assert_eq!(w.vehicles().len(), 2, "the wrecks stay on the road awaiting clearance");
+        assert!(w.vehicles().iter().all(|v| v.is_wrecked() && v.speed == 0.0));
+        let clear_ticks = (secs / cfg().dt).ceil() as u32;
+        w.run_ticks(clear_ticks + 1);
+        assert_eq!(w.vehicles().len(), 0, "cleared after wreck_clear_secs");
+        assert_eq!(w.crashed(), 2, "clearance does not re-count");
+    }
+
+    #[test]
+    fn a_follower_queues_behind_a_persistent_wreck_without_joining_it() {
+        // With persistence on, a wreck is a real obstruction: traffic behind it
+        // queues (no phantom pass-through) rather than piling in from a safe gap.
+        let mut w = NetWorld::new(straight_link(1000.0), SimConfig { wreck_clear_secs: 30.0, ..cfg() });
+        w.spawn(1, LaneId(0), 500.0, 5.0, DriverConfig::car());
+        w.spawn(2, LaneId(0), 499.0, 5.0, DriverConfig::car()); // wrecks the pair
+        w.spawn(3, LaneId(0), 400.0, 20.0, DriverConfig::car()); // fast, but far enough to stop
+        w.run_ticks(200);
+        assert_eq!(w.crashed(), 2, "the approaching car stops behind the wreck instead of joining it");
+        let survivor = w.vehicle(3);
+        assert!(
+            survivor.is_none_or(|v| !v.is_wrecked()),
+            "the follower is never flagged as crashed"
+        );
+    }
+
+    #[test]
+    fn red_running_is_rare_tunable_and_off_at_zero() {
+        // The distraction draw is per vehicle–node: across many drivers it stays a
+        // rare minority around the configured base rate, and a zero rate disables
+        // it entirely (the sterile envelope for tests that need determinism).
+        let mut w = NetWorld::new(straight_link(500.0), cfg());
+        let node = w.network.link(LinkId(0)).to;
+        let runners = |w: &NetWorld| {
+            (0..20_000u32)
+                .filter(|&id| {
+                    let d = DriverConfig::car().sample(w.cfg.seed, id);
+                    let probe = NetVehicle {
+                        id, lane: LaneId(0), position: 0.0, speed: 0.0, driver: d,
+                        route: Vec::new(), route_idx: 0, dest: None, stopped_at: None,
+                        wait_ticks: 0, crossing: None, lane_change: None, wreck: None,
+                    };
+                    w.runs_red(&probe, node)
+                })
+                .count()
+        };
+        let base = runners(&w);
+        let expected = (20_000.0 * w.cfg.red_run_prob) as usize;
+        assert!(base > 0, "some drivers do run reds at the default rate");
+        assert!(base < expected * 3 + 20, "but they stay a rare minority: {base}");
+        w.cfg.red_run_prob = 0.0;
+        assert_eq!(runners(&w), 0, "a zero rate disables red-running");
+    }
+
+    #[test]
+    fn body_overlap_is_exact_on_oriented_rectangles() {
         use std::f64::consts::{FRAC_PI_2, PI};
-        let origin = [0.0, 0.0];
-        let near = [0.5, 0.5]; // well within OVERLAP (2.4 m)
-        // A near-perpendicular meeting is a genuine T-bone.
-        assert!(crossing_overlap(origin, 0.0, near, FRAC_PI_2), "perpendicular crossing collides");
-        // Two anti-parallel bodies (opposing protected lefts passing to opposite
-        // corners) are passing, not colliding, even when they momentarily overlap.
-        assert!(!crossing_overlap(origin, 0.0, near, PI), "anti-parallel pass does not collide");
-        // Same-heading (parallel) bodies are following/side-by-side, not a crossing.
-        assert!(!crossing_overlap(origin, 0.3, near, 0.3), "parallel run is not a crossing");
-        // A true crossing that is still far apart does not collide.
-        assert!(!crossing_overlap(origin, 0.0, [5.0, 5.0], FRAC_PI_2), "distant crossing does not collide");
+        let (len, wid) = (5.0, 2.0);
+        // T-bone: B's front bumper at A's mid-body flank — genuinely intersecting.
+        assert!(body_overlap([0.0, 0.0, 0.0], len, wid, [-2.5, -0.5, FRAC_PI_2], len, wid), "T-bone into the body collides");
+        // Strike into the *rear half* of A (the case the old front-point distance missed):
+        // B crossing at A's rear axle, 4 m behind A's front bumper.
+        assert!(body_overlap([0.0, 0.0, 0.0], len, wid, [-4.0, -0.6, FRAC_PI_2], len, wid), "rear-half T-bone collides");
+        // Anti-parallel bodies on offset lines (opposing lefts passing) do not touch.
+        assert!(!body_overlap([0.0, 1.3, 0.0], len, wid, [-2.0, -1.3, PI], len, wid), "offset opposing pass is clean");
+        // Side-by-side parallel bodies a lane apart do not touch.
+        assert!(!body_overlap([0.0, 0.0, 0.0], len, wid, [0.5, 3.0, 0.0], len, wid), "parallel neighbours are clean");
+        // A crossing pair still metres short of the meet point does not touch.
+        assert!(!body_overlap([0.0, 0.0, 0.0], len, wid, [5.0, -5.0, FRAC_PI_2], len, wid), "distant crossing is clean");
+        // The same pair with B's bumper protruding into A's flank does.
+        assert!(body_overlap([0.0, 0.0, 0.0], len, wid, [-1.0, -0.5, FRAC_PI_2], len, wid), "converged crossing collides");
     }
 
     #[test]
@@ -5512,6 +6255,9 @@ mod tests {
                 road_class: String::new(),
                 highway_ref: String::new(),
                 turn_lanes: String::new(),
+                aadt: 0.0,
+                res_weight: 0.0,
+                attr_weight: 0.0,
             }],
         }
         .build();
@@ -5568,7 +6314,7 @@ mod tests {
         for o in 0..n {
             for d in 0..n {
                 if o != d && world.network.route_links(LinkId(o as u32), LinkId(d as u32)).is_some_and(|r| r.len() >= 3) {
-                    pairs.push(OdPair { origin: LinkId(o as u32), dest: LinkId(d as u32), rate_per_sec: 0.3 });
+                    pairs.push(OdPair { origin: LinkId(o as u32), dest: LinkId(d as u32), rate_per_sec: 0.3, class: SurfaceClass::Through, anchored: false });
                 }
             }
         }
@@ -5587,24 +6333,35 @@ mod tests {
         for _ in 0..1200 {
             d.step(&mut w, cfg().dt);
             w.step();
-            let mut by_lane: HashMap<u32, Vec<(f64, f64)>> = HashMap::new();
+            let mut by_lane: HashMap<u32, Vec<(f64, f64, bool)>> = HashMap::new();
             for v in w.vehicles() {
                 assert!(v.speed >= -1e-6, "no reversing: {}", v.speed);
                 assert!(v.speed <= max_limit + 1.5, "no gross speeding: {} > {}", v.speed, max_limit);
                 if v.is_crossing() {
                     continue; // inside a node, not occupying the lane
                 }
-                by_lane.entry(v.lane.0).or_default().push((v.position, v.driver.vehicle_length));
+                by_lane.entry(v.lane.0).or_default().push((v.position, v.driver.vehicle_length, v.is_wrecked()));
             }
             for cars in by_lane.values_mut() {
                 cars.sort_by(|a, b| a.0.total_cmp(&b.0));
                 for w2 in cars.windows(2) {
                     let gap = w2[1].0 - w2[0].0 - w2[1].1;
+                    // A wrecked pair legitimately overlaps — that collision was
+                    // detected and tallied. The invariant hunts *silent* overlaps.
+                    if w2[0].2 && w2[1].2 {
+                        continue;
+                    }
                     assert!(gap > -0.6, "vehicles overlap on a lane: gap {gap}");
                 }
             }
         }
-        assert_eq!(w.crashed(), 0);
+        assert!(
+            w.crashed() * 40 <= w.exited(),
+            "crashes stay rare over a busy run: {} crashed ({:?}) vs {} exited",
+            w.crashed(),
+            w.crash_counts(),
+            w.exited()
+        );
         assert!(d.spawned() > 100, "scenario should be busy");
     }
 
@@ -5661,7 +6418,7 @@ mod tests {
                 if o != d {
                     if let Some(r) = w.network.route_links(LinkId(o as u32), LinkId(d as u32)) {
                         if r.len() >= 3 {
-                            pairs.push(OdPair { origin: LinkId(o as u32), dest: LinkId(d as u32), rate_per_sec: 0.3 });
+                            pairs.push(OdPair { origin: LinkId(o as u32), dest: LinkId(d as u32), rate_per_sec: 0.3, class: SurfaceClass::Through, anchored: false });
                         }
                     }
                 }
@@ -5795,5 +6552,81 @@ mod tests {
         }
         assert!(changed_at.is_some() && settled, "the car changed lanes and the transition completed");
         assert!(max_jump < lane_gap * 0.6, "the lateral slide is gradual, not a teleport: max_jump={max_jump} lane_gap={lane_gap}");
+    }
+
+    #[test]
+    fn a_seam_lane_remap_slides_the_pose_across_gradually() {
+        // A motorway lane-add boundary maps the curb lane onto a non-adjacent index
+        // (lane 1 of 2 → lane 2 of 3). The car must cross the seam pointing down
+        // the road and ease onto its new line at the lane-change rate — never snap
+        // a lane width sideways or swing past 90° (the wrong-way lurch).
+        let hw = |a, b, lanes| LinkSpec { road_class: "motorway".into(), ..LinkSpec::oneway(a, b, lanes, 25.0) };
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, 0.0, 0.0),
+                NodeSpec::uncontrolled(2, 700.0, 0.0),
+                NodeSpec::uncontrolled(3, 1400.0, 0.0),
+            ],
+            links: vec![hw(1, 2, 2), hw(2, 3, 3)],
+        }
+        .build();
+        let mut world = NetWorld::new(net, cfg());
+        let curb = LaneId(world.network.link(LinkId(0)).lane_start.0 + 1);
+        world.spawn(1, curb, 600.0, 25.0, DriverConfig { accel_noise: 0.0, ..DriverConfig::car() });
+        let mut prev_y = world.vehicle_world_pose(world.vehicle(1).unwrap())[1];
+        let (mut max_jump, mut crossed, mut settled) = (0.0f64, false, false);
+        for _ in 0..200 {
+            world.step();
+            let Some(v) = world.vehicle(1) else { break };
+            let p = world.vehicle_world_pose(v);
+            assert!(p[2].abs() < 0.35, "heading stays down the road through the seam, got {:.1}°", p[2].to_degrees());
+            max_jump = max_jump.max((p[1] - prev_y).abs());
+            prev_y = p[1];
+            if !v.is_crossing() && world.network.lane(v.lane).link == LinkId(1) {
+                crossed = true;
+                let centerline = world.network.lane_point(v.lane, v.position)[1];
+                if v.lane_change.is_none() && (p[1] - centerline).abs() < 0.05 {
+                    settled = true;
+                }
+            }
+        }
+        assert!(crossed, "the car crossed the seam onto the wide segment");
+        assert!(settled, "the pose settled onto the remapped lane's own line");
+        assert!(max_jump < 1.0, "lateral motion is a gradual ease, not a snap: max_jump={max_jump}");
+    }
+
+    #[test]
+    fn the_mainline_flows_ungated_through_a_merge_but_the_ramp_yields() {
+        // At an on-ramp merge, the freeway through movements cross the seam with no
+        // admission gate (a freeway never brake-checks at a segment boundary) while
+        // the ramp — not the exit link's through approach — still yields.
+        let hw = |a, b, lanes| LinkSpec { road_class: "motorway".into(), ..LinkSpec::oneway(a, b, lanes, 29.0) };
+        let ramp = |a, b, lanes| LinkSpec { road_class: "motorway_link".into(), ..LinkSpec::oneway(a, b, lanes, 25.0) };
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, -400.0, 0.0),
+                NodeSpec::uncontrolled(2, 0.0, 0.0),
+                NodeSpec::uncontrolled(3, 400.0, 0.0),
+                NodeSpec::uncontrolled(4, -200.0, -200.0),
+            ],
+            links: vec![hw(1, 2, 3), hw(2, 3, 3), ramp(4, 2, 1)],
+        }
+        .build();
+        let world = NetWorld::new(net, cfg());
+        let mut checked = 0;
+        for m in 0..world.network.movements.len() as u32 {
+            let mid = MovementId(m);
+            let mv = world.network.movement(mid);
+            if world.network.lane(mv.to_lane).link != LinkId(1) {
+                continue;
+            }
+            checked += 1;
+            if world.network.lane(mv.from_lane).link == LinkId(0) {
+                assert!(world.free_flow_seam(mid), "a mainline continuation crosses ungated");
+            } else {
+                assert!(!world.free_flow_seam(mid), "the merging ramp keeps its admission gate");
+            }
+        }
+        assert!(checked >= 4, "the merge fixture wires mainline and ramp movements, got {checked}");
     }
 }

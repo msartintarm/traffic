@@ -17,8 +17,21 @@ use super::config::DriverConfig;
 use super::idm;
 use super::rng::{self, Stream};
 
+/// Ticks per noise bucket (~2 s at the 0.2 s step): driver error *drifts* over a
+/// few seconds — a foot resting heavy on the pedal — rather than flickering fresh
+/// each tick, where it would integrate away to nothing.
+const NOISE_BUCKET_TICKS: u64 = 10;
+
+/// Zero-mean, ±`sigma`-bounded throttle error, correlated over a few seconds:
+/// piecewise-linear between per-bucket draws, so it stays a pure stateless hash of
+/// the coordinates (CPU/GPU agree) while producing sustained speed wander — the
+/// kind that makes a genuinely late brake possible instead of averaging out.
 pub fn accel_noise(sigma: f64, seed: u64, agent_id: u32, tick: u64) -> f64 {
-    sigma * (2.0 * rng::uniform01(seed, agent_id, tick, Stream::AccelNoise) - 1.0)
+    let b = tick / NOISE_BUCKET_TICKS;
+    let t = (tick % NOISE_BUCKET_TICKS) as f64 / NOISE_BUCKET_TICKS as f64;
+    let u0 = rng::uniform01(seed, agent_id, b, Stream::AccelNoise);
+    let u1 = rng::uniform01(seed, agent_id, b + 1, Stream::AccelNoise);
+    sigma * (2.0 * (u0 + (u1 - u0) * t) - 1.0)
 }
 
 /// A leader (moving or stationary) ahead in the vehicle's path.
@@ -241,6 +254,23 @@ mod tests {
         assert!((sum / n as f64).abs() < 0.02, "zero-mean over time: {}", sum / n as f64);
         assert!(saw_pos && saw_neg, "noise is two-sided, not one-sided drag");
         assert_eq!(accel_noise(sigma, 7, 42, 5), accel_noise(sigma, 7, 42, 5), "reproducible");
+    }
+
+    #[test]
+    fn accel_noise_drifts_rather_than_flickers() {
+        // Adjacent ticks sit in (or lerp across) the same bucket, so the error is a
+        // slow drift; ticks far apart are independent draws. The mean step between
+        // neighbours must be much smaller than between distant samples — the
+        // correlation that lets throttle error accumulate into a genuinely late brake.
+        let sigma = 0.2;
+        let at = |t: u64| accel_noise(sigma, 7, 42, t);
+        let (mut near, mut far) = (0.0, 0.0);
+        let n = 5000u64;
+        for t in 0..n {
+            near += (at(t + 1) - at(t)).abs();
+            far += (at(t + 97) - at(t)).abs();
+        }
+        assert!(near < far / 3.0, "near-step drift {near} vs far-step jump {far}");
     }
 
     #[test]

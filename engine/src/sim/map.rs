@@ -83,6 +83,19 @@ pub struct LinkSpec {
     /// (e.g. `"left|through|through;right"`). Empty when unmapped — the renderer
     /// then falls back to arrows derived from the lane's actual movements.
     pub turn_lanes: String,
+    /// Observed Annual Average Daily Traffic for the road (both directions,
+    /// vehicles/day), joined from real counts by `tools/counts attach_counts.py
+    /// --write-map`; `0.0` = no observation. Calibrates demand to measured volumes
+    /// instead of the lanes×speed proxy.
+    pub aadt: f64,
+    /// Trip-production weight from the scraper's land-use pass (`--landuse`):
+    /// how residential the link's surroundings are, ~0.3–1.7 with 1.0 neutral;
+    /// `0.0` = no data (treated as neutral). Tilts demand origins toward homes.
+    pub res_weight: f64,
+    /// Trip-attraction weight from the land-use pass: shops/jobs/campuses around
+    /// the link, ~0.3–4 with 1.0 neutral; `0.0` = no data (treated as neutral).
+    /// Multiplies gravity destination choice.
+    pub attr_weight: f64,
 }
 
 impl LinkSpec {
@@ -492,6 +505,9 @@ impl OsmMap {
             net.link_names.push(spec.name.clone());
             net.link_refs.push(spec.highway_ref.clone());
             net.link_turn_lanes.push(spec.turn_lanes.clone());
+            net.link_aadt.push(spec.aadt);
+            net.link_res_weight.push(spec.res_weight);
+            net.link_attr_weight.push(spec.attr_weight);
         }
 
         offset_ramps_to_curb(&mut net);
@@ -898,6 +914,37 @@ const YELLOW_MAX: f64 = 6.0;
 const CLEARANCE_VEHICLE_LEN: f64 = 6.0;
 const ALL_RED_MIN: f64 = 1.5;
 const ALL_RED_MAX: f64 = 5.0;
+/// Straggler speed through a compound junction's internal path (m/s) and the larger
+/// all-red cap such junctions may need. A movement that lands on a cluster-internal
+/// link hasn't cleared anything: the car still has slivers and further interiors to
+/// traverse at box speed, and an all-red sized to one interior strands it mid-box
+/// every cycle — the cross phase then flows around a parked straggler.
+const CLUSTER_CLEAR_SPEED: f64 = 6.0;
+const ALL_RED_MAX_CLUSTER: f64 = 8.0;
+
+/// Seconds a car landing off movement `m` still needs to reach the cluster exit —
+/// zero when the movement leaves the junction directly.
+fn internal_continuation_secs(net: &Network, m: MovementId) -> f64 {
+    let mv = net.movement(m);
+    let Some(j) = net.node_junction(mv.node) else { return 0.0 };
+    let mut lane_id = mv.to_lane;
+    let mut dist = 0.0;
+    for _ in 0..8 {
+        let lane = net.lane(lane_id);
+        if net.node_junction(net.link(lane.link).to) != Some(j) {
+            break; // this link leaves the cluster
+        }
+        dist += lane.length;
+        let start = lane.movement_start.0;
+        let onward = (0..net.movements_of(lane_id).len())
+            .map(|k| MovementId(start + k as u32))
+            .max_by(|&a, &b| net.interior(a).len.total_cmp(&net.interior(b).len));
+        let Some(next) = onward else { break };
+        dist += net.interior(next).len;
+        lane_id = net.movement(next).to_lane;
+    }
+    dist / CLUSTER_CLEAR_SPEED
+}
 
 fn change_and_clearance_intervals(net: &Network, movements: &[MovementId]) -> (f64, f64) {
     let approach = movements
@@ -910,7 +957,12 @@ fn change_and_clearance_intervals(net: &Network, movements: &[MovementId]) -> (f
         .iter()
         .map(|&m| net.interior(m).len)
         .fold(0.0_f64, f64::max);
-    let all_red = ((crossing + CLEARANCE_VEHICLE_LEN) / approach).clamp(ALL_RED_MIN, ALL_RED_MAX);
+    let internal = movements
+        .iter()
+        .map(|&m| internal_continuation_secs(net, m))
+        .fold(0.0_f64, f64::max);
+    let cap = if internal > 0.0 { ALL_RED_MAX_CLUSTER } else { ALL_RED_MAX };
+    let all_red = ((crossing + CLEARANCE_VEHICLE_LEN) / approach + internal).clamp(ALL_RED_MIN, cap);
     (yellow, all_red)
 }
 
@@ -1131,7 +1183,13 @@ fn join_pass_through(
     // The downstream segment (l2, ending at the merge's `to`) carries the turn:lanes
     // that matter at the stop line; fall back to l1 if it lacks them.
     let turn_lanes = if l2.turn_lanes.is_empty() { l1.turn_lanes.clone() } else { l2.turn_lanes.clone() };
-    Some(LinkSpec { from_osm: from, to_osm: to, lanes, speed_limit: l1.speed_limit, geometry, layer: l1.layer, name, road_class, highway_ref, turn_lanes })
+    let nonzero = |a: f64, b: f64| if a > 0.0 { a } else { b };
+    let (aadt, res_weight, attr_weight) = (
+        nonzero(l1.aadt, l2.aadt),
+        nonzero(l1.res_weight, l2.res_weight),
+        nonzero(l1.attr_weight, l2.attr_weight),
+    );
+    Some(LinkSpec { from_osm: from, to_osm: to, lanes, speed_limit: l1.speed_limit, geometry, layer: l1.layer, name, road_class, highway_ref, turn_lanes, aadt, res_weight, attr_weight })
 }
 
 /// Pull every lane back from its end nodes to the junction boundary so vehicles
@@ -1252,8 +1310,20 @@ fn set_junction_setbacks(net: &mut Network) {
     // A crosswalk/stop-bar margin so vehicles halt just behind the box, as at a
     // real signalized intersection, rather than nosing into the crossing.
     const STOP_MARGIN: f64 = 2.5;
-    // Box radius per node = half the widest carriageway meeting it; the drawn
-    // road stops here, and vehicles stop `STOP_MARGIN` further back.
+    // Crossings shallower than this (|approach · band normal|) don't gate the stop
+    // line: a parallel road — the boulevard's other carriageway, this road's own
+    // continuation — never crosses the approach.
+    const MIN_CROSS: f64 = 0.25;
+    // Ceiling on one band's required clearance, so a near-parallel skew crossing
+    // in bad OSM data can't push a stop line absurdly far up the road.
+    const CLEAR_CAP: f64 = 45.0;
+    // How far past its anchor node's box a band still counts as junction sweep
+    // (wide-band corner overhang); beyond it the crossing is an infinite-strip
+    // fiction and demands no clearance.
+    const REACH_SLACK: f64 = 6.0;
+    // Box radius per node = half the widest carriageway meeting it — the drawn
+    // road stops here. The *driving* stop line per approach is computed below
+    // against the actual crossing carriageways and is usually further back.
     let mut box_r = vec![0.0f64; net.nodes.len()];
     for link in &net.links {
         let half = link.lane_count as f64 * LANE_WIDTH * 0.5;
@@ -1271,15 +1341,157 @@ fn set_junction_setbacks(net: &mut Network) {
         }
     }
     net.render_setback = box_r.clone();
-    let radius: Vec<f64> = box_r
+
+    let full_len: Vec<f64> = net.polylines.iter().map(|p| p.windows(2).map(|w| distance(w[0], w[1])).sum()).collect();
+    let n = net.nodes.len();
+    let pos: Vec<[f64; 2]> = net.nodes.iter().map(|nd| nd.position).collect();
+
+    // Cluster nodes exactly as `build_junctions` will (short internal links between
+    // intersection nodes are one junction), so an approach's stop line clears every
+    // carriageway of its whole junction — a split boulevard's far half included —
+    // not just the roads sharing its own node.
+    let mut nb: Vec<BTreeSet<u32>> = vec![Default::default(); n];
+    for l in &net.links {
+        if l.layer != 0 {
+            continue;
+        }
+        nb[l.from.idx()].insert(l.to.0);
+        nb[l.to.idx()].insert(l.from.0);
+    }
+    let is_ix = |i: usize| nb[i].len() >= 3;
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(p: &mut Vec<usize>, mut x: usize) -> usize {
+        while p[x] != x {
+            p[x] = p[p[x]];
+            x = p[x];
+        }
+        x
+    }
+    // Same short-gap fixpoint as `build_junctions`: the stub chain leading into a
+    // junction (bend/signal nodes between the outer stop line and the box) is part
+    // of the cluster, so stop lines are computed against the same junction the
+    // behavioral model uses.
+    let short: Vec<(usize, usize)> = net
+        .links
         .iter()
         .enumerate()
-        .map(|(n, &r)| if r <= 0.0 { 0.0 } else if interchange[n] { r } else { r + STOP_MARGIN })
+        .filter_map(|(i, l)| {
+            (l.layer == 0 && full_len[i] - box_r[l.from.idx()] - box_r[l.to.idx()] < JUNCTION_MERGE_GAP)
+                .then_some((l.from.idx(), l.to.idx()))
+        })
         .collect();
+    let mut root_ix: Vec<bool> = (0..n).map(is_ix).collect();
+    loop {
+        let mut changed = false;
+        for &(a, b) in &short {
+            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+            if ra != rb && (root_ix[ra] || root_ix[rb]) {
+                parent[ra] = rb;
+                root_ix[rb] |= root_ix[ra];
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let root: Vec<usize> = (0..n).map(|i| find(&mut parent, i)).collect();
+    let mut members: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, &r) in root.iter().enumerate() {
+        members.entry(r).or_default().push(i);
+    }
+
+    // Carriageway bands at each node: for every link end, the strip its lanes occupy —
+    // anchored at the node, along the link's local direction, `lanes · LANE_WIDTH`
+    // wide on the right of travel. `side` marks which longitudinal half-plane is the
+    // band's *junction* side (+1: traffic continues past the anchor into the box —
+    // an arriving end; −1: the box is behind — a departing end); the street side is
+    // the other half. (link, anchor, travel dir, width, layer, side).
+    let mut bands: Vec<Vec<(usize, [f64; 2], [f64; 2], f64, i32, f64)>> = vec![Vec::new(); n];
+    for (i, l) in net.links.iter().enumerate() {
+        let w = l.lane_count as f64 * LANE_WIDTH;
+        let lid = LinkId(i as u32);
+        bands[l.from.idx()].push((i, pos[l.from.idx()], net.departure_dir(lid), w, l.layer, -1.0));
+        bands[l.to.idx()].push((i, pos[l.to.idx()], net.arrival_dir(lid), w, l.layer, 1.0));
+    }
+
+    let setbacks: Vec<(f64, f64)> = {
+        // The clearance one link end needs: the smallest distance from the node along
+        // the link past which its whole lane band sits outside every crossing band of
+        // the cluster — where a real stop bar sits, clear of the cross street's full
+        // width. Solved on the band's linear lateral coordinate (`away` tilts it by g,
+        // the own band's breadth by al; corners suffice by linearity): exact for
+        // straight crossings at any angle — a perpendicular road demands its full
+        // width, a skew one proportionally more.
+        let clear_of = |link: usize, node: usize, away: [f64; 2], n_tr: [f64; 2], w_own: f64| -> f64 {
+            if !is_ix(node) {
+                return 0.0; // a bend or lane-count change crosses nothing
+            }
+            let p = pos[node];
+            let mut need = 0.0f64;
+            for &m in &members[&root[node]] {
+                for &(bl, q, d, w, layer, side) in &bands[m] {
+                    if bl == link || layer != net.links[link].layer {
+                        continue;
+                    }
+                    let ni = [d[1], -d[0]];
+                    let g = away[0] * ni[0] + away[1] * ni[1];
+                    if g.abs() < MIN_CROSS {
+                        continue;
+                    }
+                    let l0 = (p[0] - q[0]) * ni[0] + (p[1] - q[1]) * ni[1];
+                    let al = n_tr[0] * ni[0] + n_tr[1] * ni[1];
+                    let u = if g > 0.0 {
+                        (0.0f64).max((w - l0) / g).max((w - l0 - w_own * al) / g)
+                    } else {
+                        (0.0f64).max(l0 / -g).max((l0 + w_own * al) / -g)
+                    };
+    // A band is only real where its link's pavement actually lies: on the
+                    // street side (against `side`) up to the link's own length, and on
+                    // the junction side just across the anchor node's box — beyond
+                    // that, other links' own bands cover the pavement. Treating the
+                    // strip as infinite let distant cluster members (a split
+                    // junction's signal stubs, internal segments) demand clearances at
+                    // crossing points their road never reaches, capping stop lines
+                    // ~45 m up the approach — the "cars halt mid-intersection"
+                    // artifact at big divided junctions (El Camino × Millbrae Ave).
+                    let s = (p[0] + u * away[0] - q[0]) * d[0] + (p[1] + u * away[1] - q[1]) * d[1];
+                    let along = s * side; // >0: junction side of the anchor; <0: up the link's own street
+                    let reach = if along > 0.0 { box_r[m] } else { full_len[bl] };
+                    if along.abs() > reach + REACH_SLACK {
+                        continue;
+                    }
+                    need = need.max(u.min(CLEAR_CAP));
+                }
+            }
+            need
+        };
+        (0..net.links.len())
+            .map(|i| {
+                let link = net.links[i];
+                let w_own = link.lane_count as f64 * LANE_WIDTH;
+                let lid = LinkId(i as u32);
+                let dep = net.departure_dir(lid);
+                let arr = net.arrival_dir(lid);
+                let (fi, ti) = (link.from.idx(), link.to.idx());
+                let mut r0 = box_r[fi];
+                let mut r1 = box_r[ti];
+                if !interchange[fi] {
+                    r0 = r0.max(clear_of(i, fi, dep, [dep[1], -dep[0]], w_own));
+                }
+                if !interchange[ti] {
+                    r1 = r1.max(clear_of(i, ti, [-arr[0], -arr[1]], [arr[1], -arr[0]], w_own));
+                }
+                (r0, r1)
+            })
+            .collect()
+    };
+
+    let radius = |r: f64, node: usize| if r <= 0.0 { 0.0 } else if interchange[node] { r } else { r + STOP_MARGIN };
     for i in 0..net.links.len() {
         let link = net.links[i];
-        let full = net.polylines[i].windows(2).map(|w| distance(w[0], w[1])).sum::<f64>();
-        let (mut r0, mut r1) = (radius[link.from.idx()], radius[link.to.idx()]);
+        let full = full_len[i];
+        let (mut r0, mut r1) = (radius(setbacks[i].0, link.from.idx()), radius(setbacks[i].1, link.to.idx()));
         if r0 + r1 > full - 1.0 {
             let scale = ((full - 1.0).max(0.0)) / (r0 + r1).max(1e-9);
             r0 *= scale;
@@ -1333,6 +1545,12 @@ mod json {
         highway_ref: String,
         #[serde(default)]
         turn_lanes: String,
+        #[serde(default)]
+        aadt: f64,
+        #[serde(default)]
+        res_weight: f64,
+        #[serde(default)]
+        attr_weight: f64,
     }
 
     #[derive(Deserialize)]
@@ -1381,6 +1599,9 @@ mod json {
                 road_class: l.road_class,
                 highway_ref: l.highway_ref,
                 turn_lanes: l.turn_lanes,
+                aadt: l.aadt,
+                res_weight: l.res_weight,
+                attr_weight: l.attr_weight,
             })
             .collect();
         Ok(OsmMap { nodes, links })
@@ -1397,6 +1618,7 @@ impl OsmMap {
 
     /// [`from_json`] with the experimental extent-capped junction merge (`split_junctions`):
     /// large surface junctions stay split into aligned sub-nodes (see `merge_split_intersections`).
+    #[cfg(feature = "import")]
     pub fn from_json_opts(s: &str, split_junctions: bool) -> Result<OsmMap, String> {
         Ok(json::parse(s)?.collapse_pass_through_nodes().merge_split_intersections(split_junctions))
     }
@@ -1418,7 +1640,8 @@ mod import_tests {
                 { "osm_id": 4, "x": 200.0, "y": -150.0, "control": "uncontrolled" }
             ],
             "links": [
-                { "from_osm": 1, "to_osm": 2, "lanes": 2, "speed_limit": 20.0 },
+                { "from_osm": 1, "to_osm": 2, "lanes": 2, "speed_limit": 20.0, "aadt": 26500,
+                  "res_weight": 1.4, "attr_weight": 2.1 },
                 { "from_osm": 2, "to_osm": 3, "lanes": 2, "speed_limit": 20.0 },
                 { "from_osm": 4, "to_osm": 2, "lanes": 1, "speed_limit": 15.0 }
             ]
@@ -1429,6 +1652,58 @@ mod import_tests {
         assert_eq!(net.lanes.len(), 5);
         assert_eq!(net.programs.len(), 1, "node 2 is signalized");
         assert!(net.groups.len() >= 2);
+        // An embedded count (attach_counts.py --write-map) survives into the network,
+        // as do the land-use weights from the scraper's --landuse pass.
+        let counted = (0..net.links.len() as u32)
+            .map(LinkId)
+            .find(|&l| net.link_aadt(l) > 0.0)
+            .expect("the counted link keeps its aadt");
+        assert_eq!(net.link_aadt(counted), 26_500.0);
+        assert_eq!(net.link_res_weight(counted), 1.4);
+        assert_eq!(net.link_attr_weight(counted), 2.1);
+        let plain = (0..net.links.len() as u32).map(LinkId).find(|&l| l != counted).unwrap();
+        assert_eq!(net.link_res_weight(plain), 1.0, "no data → neutral weight");
+    }
+
+    /// The junction-end setback of every approach into and exit out of `j`, in
+    /// metres: how far the drivable lane span stops short of (or starts past)
+    /// the junction node — where cars actually halt and resume.
+    fn junction_end_setbacks(net: &Network, j: &crate::sim::network::Junction) -> Vec<(u32, f64)> {
+        let full = |l: LinkId| -> f64 { net.polylines[l.idx()].windows(2).map(|w| distance(w[0], w[1])).sum() };
+        let mut out = Vec::new();
+        for &l in &j.approaches {
+            let lane = net.lane(net.link(l).lane_start);
+            out.push((l.0, full(l) - lane.start_offset - lane.length));
+        }
+        for &l in &j.exits {
+            out.push((l.0, net.lane(net.link(l).lane_start).start_offset));
+        }
+        out
+    }
+
+    /// Regression for cars halting far from (or inside) complex intersections:
+    /// junction fixture #0 is the real El Camino Real × Millbrae Avenue crossing —
+    /// two divided roads whose OSM form splits the junction over four crossing
+    /// nodes plus signal stubs ~20 m up each approach. Treating carriageway bands
+    /// as infinite strips let stubs demand clearances at crossing points their road
+    /// never reaches, pinning stop lines at the 45 m cap — cars visibly stopped in
+    /// the middle of the road/box. Bounded bands keep every stop line and exit
+    /// mouth near the box edge, at right angles to its own lanes.
+    #[test]
+    fn complex_junction_stop_lines_sit_at_the_box_edge() {
+        for n in 0..3 {
+            let net = millbrae_junction(n);
+            for (ji, j) in net.junctions.iter().enumerate() {
+                for (l, setback) in junction_end_setbacks(&net, j) {
+                    println!("fixture {n} junction {ji} link {l}: setback {setback:.1}");
+                    assert!(
+                        setback < 33.0,
+                        "fixture {n} junction {ji} link {l}: stop line/exit mouth {setback:.1} m from the node — \
+                         far beyond any crossing carriageway's width (infinite-strip clearance regression)",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2049,7 +2324,7 @@ mod tests {
             ],
             links: vec![
                 LinkSpec::oneway(1, 2, 1, 20.0), // surface road, crosses origin
-                LinkSpec { from_osm: 3, to_osm: 4, lanes: 1, speed_limit: 25.0, geometry: Vec::new(), layer: 1, name: String::new(), road_class: String::new(), highway_ref: String::new(), turn_lanes: String::new() }, // bridge over it
+                LinkSpec { from_osm: 3, to_osm: 4, lanes: 1, speed_limit: 25.0, geometry: Vec::new(), layer: 1, name: String::new(), road_class: String::new(), highway_ref: String::new(), turn_lanes: String::new(), aadt: 0.0, res_weight: 0.0, attr_weight: 0.0 }, // bridge over it
             ],
         }
         .build();
@@ -2282,6 +2557,75 @@ mod tests {
             "the wedged 1-lane mainline artifact is widened to the through width"
         );
         assert_eq!(net.link(LinkId(3)).lane_count, 1, "the real off-ramp stays one lane");
+    }
+
+    #[test]
+    fn stop_lines_clear_the_full_crossing_carriageway() {
+        // Two-way 4-way: E-W three lanes per direction, N-S two. An approach's stop
+        // line must sit behind the *whole* width of the crossing carriageway on its
+        // side — where a real stop bar is — not half of it: cars queued at the old
+        // half-width line were parked inside the cross traffic's path and got hit.
+        let two_way = |a: i64, b: i64, lanes| vec![LinkSpec::oneway(a, b, lanes, 15.0), LinkSpec::oneway(b, a, lanes, 15.0)];
+        let mut links = Vec::new();
+        links.extend(two_way(1, 5, 3)); // west arm
+        links.extend(two_way(2, 5, 3)); // east arm
+        links.extend(two_way(3, 5, 2)); // south arm
+        links.extend(two_way(4, 5, 2)); // north arm
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, -300.0, 0.0),
+                NodeSpec::uncontrolled(2, 300.0, 0.0),
+                NodeSpec::uncontrolled(3, 0.0, -300.0),
+                NodeSpec::uncontrolled(4, 0.0, 300.0),
+                NodeSpec::uncontrolled(5, 0.0, 0.0),
+            ],
+            links,
+        }
+        .build();
+        // Eastbound approach (link 0, 1→5): the southbound carriageway (two lanes,
+        // west of the N-S centreline) crosses its path — the stop line clears it.
+        let east_lane = net.link(LinkId(0)).lane_start;
+        let east_stop = net.lane_point(east_lane, net.lane(east_lane).length);
+        assert!(east_stop[0] <= -2.0 * LANE_WIDTH, "eastbound stops behind the southbound carriageway: x={:.2}", east_stop[0]);
+        // Northbound approach (link 4, 3→5): the eastbound carriageway (three lanes,
+        // south of the E-W centreline) crosses its path.
+        let north_lane = net.link(LinkId(4)).lane_start;
+        let north_stop = net.lane_point(north_lane, net.lane(north_lane).length);
+        assert!(north_stop[1] <= -3.0 * LANE_WIDTH, "northbound stops behind the eastbound carriageway: y={:.2}", north_stop[1]);
+    }
+
+    #[test]
+    fn seam_interiors_run_straight_whatever_lane_the_movement_targets() {
+        // A lane-count change at a mainline segment boundary can map a lane onto a
+        // non-adjacent index (here lane 1 of 2 → lane 2 of 3). The crossing path
+        // must not pack that lateral move into the node's ~1 m gap — the curve
+        // doubles back and the car sweeps sideways pointing the wrong way. It runs
+        // straight through on the entry lane's own line; the car eases onto its
+        // target line on the next link via the seam-landing blend.
+        let hw = |a, b, lanes| LinkSpec { road_class: "motorway".into(), ..LinkSpec::oneway(a, b, lanes, 29.0) };
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, -400.0, 0.0),
+                NodeSpec::uncontrolled(2, 0.0, 0.0),
+                NodeSpec::uncontrolled(3, 400.0, 0.0),
+            ],
+            links: vec![hw(1, 2, 2), hw(2, 3, 3)],
+        }
+        .build();
+        assert!(!net.movements.is_empty());
+        for m in 0..net.movements.len() as u32 {
+            let mid = MovementId(m);
+            let it = net.interior(mid);
+            assert!(it.len < 3.0, "a seam interior spans the node gap, not a lateral detour: len={}", it.len);
+            for i in 0..=8 {
+                let p = net.interior_point(mid, it.len * i as f64 / 8.0);
+                assert!(
+                    p[2].abs() < 0.05,
+                    "the crossing path points down the road the whole way, got {:.1}°",
+                    p[2].to_degrees()
+                );
+            }
+        }
     }
 
     #[test]

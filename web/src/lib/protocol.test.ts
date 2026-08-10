@@ -38,6 +38,7 @@ test("CONTROL_TYPES is the complete control set", () => {
 });
 
 const snap: StatsSnapshot = {
+  dayTime: 7.5,
   vehicles: 500,
   crashed: 0,
   selectedSpeed: 3,
@@ -60,7 +61,7 @@ test("overlayFromSnapshot projects the snapshot into overlay strings", () => {
   const o = overlayFromSnapshot(snap, { fitMpp: 10, zoomRange: 60 });
   assert.equal(
     o.stats,
-    "• 500 vehicles\n• 0 crashed\n• 2.4×/3× (throttled)\n• threads ▸ parallel (≥400)\n• 5 idle-skipped",
+    "• 07:30\n• 500 vehicles\n• 0 crashed\n• 2.4×/3× (throttled)\n• threads ▸ parallel (≥400)\n• 5 idle-skipped",
   );
   assert.equal(o.perf, "▶ threads ▸ parallel (≥400) · 5 idle-skipped · routing GPU");
   assert.equal(o.rushClock, " 07:30 · US-101 N1200/S800 · I-280 N300/S200 veh/h/ln");

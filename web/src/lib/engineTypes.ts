@@ -62,9 +62,13 @@ export type Sim = {
   set_demand_sources(highway: boolean, surface: boolean): void;
   demand_highway(): boolean;
   demand_surface(): boolean;
+  // Real LODES commute flows (tools/lodes output); only on import-enabled builds.
+  set_commute_od?(json: string): boolean;
   set_rush_hour(enabled: boolean): void;
   demand_rush_hour(): boolean;
   rush_hour_time(): number;
+  // Wall-clock time of day (hours 0-24); optional so a stale wasm build degrades to no clock.
+  day_time_hours?(): number;
   rush_hour_flows(): Float32Array;
   demand_queued(): number;
   set_demand_rate(scale: number): void;

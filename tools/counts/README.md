@@ -54,3 +54,24 @@ python3 attach_counts.py --map ../../web/public/map.json --synthesize --out coun
 `peak_vph = aadt × K × D` (K = peak-hour fraction, D = directional split). Compare
 `peak_vph` to the engine's `link_flows()[link]` and adjust OD demand rates until
 they align. `counts.json` and downloaded CSVs are gitignored.
+
+## Ohio (Columbus)
+
+`fetch_odot.py` is the Ohio counterpart of the Caltrans fetcher, pulling
+`AADT_TOTAL` from the public ODOT TIMS ArcGIS service for a bounding box and
+emitting the same `ref,aadt` CSV (`I 70`, `US 33`, `OH 315`, …):
+
+```
+python3 fetch_odot.py --bbox 39.90 -83.10 40.05 -82.90 --out odot.csv
+python3 attach_counts.py --map ../../web/public/map.json --counts odot.csv --write-map
+```
+
+## Embedding counts in the map (`--write-map`)
+
+`attach_counts.py --write-map` writes each *observed* AADT into the map json as
+an `aadt` field on the matched links, which the engine reads directly: a counted
+gateway spawns at the road's real daily-mean directional flow (`AADT/2` over
+24 h, redistributed through the day by the diurnal curves) and gravity
+destination choice weighs counted roads by measured volume instead of the
+lanes × speed proxy. Synthesized counts are never embedded — they are derived
+from lanes × speed, which is already the engine's fallback.

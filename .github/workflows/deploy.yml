@@ -62,6 +62,32 @@ jobs:
       # rebuild the (single-threaded) wasm package, then the Next export copies
       # public/ (both wasm packages + the map) to the site. GitHub Pages gzips
       # map.json on the wire (~16 KB).
+      # Every real map must ship its commute-OD sibling (tools/lodes/fetch_lodes.py
+      # --map). A missing file would silently degrade that map's demand to
+      # sampled-only, so it fails the deploy — the last good deploy stays live.
+      - name: Require commute OD next to every real map
+        run: |
+          python3 - <<'EOF'
+          import json, os, sys
+          pub = "web/public"
+          missing = []
+          for f in sorted(os.listdir(pub)):
+              if not f.endswith(".json") or f.endswith(".lodes.json"):
+                  continue
+              try:
+                  meta = json.load(open(os.path.join(pub, f))).get("meta", {})
+              except Exception:
+                  continue
+              if "bbox" not in meta:
+                  continue  # not a scraped map
+              sib = f[:-5] + ".lodes.json"
+              if not os.path.exists(os.path.join(pub, sib)):
+                  missing.append(sib)
+          if missing:
+              sys.exit("missing commute OD files: " + ", ".join(missing))
+          print("commute OD present for every real map")
+          EOF
+
       - name: Build static export
         run: npm run build
         working-directory: web

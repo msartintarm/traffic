@@ -18,6 +18,11 @@ Usage:
     # or synthesize plausible counts from road class, to exercise calibration now
     python3 attach_counts.py --map ../../web/public/map.json --synthesize --out counts.json
 
+    # also embed the observed AADT into the map itself (`aadt` per link), which the
+    # engine reads directly: gateway spawn rates become the road's real daily-mean
+    # flow and gravity attraction follows measured volume instead of lanes x speed
+    python3 attach_counts.py --map ../../web/public/map.json --counts caltrans.csv --write-map
+
 Peak-hour volume = AADT x K x D (K = fraction of daily traffic in the peak hour,
 D = directional split). Defaults K=0.09, D=0.55 are typical urban-arterial values.
 """
@@ -71,14 +76,21 @@ def main():
     ap.add_argument("--out", default="counts.json")
     ap.add_argument("--k", type=float, default=0.09, help="peak-hour fraction of AADT")
     ap.add_argument("--d", type=float, default=0.55, help="peak-direction split")
+    ap.add_argument("--write-map", action="store_true",
+                    help="also write observed AADT into the map json as `aadt` per link (engine-readable)")
     args = ap.parse_args()
 
     net = json.load(open(args.map))
     observed = load_observed(args.counts) if args.counts else {}
 
-    targets, matched = [], 0
+    targets, matched, embedded = [], 0, 0
     for i, link in enumerate(net["links"]):
         aadt, source = aadt_for(link, observed)
+        if aadt is not None and args.write_map:
+            # Only *observed* counts are embedded: synthesized values are derived
+            # from lanes x speed, which is exactly the engine's built-in fallback.
+            link["aadt"] = round(aadt)
+            embedded += 1
         if aadt is None and args.synthesize:
             aadt, source = synthesize_aadt(link), "synthesized"
         if aadt is None:
@@ -98,6 +110,9 @@ def main():
     }
     json.dump(out, open(args.out, "w"), indent=2)
     print(f"wrote {args.out}: {matched}/{len(net['links'])} links have a target volume")
+    if args.write_map:
+        json.dump(net, open(args.map, "w"))
+        print(f"embedded observed aadt into {args.map}: {embedded} links")
 
 
 if __name__ == "__main__":

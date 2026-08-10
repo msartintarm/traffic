@@ -62,6 +62,18 @@ local.
 - `links` are **directed** — a two-way street becomes two links — matching
   `LinkSpec`. Ways are split at every intersection node so one link is one block.
 
+## Land-use weights (`--landuse`)
+
+A second, lightweight Overpass pass fetches land-use polygons
+(residential/commercial/retail/industrial) and point-of-interest nodes
+(shops, amenities, offices), rasterizes them onto a 150 m grid, and stamps
+each link with `res_weight` (trip production — homes) and `attr_weight`
+(trip attraction — activity centres), both ~0.3–4 with 1.0 neutral. The
+engine's demand generator places trip origins by `res_weight` and multiplies
+gravity destination choice by `attr_weight`, so traffic runs homes→shops/jobs
+instead of a uniform scatter. Maps scraped without the flag behave as before
+(every weight neutral).
+
 ## Wiring it into the engine
 
 `sim::map::millbrae_sample()` is a hand-built stand-in with this exact shape. The

@@ -13,5 +13,8 @@ web/*.tsbuildinfo
 web/public/*.json
 __pycache__/
 *.pyc
+# LODES downloads (tens of MB per state) and derived OD aggregates.
+tools/lodes/cache/
+tools/lodes/*.json
 # Golden-image regression writes this only on a mismatch, for inspection.
 *.actual.png

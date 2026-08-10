@@ -52,12 +52,74 @@ pub const FALLBACK: [u16; 24] = [
 /// shoulder, a sustained midday plateau (errand/shopping trips freeways lack), and
 /// a dominant PM peak — and its *peakiness* is pinned to the real Caltrans
 /// K-factor for these routes (peak hour ≈ 9% of the day; see `tools/counts`,
-/// `k_factor = 0.09`). Used only via [`arterial_factor`] as a normalized multiplier,
-/// so absolute magnitude is irrelevant — only the relative shape matters.
+/// `k_factor = 0.09`). Used only via [`arterial_factor`] / [`surface_factor`] as a
+/// normalized multiplier, so absolute magnitude is irrelevant — only the relative
+/// shape matters.
 pub const ARTERIAL: [u16; 24] = [
     110, 65, 50, 50, 90, 190, 370, 560, 600, 540, 520, 540, 580, 580, 620, 720, 850, 900, 760, 540,
     400, 320, 230, 160,
 ];
+
+/// Which kind of surface trip a demand stream is, by its boundary geometry. Each
+/// class breathes on its own diurnal shape — the surface analog of the per-direction
+/// freeway curves: a city's inbound side jams in the AM while outbound flows, and
+/// swaps in the PM. Shapes are modeled on the NHTS purpose mix (work trips dominate
+/// the commute classes; shopping/errand trips give Internal its midday plateau).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceClass {
+    /// Gateway→gateway across the map: the generic arterial mix.
+    Through,
+    /// Gateway→interior — arriving commuters; AM-dominant. Also carried by
+    /// measured home→work commute streams (LODES), which want the same shape.
+    Inbound,
+    /// Interior→gateway — the evening return; PM-dominant. Also the work→home
+    /// direction of measured commute streams.
+    Outbound,
+    /// Interior→interior — local errands; broad midday plateau.
+    Internal,
+}
+
+/// Inbound (arriving) surface shape: the home→work departure surge, sharp 07–08
+/// crest, then a long moderate tail (midday arrivals, a secondary PM shoulder).
+pub const SURFACE_INBOUND: [u16; 24] = [
+    70, 45, 35, 40, 90, 260, 560, 850, 800, 560, 460, 450, 460, 460, 480, 520, 560, 570, 480, 360,
+    270, 210, 150, 100,
+];
+
+/// Outbound (departing) surface shape: the work→home return, dominant 16–18 crest
+/// with a modest AM shoulder — the mirror of [`SURFACE_INBOUND`].
+pub const SURFACE_OUTBOUND: [u16; 24] = [
+    100, 60, 45, 40, 60, 130, 280, 420, 460, 430, 440, 470, 520, 560, 640, 780, 900, 920, 760, 540,
+    400, 320, 240, 160,
+];
+
+/// Internal (local) surface shape: shopping/errand/school trips — a broad
+/// 10:00–15:00 plateau between softer commute shoulders.
+pub const SURFACE_INTERNAL: [u16; 24] = [
+    80, 50, 40, 40, 60, 120, 260, 420, 520, 570, 620, 650, 670, 660, 650, 640, 610, 570, 500, 410,
+    330, 270, 200, 130,
+];
+
+/// Weekend surface shape, all classes: no commute structure — a slow morning rise
+/// into a single early-afternoon hump, with evenings staying livelier than a weekday.
+pub const SURFACE_WEEKEND: [u16; 24] = [
+    150, 100, 70, 50, 50, 70, 120, 200, 320, 450, 560, 640, 690, 700, 680, 640, 600, 560, 500, 430,
+    370, 320, 260, 200,
+];
+
+/// The hourly shape a surface stream of `class` follows. Weekends collapse every
+/// class onto the single weekend hump — the commute asymmetry is a weekday thing.
+pub fn surface_profile(class: SurfaceClass, weekend: bool) -> &'static [u16; 24] {
+    if weekend {
+        return &SURFACE_WEEKEND;
+    }
+    match class {
+        SurfaceClass::Through => &ARTERIAL,
+        SurfaceClass::Inbound => &SURFACE_INBOUND,
+        SurfaceClass::Outbound => &SURFACE_OUTBOUND,
+        SurfaceClass::Internal => &SURFACE_INTERNAL,
+    }
+}
 
 const DAY_SECS: f64 = 86_400.0;
 
@@ -124,13 +186,47 @@ pub fn congested_entry_speed(free_flow: f64, per_lane_volume: f64) -> f64 {
     free_flow + (floor - free_flow) * t
 }
 
+/// Mean of an hourly shape — the normalizer that turns a shape into a
+/// daily-mean-1.0 multiplier, so it redistributes a calibrated base rate through
+/// the day without inflating the total.
+fn shape_mean(shape: &[u16; 24]) -> f64 {
+    shape.iter().map(|&v| v as f64).sum::<f64>() / 24.0
+}
+
 /// Time-of-day multiplier for surface-street demand: the [`ARTERIAL`] shape scaled
 /// so its *daily mean is 1.0*. So a surface stream's calibrated `base_rate` (which
 /// represents its average-day volume) breathes with the commute — ~2× at the PM
 /// peak, ~0.1× pre-dawn — instead of firing flat around the clock.
 pub fn arterial_factor(seconds_into_day: f64) -> f64 {
-    let mean = ARTERIAL.iter().map(|&v| v as f64).sum::<f64>() / 24.0;
-    interp(&ARTERIAL, seconds_into_day) / mean
+    interp(&ARTERIAL, seconds_into_day) / shape_mean(&ARTERIAL)
+}
+
+/// Time-of-day multiplier for a surface stream of `class` (daily mean 1.0): the
+/// class-specific weekday shape, or the flat-topped weekend hump. This is what
+/// makes the inbound side of town build in the AM while outbound builds in the PM
+/// — the boundary categories stop breathing in lockstep.
+pub fn surface_factor(class: SurfaceClass, weekend: bool, seconds_into_day: f64) -> f64 {
+    let shape = surface_profile(class, weekend);
+    interp(shape, seconds_into_day) / shape_mean(shape)
+}
+
+/// Weekend share of a freeway's weekday volume (roughly the observed 10–20% drop).
+const WEEKEND_FREEWAY_LEVEL: f64 = 0.85;
+/// How far the weekend flattens the weekday freeway curve toward its own mean —
+/// commute peaks mostly vanish; a single soft midday crest remains.
+const WEEKEND_FREEWAY_FLATTEN: f64 = 0.5;
+
+/// Per-lane freeway flow at `seconds_into_day` adjusted for the day of week. The
+/// PeMS curves are *typical weekday*; on a weekend the volume drops ~15% and the
+/// commute peaks collapse, so the curve is blended toward its daily mean rather
+/// than replayed verbatim.
+pub fn freeway_flow(profile: &[u16; 24], weekend: bool, seconds_into_day: f64) -> f64 {
+    let v = interp(profile, seconds_into_day);
+    if !weekend {
+        return v;
+    }
+    let mean = shape_mean(profile);
+    WEEKEND_FREEWAY_LEVEL * (v + (mean - v) * WEEKEND_FREEWAY_FLATTEN)
 }
 
 #[cfg(test)]
@@ -191,6 +287,45 @@ mod tests {
         // Lower entry speed ⇒ shorter admission gap ⇒ denser entry (min_gap 2, headway 1.5).
         let gap = |v: f64| 2.0 + v * 1.5;
         assert!(gap(congested_entry_speed(vf, 1600.0)) < gap(vf) * 0.5, "peak entry packs at least twice as dense");
+    }
+
+    #[test]
+    fn surface_classes_peak_at_their_own_hours() {
+        let argmax = |p: &[u16; 24]| (0..24).max_by_key(|&h| p[h]).unwrap();
+        // The commute classes mirror each other; internal errand traffic crests midday.
+        assert_eq!(argmax(&SURFACE_INBOUND), 7, "inbound is the AM arrival surge");
+        assert_eq!(argmax(&SURFACE_OUTBOUND), 17, "outbound is the PM return");
+        assert!((10..=15).contains(&argmax(&SURFACE_INTERNAL)), "internal peaks midday");
+        assert!((11..=14).contains(&argmax(&SURFACE_WEEKEND)), "weekend is one early-afternoon hump");
+
+        // Every class factor is a daily-mean-1 multiplier, so base rates stay calibrated.
+        for class in [SurfaceClass::Through, SurfaceClass::Inbound, SurfaceClass::Outbound, SurfaceClass::Internal] {
+            for weekend in [false, true] {
+                let mean = (0..24).map(|h| surface_factor(class, weekend, h as f64 * 3600.0)).sum::<f64>() / 24.0;
+                assert!((mean - 1.0).abs() < 0.02, "{class:?} weekend={weekend} daily mean ≈ 1, got {mean}");
+            }
+        }
+
+        // At the AM peak the inbound side of town far outdraws outbound; swapped by PM.
+        let am = 7.5 * 3600.0;
+        let pm = 17.5 * 3600.0;
+        let f = |c, t| surface_factor(c, false, t);
+        assert!(f(SurfaceClass::Inbound, am) > f(SurfaceClass::Outbound, am) * 1.5, "AM is inbound-heavy");
+        assert!(f(SurfaceClass::Outbound, pm) > f(SurfaceClass::Inbound, pm) * 1.3, "PM is outbound-heavy");
+    }
+
+    #[test]
+    fn weekends_lighten_and_flatten_the_freeway() {
+        // The weekday AM crest mostly collapses on a weekend, and the whole day
+        // carries ~15% less volume.
+        let weekday_peak = freeway_flow(&I280_S, false, 7.0 * 3600.0);
+        let weekend_peak = freeway_flow(&I280_S, true, 7.0 * 3600.0);
+        assert!(weekend_peak < weekday_peak * 0.75, "weekend blunts the commute peak: {weekend_peak} vs {weekday_peak}");
+        let day_total = |weekend| (0..24).map(|h| freeway_flow(&I280_S, weekend, h as f64 * 3600.0)).sum::<f64>();
+        let ratio = day_total(true) / day_total(false);
+        assert!((ratio - 0.85).abs() < 0.02, "weekend carries ~85% of weekday volume, got {ratio}");
+        // Overnight the flattening *raises* flow toward the mean — quiet hours are less dead.
+        assert!(freeway_flow(&I280_S, true, 3.0 * 3600.0) > freeway_flow(&I280_S, false, 3.0 * 3600.0));
     }
 
     #[test]

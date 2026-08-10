@@ -12,7 +12,7 @@ import {
   sliderToMpp,
   wheelZoomFactor,
 } from "../lib/camera";
-import { panelText, startSpeedLabel } from "../lib/hud";
+import { StatsSmoother, panelText, startSpeedLabel } from "../lib/hud";
 import { type Control, type InitConfig, overlayFromSnapshot } from "../lib/protocol";
 import { createSession, type Session } from "../lib/session";
 import { SCENARIOS, scenarioName } from "../lib/maps";
@@ -64,6 +64,8 @@ export default function EngineCanvas() {
   const cameraRef = useRef<Camera | null>(null); // last frame's camera, for client→world input transforms
   const sliderRef = useRef<HTMLInputElement>(null);
   const statsRef = useRef<HTMLSpanElement>(null);
+  // Glides the HUD's jittery per-frame counts (EMA + deadband) across frames.
+  const smootherRef = useRef(new StatsSmoother());
   const perfStatusRef = useRef<HTMLSpanElement>(null); // live "what's running" line in the Performance panel
   const tipRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -315,7 +317,7 @@ export default function EngineCanvas() {
           onFrame: (f) => {
             fitMppRef.current = f.fitMpp;
             cameraRef.current = cameraFromParams(f.snapshot.camera);
-            const o = overlayFromSnapshot(f.snapshot, { fitMpp: f.fitMpp, zoomRange: ZOOM_RANGE });
+            const o = overlayFromSnapshot(f.snapshot, { fitMpp: f.fitMpp, zoomRange: ZOOM_RANGE }, smootherRef.current);
             if (statsRef.current) statsRef.current.textContent = o.stats;
             if (perfStatusRef.current) perfStatusRef.current.textContent = o.perf;
             if (rushClockRef.current) rushClockRef.current.textContent = o.rushClock ?? "";

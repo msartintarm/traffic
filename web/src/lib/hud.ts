@@ -23,6 +23,9 @@ export function execString(backend: string, vehicles: number, parThreshold: numb
 }
 
 export type Stats = {
+  // Simulated time of day in fractional hours; NaN hides the clock line
+  // (an older wasm build without the accessor).
+  dayTime: number;
   vehicles: number;
   crashed: number;
   speed: string;
@@ -32,13 +35,54 @@ export type Stats = {
   waiting: number;
 };
 
-// The stats overlay, one metric per line; the trailing three appear only when non-zero.
+// The stats overlay, one metric per line; the clock leads when the sim reports a
+// time of day, and the trailing three appear only when non-zero.
 export function statsLines(s: Stats): string[] {
-  const lines = [`${s.vehicles} vehicles`, `${s.crashed} crashed`, s.speed, s.exec];
+  const lines = Number.isFinite(s.dayTime) ? [clockText(s.dayTime)] : [];
+  lines.push(`${s.vehicles} vehicles`, `${s.crashed} crashed`, s.speed, s.exec);
   if (s.idleSkipped > 0) lines.push(`${s.idleSkipped} idle-skipped`);
   if (s.linksQueued > 0) lines.push(`${s.linksQueued} links queued`);
   if (s.waiting > 0) lines.push(`${s.waiting} waiting to enter`);
   return lines;
+}
+
+// Fractional hour → "HH:MM" wall-clock text.
+export function clockText(hour: number): string {
+  const h = ((hour % 24) + 24) % 24;
+  const hh = Math.floor(h);
+  return `${pad2(hh)}:${pad2(Math.floor((h - hh) * 60))}`;
+}
+
+// Exponential smoothing plus an integer deadband for the HUD's live counts: raw
+// per-frame values (vehicle totals, queue depths) jitter by a few units every
+// frame, which reads as flicker. Each keyed series is low-pass filtered, and the
+// *displayed* integer only moves once the filtered value clearly leaves it — so
+// the numbers glide instead of vibrating. A large step (map reset, demand clear)
+// snaps immediately rather than gliding through seconds of stale values.
+export class StatsSmoother {
+  private ema = new Map<string, number>();
+  private shown = new Map<string, number>();
+
+  // Smoothed integer for display. `alpha` is the per-frame EMA weight
+  // (~0.1 ≈ a fifth of a second at 60 fps).
+  count(key: string, raw: number, alpha = 0.1): number {
+    const filtered = this.filter(key, raw, alpha);
+    const shown = this.shown.get(key);
+    if (shown === undefined || Math.abs(filtered - shown) > 0.6) {
+      this.shown.set(key, Math.round(filtered));
+    }
+    return this.shown.get(key)!;
+  }
+
+  // Smoothed continuous value (no deadband) for readouts formatted with decimals.
+  filter(key: string, raw: number, alpha = 0.1): number {
+    const prev = this.ema.get(key);
+    const snap = prev === undefined || Math.abs(raw - prev) > Math.max(20, 0.25 * Math.max(Math.abs(raw), Math.abs(prev)));
+    const next = snap ? raw : prev + alpha * (raw - prev);
+    this.ema.set(key, next);
+    if (snap) this.shown.set(key, Math.round(next));
+    return next;
+  }
 }
 
 // The stats lines rendered as the overlay's bulleted text block.
@@ -64,10 +108,8 @@ function dir(n: number, s: number): string {
 // The rush-hour clock: fractional hour → "HH:MM" plus the two corridors' directional flows.
 // `flows` mirrors `sim.rush_hour_flows()`: [n101, s101, n280, s280].
 export function rushClockText(hour: number, flows: ArrayLike<number>): string {
-  const hh = Math.floor(hour);
-  const mm = Math.floor((hour - hh) * 60);
   return (
-    ` ${pad2(hh)}:${pad2(mm)} · US-101 ${dir(flows[0], flows[1])}` +
+    ` ${clockText(hour)} · US-101 ${dir(flows[0], flows[1])}` +
     ` · I-280 ${dir(flows[2], flows[3])} veh/h/ln`
   );
 }

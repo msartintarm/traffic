@@ -12,6 +12,7 @@ import {
 import {
   type Stats,
   type Units,
+  StatsSmoother,
   execString,
   perfStatus,
   rushClockText,
@@ -72,6 +73,8 @@ export function isControl(msg: unknown): msg is Control {
 // worker → main, once per rendered frame. Mirrors the sim reads the HUD used to make
 // directly; `overlayFromSnapshot` turns it back into the strings the overlay shows.
 export type StatsSnapshot = {
+  // Simulated time of day, fractional hours; NaN when the wasm build predates it.
+  dayTime: number;
   vehicles: number;
   crashed: number;
   selectedSpeed: number;
@@ -102,17 +105,24 @@ export type OverlayOpts = { fitMpp: number; zoomRange: number };
 
 // Project a frame snapshot to the overlay's strings + the cached camera the main thread
 // uses to pre-transform the next gesture. Pure composition over camera.ts + hud.ts.
-export function overlayFromSnapshot(s: StatsSnapshot, opts: OverlayOpts): Overlay {
-  const speed = speedString(s.selectedSpeed, s.effectiveSpeed, s.throttled);
-  const exec = execString(s.backend, s.vehicles, s.parThreshold);
+export function overlayFromSnapshot(s: StatsSnapshot, opts: OverlayOpts, smoother?: StatsSmoother): Overlay {
+  // The live counts jitter a few units per frame; a caller-held smoother makes
+  // the displayed numbers glide (per-key EMA + integer deadband) while one-shot
+  // projections (tests, screenshots) stay exact by omitting it.
+  const n = (key: string, raw: number) => (smoother ? smoother.count(key, raw) : raw);
+  const effective = smoother ? smoother.filter("effectiveSpeed", s.effectiveSpeed) : s.effectiveSpeed;
+  const vehicles = n("vehicles", s.vehicles);
+  const speed = speedString(s.selectedSpeed, effective, s.throttled);
+  const exec = execString(s.backend, vehicles, s.parThreshold);
   const stats: Stats = {
-    vehicles: s.vehicles,
+    dayTime: s.dayTime,
+    vehicles,
     crashed: s.crashed,
     speed,
     exec,
-    idleSkipped: s.idleSkipped,
-    linksQueued: s.linksQueued,
-    waiting: s.waiting,
+    idleSkipped: n("idleSkipped", s.idleSkipped),
+    linksQueued: n("linksQueued", s.linksQueued),
+    waiting: n("waiting", s.waiting),
   };
   const t = mppToSlider(s.metersPerPixel, opts.fitMpp, opts.zoomRange);
   return {

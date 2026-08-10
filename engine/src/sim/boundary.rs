@@ -77,13 +77,34 @@ pub fn exit_links(net: &Network) -> Vec<LinkId> {
     (0..net.links.len() as u32).map(LinkId).filter(|&l| g[net.link(l).to.idx()]).collect()
 }
 
+/// The drivable span (m) a link needs before a trip may start or end on it — room
+/// to actually hold a car outside any junction box.
+const MIN_TRIP_SPAN: f64 = 7.0;
+
+/// Whether `link` is usable as a trip end: not a junction-interior fragment (both
+/// endpoints inside one junction cluster — the crossing pavement of a big divided
+/// intersection) and long enough, after setbacks, to hold a stopped car. Without
+/// this, gravity happily targets a wide internal stub of a merged intersection
+/// (high lanes×speed weight) and trips *end in the middle of the box* — cars park
+/// there and gridlock the junction.
+fn trip_end_worthy(net: &Network, link: LinkId) -> bool {
+    let l = net.link(link);
+    let same_junction = match (net.node_junction.get(l.from.idx()), net.node_junction.get(l.to.idx())) {
+        (Some(Some(a)), Some(Some(b))) => a == b,
+        _ => false,
+    };
+    !same_junction && net.lane(l.lane_start).length >= MIN_TRIP_SPAN
+}
+
 /// Links that neither leave nor arrive at a gateway — the genuinely internal
-/// segments, the candidate interior origins/destinations.
+/// segments, the candidate interior origins/destinations. Junction-interior
+/// fragments and stubs too short to hold a car are excluded (see
+/// [`trip_end_worthy`]).
 pub fn interior_links(net: &Network) -> Vec<LinkId> {
     let g = gateway_mask(net);
     (0..net.links.len() as u32)
         .map(LinkId)
-        .filter(|&l| !g[net.link(l).from.idx()] && !g[net.link(l).to.idx()])
+        .filter(|&l| !g[net.link(l).from.idx()] && !g[net.link(l).to.idx()] && trip_end_worthy(net, l))
         .collect()
 }
 

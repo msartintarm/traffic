@@ -10,6 +10,10 @@ pub enum Stream {
     GapAcceptance = 1,
     RouteChoice = 2,
     AccelNoise = 3,
+    /// Demand-side variation: day-to-day multipliers, per-stream rate modulation,
+    /// platoon sizes, OD churn — decorrelated from the spawn Bernoulli draws,
+    /// which live on `RouteChoice` coordinates.
+    Demand = 4,
 }
 
 #[inline]

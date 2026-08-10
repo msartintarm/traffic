@@ -138,11 +138,19 @@ pub struct SimConfig {
     /// the *deciding* fraction rather than the whole fleet. Off by default; the all-cars
     /// step stays the behavioural reference it is A/B'd against.
     pub sleep_scheduler: bool,
+    /// How long a wreck stays on the road blocking traffic before it is cleared
+    /// (seconds). Zero — the default — removes crashed vehicles instantly; setting
+    /// it opts in to post-crash obstruction (queues form behind the wreck).
+    pub wreck_clear_secs: f64,
+    /// Base probability that a driver is blind to one particular signal (a
+    /// distraction model, decided once per vehicle–node pair) and so runs its red.
+    /// Scaled by driver aggression; zero disables red-running entirely.
+    pub red_run_prob: f64,
 }
 
 impl SimConfig {
     pub const fn default_config() -> Self {
-        Self { dt: 0.2, seed: 0xC0FFEE, sleep_scheduler: false }
+        Self { dt: 0.2, seed: 0xC0FFEE, sleep_scheduler: false, wreck_clear_secs: 0.0, red_run_prob: 0.002 }
     }
 }
 

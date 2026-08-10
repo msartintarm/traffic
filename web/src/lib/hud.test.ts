@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  StatsSmoother,
+  clockText,
   execString,
   panelText,
   perfStatus,
@@ -24,7 +26,7 @@ test("execString annotates the thread pool at the parallel crossover", () => {
 });
 
 const baseStats = {
-  vehicles: 12, crashed: 0, speed: "3×", exec: "gpu",
+  dayTime: Number.NaN, vehicles: 12, crashed: 0, speed: "3×", exec: "gpu",
   idleSkipped: 0, linksQueued: 0, waiting: 0,
 };
 
@@ -70,4 +72,29 @@ test("panelText converts m/s to the chosen units", () => {
 test("startSpeedLabel formats a start-speed cap", () => {
   assert.equal(startSpeedLabel(13.4, "mi"), "Start ≤ 30 mph");
   assert.equal(startSpeedLabel(13.4, "km"), "Start ≤ 48 km/h");
+});
+
+test("clockText wraps and zero-pads the wall clock", () => {
+  assert.equal(clockText(7.5), "07:30");
+  assert.equal(clockText(0), "00:00");
+  assert.equal(clockText(24.25), "00:15");
+  assert.equal(clockText(23.999), "23:59");
+});
+
+test("statsLines leads with the clock when the sim reports a time of day", () => {
+  assert.deepEqual(statsLines({ ...baseStats, dayTime: 7.5 })[0], "07:30");
+  assert.equal(statsLines(baseStats)[0], "12 vehicles"); // NaN hides the clock
+});
+
+test("StatsSmoother glides small jitter and snaps large steps", () => {
+  const sm = new StatsSmoother();
+  assert.equal(sm.count("v", 100), 100); // first sample shows as-is
+  // ±1 flicker around 100 never moves the displayed integer.
+  for (const raw of [101, 99, 101, 99, 100, 101]) assert.equal(sm.count("v", raw), 100);
+  // A sustained move converges to the new value.
+  let shown = 100;
+  for (let i = 0; i < 120; i++) shown = sm.count("v", 110);
+  assert.equal(shown, 110);
+  // A big jump (map reset) snaps immediately instead of gliding.
+  assert.equal(sm.count("v", 500), 500);
 });

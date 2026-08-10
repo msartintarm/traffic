@@ -85,7 +85,11 @@ def overpass_query(bbox, classes=None):
 
 
 def fetch(bbox, classes=None, attempts=6):
-    body = urllib.parse.urlencode({"data": overpass_query(bbox, classes)}).encode()
+    return fetch_query(overpass_query(bbox, classes), attempts)
+
+
+def fetch_query(query, attempts=6):
+    body = urllib.parse.urlencode({"data": query}).encode()
     headers = {
         "User-Agent": "traffic-sim-osm-scraper/0.1 (github traffic sim)",
         "Content-Type": "application/x-www-form-urlencoded",
@@ -152,7 +156,97 @@ def project(lat, lon, lat0, lon0):
     return round(x, 2), round(y, 2)
 
 
-def build(raw, bbox, place, drivable=DRIVABLE):
+# --- land use (`--landuse`) -------------------------------------------------
+# A second, lightweight Overpass pass: land-use polygons and point-of-interest
+# nodes, rasterized onto a coarse grid, weight each link's trip *production*
+# (res_weight — homes) and *attraction* (attr_weight — shops, jobs, campuses).
+# The engine's demand generator reads these to place origins in residential
+# fabric and pull destinations toward activity centres instead of a uniform
+# scatter. Both default to neutral when the pass is skipped.
+
+LANDUSE_CELL_M = 150.0
+ATTR_LANDUSE = {"commercial": 1.0, "retail": 1.0, "industrial": 0.5}
+POI_AMENITIES = (
+    "restaurant|cafe|fast_food|bar|bank|school|college|university|hospital|"
+    "clinic|pharmacy|cinema|theatre|library|townhall|marketplace|place_of_worship"
+)
+
+
+def landuse_query(bbox):
+    s, w, n, e = bbox
+    return f"""
+    [out:json][timeout:90];
+    (
+      way["landuse"~"^(residential|commercial|retail|industrial)$"]({s},{w},{n},{e});
+      node["shop"]({s},{w},{n},{e});
+      node["amenity"~"^({POI_AMENITIES})$"]({s},{w},{n},{e});
+      node["office"]({s},{w},{n},{e});
+    );
+    (._;>;);
+    out body;
+    """
+
+
+def point_in_ring(x, y, ring):
+    inside = False
+    j = len(ring) - 1
+    for i in range(len(ring)):
+        xi, yi = ring[i]
+        xj, yj = ring[j]
+        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+class LandUseGrid:
+    """Residential / attraction signals on a coarse metre grid: polygon interiors
+    painted by point-in-ring over the cells the polygon's bbox covers, POIs
+    accumulated into their cell. Reads are 3x3-smoothed so a street bordering a
+    zone still feels it."""
+
+    def __init__(self, raw, lat0, lon0):
+        pts = {
+            e["id"]: project(e["lat"], e["lon"], lat0, lon0)
+            for e in raw["elements"] if e["type"] == "node"
+        }
+        self.res, self.attr = defaultdict(float), defaultdict(float)
+        cs = LANDUSE_CELL_M
+        for e in raw["elements"]:
+            tags = e.get("tags", {})
+            if e["type"] == "way":
+                lu = tags.get("landuse")
+                ring = [pts[n] for n in e["nodes"] if n in pts]
+                if lu is None or len(ring) < 3:
+                    continue
+                xs, ys = [p[0] for p in ring], [p[1] for p in ring]
+                ci0, ci1 = int(min(xs) // cs), int(max(xs) // cs)
+                cj0, cj1 = int(min(ys) // cs), int(max(ys) // cs)
+                for ci in range(ci0, ci1 + 1):
+                    for cj in range(cj0, cj1 + 1):
+                        centre = ((ci + 0.5) * cs, (cj + 0.5) * cs)
+                        if not point_in_ring(*centre, ring):
+                            continue
+                        if lu == "residential":
+                            self.res[ci, cj] = 1.0
+                        else:
+                            self.attr[ci, cj] = max(self.attr[ci, cj], ATTR_LANDUSE[lu])
+            elif e["type"] == "node" and any(k in tags for k in ("shop", "amenity", "office")):
+                x, y = pts[e["id"]]
+                self.attr[int(x // cs), int(y // cs)] += 0.25
+
+    def _smooth(self, grid, x, y):
+        ci, cj = int(x // LANDUSE_CELL_M), int(y // LANDUSE_CELL_M)
+        cells = [(ci + di, cj + dj) for di in (-1, 0, 1) for dj in (-1, 0, 1)]
+        return sum(grid[c] for c in cells if c in grid) / 9.0
+
+    def weights(self, x, y):
+        res = self._smooth(self.res, x, y)
+        attr = min(self._smooth(self.attr, x, y), 3.0)
+        return round(0.3 + 1.4 * res, 2), round(0.3 + 1.2 * attr, 2)
+
+
+def build(raw, bbox, place, drivable=DRIVABLE, landuse=None):
     nodes = {e["id"]: e for e in raw["elements"] if e["type"] == "node"}
     ways = [
         e for e in raw["elements"]
@@ -255,6 +349,13 @@ def build(raw, bbox, place, drivable=DRIVABLE):
             # OSM turn:lanes for this direction, e.g. "left|through|through;right" —
             # the renderer paints the lane-use arrows from it.
             link["turn_lanes"] = turn_lanes
+        if landuse:
+            # Trip production/attraction weights from the land-use grid at the
+            # link's midpoint — the engine tilts demand origins toward homes and
+            # destinations toward activity centres.
+            res_w, attr_w = landuse.weights((ea["x"] + eb["x"]) / 2, (ea["y"] + eb["y"]) / 2)
+            link["res_weight"] = res_w
+            link["attr_weight"] = attr_w
         out_links.append(link)
 
     for way in ways:
@@ -322,11 +423,21 @@ def main():
         "--highways-only", action="store_true",
         help="keep only freeways and their ramps/exits (motorway/trunk + _link)",
     )
+    ap.add_argument(
+        "--landuse", action="store_true",
+        help="also scrape land-use polygons and POIs; weight each link's trip production/attraction",
+    )
     args = ap.parse_args()
 
     bbox = resolve_bbox(args)
     classes = FREEWAY if args.highways_only else None
-    graph = build(fetch(bbox, classes), bbox, args.place, classes or DRIVABLE)
+    landuse = None
+    if args.landuse:
+        lat0, lon0 = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+        raw = fetch_query(landuse_query(bbox))
+        landuse = LandUseGrid(raw, lat0, lon0)
+        print(f"land use: {len(landuse.res)} residential cells, {len(landuse.attr)} attraction cells")
+    graph = build(fetch(bbox, classes), bbox, args.place, classes or DRIVABLE, landuse)
     with open(args.out, "w") as f:
         json.dump(graph, f, separators=(",", ":"))
     print(f"wrote {args.out}: {len(graph['nodes'])} nodes, {len(graph['links'])} links")

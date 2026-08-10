@@ -32,6 +32,11 @@ index_type!(JunctionId);
 
 pub const LANE_WIDTH: f64 = 3.5;
 
+/// Alignment (dot of arrival and departure directions) above which an
+/// interchange movement counts as a continuation seam rather than a turn —
+/// cos 45°, wide enough to take in merge ramps at the gore.
+const SEAM_ALIGN_DOT: f64 = 0.7;
+
 /// Turn-pocket bay geometry: the bay is fully open (turn lane at its own offset)
 /// for [`POCKET_OPEN`] metres before the stop line, having diverged from the
 /// adjacent through lane over the bay taper (a per-lane length) upstream of that.
@@ -236,6 +241,16 @@ pub struct Network {
     /// OSM `turn:lanes` per link (index-aligned with `links`), for this travel
     /// direction; empty when unmapped. The renderer paints lane-use arrows from it.
     pub link_turn_lanes: Vec<String>,
+    /// Observed AADT per link (index-aligned with `links`; both directions,
+    /// vehicles/day; `0.0` = unobserved). Real counts joined at import — demand
+    /// calibrates gateway inflow and gravity attraction against these.
+    pub link_aadt: Vec<f64>,
+    /// Land-use trip-production weight per link (`0.0` = no data → neutral 1.0):
+    /// residential surroundings produce trips. From the scraper's `--landuse` pass.
+    pub link_res_weight: Vec<f64>,
+    /// Land-use trip-attraction weight per link (`0.0` = no data → neutral 1.0):
+    /// shops/jobs/campuses attract trips.
+    pub link_attr_weight: Vec<f64>,
     pub junctions: Vec<Junction>,
     pub node_junction: Vec<Option<JunctionId>>,
     /// O(1) membership index over `conflicts` (unordered movement-id pair packed into
@@ -264,7 +279,7 @@ fn unit(v: [f64; 2]) -> [f64; 2] {
     [v[0] / n, v[1] / n]
 }
 
-const JUNCTION_MERGE_GAP: f64 = 14.0;
+pub(crate) const JUNCTION_MERGE_GAP: f64 = 14.0;
 const FOOTPRINT_RADIUS: f64 = 28.0;
 
 /// ~ a vehicle width: interior paths passing farther apart than this share the box
@@ -462,6 +477,28 @@ impl Network {
         self.link_refs.get(id.idx()).map_or("", String::as_str)
     }
 
+    /// Observed AADT of a link (both directions, vehicles/day), or `0.0` when the
+    /// road has no attached count.
+    pub fn link_aadt(&self, id: LinkId) -> f64 {
+        self.link_aadt.get(id.idx()).copied().unwrap_or(0.0)
+    }
+
+    /// Land-use trip-production weight of a link; neutral 1.0 without data.
+    pub fn link_res_weight(&self, id: LinkId) -> f64 {
+        match self.link_res_weight.get(id.idx()).copied().unwrap_or(0.0) {
+            w if w > 0.0 => w,
+            _ => 1.0,
+        }
+    }
+
+    /// Land-use trip-attraction weight of a link; neutral 1.0 without data.
+    pub fn link_attr_weight(&self, id: LinkId) -> f64 {
+        match self.link_attr_weight.get(id.idx()).copied().unwrap_or(0.0) {
+            w if w > 0.0 => w,
+            _ => 1.0,
+        }
+    }
+
     pub fn lane(&self, id: LaneId) -> &Lane {
         &self.lanes[id.idx()]
     }
@@ -515,11 +552,24 @@ impl Network {
                 let mv = self.movement(MovementId(m));
                 let entry = point2(self.lane_point(mv.from_lane, self.lane(mv.from_lane).length));
                 let exit = point2(self.lane_point(mv.to_lane, 0.0));
+                let arr = self.arrival_dir(self.lane(mv.from_lane).link);
+                let dep = self.departure_dir(self.lane(mv.to_lane).link);
+                // A continuation seam is not a place a car steers: it runs straight
+                // through at its own lateral line, however far the target lane sits —
+                // the landing blend eases it over on the next link. A curve here would
+                // pack the whole lateral move into the node's ~1 m gap and double back
+                // on itself whenever the chord is mostly sideways.
+                if self.is_continuation_seam(MovementId(m)) {
+                    let d = sub(exit, entry);
+                    let gap = (d[0] * arr[0] + d[1] * arr[1]).max(0.25);
+                    let exit = [entry[0] + arr[0] * gap, entry[1] + arr[1] * gap];
+                    let c1 = [entry[0] + arr[0] * gap / 3.0, entry[1] + arr[1] * gap / 3.0];
+                    let c2 = [entry[0] + arr[0] * gap * 2.0 / 3.0, entry[1] + arr[1] * gap * 2.0 / 3.0];
+                    return Interior { entry, c1, c2, exit, len: gap };
+                }
                 // Control handles lie along the arrival and departure road
                 // directions, a third of the chord out, so the path leaves and
                 // arrives tangent to each road (straight when collinear).
-                let arr = self.arrival_dir(self.lane(mv.from_lane).link);
-                let dep = self.departure_dir(self.lane(mv.to_lane).link);
                 let k = norm(sub(exit, entry)) / 3.0;
                 let c1 = [entry[0] + arr[0] * k, entry[1] + arr[1] * k];
                 let c2 = [exit[0] - dep[0] * k, exit[1] - dep[1] * k];
@@ -700,17 +750,41 @@ impl Network {
             }
             r
         }
-        for (i, l) in self.links.iter().enumerate() {
-            if l.layer != 0 || (!is_ix(l.from.idx()) && !is_ix(l.to.idx())) {
-                continue;
+        // Short-gap links (their boxes nearly touch) are junction-interior pavement.
+        // Seeded at intersection nodes, then expanded to a fixpoint: a short link also
+        // joins when either side's cluster already holds an intersection — so the stub
+        // chain leading into a junction (the bend and signal nodes between the outer
+        // stop line and the box) is annexed whole. Without the expansion, sliver links
+        // straddle the boundary and cars stop at red on a few metres of pavement in
+        // the middle of the drawn intersection.
+        let short: Vec<(usize, usize)> = self
+            .links
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                if l.layer != 0 {
+                    return None;
+                }
+                let full: f64 = self.polylines[i].windows(2).map(|w| norm(sub(w[1], w[0]))).sum();
+                let gap = full
+                    - self.render_setback.get(l.from.idx()).copied().unwrap_or(0.0)
+                    - self.render_setback.get(l.to.idx()).copied().unwrap_or(0.0);
+                (gap < JUNCTION_MERGE_GAP).then_some((l.from.idx(), l.to.idx()))
+            })
+            .collect();
+        let mut root_ix: Vec<bool> = (0..n).map(is_ix).collect();
+        loop {
+            let mut changed = false;
+            for &(a, b) in &short {
+                let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+                if ra != rb && (root_ix[ra] || root_ix[rb]) {
+                    parent[ra] = rb;
+                    root_ix[rb] |= root_ix[ra];
+                    changed = true;
+                }
             }
-            let full: f64 = self.polylines[i].windows(2).map(|w| norm(sub(w[1], w[0]))).sum();
-            let gap = full
-                - self.render_setback.get(l.from.idx()).copied().unwrap_or(0.0)
-                - self.render_setback.get(l.to.idx()).copied().unwrap_or(0.0);
-            if gap < JUNCTION_MERGE_GAP {
-                let (ra, rb) = (find(&mut parent, l.from.idx()), find(&mut parent, l.to.idx()));
-                parent[ra] = rb;
+            if !changed {
+                break;
             }
         }
         let mut has_ix: std::collections::HashMap<usize, bool> = Default::default();
@@ -959,6 +1033,18 @@ impl Network {
         let mv = self.movement(mid);
         self.link(self.lane(mv.from_lane).link).kind.is_grade_separated()
             && self.link(self.lane(mv.to_lane).link).kind.is_grade_separated()
+    }
+
+    /// An interchange movement whose roads run on together — a segment seam, merge,
+    /// or gore, not a real turn. A car takes it by continuing straight; whatever
+    /// lane the movement targets is reached by a lateral ease *on* the next link
+    /// (the seam-landing blend), never by swerving inside the node.
+    pub fn is_continuation_seam(&self, mid: MovementId) -> bool {
+        let mv = self.movement(mid);
+        let (fl, tl) = (self.lane(mv.from_lane).link, self.lane(mv.to_lane).link);
+        let a = self.arrival_dir(fl);
+        let b = self.departure_dir(tl);
+        self.is_interchange_movement(mid) && a[0] * b[0] + a[1] * b[1] > SEAM_ALIGN_DOT
     }
 
     /// Whether every carriageway meeting `node` is grade-separated — a pure highway
@@ -1329,7 +1415,7 @@ mod tests {
         // L-shaped link (0,0) → bend (100,0) → (100,100).
         let net = OsmMap {
             nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 100.0, 100.0)],
-            links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 1, speed_limit: 20.0, geometry: vec![[100.0, 0.0]], layer: 0, name: String::new(), road_class: String::new(), highway_ref: String::new(), turn_lanes: String::new() }],
+            links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 1, speed_limit: 20.0, geometry: vec![[100.0, 0.0]], layer: 0, name: String::new(), road_class: String::new(), highway_ref: String::new(), turn_lanes: String::new(), aadt: 0.0, res_weight: 0.0, attr_weight: 0.0 }],
         }
         .build();
         let lane = LaneId(0);

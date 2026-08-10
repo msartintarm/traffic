@@ -74,6 +74,9 @@ pub struct Simulation {
     seed: u64,
     demand: DemandGenerator,
     demand_sources: DemandSources,
+    /// Real LODES commute flows (`tools/lodes`), once loaded via `set_commute_od`;
+    /// carried across demand rebuilds so toggles keep the measured streams.
+    commute: Option<demand::CommuteOd>,
     /// Spawn-rate multiplier and entry-speed cap (m/s), carried across demand rebuilds
     /// so the UI's frequency / start-speed controls persist when sources are toggled.
     demand_rate: f64,
@@ -172,13 +175,13 @@ impl Simulation {
         let mut world = NetWorld::new(network, cfg);
         let demand_sources = DemandSources::new(true, true); // freeway + surface by default
         let (demand_rate, entry_speed_cap) = (1.0, f64::INFINITY);
-        let demand = build_demand(&world, cfg.seed, demand_sources, demand_rate, entry_speed_cap);
+        let demand = build_demand(&world, cfg.seed, demand_sources, demand_rate, entry_speed_cap, None);
         world.install_router(&demand.destinations());
         let mut clock = SimClock::new(&cfg);
         clock.play();
         let signal_heads = geometry::signal_head_placements(&world.network);
         Simulation {
-            world, clock, seed: cfg.seed, demand, demand_sources, demand_rate, entry_speed_cap, camera,
+            world, clock, seed: cfg.seed, demand, demand_sources, commute: None, demand_rate, entry_speed_cap, camera,
             prev: PoseMap::default(), prev_lane: IntMap::default(), prev_crossing: IntMap::default(), selected: None, signal_heads,
             gpu: None, gpu_pending: None, gpu_relax: None, gpu_generation: 0, gpu_cost: Vec::new(), gpu_last: 0.0, gpu_fingerprint: 0,
             effective_speed: 0.0, throttled: false, last_advance_ms: 0.0, last_camera_ms: 0.0,
@@ -218,6 +221,23 @@ impl Simulation {
         self.apply_demand_sources(DemandSources { rush_hour: enabled, ..self.demand_sources });
     }
 
+    /// Load real commute OD flows (`tools/lodes/fetch_lodes.py` output): measured
+    /// home→work streams — AM toward work, PM the reverse — join the sampled
+    /// categories, displacing their volume in proportion to the measured share
+    /// (never their coverage). Rebuilds demand live (non-destructive, like the
+    /// source toggles). Returns `false` on a parse failure, leaving demand unchanged.
+    #[cfg(feature = "import")]
+    pub fn set_commute_od(&mut self, json: &str) -> bool {
+        match demand::CommuteOd::from_json(json) {
+            Ok(od) => {
+                self.commute = Some(od);
+                self.rebuild_demand();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Rebuild the demand generator for a new source mix and reinstall the router over
     /// its destinations plus those of cars already on the road, so in-flight trips
     /// aren't stranded. No-op if the mix is unchanged.
@@ -226,6 +246,12 @@ impl Simulation {
             return;
         }
         self.demand_sources = sources;
+        self.rebuild_demand();
+    }
+
+    /// Swap in a freshly built demand generator (current sources/commute data) and
+    /// reinstall the router, preserving live-vehicle ids and destinations.
+    fn rebuild_demand(&mut self) {
         // Carry the id counter past every vehicle still on the road (and the old
         // generator's own counter), so the rebuilt generator never reissues a live id.
         // A restart at 0 would alias two cars onto one id in the render's per-id `prev`
@@ -238,7 +264,14 @@ impl Simulation {
             .max()
             .map_or(0, |m| m + 1)
             .max(self.demand.next_id());
-        self.demand = build_demand(&self.world, self.seed, sources, self.demand_rate, self.entry_speed_cap);
+        self.demand = build_demand(
+            &self.world,
+            self.seed,
+            self.demand_sources,
+            self.demand_rate,
+            self.entry_speed_cap,
+            self.commute.as_ref(),
+        );
         self.demand.set_next_id(next_id);
         let mut dests = self.demand.destinations();
         for v in self.world.vehicles() {
@@ -277,6 +310,12 @@ impl Simulation {
     /// the UI to display the peak building and fading. 0 when the mode is off.
     pub fn rush_hour_time(&self) -> f64 {
         self.demand.rush_hour_day_secs() / 3600.0
+    }
+
+    /// Simulated wall-clock time of day (hours, 0–24) for the HUD clock — defined in
+    /// every mode, unlike [`Self::rush_hour_time`], which reads 0 when rush hour is off.
+    pub fn day_time_hours(&self) -> f64 {
+        self.demand.day_secs(self.world.time()) / 3600.0
     }
 
     /// Live per-lane freeway volumes (veh/h/lane) read off the real diurnal profile at
@@ -588,9 +627,25 @@ impl Simulation {
         self.world.vehicles().len() as u32
     }
 
-    /// Cumulative vehicles removed from the road after a collision.
+    /// Cumulative vehicles wrecked in a collision (wrecks may still be on the
+    /// road awaiting clearance).
     pub fn crashed(&self) -> u32 {
         self.world.crashed()
+    }
+
+    /// The crashed tally split by nature: `[rear_end, junction]`.
+    pub fn crash_counts(&self) -> Vec<u32> {
+        self.world.crash_counts().to_vec()
+    }
+
+    /// Wreck persistence: seconds a crashed vehicle stays on the road blocking
+    /// traffic (0 = removed instantly, the default).
+    pub fn set_wreck_clear_secs(&mut self, secs: f64) {
+        self.world.set_wreck_clear_secs(secs);
+    }
+
+    pub fn wreck_clear_secs(&self) -> f64 {
+        self.world.wreck_clear_secs()
     }
 
     /// Measured flow (vehicles/hour) per link — the sim's own counts, to compare
@@ -855,10 +910,10 @@ impl Simulation {
         let hx = self.camera.viewport[0] * mpp * 0.5 + CRASH_CULL_MARGIN_M;
         let hy = self.camera.viewport[1] * mpp * 0.5 + CRASH_CULL_MARGIN_M;
         self.world
-            .crash_sites()
+            .crash_log()
             .iter()
-            .filter(|&&p| (p[0] as f64 - c[0]).abs() <= hx && (p[1] as f64 - c[1]).abs() <= hy)
-            .map(|&p| crash_instance(p, size))
+            .filter(|r| (r.pos[0] as f64 - c[0]).abs() <= hx && (r.pos[1] as f64 - c[1]).abs() <= hy)
+            .map(|r| crash_instance(r.pos, size))
             .collect()
     }
 
@@ -1054,8 +1109,15 @@ fn flatten_static_vertices(mut v: Vec<StaticVertex>) -> Vec<f32> {
     unsafe { Vec::from_raw_parts(ptr, len, cap) }
 }
 
-fn build_demand(world: &NetWorld, seed: u64, sources: DemandSources, rate: f64, entry_cap: f64) -> DemandGenerator {
-    let pairs = demand::od_pairs(&world.network, seed, 48, sources);
+fn build_demand(
+    world: &NetWorld,
+    seed: u64,
+    sources: DemandSources,
+    rate: f64,
+    entry_cap: f64,
+    commute: Option<&demand::CommuteOd>,
+) -> DemandGenerator {
+    let pairs = demand::od_pairs_with_commute(&world.network, seed, 48, sources, commute);
     let mut gen = DemandGenerator::new(world, &pairs, seed);
     gen.set_rate_scale(rate);
     gen.set_entry_speed_cap(entry_cap);
