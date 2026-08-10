@@ -7,7 +7,8 @@
 //! constraint gather, and lane changes are skipped. The car at the front of a lane
 //! keeps the full model, so signals, yielding and junctions are still handled
 //! correctly at the point they matter. Nothing is aggregated and no car ever leaves
-//! the fleet, so behaviour stays close to per-car and overlaps remain impossible.
+//! the fleet, so queue-mode cars stay ordinary vehicles under the same crash
+//! detection as the full model.
 
 /// Settings for the congestion LOD. `engage`/`release` are occupancy ratios
 /// (cars ÷ jam) with a gap between them, and `dwell_ticks` a sustain count, so a

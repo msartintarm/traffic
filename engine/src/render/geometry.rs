@@ -260,8 +260,9 @@ fn junction_rings(net: &Network) -> JunctionRings {
     let mut rings = Vec::with_capacity(ncl);
     for ci in 0..ncl {
         let c = apex[ci];
-        // A lone crossing gets the clean rectilinear box (the intersection of its
-        // approach half-planes). A multi-node cluster — a divided arterial or a
+        // A lone crossing gets the street-band box (the crossing streets' width
+        // bands clipped against each other — a parallelogram when they meet
+        // obliquely). A multi-node cluster — a divided arterial or a
         // sprawling interchange whose arms stagger — can't be one convex box
         // without leaving arms or the core unpaved, so it uses the arm-mouth fan.
         let ring = if arms[ci].len() < 2 || apex_deg[ci] == 0 {

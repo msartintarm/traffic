@@ -1,5 +1,5 @@
-//! Intelligent Driver Model (Treiber, Hennecke & Helbing, 2000), the pure
-//! collision-free car-following law of the micro layer:
+//! Intelligent Driver Model (Treiber, Hennecke & Helbing, 2000), the micro
+//! layer's car-following law:
 //!
 //! ```text
 //!   s*(v, Δv) = s0 + max(0, v·T + v·Δv / (2·√(a·b)))
@@ -7,7 +7,7 @@
 //! ```
 //!
 //! `s` is the bumper-to-bumper gap and `Δv = v − v_lead`. No state or RNG here,
-//! so it is unit-tested alone and reused unchanged by a future WGSL port.
+//! so it is unit-tested alone, and `accel.wgsl` mirrors it on the GPU backend.
 
 use super::config::DriverConfig;
 

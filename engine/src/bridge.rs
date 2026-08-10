@@ -552,7 +552,7 @@ impl Simulation {
 
     /// Choose the accel executor: `"serial"`, `"threads"`, or `"gpu"`. The sim falls
     /// back automatically when the request isn't available on this device (no CPU
-    /// worker pool, or the GPU kernel not yet wired), so the UI can offer all three.
+    /// worker pool; the GPU evaluate runs native-only), so the UI can offer all three.
     pub fn set_accel_backend(&mut self, name: &str) {
         self.world.set_accel_backend(AccelBackend::from_name(name));
     }

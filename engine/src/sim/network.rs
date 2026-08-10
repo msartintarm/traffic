@@ -255,7 +255,8 @@ pub struct Network {
     /// unnumbered roads. Lets demand route freeway through-traffic along one highway.
     pub link_refs: Vec<String>,
     /// OSM `turn:lanes` per link (index-aligned with `links`), for this travel
-    /// direction; empty when unmapped. The renderer paints lane-use arrows from it.
+    /// direction; empty when unmapped. Channelizes the lane→movement assignment
+    /// (`map::turn_lane_exits`) and paints the renderer's lane-use arrows.
     pub link_turn_lanes: Vec<String>,
     /// Observed AADT per link (index-aligned with `links`; both directions,
     /// vehicles/day; `0.0` = unobserved). Real counts joined at import — demand

@@ -144,14 +144,12 @@ pub fn od_pairs(net: &Network, seed: u64, target: usize, sources: DemandSources)
 /// sampled streams, and the sampled *surface* rates are scaled down by the
 /// measured volume's share — the work trips the categories were approximating.
 ///
-/// Measured volume displaces sampled **volume, never coverage**: every sampled
-/// stream survives, so the city stays evenly seeded. This matters because the
-/// wholly-in-bbox commute volume varies enormously by map — a small box whose
-/// residents mostly work outside it (Millbrae: ~450 trips/day) must barely dent
-/// the sampled fabric, while a metro box (Columbus: ~570k) should dominate it.
-/// The old flat half-the-budget split deleted half the sampled streams either
-/// way, hollowing out small maps for a trickle of measured trips. The scale is
-/// floored so sampled non-work trips never vanish (LODES covers jobs only).
+/// Measured volume displaces sampled **volume, keeping coverage**: every sampled
+/// stream survives at a scaled rate, so the city stays evenly seeded whatever
+/// the measured share — a small box whose residents mostly work outside it
+/// (Millbrae: ~450 wholly-in-bbox trips/day) barely dents the sampled fabric,
+/// while a metro box (Columbus: ~570k) dominates it. The scale is floored so
+/// sampled non-work trips persist (LODES covers jobs only).
 pub fn od_pairs_with_commute(
     net: &Network,
     seed: u64,

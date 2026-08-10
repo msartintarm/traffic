@@ -9,9 +9,9 @@
 //! and since a constraint can only ever *lower* the chosen acceleration, adding
 //! constraints refines behaviour monotonically without touching the rest.
 //!
-//! Everything here is a pure `fn` with no state, heap, or dispatch, so the same
-//! set inlines into a WGSL kernel as a sequence of `min()` calls when the micro
-//! layer moves onto the GPU.
+//! Everything here is a pure `fn` with no state, heap, or dispatch, and
+//! `accel.wgsl` executes the same fold as a sequence of `min()` calls on the
+//! GPU backend.
 
 use super::config::DriverConfig;
 use super::idm;
@@ -56,7 +56,8 @@ pub struct LongContext<'a> {
     pub driver: &'a DriverConfig,
     pub speed: f64,
     pub leader: Option<Obstacle>,
-    /// Distance to a stop line the vehicle must halt at (red signal).
+    /// Distance to a stop line the vehicle must halt at (a red signal, a
+    /// blocked box, or a junction it cannot yet clear).
     pub stop_line: Option<f64>,
     pub speed_target: Option<SpeedTarget>,
     /// Distance to a not-yet-satisfied stop sign's line.
@@ -126,8 +127,8 @@ pub fn curve_speed(ctx: &LongContext) -> f64 {
     brake_to_target(ctx.speed, ctx.curve)
 }
 
-/// Mandatory halt at a stop sign: brake to a stationary line until the world
-/// marks the sign satisfied (the vehicle has actually stopped there).
+/// Braking for a stop sign: a stationary line until the world marks the sign
+/// served — the driver's full or rolling stop at the line.
 pub fn stop_sign(ctx: &LongContext) -> f64 {
     brake_to_line(ctx, ctx.stop_sign)
 }

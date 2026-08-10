@@ -1,15 +1,11 @@
-//! Mesoscopic mass layer: Daganzo's Cell Transmission Model (CTM).
-//!
-//! This is the layer that scales to 1M+ vehicles. A link is a chain of cells,
-//! each one free-flow-speed × dt long, holding a vehicle *count*. Every tick a
-//! cell's outflow is `min(sending_i, receiving_{i+1})` of a send/receive pair,
-//! so the update is local, conservative, and reads only committed neighbour
-//! state — which is exactly why it double-buffers onto a GPU compute kernel with
-//! no races (see `meso.wgsl`, the WGSL mirror of [`MesoCorridor::step`]).
-//!
-//! Kept as the CPU *reference*: correctness is asserted here (conservation,
-//! capacity, backward-propagating congestion) and the GPU path is validated to
-//! reproduce the same behaviour.
+//! A standalone Cell Transmission Model (Daganzo CTM) corridor — **not wired
+//! into the sim step**; the running per-car LOD is [`super::congestion`]. A link
+//! is a chain of cells, each one free-flow-speed × dt long, holding a vehicle
+//! *count*. Every tick a cell's outflow is `min(sending_i, receiving_{i+1})` of
+//! a send/receive pair, so the update is local, conservative, and reads only
+//! committed neighbour state; `meso.wgsl` mirrors [`MesoCorridor::step`] on the
+//! GPU and is validated against this CPU reference (conservation, capacity,
+//! backward-propagating congestion).
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CtmParams {

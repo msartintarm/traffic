@@ -1,8 +1,7 @@
 //! Junctions as index-addressed views over the flat network arrays. A
 //! [`Junctions`] table is built once and gives O(degree) access to each node's
-//! movements and conflict points — the per-intersection grouping that the runtime
-//! (box gates, in-box conflict avoidance, crash detection) would otherwise get by
-//! scanning every movement or conflict each tick.
+//! movements and conflict points — the per-intersection grouping the runtime's
+//! in-box conflict avoidance and permissive-left checks read each tick.
 //!
 //! It stays data-oriented: CSR (`offsets` + concatenated ids) over the existing
 //! `Vec`s, no per-object ownership, so the GPU-friendly SoA layout is preserved.

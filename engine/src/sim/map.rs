@@ -2049,10 +2049,9 @@ pub fn arterial_intersection() -> Network {
     .build()
 }
 
-/// A small hand-built stand-in for scraped Millbrae, CA geometry: three
-/// El Camino Real blocks (north↔south, two lanes each way) with signalized
-/// cross streets, offset for a green wave. Replaced wholesale once the scraper
-/// emits a real extract.
+/// A small hand-built sample of Millbrae, CA geometry: three El Camino Real
+/// blocks (north↔south, two lanes each way) with signalized cross streets,
+/// offset for a green wave — the fallback scene when no scraped map loads.
 pub fn millbrae_sample() -> Network {
     let plan = |offset| SignalPlan { green_secs: 25.0, yellow_secs: 4.0, offset };
     let mut links = Vec::new();

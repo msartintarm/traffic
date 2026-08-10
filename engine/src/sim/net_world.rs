@@ -149,7 +149,8 @@ fn record_history(hist: &mut History, len: &mut u8, position: f64, speed: f64) {
 
 impl NetVehicle {
     /// Whether the vehicle is currently inside a node traversing a movement's
-    /// interior path (its `lane`/`position` are pinned at the stop line).
+    /// interior path (`position` counts on past its `lane`'s length; the overrun
+    /// is the interior arc).
     pub fn is_crossing(&self) -> bool {
         self.crossing.is_some()
     }
@@ -652,7 +653,7 @@ enum Sleep {
 
 /// Per-vehicle input to the accel evaluate pass. A rolling vehicle carries its full
 /// [`VehicleContext`]; an in-node crosser carries the acceleration its bespoke
-/// [`NetWorld::crossing_accel`] already produced (a separate kernel, and noiseless).
+/// [`NetWorld::crossing_accel`] already produced, throttle noise included at gather.
 enum AccelInput {
     Rolling(VehicleContext),
     Crossing(f64),
@@ -1324,10 +1325,8 @@ impl NetWorld {
 
     /// The speed a driver actually enters `lane` with: their requested speed, capped
     /// so that comfortable braking can settle them behind the current tail-of-queue
-    /// (`√(v_tail² + 2·b·gap)`). A driver joining a road matches the traffic they can
-    /// see — entering hot 12 m from a stopping queue is a teleport artifact, and with
-    /// braking now physically bounded it produced a stream of phantom gateway
-    /// rear-ends. A free entrance (no tail in sight) keeps the requested speed.
+    /// (`√(v_tail² + 2·b·gap)`) — a driver joining a road matches the traffic they
+    /// can see. A free entrance (no tail in sight) keeps the requested speed.
     fn safe_entry_speed(&self, lane: LaneId, speed: f64, driver: &DriverConfig) -> f64 {
         let mut tail: Option<(f64, f64)> = None; // (rear position, speed) nearest the entrance
         for v in self.fleet.rows.iter().filter(|v| v.lane == lane && v.crossing.is_none()) {
@@ -1649,10 +1648,9 @@ impl NetWorld {
             let to_lane = self.network.movement(mv).to_lane;
             let to_link = self.network.lane(to_lane).link;
             if self.network.node_junction(self.network.link(to_link).to) != Some(jid) {
-                // This hop leaves the junction — but the car only truly clears it if
-                // the exit street can receive its whole body, with spare-car slack:
-                // the exit queue can advance during the traversal and trap late
-                // entrants on the internal slivers for the rest of its red.
+                // This hop leaves the junction — and the car truly clears it only if
+                // the exit street can receive its whole body, with spare-car slack for
+                // the queue advance that happens during the multi-second traversal.
                 return nb.lane_front.get(&to_lane.0).is_some_and(|&f| {
                     let o = &self.fleet.rows[f];
                     let unit = veh.driver.vehicle_length + veh.driver.min_gap;
@@ -2532,13 +2530,11 @@ impl NetWorld {
                         || (self.is_rtor(mid) && veh.stopped_at == Some(node))
                         || self.runs_red(veh, node);
                     let conflict_free = !block_entry && !self.entered_conflicting(mid, node, entered_at);
-                    // Don't-block-the-box, in full: commit into the interior only when the
-                    // receiving lane has room for this *whole vehicle* past the box —
+                    // Don't-block-the-box, in full: commit into the interior only when
+                    // the receiving lane has room for this *whole vehicle* past the box,
                     // net of the space every crosser already in flight toward it will
-                    // consume — not merely a bumper's clearance at the entrance.
-                    // Entering on 2 m of space (or on room another approach's crosser
-                    // was about to take) parked cars mid-box behind spillback tails for
-                    // minutes. Landing itself (already committed) needs only the bumper gap.
+                    // consume. Landing itself (already committed) needs only the bumper
+                    // gap.
                     self.free_flow_seam(mid)
                         || (((signal_ok && conflict_free) || committed)
                             && self.receiving_room(mid, veh, front, inbound)
@@ -2750,12 +2746,11 @@ impl NetWorld {
         // Human perception of the leader (Treiber's human-driver formulation): the
         // driver's last *observation* of the leader is `reaction_time` old, and they
         // extrapolate it forward at its observed speed; their own position is always
-        // current. A stopped or steady leader is therefore perceived exactly (no
-        // phantom braking), but for `reaction_time` after a leader starts braking
-        // the driver still acts on the old speed — under-braking that, with the
-        // applied deceleration clamped to `MAX_BRAKE_DECEL`, can genuinely rear-end.
-        // That is the physical crash mechanism, deliberately no longer floored away
-        // by the true current gap.
+        // current. A stopped or steady leader is therefore perceived exactly, while
+        // for `reaction_time` after a leader starts braking the driver still acts on
+        // the old speed — under-braking that, with the applied deceleration clamped
+        // to `MAX_BRAKE_DECEL`, can genuinely rear-end. That is the physical crash
+        // mechanism.
         let leader = if let Some(li) = nb.leader_of[i] {
             let lead = &self.fleet.rows[li];
             let delay = (driver.reaction_time / dt).round() as usize;
@@ -2992,8 +2987,8 @@ impl NetWorld {
 
         // In-intersection avoidance: if a vehicle on a conflicting movement will
         // reach a shared conflict point first, brake to stop short of it. This is
-        // the crash-avoidant behaviour; a collision only occurs when a driver is
-        // already too close/fast to stop (then the conflict-point check crashes it).
+        // the crash-avoidant behaviour; a driver already too close/fast to stop
+        // (within the grip bound) sweeps on, and the body-overlap detector decides.
         let node = self.network.movement(c.movement).node;
         for &ci in self.junctions.conflict_ids(node) {
             let cp = &self.network.conflicts[ci as usize];
@@ -3031,9 +3026,8 @@ impl NetWorld {
     /// Two ground-truth checks, no tolerance bands:
     /// - **Rear-end**: sweep the pre-step corridor leader chain — a follower whose
     ///   front passed its leader's rear collided, including a full pass-through in
-    ///   one tick (the re-sorted order the old scan used made tunnelling invisible)
-    ///   and overlaps across a segment seam (the chain spans the corridor). Reaction
-    ///   delay plus the physical brake clamp is what makes these reachable.
+    ///   one tick and overlaps across a segment seam (the chain spans the corridor).
+    ///   Reaction delay plus the physical brake clamp is what makes these reachable.
     /// - **Junction**: exact oriented-body intersection between co-node crossers on
     ///   distinct paths — what makes running a red or misjudging a gap actually
     ///   crash. Cost is Σ k² over nodes with k = that node's simultaneous crossers;
@@ -3223,10 +3217,9 @@ impl NetWorld {
     }
 
     /// Whether a conflicting movement at `node`'s intersection was already committed
-    /// by an earlier car in this tick's serial boundary pass. The pre-step
-    /// `box_conflict` gate can't see same-tick entries, so without this two cars on
-    /// conflicting approaches could accept the same box simultaneously — a crash
-    /// rate set by the tick length rather than by driver gap acceptance.
+    /// by an earlier car in this tick's serial boundary pass — the same-tick
+    /// complement of the pre-step `box_conflict` gate, so simultaneous entries are
+    /// governed by driver gap acceptance rather than the tick length.
     fn entered_conflicting(&self, mid: MovementId, node: NodeId, entered_at: &IntMap<Vec<MovementId>>) -> bool {
         entered_at
             .get(&self.network.intersection_key(node))
