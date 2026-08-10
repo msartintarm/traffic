@@ -65,24 +65,29 @@ jobs:
       # Every real map must ship its commute-OD sibling (tools/lodes/fetch_lodes.py
       # --map). A missing file would silently degrade that map's demand to
       # sampled-only, so it fails the deploy — the last good deploy stays live.
+      # Maps and OD files ship as `.gz` (the app fetches gz-first); a plain
+      # sibling is optional either way.
       - name: Require commute OD next to every real map
         run: |
           python3 - <<'EOF'
-          import json, os, sys
+          import gzip, json, os, sys
           pub = "web/public"
-          missing = []
-          for f in sorted(os.listdir(pub)):
-              if not f.endswith(".json") or f.endswith(".lodes.json"):
+          names = sorted(os.listdir(pub))
+          missing, seen = [], set()
+          for f in names:
+              base = f[:-8] if f.endswith(".json.gz") else f[:-5] if f.endswith(".json") else None
+              if base is None or base.endswith(".lodes") or base in seen:
                   continue
+              seen.add(base)
+              opener = gzip.open if f.endswith(".gz") else open
               try:
-                  meta = json.load(open(os.path.join(pub, f))).get("meta", {})
+                  meta = json.load(opener(os.path.join(pub, f), "rt")).get("meta", {})
               except Exception:
                   continue
               if "bbox" not in meta:
                   continue  # not a scraped map
-              sib = f[:-5] + ".lodes.json"
-              if not os.path.exists(os.path.join(pub, sib)):
-                  missing.append(sib)
+              if not any(f"{base}.lodes{s}" in names for s in (".json", ".json.gz")):
+                  missing.append(f"{base}.lodes.json.gz")
           if missing:
               sys.exit("missing commute OD files: " + ", ".join(missing))
           print("commute OD present for every real map")

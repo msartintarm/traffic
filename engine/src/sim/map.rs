@@ -5,9 +5,9 @@
 //! speed limit — so importing a real Millbrae extract is `OsmMap { .. }.build()`.
 //!
 //! The builder resolves signals into [`SignalGroup`]s (one per signalized
-//! approach), and connects each incoming lane to the lanes of every onward link
-//! at its downstream node, skipping U-turns. Turn restrictions and lane-level
-//! `turn:lanes` from OSM prune these movements in a later pass.
+//! approach), and connects each incoming lane to onward links at its downstream
+//! node, skipping U-turns. A link carrying OSM `turn:lanes` channelizes its lanes
+//! from that tag (`turn_lane_exits`); the rest split their exits by angular slice.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -604,11 +604,16 @@ impl OsmMap {
                     }
                 }
             } else if m > 0 {
-                for i in 0..m {
-                    lane_exits[nearest(i, m - 1, n - 1)].insert(i); // every exit served
-                }
-                for (k, exits) in lane_exits.iter_mut().enumerate() {
-                    exits.insert(nearest(k, n - 1, m - 1)); // every lane serves its nearest
+                match turn_lane_exits(&net, in_li, n, &onward) {
+                    Some(sets) => lane_exits = sets,
+                    None => {
+                        for i in 0..m {
+                            lane_exits[nearest(i, m - 1, n - 1)].insert(i); // every exit served
+                        }
+                        for (k, exits) in lane_exits.iter_mut().enumerate() {
+                            exits.insert(nearest(k, n - 1, m - 1)); // every lane serves its nearest
+                        }
+                    }
                 }
             }
             for (k, exits) in lane_exits.iter().enumerate() {
@@ -626,6 +631,12 @@ impl OsmMap {
                     } else if link.kind == RoadKind::Freeway && out.kind == RoadKind::Ramp {
                         let from_curb = (link.lane_count - 1).saturating_sub(k as u32); // 0 at the curb lane
                         (out.lane_count - 1).saturating_sub(from_curb)
+                    } else if let Some(t) = through_targets(&net, onward[exit_i].0, onward[exit_i].1) {
+                        // A through arrival lands on the receiver's *through-marked* lanes
+                        // (its `turn:lanes`), so a widening that opens a turn pocket feeds
+                        // the pocket only from turning traffic — an upstream through lane
+                        // continues onto the through lane beside it.
+                        t[(k).min(t.len() - 1)]
                     } else {
                         // A lane drop maps excess lanes onto the curb (the rightmost exit lane
                         // ends and merges left — a realistic single-lane drop). The pathological
@@ -714,13 +725,100 @@ fn relocate_signals_to_junctions(net: &Network, specs: &[NodeSpec]) -> Vec<Optio
     plans
 }
 
-/// Flag dedicated turn lanes as physical turn pockets. A lane qualifies when it
-/// serves only one turn direction (left on the median-side lane 0, right on the
-/// outermost lane), its neighbour is a through lane it can peel away from, and the
-/// approach is long enough to hold a bay. The lane then gets a bay taper, so
-/// [`Network::lane_lateral_offset`] opens the pocket near the stop line and merges
-/// it into the through lane upstream — turners queue in the bay, not the through
-/// lane, and the widened approach renders like a real intersection.
+/// Per-lane exit sets from the link's OSM `turn:lanes` (lanes listed left→right,
+/// matching lane 0 at the median): each marked direction claims the exits whose
+/// signed-angle turn class matches; unmarked (`none`) and merge lanes carry the
+/// through class; `reverse` has no modelled movement, so a `reverse;left` lane
+/// serves its left. Data gaps degrade to geometry: an absent tag or a lane-count
+/// mismatch falls back to the angular-slice channelization, a marked direction
+/// with no matching exit takes the lane's geometric nearest, and every exit keeps
+/// a serving lane (a side street too minor for an arrow still connects).
+fn turn_lane_exits(
+    net: &Network,
+    in_li: usize,
+    n: usize,
+    onward: &[(usize, f64)],
+) -> Option<Vec<std::collections::BTreeSet<usize>>> {
+    let spec = net.link_turn_lanes.get(in_li)?.as_str();
+    if spec.is_empty() {
+        return None;
+    }
+    let entries: Vec<&str> = spec.split('|').collect();
+    if entries.len() != n {
+        return None;
+    }
+    let m = onward.len();
+    let class_of = |ang: f64| {
+        if ang > 0.5 {
+            TurnType::Left
+        } else if ang < -0.5 {
+            TurnType::Right
+        } else {
+            TurnType::Through
+        }
+    };
+    let lane_to_exit = |k: usize| if n <= 1 { 0 } else { ((k as f64) * ((m - 1) as f64) / ((n - 1) as f64)).round() as usize };
+    let exit_to_lane = |i: usize| if m <= 1 { 0 } else { ((i as f64) * ((n - 1) as f64) / ((m - 1) as f64)).round() as usize };
+    let mut sets: Vec<std::collections::BTreeSet<usize>> = vec![Default::default(); n];
+    for (k, entry) in entries.iter().enumerate() {
+        for part in entry.split(';') {
+            let want = match part.trim() {
+                "left" | "slight_left" | "sharp_left" => Some(TurnType::Left),
+                "right" | "slight_right" | "sharp_right" => Some(TurnType::Right),
+                "through" | "none" | "" | "merge_to_left" | "merge_to_right" => Some(TurnType::Through),
+                _ => None,
+            };
+            if let Some(t) = want {
+                sets[k].extend((0..m).filter(|&i| class_of(onward[i].1) == t));
+            }
+        }
+        if sets[k].is_empty() {
+            sets[k].insert(lane_to_exit(k));
+        }
+    }
+    for i in 0..m {
+        if !sets.iter().any(|s| s.contains(&i)) {
+            sets[exit_to_lane(i)].insert(i);
+        }
+    }
+    Some(sets)
+}
+
+/// The receiving link's through-marked lane indices, for landing a *through*
+/// arrival (`|ang| ≤ 0.5`) on its through lanes: a receiver whose `turn:lanes`
+/// opens turn pockets keeps them for turning traffic. `None` (no tag, no
+/// through-marked lanes, or a turning arrival) keeps the plain index mapping.
+fn through_targets(net: &Network, out_li: usize, ang: f64) -> Option<Vec<u32>> {
+    if ang.abs() > 0.5 {
+        return None;
+    }
+    let spec = net.link_turn_lanes.get(out_li)?.as_str();
+    if spec.is_empty() {
+        return None;
+    }
+    let entries: Vec<&str> = spec.split('|').collect();
+    if entries.len() != net.links[out_li].lane_count as usize {
+        return None;
+    }
+    let through: Vec<u32> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            e.split(';').any(|p| matches!(p.trim(), "through" | "none" | "" | "merge_to_left" | "merge_to_right"))
+        })
+        .map(|(k, _)| k as u32)
+        .collect();
+    (!through.is_empty()).then_some(through)
+}
+
+/// Flag dedicated turn lanes as physical turn pockets. A contiguous block of
+/// lanes serving only one turn direction — lefts from the median side, rights
+/// from the curb (a dual left is a two-lane block) — qualifies when the first
+/// lane beyond the block is a through lane it peels away from and the approach
+/// is long enough to hold a bay. Each bay lane gets a taper, so
+/// [`Network::lane_lateral_offset`] opens the pocket near the stop line and
+/// merges it into the through lane upstream — turners queue in the bay, not the
+/// through lane, and the widened approach renders like a real intersection.
 fn assign_turn_pockets(net: &mut Network) {
     const MIN_LEN: f64 = 45.0;
     let turns = |lane_id: u32| -> Vec<TurnType> {
@@ -733,17 +831,25 @@ fn assign_turn_pockets(net: &mut Network) {
         if link.lane_count < 2 {
             continue;
         }
-        for (lane_idx, want) in [(0u32, TurnType::Left), (link.lane_count - 1, TurnType::Right)] {
+        let dedicated = |lane_idx: u32, want: TurnType| -> bool {
             let lane_id = link.lane_start.0 + lane_idx;
             let ts = turns(lane_id);
-            if net.lanes[lane_id as usize].length < MIN_LEN || ts.is_empty() || ts.iter().any(|&t| t != want) {
-                continue;
+            net.lanes[lane_id as usize].length >= MIN_LEN && !ts.is_empty() && ts.iter().all(|&t| t == want)
+        };
+        for (start, step, want) in [(0i64, 1i64, TurnType::Left), (link.lane_count as i64 - 1, -1, TurnType::Right)] {
+            let mut block = Vec::new();
+            let mut idx = start;
+            while (0..link.lane_count as i64).contains(&idx) && dedicated(idx as u32, want) {
+                block.push(idx as u32);
+                idx += step;
             }
-            let nb_idx = if lane_idx == 0 { 1 } else { link.lane_count - 2 };
-            if !turns(link.lane_start.0 + nb_idx).contains(&TurnType::Through) {
+            if block.is_empty() || !(0..link.lane_count as i64).contains(&idx) {
+                continue; // no bay, or the whole link turns (a turn roadway, not a pocket)
+            }
+            if !turns(link.lane_start.0 + idx as u32).contains(&TurnType::Through) {
                 continue; // the bay must peel off a through lane, not another pocket
             }
-            pockets.push(lane_id);
+            pockets.extend(block.into_iter().map(|k| link.lane_start.0 + k));
         }
     }
     for lane_id in pockets {
@@ -1150,30 +1256,27 @@ fn join_pass_through(
     pos: &HashMap<i64, [f64; 2]>,
 ) -> Option<LinkSpec> {
     let (l1, l2) = (links[s1].as_ref().unwrap(), links[s2].as_ref().unwrap());
-    if l1.speed_limit != l2.speed_limit || l1.layer != l2.layer {
-        return None;
-    }
     let link_len = |l: &LinkSpec| -> f64 {
         let mut pts = vec![pos[&l.from_osm]];
         pts.extend(l.geometry.iter().copied());
         pts.push(pos[&l.to_osm]);
         pts.windows(2).map(|w| distance(w[0], w[1])).sum()
     };
-    // Lane counts must match, except when one side is a grade-separated ramp sliver
-    // too short to hold a vehicle — an OSM lane-count fragment on a ramp approach.
-    // Absorb it into the substantive segment, adopting that segment's lane count, so
-    // the ramp isn't chopped into micro-links that thrash the node-crossing logic.
+    // Attributes must match across the joint — except a grade-separated fragment
+    // too short to hold a vehicle, which is survey noise (a maxspeed, layer, or
+    // lane-count change tagged onto a few metres of ramp approach): it adopts the
+    // substantive segment's attributes, so the freeway system never carries
+    // micro-links that thrash the node-crossing logic.
     const SLIVER_MAX: f64 = 30.0;
-    let lanes = if l1.lanes == l2.lanes {
-        l1.lanes
-    } else {
-        let ramp = |l: &LinkSpec| RoadKind::from_osm(&l.road_class).is_grade_separated();
-        let (len1, len2) = (link_len(l1), link_len(l2));
-        if !(ramp(l1) && ramp(l2)) || len1.min(len2) >= SLIVER_MAX {
-            return None;
-        }
-        if len1 >= len2 { l1.lanes } else { l2.lanes }
-    };
+    let (len1, len2) = (link_len(l1), link_len(l2));
+    let grade_sep = |l: &LinkSpec| RoadKind::from_osm(&l.road_class).is_grade_separated();
+    let sliver = grade_sep(l1) && grade_sep(l2) && len1.min(len2) < SLIVER_MAX;
+    let big = if len1 >= len2 { l1 } else { l2 };
+    if !sliver && (l1.speed_limit != l2.speed_limit || l1.layer != l2.layer || l1.lanes != l2.lanes) {
+        return None;
+    }
+    let (speed_limit, layer) = if sliver { (big.speed_limit, big.layer) } else { (l1.speed_limit, l1.layer) };
+    let lanes = if l1.lanes == l2.lanes { l1.lanes } else { big.lanes };
     let mut geometry = l1.geometry.clone();
     geometry.push(pos[&n]);
     geometry.extend(l2.geometry.iter().copied());
@@ -1189,7 +1292,7 @@ fn join_pass_through(
         nonzero(l1.res_weight, l2.res_weight),
         nonzero(l1.attr_weight, l2.attr_weight),
     );
-    Some(LinkSpec { from_osm: from, to_osm: to, lanes, speed_limit: l1.speed_limit, geometry, layer: l1.layer, name, road_class, highway_ref, turn_lanes, aadt, res_weight, attr_weight })
+    Some(LinkSpec { from_osm: from, to_osm: to, lanes, speed_limit, geometry, layer, name, road_class, highway_ref, turn_lanes, aadt, res_weight, attr_weight })
 }
 
 /// Pull every lane back from its end nodes to the junction boundary so vehicles
@@ -2815,5 +2918,110 @@ mod tests {
         assert!(net.programs.len() >= 2);
         let states = net.signal_states(30.0);
         assert_eq!(states.len(), net.groups.len());
+    }
+
+    fn cross_with_turn_lanes(lanes: u32, turn_lanes: &str) -> Network {
+        // Eastbound approach into a 4-way; left exit north (2 lanes, so a dual
+        // left can fan), through east (3), right south (1).
+        OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, -200.0, 0.0),
+                NodeSpec::uncontrolled(2, 0.0, 0.0),
+                NodeSpec::uncontrolled(3, 200.0, 0.0),
+                NodeSpec::uncontrolled(4, 0.0, 200.0),
+                NodeSpec::uncontrolled(5, 0.0, -200.0),
+            ],
+            links: vec![
+                LinkSpec { turn_lanes: turn_lanes.into(), ..LinkSpec::oneway(1, 2, lanes, 15.0) },
+                LinkSpec::oneway(2, 3, 3, 15.0),
+                LinkSpec::oneway(2, 4, 2, 15.0),
+                LinkSpec::oneway(2, 5, 1, 15.0),
+            ],
+        }
+        .build()
+    }
+
+    fn lane_turns(net: &Network, lane: LaneId) -> Vec<TurnType> {
+        let l = net.lane(lane);
+        (0..l.movement_count).map(|k| net.movement_turn(MovementId(l.movement_start.0 + k))).collect()
+    }
+
+    #[test]
+    fn turn_lanes_channelize_movements_and_open_pockets() {
+        let net = cross_with_turn_lanes(4, "left|through|through|right");
+        let lanes: Vec<LaneId> = net.lanes_of(LinkId(0)).collect();
+        assert!(lane_turns(&net, lanes[0]).iter().all(|&t| t == TurnType::Left), "median lane turns left only");
+        assert!(lane_turns(&net, lanes[3]).iter().all(|&t| t == TurnType::Right), "curb lane turns right only");
+        for &l in &lanes[1..3] {
+            assert!(lane_turns(&net, l).iter().all(|&t| t == TurnType::Through), "middle lanes run through");
+        }
+        assert!(net.lane(lanes[0]).pocket_taper > 0.0, "the left bay tapers open");
+        assert!(net.lane(lanes[3]).pocket_taper > 0.0, "the right bay tapers open");
+        assert_eq!(net.lane(lanes[1]).pocket_taper, 0.0, "through lanes run full length");
+    }
+
+    #[test]
+    fn dual_left_block_channelizes_and_pockets_both_lanes() {
+        let net = cross_with_turn_lanes(5, "left|left|none|none|none");
+        let lanes: Vec<LaneId> = net.lanes_of(LinkId(0)).collect();
+        for &l in &lanes[..2] {
+            assert!(lane_turns(&net, l).iter().all(|&t| t == TurnType::Left), "both bay lanes turn left only");
+            assert!(net.lane(l).pocket_taper > 0.0, "both bay lanes taper open");
+        }
+        for &l in &lanes[2..4] {
+            assert!(lane_turns(&net, l).iter().all(|&t| t == TurnType::Through));
+        }
+        // The south exit carries no arrow in the tag, so the curb `none` lane picks
+        // it up alongside its through — every exit keeps a serving lane.
+        assert!(lane_turns(&net, lanes[4]).contains(&TurnType::Through));
+        for &l in &lanes[2..] {
+            assert_eq!(net.lane(l).pocket_taper, 0.0);
+        }
+        // The dual left fans onto both receiving lanes rather than piling into one.
+        let to_lane = |lane: LaneId| net.movements_of(lane)[0].to_lane;
+        assert_ne!(to_lane(lanes[0]), to_lane(lanes[1]));
+    }
+
+    #[test]
+    fn through_traffic_lands_on_through_lanes_across_a_widening() {
+        // A 3-lane road widens to a 4-lane bay segment ("left|||") before the
+        // junction — the OSM way split at the physical bay start. Through lanes
+        // continue onto the through-marked lanes; the pocket fills from turners.
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, -400.0, 0.0),
+                NodeSpec::uncontrolled(2, -120.0, 0.0),
+                NodeSpec::uncontrolled(3, 0.0, 0.0),
+                NodeSpec::uncontrolled(4, 200.0, 0.0),
+                NodeSpec::uncontrolled(5, 0.0, 200.0),
+            ],
+            links: vec![
+                LinkSpec::oneway(1, 2, 3, 15.0),
+                LinkSpec { turn_lanes: "left|none|none|none".into(), ..LinkSpec::oneway(2, 3, 4, 15.0) },
+                LinkSpec::oneway(3, 4, 3, 15.0),
+                LinkSpec::oneway(3, 5, 2, 15.0),
+            ],
+        }
+        .build();
+        let bay_lanes: Vec<LaneId> = net.lanes_of(LinkId(1)).collect();
+        for lane in net.lanes_of(LinkId(0)) {
+            for m in net.movements_of(lane) {
+                assert_ne!(m.to_lane, bay_lanes[0], "no through lane continues into the left pocket");
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_turn_lanes_fall_back_to_angular_channelization() {
+        // Two entries on a three-lane approach: the tag disagrees with the model,
+        // so the angular slice takes over and every exit stays reachable.
+        let net = cross_with_turn_lanes(3, "left|through");
+        for exit in [LinkId(1), LinkId(2), LinkId(3)] {
+            let served = net
+                .lanes_of(LinkId(0))
+                .flat_map(|l| net.movements_of(l).iter())
+                .any(|m| net.lane(m.to_lane).link == exit);
+            assert!(served, "exit {exit:?} keeps a serving lane");
+        }
     }
 }

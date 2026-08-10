@@ -326,6 +326,30 @@ mod golden {
 
     #[test]
     #[ignore] // diagnostic: link inventory for a junction fixture
+    fn diag_freeway_slivers() {
+        use crate::sim::network::LinkId;
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let net = crate::sim::map::OsmMap::from_json(&text).expect("map json").build();
+        for i in 0..net.links.len() as u32 {
+            let l = net.link(LinkId(i));
+            if !l.kind.is_grade_separated() {
+                continue;
+            }
+            let len = net.lane(l.lane_start).length;
+            if len < 18.0 {
+                println!(
+                    "link {i} len {len:.1} lanes {} layer {} from {:?}({:?},{:?}) to {:?}({:?},{:?})",
+                    l.lane_count, l.layer,
+                    l.from, net.node(l.from).control, net.node_junction(l.from),
+                    l.to, net.node(l.to).control, net.node_junction(l.to),
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore] // diagnostic dump
     fn diag_render_lone_crossing() {
         use crate::sim::network::{NodeControl, NodeId};
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
