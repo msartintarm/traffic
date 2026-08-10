@@ -158,6 +158,12 @@ impl NetVehicle {
     pub fn is_wrecked(&self) -> bool {
         self.wreck.is_some()
     }
+
+    /// Consecutive ticks spent essentially stopped — the wait the yield
+    /// impatience and the HUD's junction readout run on.
+    pub fn wait_ticks(&self) -> u32 {
+        self.wait_ticks
+    }
 }
 
 /// Which detector took a vehicle off the road — the *nature* of a crash, so
@@ -208,11 +214,6 @@ pub struct NetWorld {
     /// (`merge_conflict`) that the synthesized sleeper contexts don't see, so the free-car
     /// path excludes it (e.g. freeway mainline lanes an on-ramp merges into).
     merge_feeder_lane: Vec<bool>,
-    /// Per-node: the id-free road rank (speed, lanes — `priority_key >> 24`) of the
-    /// *major* road at the node when the roads meeting it rank differently, else 0.
-    /// Drives [`Self::approach_must_stop`]: MUTCD assigns stop signs to the minor
-    /// street, so a node-wide `Stop` between unequal roads is a two-way stop.
-    stop_major_rank: Vec<u64>,
     /// Per-lane through-continuation: the lane a straight-through car flows onto next and
     /// the interior length to reach it. Lets car-following see a leader across segment
     /// boundaries by walking this chain, instead of losing sight of it at every node (the
@@ -911,27 +912,13 @@ impl NetWorld {
             })
             .collect();
 
-        // Min/max road rank per node (the id-free `priority_key` prefix: speed then
-        // lanes). Where they differ, the max is the major road a stop node protects.
-        let mut node_ranks: Vec<(u64, u64)> = vec![(u64::MAX, 0); network.nodes.len()];
-        for l in &network.links {
-            let lane = network.lane(l.lane_start);
-            let rank = ((lane.speed_limit * 1000.0) as u64) << 16 | l.lane_count as u64;
-            for nd in [l.from, l.to] {
-                let e = &mut node_ranks[nd.idx()];
-                e.0 = e.0.min(rank);
-                e.1 = e.1.max(rank);
-            }
-        }
-        let stop_major_rank = node_ranks.iter().map(|&(lo, hi)| if lo < hi { hi } else { 0 }).collect();
-
         let signals = SignalController::build(&network);
         let link_entries = vec![0u32; network.links.len()];
         let junctions = Junctions::build(&network);
         let congestion = CongestionLod::new(network.links.len());
         Self {
             network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0, crashed_by: [0; 2], crash_log: Vec::new(),
-            merges, link_straight, merge_feeder_lane, stop_major_rank, through_next, corridor_of, corridor_offset, seam_primary, signals, link_entries, router: None, external_reroute: false,
+            merges, link_straight, merge_feeder_lane, through_next, corridor_of, corridor_offset, seam_primary, signals, link_entries, router: None, external_reroute: false,
             route_fingerprint: 0, route_cycle_tick: 0, parallel_routing: true, cache_sort: true, junctions,
             accel_backend: AccelBackend::Serial,
             #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
@@ -1776,13 +1763,18 @@ impl NetWorld {
         self.network.link(self.network.lane(lane).link).to
     }
 
-    /// A strict priority order over links (higher wins): faster road first, then
-    /// more lanes, then link id as a deterministic tie-break so opposing yields
-    /// can never deadlock.
+    /// A strict priority order over links (higher wins): functional class first
+    /// (the primary right-of-way determinant — see [`RoadKind::at_grade_rank`]),
+    /// then speed, then lanes, then link id as a deterministic tie-break so
+    /// opposing yields can never deadlock. `>> 24` drops the id, leaving the
+    /// road-rank prefix the stop/merge rules compare.
     fn priority_key(&self, link: LinkId) -> u64 {
         let l = self.network.link(link);
         let lane = self.network.lane(l.lane_start);
-        ((lane.speed_limit * 1000.0) as u64) << 40 | (l.lane_count as u64) << 24 | (link.0 as u64 & 0xFF_FFFF)
+        l.kind.at_grade_rank() << 56
+            | ((lane.speed_limit * 1000.0) as u64) << 40
+            | (l.lane_count as u64) << 24
+            | (link.0 as u64 & 0xFF_FFFF)
     }
 
     /// MOBIL lane changes: evaluated on committed positions, applied before the
@@ -2467,10 +2459,11 @@ impl NetWorld {
         let must_stop_here = (matches!(self.network.node(node).control, NodeControl::Stop)
             && self.approach_must_stop(lane.link, node))
             || intended.is_some_and(|mid| self.is_rtor(mid));
-        if must_stop_here
-            && veh.speed < Self::stop_roll_speed(&veh.driver)
-            && (lane.length - veh.position) < veh.driver.vehicle_length + veh.driver.min_gap + 1.0
-        {
+        // The sign is served *at the line*: a stopped front car settles 2–3 m short,
+        // inside this window, and each queued car behind arms afresh when it rolls
+        // up in turn — so the turn-taking below always ranks the drivers actually
+        // facing the intersection.
+        if must_stop_here && veh.speed < Self::stop_roll_speed(&veh.driver) && (lane.length - veh.position) < 5.0 {
             veh.stopped_at = Some(node);
         }
         veh.position >= lane.length
@@ -3195,18 +3188,13 @@ impl NetWorld {
             && self.movement_state(mid) == SignalState::Red
     }
 
-    /// Whether this approach faces a stop line at a stop-controlled node. MUTCD
-    /// assigns stop signs to the *minor* street: where the roads meeting the node
-    /// rank differently (speed, lanes), the top-rank road is the arterial the
-    /// control protects — its approaches flow through (a two-way stop) and only
-    /// the lower-rank approaches stop. Uniform ranks are a genuine all-way stop.
-    /// Without this, a node-wide `Stop` full-stopped a 35 mph arterial at every
-    /// side street, and the all-way FIFO's capacity gridlocked the corridor.
-    fn approach_must_stop(&self, link: LinkId, node: NodeId) -> bool {
-        match self.stop_major_rank[node.idx()] {
-            0 => true,
-            major => self.priority_key(link) >> 24 < major,
-        }
+    /// Whether this approach faces a stop line at a stop-controlled node. Drivers
+    /// act on the posted signs: every `Stop` node in the scraped maps carries
+    /// OSM's `stop=all` — a surveyed all-way stop — so every approach serves the
+    /// line. Per-approach sign data (direction-tagged OSM stop nodes) plugs in
+    /// here once the scraper carries it.
+    fn approach_must_stop(&self, _link: LinkId, _node: NodeId) -> bool {
+        true
     }
 
     /// The speed below which this driver treats a stop sign as served. Observed
@@ -3295,7 +3283,10 @@ impl NetWorld {
                 return false;
             }
             let o = &self.fleet.rows[j];
-            if o.speed > 0.5 {
+            // Turn-taking runs between the cars facing the intersection: the armed
+            // front driver of each approach — the drivers who can actually exchange
+            // the right-of-way and proceed when their turn comes.
+            if o.speed > 0.5 || o.stopped_at != Some(node) || nb.lane_front.get(&o.lane.0) != Some(&j) {
                 return false;
             }
             let stopped_earlier = o.wait_ticks > me.wait_ticks || (o.wait_ticks == me.wait_ticks && o.id < me.id);
@@ -3988,6 +3979,86 @@ mod tests {
     /// Brief in-box waits are real (a left-turner yielding, spillback backpressure);
     /// camping there was the broken-setback artifact.
     #[cfg(feature = "import")]
+    #[test]
+    #[ignore] // diagnostic: why all-way-stop corridor cars stall; run with -- --ignored
+    fn diag_all_way_stop_gridlock() {
+        use super::super::demand::{self, DemandGenerator, DemandSources};
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let net = super::super::map::OsmMap::from_json(&text).expect("map json").build();
+        let mut world = NetWorld::new(net, cfg());
+        let pairs = demand::od_pairs(&world.network, 0, 600, DemandSources::new(true, true));
+        let mut gen = DemandGenerator::new(&world, &pairs, 0);
+        world.install_router(&gen.destinations());
+        let dt = cfg().dt;
+        let stop_nodes: Vec<u32> = (0..world.network.nodes.len() as u32)
+            .filter(|&i| matches!(world.network.node(NodeId(i)).control, NodeControl::Stop))
+            .collect();
+        let mut streak: std::collections::HashMap<u32, f64> = Default::default();
+        let mut focus: Option<NodeId> = None;
+        for tick in 0..1500 {
+            gen.step(&mut world, dt);
+            world.step();
+            // Focus on the first stop node where a car has been parked 60 s.
+            if focus.is_none() {
+                let mut still: std::collections::HashMap<u32, f64> = Default::default();
+                for v in world.fleet.rows.iter() {
+                    if v.speed >= 0.3 || v.crossing.is_some() {
+                        continue;
+                    }
+                    let node = world.downstream_node(v.lane);
+                    if !stop_nodes.contains(&node.0) {
+                        continue;
+                    }
+                    let t = streak.get(&v.id).copied().unwrap_or(0.0) + dt;
+                    still.insert(v.id, t);
+                    if t >= 60.0 && focus.is_none() {
+                        eprintln!("FOCUS node {} (car id{} parked {t:.0}s) at tick {tick}", node.0, v.id);
+                        focus = Some(node);
+                    }
+                }
+                streak = still;
+            }
+            let Some(focus) = focus else { continue };
+            if tick % 25 != 0 {
+                continue;
+            }
+            let nb = world.neighbors();
+            let mut lines: Vec<String> = Vec::new();
+            for i in 0..world.fleet.rows.len() {
+                let v = &world.fleet.rows[i];
+                if v.crossing.is_some() {
+                    if world.network.movement(v.crossing.unwrap().movement).node == focus {
+                        lines.push(format!("  cross id{} mv{} arc {:.1} v{:.1}", v.id, v.crossing.unwrap().movement.0, world.crossing_arc(v), v.speed));
+                    }
+                    continue;
+                }
+                if world.downstream_node(v.lane) != focus {
+                    continue;
+                }
+                let lane_len = world.network.lane(v.lane).length;
+                if lane_len - v.position > 25.0 {
+                    continue;
+                }
+                let intended = world.intended_movement(v);
+                let fifo = intended.is_some_and(|m| world.earlier_stopped_conflict(i, m, focus, &nb));
+                let cx = world.gather_context(i, &nb, intended);
+                lines.push(format!(
+                    "  id{} lane{} to_line {:.1} v{:.1} wait {} armed {} fifo {} yield {:.0} sign {:.0} stopline {:.0} lead {:.0} down {:?}",
+                    v.id, v.lane.0, lane_len - v.position, v.speed, v.wait_ticks,
+                    v.stopped_at == Some(focus), fifo, cx.yield_line, cx.stop_sign, cx.stop_line, cx.leader_gap,
+                    intended.map(|m| world.movement_downstream_blocked(m, &v.driver, &nb)),
+                ));
+            }
+            if !lines.is_empty() {
+                eprintln!("t{tick}:");
+                for l in lines {
+                    eprintln!("{l}");
+                }
+            }
+        }
+    }
+
     #[test]
     #[ignore] // diagnostic: categorize stopped-in-box car-time; run with -- --ignored
     fn diag_where_cars_stop_inside_boxes() {

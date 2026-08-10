@@ -353,19 +353,56 @@ fn point_in_ring(ring: &[[f64; 2]], p: [f64; 2]) -> bool {
     inside
 }
 
-/// The rectilinear box of a lone crossing: a generous square clipped by each
-/// arm's stop line (across its mouth) and outer edge, so the surviving convex
-/// polygon is bounded by the lines where cars stop — a clean rectangle for a
-/// right-angle crossing, a parallelogram when skewed.
+/// The box of a lone crossing: the intersection of the crossing *streets'* bands,
+/// each bounded by its arms' stop lines. Arms whose axes run within ~25° of each
+/// other (a street's opposite carriageways and continuations) merge into one band
+/// spanning their combined width; clipping the bands against each other yields the
+/// street-aligned region — a rectangle for a right-angle crossing, a parallelogram
+/// when the streets meet obliquely.
 fn junction_box(arms: &[([f64; 2], [f64; 2])], c: [f64; 2]) -> Vec<[f64; 2]> {
     let r = arms.iter().map(|&(m, o)| norm(sub(m, c)).max(norm(sub(o, c)))).fold(0.0, f64::max) + 20.0;
     let mut poly = vec![[c[0] - r, c[1] - r], [c[0] + r, c[1] - r], [c[0] + r, c[1] + r], [c[0] - r, c[1] + r]];
+
+    // Group arms by axis (sign-insensitive): each group is one street through the node.
+    let axis_of = |&(m, o): &([f64; 2], [f64; 2])| {
+        let e = [(m[0] + o[0]) * 0.5, (m[1] + o[1]) * 0.5];
+        norm2(sub(e, c))
+    };
+    let mut groups: Vec<(usize, [f64; 2])> = Vec::new(); // (group id per arm order, axis)
+    let mut arm_group = Vec::with_capacity(arms.len());
+    for arm in arms {
+        let a = axis_of(arm);
+        let gid = groups
+            .iter()
+            .position(|&(_, g)| (a[0] * g[0] + a[1] * g[1]).abs() > 0.9)
+            .unwrap_or_else(|| {
+                groups.push((groups.len(), a));
+                groups.len() - 1
+            });
+        arm_group.push(gid);
+    }
+
+    // Each street's band: the extreme edge lines parallel to its axis, spanning
+    // every member arm's corners; plus its stop lines across each member mouth.
+    for &(gid, axis) in &groups {
+        let perp = [axis[1], -axis[0]];
+        let lat = |p: [f64; 2]| (p[0] - c[0]) * perp[0] + (p[1] - c[1]) * perp[1];
+        let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+        for (k, &(m, o)) in arms.iter().enumerate() {
+            if arm_group[k] != gid {
+                continue;
+            }
+            for p in [m, o] {
+                lo = lo.min(lat(p));
+                hi = hi.max(lat(p));
+            }
+        }
+        poly = clip_halfplane(&poly, [c[0] + perp[0] * lo, c[1] + perp[1] * lo], perp);
+        poly = clip_halfplane(&poly, [c[0] + perp[0] * hi, c[1] + perp[1] * hi], [-perp[0], -perp[1]]);
+    }
     for &(m, o) in arms {
         let mc = [(m[0] + o[0]) * 0.5, (m[1] + o[1]) * 0.5];
-        poly = clip_halfplane(&poly, mc, norm2(sub(c, mc))); // stop line (across the mouth)
-        let along = norm2(sub(o, m)); // median → outer, i.e. across the arm
-        let sign = if (c[0] - o[0]) * along[0] + (c[1] - o[1]) * along[1] >= 0.0 { 1.0 } else { -1.0 };
-        poly = clip_halfplane(&poly, o, [along[0] * sign, along[1] * sign]); // outer edge (along the arm)
+        poly = clip_halfplane(&poly, mc, norm2(sub(c, mc))); // stop line across the mouth
     }
     poly
 }

@@ -23,6 +23,12 @@ export type Sim = {
   signal_instances(): Uint8Array;
   signal_instance_count(): number;
   crash_instances(): Uint8Array;
+  // Junction selection (optional so a stale wasm build degrades to link-only selection).
+  junction_hit?(wx: number, wy: number): number;
+  set_selected_junction?(index: number): void;
+  junction_label?(index: number): string;
+  junction_control?(index: number): string;
+  junction_stats?(index: number): Float32Array;
   crash_instance_count(): number;
   set_show_crashes(on: boolean): void;
   show_crashes(): boolean;

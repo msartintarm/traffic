@@ -4,6 +4,7 @@ import {
   StatsSmoother,
   clockText,
   execString,
+  junctionPanelText,
   panelText,
   perfStatus,
   rushClockText,
@@ -97,4 +98,11 @@ test("StatsSmoother glides small jitter and snaps large steps", () => {
   assert.equal(shown, 110);
   // A big jump (map reset) snaps immediately instead of gliding.
   assert.equal(sm.count("v", 500), 500);
+});
+
+test("junctionPanelText formats the crossing readout", () => {
+  assert.equal(
+    junctionPanelText("Trousdale Drive × Sequoia Avenue", "all-way stop", [3, 1, 12.4, 481.6]),
+    "Trousdale Drive × Sequoia Avenue — all-way stop · 3 queued · 1 crossing · 12s max wait · 482 veh/h",
+  );
 });

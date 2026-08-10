@@ -109,6 +109,22 @@ impl RoadKind {
     pub fn is_major(self) -> bool {
         matches!(self, RoadKind::Freeway | RoadKind::Ramp | RoadKind::Arterial)
     }
+
+    /// At-grade right-of-way rank of the functional class (higher wins): the
+    /// primary determinant of priority between crossing streets — a collector
+    /// beats a residential street even at the same posted speed and lane count
+    /// (Hillcrest × Ashton: both 25 mph × 1, only the class separates them).
+    /// Ramps rank below the surface classes they terminate on: a ramp mouth
+    /// yields to the street it meets.
+    pub fn at_grade_rank(self) -> u64 {
+        match self {
+            RoadKind::Freeway => 5,
+            RoadKind::Arterial => 4,
+            RoadKind::Collector => 3,
+            RoadKind::Ramp => 2,
+            RoadKind::Local => 1,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -307,6 +323,32 @@ fn dominant_axis(arms: &[([f64; 2], f64)]) -> [f64; 2] {
         }
     }
     best.0
+}
+
+/// The bounding parallelogram of `pts` with its sides along the two street axes
+/// through the junction: each point decomposes as `a + u·e1 + v·e2` in the dual
+/// basis and the corners take the extreme `(u, v)` pairs — so an oblique crossing
+/// wears the skewed quad its pavement actually covers. Near-parallel axes fall
+/// back to the axis-aligned rectangle.
+fn oriented_parallelogram(pts: &[[f64; 2]], axis1: [f64; 2], axis2: [f64; 2]) -> [[f64; 2]; 4] {
+    let (e1, e2) = (unit(axis1), unit(axis2));
+    let det = e1[0] * e2[1] - e1[1] * e2[0];
+    if det.abs() < 0.25 {
+        return oriented_rect(pts, axis1);
+    }
+    let a = pts[0];
+    let (mut lu, mut hu, mut lv, mut hv) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+    for &p in pts {
+        let d = sub(p, a);
+        let u = (d[0] * e2[1] - d[1] * e2[0]) / det;
+        let v = (e1[0] * d[1] - e1[1] * d[0]) / det;
+        lu = lu.min(u);
+        hu = hu.max(u);
+        lv = lv.min(v);
+        hv = hv.max(v);
+    }
+    let corner = |u: f64, v: f64| [a[0] + u * e1[0] + v * e2[0], a[1] + u * e1[1] + v * e2[1]];
+    [corner(lu, lv), corner(hu, lv), corner(hu, hv), corner(lu, hv)]
 }
 
 /// The bounding rectangle of `pts` with its sides parallel and perpendicular to
@@ -858,8 +900,21 @@ impl Network {
 
         self.junctions = (0..ncl)
             .map(|ci| {
+                // A lone crossing wears the skewed quad its two streets actually
+                // cover; a sprawling multi-node cluster keeps the dominant-axis
+                // rectangle, which bounds its scattered arms tightly.
                 let footprint = if arm_pts[ci].len() >= 4 {
-                    oriented_rect(&arm_pts[ci], dominant_axis(&arm_dirs[ci]))
+                    let e1 = dominant_axis(&arm_dirs[ci]);
+                    let crossing: Vec<([f64; 2], f64)> = arm_dirs[ci]
+                        .iter()
+                        .filter(|(d, _)| (d[0] * e1[0] + d[1] * e1[1]).abs() <= 0.866)
+                        .copied()
+                        .collect();
+                    if members[ci].len() == 1 && !crossing.is_empty() {
+                        oriented_parallelogram(&arm_pts[ci], e1, dominant_axis(&crossing))
+                    } else {
+                        oriented_rect(&arm_pts[ci], e1)
+                    }
                 } else {
                     let c = apex[ci];
                     [[c[0] - 3.0, c[1] - 3.0], [c[0] + 3.0, c[1] - 3.0], [c[0] + 3.0, c[1] + 3.0], [c[0] - 3.0, c[1] + 3.0]]

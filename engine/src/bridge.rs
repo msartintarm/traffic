@@ -12,7 +12,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::render::camera::Camera;
 use crate::render::interp;
-use crate::render::scene::{brake_intensity, class_color, class_dims, crash_instance, signal_color, signal_head_instances};
+use crate::render::scene::{brake_intensity, class_color, class_dims, crash_instance, edge_ribbon, signal_color, signal_head_instances};
 use crate::render::gpu::Renderer;
 use crate::render::{geometry, Instance, StaticMesh, StaticVertex};
 use crate::sim::clock::SimClock;
@@ -136,6 +136,8 @@ pub struct Simulation {
     frame_budget: bool,
     /// Whether to emit the crash-location overlay markers. Off by default.
     show_crashes: bool,
+    /// The junction the user selected (stats panel + footprint highlight).
+    selected_junction: Option<usize>,
 }
 
 #[wasm_bindgen]
@@ -188,6 +190,7 @@ impl Simulation {
             speed_sim_accum: 0.0, speed_wall_accum: 0.0, speed_dropped: false,
             frame_budget: true,
             show_crashes: false,
+            selected_junction: None,
         }
     }
 
@@ -685,6 +688,103 @@ impl Simulation {
         self.selected = (index >= 0 && (index as usize) < self.world.network.links.len()).then_some(index as usize);
     }
 
+    /// The junction whose footprint contains the world point, else -1 — the
+    /// click target for intersection selection.
+    pub fn junction_hit(&self, wx: f64, wy: f64) -> i32 {
+        let inside = |fp: &[[f64; 2]; 4]| {
+            let mut sign = 0.0f64;
+            for k in 0..4 {
+                let (a, b) = (fp[k], fp[(k + 1) % 4]);
+                let c = (b[0] - a[0]) * (wy - a[1]) - (b[1] - a[1]) * (wx - a[0]);
+                if c.abs() < 1e-9 {
+                    continue;
+                }
+                if sign == 0.0 {
+                    sign = c.signum();
+                } else if c.signum() != sign {
+                    return false;
+                }
+            }
+            true
+        };
+        self.world
+            .network
+            .junctions
+            .iter()
+            .position(|j| inside(&j.footprint))
+            .map_or(-1, |i| i as i32)
+    }
+
+    /// Select a junction for the stats panel and footprint highlight (negative clears).
+    pub fn set_selected_junction(&mut self, index: i32) {
+        self.selected_junction =
+            (index >= 0 && (index as usize) < self.world.network.junctions.len()).then_some(index as usize);
+    }
+
+    /// The crossing's display name: its two busiest distinct street names.
+    pub fn junction_label(&self, index: u32) -> String {
+        let Some(j) = self.world.network.junctions.get(index as usize) else { return String::new() };
+        let mut names: Vec<&str> = Vec::new();
+        for &l in j.approaches.iter().chain(&j.exits) {
+            let n = self.world.network.link_names[l.idx()].as_str();
+            if !n.is_empty() && !names.contains(&n) {
+                names.push(n);
+            }
+        }
+        match names[..] {
+            [] => format!("junction {index}"),
+            [a] => a.to_string(),
+            [a, b, ..] => format!("{a} × {b}"),
+        }
+    }
+
+    /// The control regime the junction runs: "signal", "all-way stop", "yield",
+    /// or "uncontrolled".
+    pub fn junction_control(&self, index: u32) -> String {
+        let Some(j) = self.world.network.junctions.get(index as usize) else { return String::new() };
+        use crate::sim::network::NodeControl;
+        if j.program.is_some() {
+            return "signal".into();
+        }
+        let controls = j.nodes.iter().map(|&nd| self.world.network.node(nd).control);
+        if controls.clone().any(|c| matches!(c, NodeControl::Stop)) {
+            "all-way stop".into()
+        } else if controls.clone().any(|c| matches!(c, NodeControl::Yield)) {
+            "yield".into()
+        } else {
+            "uncontrolled".into()
+        }
+    }
+
+    /// Live junction stats: `[queued_on_approaches, crossing_inside,
+    /// longest_current_wait_secs, throughput_vph]`.
+    pub fn junction_stats(&self, index: u32) -> Vec<f32> {
+        let Some(j) = self.world.network.junctions.get(index as usize) else { return vec![0.0; 4] };
+        let net = &self.world.network;
+        let approach: std::collections::HashSet<u32> = j.approaches.iter().map(|l| l.0).collect();
+        let nodes: std::collections::HashSet<u32> = j.nodes.iter().map(|n| n.0).collect();
+        let (mut queued, mut inside, mut max_wait) = (0u32, 0u32, 0u32);
+        for v in self.world.vehicles() {
+            if v.is_crossing() {
+                if nodes.contains(&net.link(net.lane(v.lane).link).to.0) {
+                    inside += 1;
+                }
+                continue;
+            }
+            let link = net.lane(v.lane).link;
+            let internal = nodes.contains(&net.link(link).from.0) && nodes.contains(&net.link(link).to.0);
+            if internal {
+                inside += 1;
+            } else if approach.contains(&link.0) && v.speed < 0.5 {
+                queued += 1;
+                max_wait = max_wait.max(v.wait_ticks());
+            }
+        }
+        let flows = self.world.link_flows();
+        let vph: f64 = j.exits.iter().map(|l| flows[l.idx()]).sum();
+        vec![queued as f32, inside as f32, (max_wait as f64 * self.clock.dt()) as f32, vph as f32]
+    }
+
     /// Live stats for a link: `[vehicle_count, mean_speed_mps, flow_vph,
     /// occupancy_ratio]`.
     pub fn link_stats(&self, index: u32) -> Vec<f32> {
@@ -862,7 +962,8 @@ impl Simulation {
         self.world.vehicles().len() as u32
     }
 
-    /// Signal heads as raw `Instance` bytes for the emissive-disc draw.
+    /// Signal heads — plus the selected junction's footprint highlight — as raw
+    /// `Instance` bytes for the emissive draw.
     pub fn signal_instances(&self) -> Vec<u8> {
         bytemuck::cast_slice(&self.signal_instance_vec()).to_vec()
     }
@@ -948,18 +1049,36 @@ impl Simulation {
         const SIGNAL_MAX_MPP: f64 = 2.0;
         const SIGNAL_CULL_MARGIN_M: f64 = 40.0;
         let mpp = self.camera.meters_per_pixel;
+        // The selected junction's footprint outline rides this stream at every
+        // zoom, sized in world metres to hold a constant on-screen width.
+        let mut out: Vec<Instance> = Vec::new();
+        if let Some(ji) = self.selected_junction {
+            let fp = self.world.network.junctions[ji].footprint;
+            let hw = (1.5 * mpp).clamp(0.35, 3.0) as f32;
+            for k in 0..4 {
+                let (a, b) = (fp[k], fp[(k + 1) % 4]);
+                out.push(edge_ribbon(
+                    [a[0] as f32, a[1] as f32],
+                    [b[0] as f32, b[1] as f32],
+                    hw,
+                    crate::render::geometry::HIGHLIGHT_COLOR,
+                ));
+            }
+        }
         if mpp > SIGNAL_MAX_MPP {
-            return Vec::new();
+            return out;
         }
         let c = self.camera.center;
         let hx = self.camera.viewport[0] * mpp * 0.5 + SIGNAL_CULL_MARGIN_M;
         let hy = self.camera.viewport[1] * mpp * 0.5 + SIGNAL_CULL_MARGIN_M;
         let states = self.world.signal_states();
-        self.signal_heads
-            .iter()
-            .filter(|&&(_, pos, _, _)| (pos[0] as f64 - c[0]).abs() <= hx && (pos[1] as f64 - c[1]).abs() <= hy)
-            .flat_map(|&(gi, pos, heading, is_left)| signal_head_instances(pos, heading, states[gi], is_left))
-            .collect()
+        out.extend(
+            self.signal_heads
+                .iter()
+                .filter(|&&(_, pos, _, _)| (pos[0] as f64 - c[0]).abs() <= hx && (pos[1] as f64 - c[1]).abs() <= hy)
+                .flat_map(|&(gi, pos, heading, is_left)| signal_head_instances(pos, heading, states[gi], is_left)),
+        );
+        out
     }
 
     fn snapshot(&self) -> PoseMap {

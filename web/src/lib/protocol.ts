@@ -134,9 +134,13 @@ export function overlayFromSnapshot(s: StatsSnapshot, opts: OverlayOpts, smoothe
   };
 }
 
-// The selected link's live readout, posted each frame so the main thread formats the panel
-// in the user's chosen units (units are a display concern the worker never needs to know).
-export type SelectedInfo = { name: string; stats: [number, number, number, number] };
+// The selected element's live readout, posted each frame so the main thread formats the
+// panel in the user's chosen units (units are a display concern the worker never needs to
+// know). A link carries `[vehicles, speed, flow, fullness]`; a junction carries
+// `[queued, crossing, maxWaitSecs, throughputVph]` plus its control regime.
+export type SelectedInfo =
+  | { kind: "link"; name: string; stats: [number, number, number, number] }
+  | { kind: "junction"; name: string; control: string; stats: [number, number, number, number] };
 
 // The one-shot boot config the worker needs to build the scene. Everything is plain data;
 // the OffscreenCanvas travels separately in the transfer list of the init message.

@@ -124,6 +124,16 @@ export function panelText(name: string, stats: ArrayLike<number>, units: Units):
   );
 }
 
+// The selected-junction panel: crossing name, control regime, live queue/occupancy,
+// the longest current wait at its lines, and served throughput. `stats` mirrors
+// `sim.junction_stats(i)`: [queued, crossing, maxWaitSecs, throughputVph].
+export function junctionPanelText(name: string, control: string, stats: ArrayLike<number>): string {
+  return (
+    `${name} — ${control} · ${stats[0] | 0} queued · ${stats[1] | 0} crossing` +
+    ` · ${Math.round(stats[2])}s max wait · ${Math.round(stats[3])} veh/h`
+  );
+}
+
 // The demand-slider label ("Start ≤ N mph") for a start-speed cap in m/s.
 export function startSpeedLabel(startSpeedMps: number, units: Units): string {
   return `Start ≤ ${Math.round(startSpeedMps * MPS_TO[units])} ${UNIT_LABEL[units]}`;

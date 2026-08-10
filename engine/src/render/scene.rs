@@ -112,6 +112,14 @@ fn emissive(pos: [f32; 2], scale: [f32; 2], color: [f32; 3], heading: f32) -> In
 /// red/yellow/green of signals so a wreck reads unambiguously.
 pub const CRASH_COLOR: [f32; 3] = [1.0, 0.32, 0.05];
 
+/// An emissive ribbon along the segment `a → b`, `2·half_w` wide — the selected
+/// junction's footprint edges, drawn in the same pass as the signal heads.
+pub fn edge_ribbon(a: [f32; 2], b: [f32; 2], half_w: f32, color: [f32; 3]) -> Instance {
+    let mid = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    emissive(mid, [(dx * dx + dy * dy).sqrt(), half_w * 2.0], color, dy.atan2(dx))
+}
+
 /// A crash-site marker at `pos`: an emissive square rotated 45° into a diamond (so it
 /// never reads as a signal lamp), `size` metres across the diagonal. Reuses the signal
 /// emissive-square mesh; the caller sizes it in world metres to hold a constant pixel size.

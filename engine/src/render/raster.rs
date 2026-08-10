@@ -326,6 +326,35 @@ mod golden {
 
     #[test]
     #[ignore] // diagnostic: link inventory for a junction fixture
+    fn diag_render_lone_crossing() {
+        use crate::sim::network::{NodeControl, NodeId};
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let net = crate::sim::map::OsmMap::from_json(&text).expect("map json").build();
+        let node = (0..net.nodes.len() as u32).map(NodeId).find(|&nd| {
+            matches!(net.node(nd).control, NodeControl::Stop) && {
+                let names: Vec<&str> = net
+                    .links
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| l.from == nd || l.to == nd)
+                    .map(|(i, _)| net.link_names[i].as_str())
+                    .collect();
+                names.iter().any(|n| n.contains("Trousdale")) && names.iter().any(|n| n.contains("Sequoia"))
+            }
+        }).expect("Trousdale x Sequoia");
+        let c = net.node(node).position;
+        let mut r = Raster::centered(c, 45.0, 512, BG);
+        draw_world(&net, &[], &mut r);
+        let rgb = r.rgb();
+        let out = concat!(env!("CARGO_MANIFEST_DIR"), "/../..", "/scratch_crossing.png");
+        let _ = out;
+        std::fs::write("/tmp/claude-1000/-home-mst-Projects-gamez-traffic/e9418e98-7121-4bb6-89ad-c5b5940ce1a5/scratchpad/crossing.png", encode(512, 512, &rgb)).unwrap();
+        println!("wrote crossing.png at {:?}", c);
+    }
+
+    #[test]
+    #[ignore] // diagnostic dump
     fn dump_junction_links() {
         use crate::sim::network::LinkId;
         let net = millbrae_junction(0);

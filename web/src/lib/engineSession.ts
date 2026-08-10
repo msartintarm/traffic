@@ -117,6 +117,7 @@ export async function startEngineSession(
   let scene: Scene | null = null;
   let gpuRouting = false;
   let selectedIndex = -1;
+  let selectedJunction = -1;
   let width = config.width;
   let height = config.height;
   let fitMpp = 1;
@@ -242,9 +243,19 @@ export async function startEngineSession(
   };
 
   const selectedInfo = (): SelectedInfo | null => {
+    if (selectedJunction >= 0 && sim.junction_stats) {
+      const st = sim.junction_stats(selectedJunction);
+      return {
+        kind: "junction",
+        name: sim.junction_label?.(selectedJunction) || `junction ${selectedJunction}`,
+        control: sim.junction_control?.(selectedJunction) || "",
+        stats: [st[0], st[1], st[2], st[3]],
+      };
+    }
     if (selectedIndex < 0) return null;
     const st = sim.link_stats(selectedIndex);
     return {
+      kind: "link",
       name: roads[selectedIndex]?.name || `link ${selectedIndex}`,
       stats: [st[0], st[1], st[2], st[3]],
     };
@@ -317,11 +328,20 @@ export async function startEngineSession(
       case "pause": sim.pause(); break;
       case "frameBudget": sim.set_frame_budget(c.value); break;
       case "select": {
-        selectedIndex = nearestLink(roads, c.wx, c.wy, c.radius);
+        // A click inside a junction footprint selects the intersection; anywhere
+        // else selects the nearest road segment.
+        selectedJunction = sim.junction_hit ? sim.junction_hit(c.wx, c.wy) : -1;
+        selectedIndex = selectedJunction >= 0 ? -1 : nearestLink(roads, c.wx, c.wy, c.radius);
         sim.set_selected_link(selectedIndex);
+        sim.set_selected_junction?.(selectedJunction);
         break;
       }
       case "hover": {
+        const j = sim.junction_hit && sim.junction_label ? sim.junction_hit(c.wx, c.wy) : -1;
+        if (j >= 0) {
+          cb.onHover(sim.junction_label!(j) || null, c.x, c.y);
+          break;
+        }
         const i = nearestLink(roads, c.wx, c.wy, 12); // ~a lane-and-a-half in world metres
         cb.onHover(i >= 0 ? roads[i]?.name || null : null, c.x, c.y);
         break;
