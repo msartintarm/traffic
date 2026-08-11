@@ -34,25 +34,37 @@ Every phase below is implemented and green (`cargo test --features import`:
   priority approaches (ease below the dilemma threshold while a yield may
   still bind) and the same at boxes with live conflicting crossers.
 
-## Remaining
+## Remaining (updated after the R1 calibration leg, 2026-08-11)
 
-1. **P3.5 named transit lines** (dwell half is DONE): real `highway=bus_stop`
-   locations are scraped (`bus_stops` in the map JSON, 33 in Millbrae),
-   resolved onto links, and buses dwell ~25 s curbside at them — arterial
-   speeds now dip around real stops. Remaining: `route=bus` relations →
+The **queue-discharge root cause is fixed**: the box commit-room gates demanded
+~20 m of absolute clearance even from tails accelerating away, serializing
+every queued crossing to one car per ~6.8 s (≈530 veh/h/lane) — the systemic
+ceiling behind both the US-101 gateway jam and El Camino's missing volume.
+Departing tails (≥3 m/s) are now followed in at a speed-scaled margin over the
+continuous path, scoped to signalized nodes and freeway seams (uncontrolled
+grids keep conservative room — they ring-gridlock otherwise). Discharge:
+2.6–2.8 s headways. With AADT-continuity through-share (85%), anchored
+counted-corridor streams, and time-of-day-aware arterial targets, GEH share
+went 1.4% → 4–10% and every corridor's median dropped 2–3×. Plus four
+protocol defects fixed (cluster-blind all-way FIFO, mixed-control clusters,
+gap-acceptance vetoing armed stop-servers, bus double-stop trap).
+
+1. **Graded box occupancy / capacity breakdown** (the current frontier): the
+   101 seam now sits on a run-to-run capacity-breakdown knife edge
+   (4,800–6,400 veh/h vs ~6,300 target); minor streets still starve at
+   600 veh/h/dir (fixture, HCM ~200/h); saturated grids still form spillback
+   rings (~2–3 min parks under the never-abating stress fixture); and a rare
+   low-speed box-convergence graze (≲5 m/s, ≤1 pair per heavy-burst run)
+   remains in the sober stress test. Per-conflict-point occupancy timing is
+   the shared fix.
+2. **P3.5 named transit lines** (dwell half DONE): `route=bus` relations →
    link-chain routes with day-clock headway schedules, replacing the random
    bus draw in `class_of`.
-2. **US-101 mainline GEH** (P4.1 loop): gateways now demand AADT-calibrated
-   inflow but mid-segment mainline links carry a fraction of target — trace
-   where the volume exits (OD through-share vs admission throttling) with the
-   scorecard's per-link rows.
-3. **Graded box occupancy** (P2.1 residual): binary `box_conflict` double-counts
-   crossing majors, starving minor streets at 600 veh/h/dir (fixture expects
-   ~200/h per HCM); per-conflict-point timing would lift it and enable the
-   TWSC ±15% assertion.
-4. **AM/PM directional offset plans** (P3.6 residual) and **rail preemption of
+3. **AM/PM directional offset plans** (P3.6 residual) and **rail preemption of
    adjacent signals** (P3.3 residual).
-5. **Scorecard hard gate** (P4.2): flip `--assert` on once GEH share stabilizes.
+4. **Scorecard hard gate** (P4.2): stays a soft gate — the GEH share is
+   improving but equilibrium-sensitive; flip `--assert` when item 1 stabilizes
+   it.
 
 ## Phase 0 — Clocks and yardsticks
 

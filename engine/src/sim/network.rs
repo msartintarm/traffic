@@ -603,6 +603,9 @@ impl Network {
             }
         }
         self.bus_stops.sort_by(|a, b| a.0 .0.cmp(&b.0 .0).then(a.1.total_cmp(&b.1)));
+        // Opposite-side stop pairs often project onto the same link a few metres
+        // apart; one service position suffices (two would re-trap a bus).
+        self.bus_stops.dedup_by(|b, a| b.0 == a.0 && (b.1 - a.1).abs() < 15.0);
     }
 
     /// Whether `lane` is HOV/express-restricted (OSM `hov:lanes`).

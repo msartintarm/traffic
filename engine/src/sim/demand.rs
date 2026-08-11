@@ -185,7 +185,11 @@ pub fn od_pairs_with_commute(
         if measured > 0.0 && sampled > 0.0 {
             let keep = (1.0 - measured / sampled).max(0.3);
             for p in &mut pairs[surface_start..n0] {
-                p.rate_per_sec *= keep;
+                // Counted-corridor streams are measured volume themselves — the
+                // LODES displacement applies only to the sampled approximations.
+                if !p.anchored {
+                    p.rate_per_sec *= keep;
+                }
             }
         }
     }
@@ -302,13 +306,27 @@ pub fn commute_od_pairs(net: &Network, od: &CommuteOd, seed: u64, target: usize,
 /// `pairs × rate` — harmless while injection stacked everything on one lane and the
 /// entrance throttled it, but a flood once inflow fills all lanes. Mirrors the
 /// rush-hour path, which already divides a gateway's volume by its pair `share`.
+///
+/// Anchored pairs (a measured corridor's through stream) keep their absolute
+/// rate; the sampled pairs share what remains of the origin's capacity.
 fn calibrate_origin_inflow(pairs: &mut [OdPair]) {
-    let mut count: std::collections::HashMap<LinkId, usize> = std::collections::HashMap::new();
+    use std::collections::HashMap;
+    let mut anchored_sum: HashMap<LinkId, f64> = HashMap::new();
+    let mut unanchored: HashMap<LinkId, usize> = HashMap::new();
     for p in pairs.iter() {
-        *count.entry(p.origin).or_insert(0) += 1;
+        if p.anchored {
+            *anchored_sum.entry(p.origin).or_insert(0.0) += p.rate_per_sec;
+        } else {
+            *unanchored.entry(p.origin).or_insert(0) += 1;
+        }
     }
     for p in pairs.iter_mut() {
-        p.rate_per_sec /= count[&p.origin] as f64;
+        if p.anchored {
+            continue;
+        }
+        let cap = p.rate_per_sec;
+        let remaining = (cap - anchored_sum.get(&p.origin).copied().unwrap_or(0.0)).max(cap * 0.15);
+        p.rate_per_sec = remaining / unanchored[&p.origin] as f64;
     }
 }
 
@@ -378,6 +396,9 @@ pub struct DemandGenerator {
     tick: u64,
     next_id: u32,
     spawned: u32,
+    /// Trips discarded because their gateway's backlog hit [`MAX_QUEUE`] — real
+    /// demand the sim failed to carry; nonzero means gateways are underfeeding.
+    dropped: u32,
     /// Global multiplier on every stream's spawn rate (the UI frequency control).
     rate_scale: f64,
     /// Cap (m/s) on the speed a vehicle enters the map at, applied on top of the
@@ -473,12 +494,17 @@ impl DemandGenerator {
             })
             .collect();
         Self {
-            pairs, seed, tick: 0, next_id: 0, spawned: 0,
+            pairs, seed, tick: 0, next_id: 0, spawned: 0, dropped: 0,
             rate_scale: 1.0, entry_speed_cap: f64::INFINITY, rush_clock: None,
             day_compression: DEFAULT_DAY_COMPRESSION,
             day: 0, sim_secs: 0.0, churn_epoch: 0,
             queues: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Trips lost to full gateway backlogs — demand the network failed to admit.
+    pub fn dropped(&self) -> u32 {
+        self.dropped
     }
 
     /// Set how fast the simulated day plays (day-seconds per sim second, clamped to
@@ -658,6 +684,8 @@ impl DemandGenerator {
                 let q = self.queues.entry(origin.0).or_default();
                 if q.len() < MAX_QUEUE {
                     q.push_back((i, id));
+                } else {
+                    self.dropped += 1;
                 }
             }
             if surface {
@@ -667,6 +695,8 @@ impl DemandGenerator {
                     let q = self.queues.entry(origin.0).or_default();
                     if q.len() < MAX_QUEUE {
                         q.push_back((i, follower));
+                    } else {
+                        self.dropped += 1;
                     }
                 }
             }
@@ -860,12 +890,16 @@ pub fn highway_od_pairs(net: &Network, seed: u64, target: usize, out: &mut Vec<O
         let (e, same, other) = &pools[(rng::hash(seed, 60, attempt, Stream::RouteChoice) as usize) % pools.len()];
         let r = rng::uniform01(seed, e.0, attempt, Stream::RouteChoice);
         // Weighted by category, cascading when a pool is empty so the majority still
-        // lands on the same highway wherever refs make it possible.
-        let dest = if r < 0.60 {
+        // lands on the same highway wherever refs make it possible. The through
+        // share is set by AADT continuity: a freeway's counted volume barely
+        // decays across a city-sized box (US-101 carries ~219k the whole way
+        // through Millbrae), so ~85% of gateway trips ride the mainline out the
+        // far end and only the remainder leaves for an interchange or the city.
+        let dest = if r < 0.85 {
             pick(same, seed, attempt)
                 .or_else(|| pick(other, seed, attempt))
                 .or_else(|| pick_routable(net, &reach, *e, &surface, seed, attempt))
-        } else if r < 0.75 {
+        } else if r < 0.93 {
             pick(other, seed, attempt)
                 .or_else(|| pick(same, seed, attempt))
                 .or_else(|| pick_routable(net, &reach, *e, &surface, seed, attempt))
@@ -891,6 +925,39 @@ pub fn surface_od_pairs(net: &Network, seed: u64, target: usize, out: &mut Vec<O
     let entries = boundary::surface_entry_links(net);
     let exits = boundary::surface_exit_links(net);
     let interior = boundary::surface_interior_links(net);
+    // Observed corridors first: a counted state route (El Camino's CA-82) mostly
+    // *carries its measured volume through* — the count at every screenline is
+    // dominated by traffic riding the corridor, not by trips scattering off it.
+    // Each counted, named gateway gets an anchored through stream to the far end
+    // of the same-named road at ~65% of its calibrated inflow; the sampled
+    // categories below split the remainder (see `calibrate_origin_inflow`).
+    for &e in &entries {
+        if net.link_aadt(e) <= 0.0 {
+            continue;
+        }
+        let name = net.link_names[e.idx()].as_str();
+        if name.is_empty() {
+            continue;
+        }
+        let ep = link_centroid(net, e);
+        let far = exits
+            .iter()
+            .filter(|&&d| d != e && net.link_names[d.idx()] == name && reach.reachable(e, d))
+            .max_by(|&&a, &&b| {
+                let da = link_centroid(net, a);
+                let db = link_centroid(net, b);
+                (da[0] - ep[0]).hypot(da[1] - ep[1]).total_cmp(&(db[0] - ep[0]).hypot(db[1] - ep[1]))
+            });
+        if let Some(&d) = far {
+            out.push(OdPair {
+                origin: e,
+                dest: d,
+                rate_per_sec: 0.9 * capacity_rate(net, e),
+                class: SurfaceClass::Through,
+                anchored: true,
+            });
+        }
+    }
     let categories: [(&[LinkId], &[LinkId], f64, SurfaceClass); 4] = [
         (&entries, &exits, 0.35, SurfaceClass::Through),      // through the city
         (&entries, &interior, 0.25, SurfaceClass::Inbound),   // arriving to a local destination

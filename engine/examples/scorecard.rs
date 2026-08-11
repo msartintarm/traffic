@@ -35,6 +35,7 @@ struct Args {
     d_factor: f64,
     seed: u64,
     assert_gate: bool,
+    dump_ref: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -49,6 +50,7 @@ fn parse_args() -> Args {
         d_factor: 0.55,
         seed: 0xC0FFEE,
         assert_gate: false,
+        dump_ref: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -64,6 +66,7 @@ fn parse_args() -> Args {
             "--d" => args.d_factor = val().parse().expect("d"),
             "--seed" => args.seed = val().parse().expect("seed"),
             "--assert" => args.assert_gate = true,
+            "--dump-ref" => args.dump_ref = Some(val()),
             other => panic!("unknown arg {other}"),
         }
     }
@@ -152,7 +155,22 @@ fn main() {
             let t = aadt * 0.5 * k_dir;
             (t, t)
         } else {
-            (aadt * args.k_factor * args.d_factor, aadt * args.k_factor * (1.0 - args.d_factor))
+            // K·D describes the arterial's daily *peak* hour (PM for urban
+            // arterials); a window elsewhere in the day is scored against the
+            // diurnal shape's ratio to that peak, or an AM run would demand
+            // PM volumes.
+            let shape = |t: f64| engine::sim::rush_hour::arterial_factor(t);
+            let window = {
+                let (a, b) = (args.start_hour * 3600.0, args.end_hour * 3600.0);
+                let n = 8;
+                (0..n).map(|k| shape(a + (b - a) * k as f64 / (n - 1) as f64)).sum::<f64>() / n as f64
+            };
+            let day_peak = (0..96).map(|k| shape(k as f64 * 900.0)).fold(0.0f64, f64::max);
+            let tod = (window / day_peak.max(1e-9)).min(1.0);
+            (
+                aadt * args.k_factor * args.d_factor * tod,
+                aadt * args.k_factor * (1.0 - args.d_factor) * tod,
+            )
         };
         let g = measure::geh(flows[i], peak).min(measure::geh(flows[i], off));
         obs_total += 1;
@@ -198,6 +216,45 @@ fn main() {
         }
     }
 
+    // Gateway audit: is the demanded inflow actually being admitted?
+    let gateways: Vec<serde_json::Value> = boundary::highway_entry_links(&world.network)
+        .iter()
+        .map(|&e| {
+            serde_json::json!({
+                "link": e.0,
+                "ref": world.network.link_ref(e),
+                "lanes": world.network.link(e).lane_count,
+                "aadt": world.network.link_aadt(e),
+                "sim_vph": flows[e.idx()],
+            })
+        })
+        .collect();
+
+    // Optional corridor trace: every link whose ref matches, with its flow — the
+    // where-does-the-volume-go debugging view.
+    let ref_dump: Vec<serde_json::Value> = args
+        .dump_ref
+        .as_deref()
+        .map(|want| {
+            (0..flows.len())
+                .filter(|&i| world.network.link_ref(LinkId(i as u32)).contains(want))
+                .map(|i| {
+                    let link = world.network.link(LinkId(i as u32));
+                    serde_json::json!({
+                        "link": i,
+                        "kind": format!("{:?}", link.kind),
+                        "lanes": link.lane_count,
+                        "from": link.from.0,
+                        "to": link.to.0,
+                        "aadt": world.network.link_aadt(LinkId(i as u32)),
+                        "sim_vph": flows[i],
+                        "speed_mps": if speeds[i].is_nan() { serde_json::Value::Null } else { speeds[i].into() },
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let report = serde_json::json!({
         "meta": {
             "map": args.map,
@@ -208,6 +265,7 @@ fn main() {
             "spawned": gen.spawned(),
             "exited": world.exited(),
             "queued_at_gateways": gen.queued(),
+            "dropped_at_gateways": gen.dropped(),
         },
         "totals": {
             "vkt": meas.vkt(),
@@ -223,6 +281,8 @@ fn main() {
         },
         "corridors": corridors,
         "flow_by_ref": by_ref,
+        "gateways": gateways,
+        "ref_dump": ref_dump,
     });
     println!("{}", serde_json::to_string_pretty(&report).expect("serialize"));
 

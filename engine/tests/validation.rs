@@ -142,3 +142,192 @@ fn print_priority_capacity_curve() {
         println!("major demand {v:>6.0}/dir → minor {cap:>5.0} veh/h, major flow {major:>6.0} veh/h, crashes {crashes:?}");
     }
 }
+
+/// Diagnostic (ignored): per-lane state at the US-101 gateway lane-drop seam.
+#[test]
+#[ignore]
+fn diag_gateway_seam_lanes() {
+    use engine::sim::demand::{self, DemandGenerator, DemandSources};
+    use engine::sim::net_world::NetWorld;
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+    let Ok(text) = std::fs::read_to_string(path) else { return };
+    let net = engine::sim::OsmMap::from_json(&text).expect("map json").build();
+    let mut world = NetWorld::new(net, SimConfig::default_config());
+    let sources = DemandSources::with_rush_hour(true, false, true);
+    let pairs = demand::od_pairs_with_commute(&world.network, 0xC0FFEE, 48, sources, None);
+    let mut gen = DemandGenerator::new(&world, &pairs, 0xC0FFEE);
+    gen.set_rush_hour(&world.network, true);
+    gen.set_day_compression(12.0);
+    gen.resume_clock(7.0 * 3600.0, 0);
+    world.install_router(&gen.destinations());
+    for _ in 0..4000 {
+        gen.step(&mut world, 0.2);
+        world.step();
+    }
+    for lid in [990u32, 991, 1380, 988] {
+        let link = *world.network.link(LinkId(lid));
+        println!("link {lid} ({} lanes):", link.lane_count);
+        for k in 0..link.lane_count {
+            let lane = engine::sim::network::LaneId(link.lane_start.0 + k);
+            let ln = world.network.lane(lane);
+            let cars: Vec<&engine::sim::NetVehicle> =
+                world.vehicles().iter().filter(|v| v.lane == lane).collect();
+            let n = cars.len();
+            let mean_v = if n > 0 { cars.iter().map(|v| v.speed).sum::<f64>() / n as f64 } else { f64::NAN };
+            let near_end = cars.iter().filter(|v| ln.length - v.position < 60.0).count();
+            println!("  lane {k}: {n} cars, mean v {mean_v:.1}, {near_end} in last 60 m (len {:.0})", ln.length);
+        }
+    }
+}
+
+/// Diagnostic (ignored): movement wiring of the gateway seam lanes.
+#[test]
+#[ignore]
+fn diag_gateway_seam_movements() {
+    use engine::sim::network::LaneId;
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+    let Ok(text) = std::fs::read_to_string(path) else { return };
+    let net = engine::sim::OsmMap::from_json(&text).expect("map json").build();
+    for lid in [990u32, 1380] {
+        let link = *net.link(LinkId(lid));
+        println!("link {lid} ({} lanes) turn_lanes={:?}:", link.lane_count, net.link_turn_lanes[lid as usize]);
+        for k in 0..link.lane_count {
+            let lane = LaneId(link.lane_start.0 + k);
+            let mvs: Vec<String> = net
+                .movements_of(lane)
+                .iter()
+                .map(|m| {
+                    let to = net.lane(m.to_lane);
+                    format!("→link{} lane{}", to.link.0, to.index_in_link)
+                })
+                .collect();
+            println!("  lane {k}: {} movements {:?}", mvs.len(), mvs);
+        }
+    }
+}
+
+/// Diagnostic (ignored): gate-relevant flags on the gateway seam movements.
+#[test]
+#[ignore]
+fn diag_gateway_seam_flags() {
+    use engine::sim::network::{LaneId, MovementId};
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+    let Ok(text) = std::fs::read_to_string(path) else { return };
+    let net = engine::sim::OsmMap::from_json(&text).expect("map json").build();
+    for lid in [990u32, 1380] {
+        let link = *net.link(LinkId(lid));
+        println!("link {lid}:");
+        for k in 0..link.lane_count {
+            let lane = LaneId(link.lane_start.0 + k);
+            let ln = net.lane(lane);
+            for j in 0..ln.movement_count {
+                let mid = MovementId(ln.movement_start.0 + j);
+                let conflicts = net.conflicts.iter().filter(|c| c.a == mid || c.b == mid).count();
+                println!(
+                    "  lane {k} mv{}: interchange={} continuation={} conflicts={} node={}",
+                    mid.0,
+                    net.is_interchange_movement(mid),
+                    net.is_continuation_seam(mid),
+                    conflicts,
+                    net.movement(mid).node.0,
+                );
+            }
+        }
+    }
+}
+
+/// Queue-discharge saturation flow: park a standing queue at a red, release it,
+/// and measure the between-vehicle headways crossing the line. US signalized
+/// approaches discharge at ~1,800–1,900 veh/h/lane (headway ≈ 1.9–2.0 s).
+#[test]
+#[ignore]
+fn diag_queue_discharge_headway() {
+    use engine::sim::map::SignalPlan;
+    let plan = SignalPlan { green_secs: 60.0, yellow_secs: 4.0, offset: 30.0 };
+    let net = OsmMap {
+        nodes: vec![
+            NodeSpec::uncontrolled(1, -600.0, 0.0),
+            NodeSpec::signalized(2, 0.0, 0.0, plan),
+            NodeSpec::uncontrolled(3, 400.0, 0.0),
+            NodeSpec::uncontrolled(4, 0.0, -200.0),
+            NodeSpec::uncontrolled(5, 0.0, 200.0),
+        ],
+        links: {
+            let mut v = vec![LinkSpec::oneway(1, 2, 1, 15.0), LinkSpec::oneway(2, 3, 1, 15.0)];
+            v.extend(LinkSpec::twoway(4, 2, 1, 10.0));
+            v.extend(LinkSpec::twoway(2, 5, 1, 10.0));
+            v
+        },
+    }
+    .build();
+    let mut w = NetWorld::new(net, SimConfig { red_run_prob: 0.0, ..SimConfig::default_config() });
+    let mut id = 0u32;
+    // Fill a standing queue during red.
+    for _ in 0..1500 {
+        if w.spawn_routed(id, vec![LinkId(0), LinkId(1)], 10.0, DriverConfig { accel_noise: 0.0, ..DriverConfig::car() }) {
+            id += 1;
+        }
+        w.step();
+    }
+    // Now record crossing times over several cycles.
+    let mut crossings: Vec<f64> = Vec::new();
+    let mut t = 0.0f64;
+    let mut last_count = w.link_entry_counts()[1];
+    for _ in 0..9000 {
+        if w.spawn_routed(id, vec![LinkId(0), LinkId(1)], 10.0, DriverConfig { accel_noise: 0.0, ..DriverConfig::car() }) {
+            id += 1;
+        }
+        w.step();
+        t += 0.2;
+        let c = w.link_entry_counts()[1];
+        for _ in 0..(c - last_count) {
+            crossings.push(t);
+        }
+        last_count = c;
+    }
+    let mut headways: Vec<f64> = crossings.windows(2).map(|w| w[1] - w[0]).collect();
+    headways.sort_by(|a, b| a.total_cmp(b));
+    let pick = |q: f64| headways[((headways.len() - 1) as f64 * q) as usize];
+    println!(
+        "{} crossings; headway p10 {:.1} p25 {:.1} p50 {:.1} p75 {:.1} p90 {:.1}",
+        crossings.len(),
+        pick(0.1),
+        pick(0.25),
+        pick(0.5),
+        pick(0.75),
+        pick(0.9),
+    );
+    // Watch the line for 15 s: approach front car vs receiver tail.
+    let l0 = *world_link(&w, 0);
+    for t in 0..75 {
+        w.step();
+        let front = w
+            .vehicles()
+            .iter()
+            .filter(|v| w_lane_link(&w, v) == 0 && !v.is_crossing())
+            .max_by(|a, b| a.position.total_cmp(&b.position));
+        let crossing = w.vehicles().iter().find(|v| v.is_crossing());
+        let tail = w
+            .vehicles()
+            .iter()
+            .filter(|v| w_lane_link(&w, v) == 1)
+            .min_by(|a, b| a.position.total_cmp(&b.position));
+        if t % 3 == 0 {
+            println!(
+                "t{:>4.1} front {:?} crossing {:?} tail {:?}",
+                t as f64 * 0.2,
+                front.map(|v| (v.id, format!("{:.1}/{:.1}", v.position, l0), format!("v{:.1}", v.speed))),
+                crossing.map(|v| (v.id, format!("v{:.1}", v.speed))),
+                tail.map(|v| (v.id, format!("{:.1}", v.position), format!("v{:.1}", v.speed))),
+            );
+        }
+    }
+}
+
+fn world_link(w: &NetWorld, link: u32) -> &f64 {
+    Box::leak(Box::new(w.network.lane(w.network.link(LinkId(link)).lane_start).length))
+}
+
+fn w_lane_link(w: &NetWorld, v: &engine::sim::NetVehicle) -> u32 {
+    w.network.lane(v.lane).link.0
+}

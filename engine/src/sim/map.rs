@@ -685,6 +685,35 @@ impl OsmMap {
         }
         net.build_hov_lanes();
         net.build_junctions();
+        // Stop control is a property of the *intersection*: OSM surveys the sign
+        // per approach, so a multi-node cluster ends up with Stop on some member
+        // nodes and Uncontrolled on the rest — and the uncontrolled street then
+        // streams through the "all-way stop" while the signed street waits
+        // forever. Promote: any unsignalized cluster with a Stop member is
+        // stop-controlled at every member.
+        let mut touches_freeway = vec![false; net.nodes.len()];
+        for l in &net.links {
+            if matches!(l.kind, RoadKind::Freeway | RoadKind::Ramp) {
+                touches_freeway[l.from.idx()] = true;
+                touches_freeway[l.to.idx()] = true;
+            }
+        }
+        for ji in 0..net.junctions.len() {
+            let members = net.junctions[ji].nodes.clone();
+            let signalized =
+                members.iter().any(|&n| matches!(net.nodes[n.idx()].control, NodeControl::Signalized(_)));
+            let any_stop = members.iter().any(|&n| matches!(net.nodes[n.idx()].control, NodeControl::Stop));
+            if !signalized && any_stop {
+                for &n in &members {
+                    // The stop sign is an at-grade artifact: a freeway seam node
+                    // clustered nearby (a frontage stop beside the gateway) must
+                    // not put a phantom stop on the mainline.
+                    if !touches_freeway[n.idx()] {
+                        net.nodes[n.idx()].control = NodeControl::Stop;
+                    }
+                }
+            }
+        }
         net.build_cross_junction_conflicts();
         net.build_conflict_index();
         coordinate_junction_signals(&mut net, &plans);
