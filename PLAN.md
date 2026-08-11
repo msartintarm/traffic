@@ -49,22 +49,35 @@ went 1.4% → 4–10% and every corridor's median dropped 2–3×. Plus four
 protocol defects fixed (cluster-blind all-way FIFO, mixed-control clusters,
 gap-acceptance vetoing armed stop-servers, bus double-stop trap).
 
-1. **Graded box occupancy / capacity breakdown** (the current frontier): the
-   101 seam now sits on a run-to-run capacity-breakdown knife edge
-   (4,800–6,400 veh/h vs ~6,300 target); minor streets still starve at
-   600 veh/h/dir (fixture, HCM ~200/h); saturated grids still form spillback
-   rings (~2–3 min parks under the never-abating stress fixture); and a rare
-   low-speed box-convergence graze (≲5 m/s, ≤1 pair per heavy-burst run)
-   remains in the sober stress test. Per-conflict-point occupancy timing is
-   the shared fix.
-2. **P3.5 named transit lines** (dwell half DONE): `route=bus` relations →
-   link-chain routes with day-clock headway schedules, replacing the random
-   bus draw in `class_of`.
-3. **AM/PM directional offset plans** (P3.6 residual) and **rail preemption of
-   adjacent signals** (P3.3 residual).
-4. **Scorecard hard gate** (P4.2): stays a soft gate — the GEH share is
-   improving but equilibrium-sensitive; flip `--assert` when item 1 stabilizes
-   it.
+All four were executed in the follow-up leg (same day):
+
+1. **Graded box occupancy** — DONE (core): `box_conflict_graded` times each
+   shared conflict point (entrant's reach vs crosser's clear), permissive
+   lefts graded the same way, commit hysteresis for rolling acceptances, and
+   the TWSC fixture switched to Poisson arrivals (its old synchronized
+   metronome provably admitted no usable gap). Minor streets now cross at
+   600+ veh/h/dir (24–48/h; HCM says ~200 — magnitude still conservative),
+   majors never invert, discharge stays 2.6 s, sober envelope holds.
+   *Explored and reverted with findings*: launcher-kinematic threat projection
+   and two-stage mid-box crossing (needs body-geometry-aware hold positions —
+   the genuine next step for the HCM magnitude and the spillback rings).
+2. **Named transit lines** — DONE: 34 scraped `route=bus` relations
+   (bbox-clipped, stitched, sampled), resolved to connected link chains
+   (longest-run + short splices), scheduled on day-clock headways (15 min
+   day / 30 min night, phase-spread), buses dwell at the 33 real stops; the
+   random background bus draw is gone.
+3. **AM/PM offset plans + rail preemption** — DONE: every coordinated program
+   stores mirrored AM/PM green-wave offsets and the world swaps plans at noon;
+   rail closures force adjacent signals (≤120 m) to the track-clearing phase
+   through a 3 s grace + normal clearance, held until the gates lift.
+4. **Scorecard gate** — DONE (interim): CI now *hard-fails* below a 5% GEH
+   floor (`--assert-floor 0.05`; calibrated runs sit at 10–23% across seeds);
+   the 0.85 aspiration stays soft pending the two-stage-crossing work.
+
+Watch item: default-config scorecard windows now log 2–4 red-running crashes
+(the graded gates let red-runners meet more cross traffic); per-VMT that is
+above real rates — revisit `red_run_prob` (0.002) or its aggression scaling
+when tuning next.
 
 ## Phase 0 — Clocks and yardsticks
 

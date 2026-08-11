@@ -465,6 +465,52 @@ def main():
             list(project(el["lat"], el["lon"], lat0, lon0)) for el in stops.get("elements", [])
         ]
         print(f"bus stops: {len(graph['bus_stops'])}")
+        # Named bus lines: each route relation's member ways stitched into one
+        # sampled polyline; the engine resolves it to a link chain and runs
+        # scheduled buses along it.
+        rels = fetch_query(
+            f'[out:json][timeout:90]; rel["route"="bus"]({s},{w},{n},{e}); out body; way(r); out geom;'
+        )
+        ways = {el["id"]: el for el in rels.get("elements", []) if el["type"] == "way"}
+        routes = []
+        for el in rels.get("elements", []):
+            if el["type"] != "relation":
+                continue
+            tags = el.get("tags", {})
+            name = tags.get("ref") or tags.get("name") or f"route {el['id']}"
+            pts = []
+            for m in el.get("members", []):
+                if m.get("type") != "way" or m.get("role") in ("platform", "stop"):
+                    continue
+                geom = ways.get(m["ref"], {}).get("geometry")
+                if not geom:
+                    continue
+                # Route relations run far past the box; only the in-box portion
+                # can resolve onto the scraped network.
+                geom = [g for g in geom if s <= g["lat"] <= n and w <= g["lon"] <= e]
+                if len(geom) < 2:
+                    continue
+                seg = [project(g["lat"], g["lon"], lat0, lon0) for g in geom]
+                # Orient each way to continue from the stitched end (relations
+                # are ordered but member ways face either way).
+                if pts:
+                    d_fwd = (seg[0][0] - pts[-1][0]) ** 2 + (seg[0][1] - pts[-1][1]) ** 2
+                    d_rev = (seg[-1][0] - pts[-1][0]) ** 2 + (seg[-1][1] - pts[-1][1]) ** 2
+                    if d_rev < d_fwd:
+                        seg.reverse()
+                pts.extend(seg)
+            # Thin to ~40 m samples; the engine only needs a link-resolvable trace.
+            sampled, acc = [], 1e9
+            for i, p in enumerate(pts):
+                if i:
+                    acc += ((p[0] - pts[i - 1][0]) ** 2 + (p[1] - pts[i - 1][1]) ** 2) ** 0.5
+                if acc >= 40.0:
+                    sampled.append([round(p[0], 1), round(p[1], 1)])
+                    acc = 0.0
+            if len(sampled) >= 5:
+                routes.append({"name": name, "pts": sampled})
+        graph["bus_routes"] = routes
+        print(f"bus routes: {len(routes)}")
     with open(args.out, "w") as f:
         json.dump(graph, f, separators=(",", ":"))
     print(f"wrote {args.out}: {len(graph['nodes'])} nodes, {len(graph['links'])} links")

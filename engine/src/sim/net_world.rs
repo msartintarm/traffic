@@ -220,6 +220,10 @@ pub struct NetWorld {
     /// Simulated seconds-into-day (fed by the demand clock), the timebase for
     /// day-scheduled infrastructure: rail-crossing timetables.
     day_secs: f64,
+    /// Which green-wave plan is loaded (false = AM progression, true = PM).
+    pm_plan: bool,
+    /// Rail preemption table: `(program, track-clearing phase, crossing node)`.
+    rail_preempts: Vec<(u32, usize, NodeId)>,
     /// Bus stops per link `(stop index, link arc)` — from `Network::bus_stops`.
     stops_by_link: IntMap<Vec<(u32, f64)>>,
     /// Per movement: does it carry any registered conflict point? An
@@ -988,6 +992,7 @@ impl NetWorld {
             .collect();
 
         let signals = SignalController::build(&network);
+        let rail_preempts = Self::build_rail_preempts(&network);
         let mut movement_conflicted = vec![false; network.movements.len()];
         for c in &network.conflicts {
             movement_conflicted[c.a.idx()] = true;
@@ -1003,7 +1008,7 @@ impl NetWorld {
         Self {
             network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0, crashed_by: [0; 2], crash_log: Vec::new(),
             merges, link_straight, merge_feeder_lane, through_next, corridor_of, corridor_offset, seam_primary, signals, link_entries, router: None, external_reroute: false,
-            meters: Vec::new(), metering_on: false, day_secs: 0.0,
+            meters: Vec::new(), metering_on: false, day_secs: 0.0, pm_plan: false, rail_preempts,
             stops_by_link, bus_dwell: HashMap::new(), movement_conflicted,
             route_fingerprint: 0, route_cycle_tick: 0, parallel_routing: true, cache_sort: true, junctions,
             accel_backend: AccelBackend::Serial,
@@ -2215,9 +2220,53 @@ impl NetWorld {
                 demand.insert(lane.link.0);
             }
         }
-        self.signals.advance(&self.network, &demand, dt);
+        // Rail preemption: while a crossing is closed, adjacent signals force
+        // the phase that flushes the from-crossing approach away from the tracks.
+        let mut forced: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        for &(pid, phase, crossing) in &self.rail_preempts {
+            if self.rail_closed(crossing) {
+                forced.insert(pid as usize, phase);
+            }
+        }
+        self.signals.advance(&self.network, &demand, dt, &forced);
         self.advance_meters(dt);
         self.advance_bus_stops(dt);
+    }
+
+    /// Map each rail crossing to the adjacent signal phase that clears traffic
+    /// *away from* the tracks: for every link departing a crossing into a nearby
+    /// signalized node, the phase greening that approach's movements.
+    fn build_rail_preempts(network: &Network) -> Vec<(u32, usize, NodeId)> {
+        let mut out = Vec::new();
+        for r in 0..network.nodes.len() {
+            if !network.nodes[r].rail_crossing {
+                continue;
+            }
+            for li in 0..network.links.len() {
+                let l = network.link(LinkId(li as u32));
+                if l.from != NodeId(r as u32) {
+                    continue;
+                }
+                let lane = network.lane(l.lane_start);
+                if lane.length > 120.0 {
+                    continue; // not adjacent — the queue can't back onto the tracks
+                }
+                for k in 0..lane.movement_count {
+                    let mid = MovementId(lane.movement_start.0 + k);
+                    let Some(gid) = network.movement(mid).signal_group else { continue };
+                    let group = network.groups[gid.idx()];
+                    let program = &network.programs[group.program.idx()];
+                    if let Some(phase) =
+                        program.phases.iter().position(|ph| ph.green_mask & (1u64 << group.bit) != 0)
+                    {
+                        out.push((group.program.idx() as u32, phase, NodeId(r as u32)));
+                    }
+                }
+            }
+        }
+        out.sort_unstable_by_key(|&(p, ph, n)| (p, ph, n.0));
+        out.dedup();
+        out
     }
 
     /// Turn ramp metering on or off (Caltrans D4 meters the peninsula freeway
@@ -2303,9 +2352,21 @@ impl NetWorld {
     }
 
     /// Feed the simulated time of day (seconds since midnight) for day-scheduled
-    /// infrastructure — the rail-crossing timetable reads it.
+    /// infrastructure — the rail-crossing timetable reads it, and the signal
+    /// system switches its green-wave plan (AM progression up to noon, PM
+    /// progression after, the way real corridor timing plans rotate).
     pub fn set_day_secs(&mut self, s: f64) {
         self.day_secs = s.rem_euclid(86_400.0);
+        let pm = self.day_secs >= 12.0 * 3600.0;
+        if pm != self.pm_plan && !self.network.am_offsets.is_empty() {
+            self.pm_plan = pm;
+            for p in 0..self.network.programs.len() {
+                if self.network.programs[p].coordinated {
+                    self.network.programs[p].offset =
+                        if pm { self.network.pm_offsets[p] } else { self.network.am_offsets[p] };
+                }
+            }
+        }
     }
 
     /// Whether a rail crossing at `node` is currently closed to road traffic.
@@ -3648,6 +3709,76 @@ impl NetWorld {
             .any(|&o| self.network.movements_conflict(mid, o))
     }
 
+    /// Graded box occupancy: a conflicting crosser blocks entry only while it
+    /// still *owns the shared conflict point* during the entrant's own arrival
+    /// window — the entrant's time to reach the point vs the crosser's time to
+    /// clear it (tail past, plus a margin). The binary any-crosser-anywhere test
+    /// double-counted traffic that had already swept past the entrant's path:
+    /// a minor street facing a busy major never saw a usable instant even though
+    /// each major car occupies the minor's point for barely a second. Future
+    /// cluster hops of moving crossers stay binary (their timing is a guess).
+    fn box_conflict_graded(
+        &self,
+        veh: &NetVehicle,
+        mid: MovementId,
+        dist_to_line: f64,
+        node: NodeId,
+        nb: &Neighbors,
+    ) -> bool {
+        let key = self.network.intersection_key(node);
+        let conflict_ids = self.junctions.conflict_ids(node);
+        for &j in nb.crossing_at.get(&key).into_iter().flatten() {
+            let o = &self.fleet.rows[j];
+            let cm = o.crossing.unwrap().movement;
+            // Future hops of a moving crosser: binary (as before).
+            if o.speed >= 0.5 {
+                let mut lane = self.network.movement(cm).to_lane;
+                for _ in 0..4 {
+                    if !self.junction_internal_lane(lane) {
+                        break;
+                    }
+                    let Some(next) = self.movement_from_lane_for(o, lane) else { break };
+                    if self.network.movements_conflict(mid, next) {
+                        return true;
+                    }
+                    lane = self.network.movement(next).to_lane;
+                }
+            }
+            if !self.network.movements_conflict(mid, cm) {
+                continue;
+            }
+            // Current movement: time the shared point(s).
+            let mut timed_any = false;
+            let o_arc = self.crossing_arc(o);
+            for &ci in conflict_ids {
+                let cp = &self.network.conflicts[ci as usize];
+                let (my_s, o_s) = if cp.a == mid && cp.b == cm {
+                    (cp.sa, cp.sb)
+                } else if cp.b == mid && cp.a == cm {
+                    (cp.sb, cp.sa)
+                } else {
+                    continue;
+                };
+                timed_any = true;
+                let tail_clear = o_s + o.driver.vehicle_length + 1.0;
+                if o_arc >= tail_clear {
+                    continue; // their body is past this point
+                }
+                let t_clear = (tail_clear - o_arc) / o.speed.max(0.8);
+                let cap = self.turn_speed_cap(mid).min(veh.driver.desired_speed);
+                let t_reach =
+                    travel_time(dist_to_line + my_s, veh.speed.max(1.0), veh.driver.max_accel, cap);
+                if t_reach < t_clear + 0.6 {
+                    return true;
+                }
+            }
+            if !timed_any {
+                return true; // conflicting but no point registered here — stay safe
+            }
+        }
+        false
+    }
+
     /// [`box_conflict`] over the vehicle's whole committed path through the
     /// intersection: the immediate movement plus each subsequent hop while the
     /// path stays on junction-internal links (a multi-node cluster). Admission at
@@ -3657,7 +3788,8 @@ impl NetWorld {
     /// fast through is waved in only to meet a crosser mid-cluster with no
     /// stopping distance.
     fn box_conflict_on_path(&self, veh: &NetVehicle, mid: MovementId, node: NodeId, nb: &Neighbors) -> bool {
-        if self.box_conflict(mid, node, nb) {
+        let dist_to_line = (self.network.lane(veh.lane).length - veh.position).max(0.0);
+        if self.box_conflict_graded(veh, mid, dist_to_line, node, nb) {
             return true;
         }
         let mut lane = self.network.movement(mid).to_lane;
@@ -3773,6 +3905,14 @@ impl NetWorld {
     ) -> Option<()> {
         let me = &self.fleet.rows[i];
         let waited = me.wait_ticks as f64 * self.cfg.dt;
+        // Commit hysteresis: a driver who has accepted a gap and is rolling into
+        // the crossing no longer re-litigates the full window every tick — only
+        // an *imminent* arrival aborts. Without this the acceptance must hold
+        // through the entire creep-and-cross (re-tested 5×/s), which squared the
+        // odds and starved minor streets that HCM says should trickle through.
+        let rolling_commit =
+            me.speed > 1.0 && (self.network.lane(lane).length - me.position) < 8.0;
+        let hysteresis = if rolling_commit { 0.5 } else { 1.0 };
         // Physical floor: never accept less than the time to clear our own
         // crossing (interior arc plus body at the turn's speed profile).
         let (cap, arc) = self.intended_movement(me).map_or((me.driver.desired_speed, 8.0), |m| {
@@ -3782,7 +3922,8 @@ impl NetWorld {
         let my_link = self.network.lane(lane).link;
         let my_key = self.priority_key(my_link);
         let my_dir = self.network.arrival_dir(my_link);
-        let my_turn = self.intended_movement(me).map_or(TurnType::Through, |m| self.network.movement_turn(m));
+        let my_mid = self.intended_movement(me);
+        let my_turn = my_mid.map_or(TurnType::Through, |m| self.network.movement_turn(m));
         for &j in nb.approaching.get(&self.network.intersection_key(node))? {
             if j == i {
                 continue;
@@ -3795,13 +3936,16 @@ impl NetWorld {
             // HCM base for this conflict pair: minor when the conflicting
             // approach outranks ours; impatience shrinks it, physics floors it.
             let minor = my_key < self.priority_key(o_lane.link);
-            let critical = effective_critical_gap(hcm_critical_gap(my_turn, minor, &me.driver), waited)
-                .max(t_clear + 0.5)
+            // Hysteresis scales only the behavioural window; the physics floor
+            // (own remaining clearance, recomputed from current speed) holds.
+            let critical = (effective_critical_gap(hcm_critical_gap(my_turn, minor, &me.driver), waited)
+                * hysteresis)
+                .max(t_clear + 0.3)
                 * margin;
+            let o_mid = self.intended_movement(o);
             if (o_lane.length - o.position) / o.speed.max(0.1) >= critical {
                 continue;
             }
-            let o_mid = self.intended_movement(o);
             let o_turn = o_mid.map_or(TurnType::Through, |m| self.network.movement_turn(m));
             // A turn yields to a conflicting through outright — right-of-way
             // doesn't depend on approach angle when the paths genuinely cross
@@ -3981,10 +4125,41 @@ impl NetWorld {
             if other_state == SignalState::Red {
                 return false;
             }
-            // A conflicting car already inside the box (or swinging onto this
-            // movement on a later cluster hop): no gap is acceptable.
-            if nb.crossing_mvs.get(&key).into_iter().flatten().any(|&m| m == other) {
-                return true;
+            // A conflicting car inside the box blocks only while it still owns
+            // the shared point during our own arrival window (graded — a crosser
+            // whose tail has swept past frees the movement immediately). Future
+            // cluster hops onto `other` stay binary.
+            let my_line = (self.network.lane(me.lane).length - me.position).max(0.0);
+            for &j in nb.crossing_at.get(&key).into_iter().flatten() {
+                let o = &self.fleet.rows[j];
+                let cm = o.crossing.unwrap().movement;
+                if cm != other {
+                    if o.speed >= 0.5 {
+                        let mut olane = self.network.movement(cm).to_lane;
+                        for _ in 0..4 {
+                            if !self.junction_internal_lane(olane) {
+                                break;
+                            }
+                            let Some(next) = self.movement_from_lane_for(o, olane) else { break };
+                            if next == other {
+                                return true;
+                            }
+                            olane = self.network.movement(next).to_lane;
+                        }
+                    }
+                    continue;
+                }
+                let o_arc = self.crossing_arc(o);
+                let tail_clear = other_s + o.driver.vehicle_length + 1.0;
+                if o_arc >= tail_clear {
+                    continue;
+                }
+                let t_clear = (tail_clear - o_arc) / o.speed.max(0.8);
+                let cap_me = self.turn_speed_cap(mid).min(me.driver.desired_speed);
+                let t_reach = travel_time(my_line + my_s, me.speed.max(1.0), me.driver.max_accel, cap_me);
+                if t_reach < t_clear + 0.6 {
+                    return true;
+                }
             }
             // The window this driver needs: the physical time to clear the conflict
             // point (line → point plus the body, on the turn's speed profile) plus a
@@ -6068,6 +6243,40 @@ mod tests {
     }
 
     #[test]
+    fn transit_lines_run_scheduled_buses_and_the_mix_has_no_random_ones() {
+        use super::super::demand::{DemandGenerator, TransitLine};
+        // A street with a stop: the named line spawns buses on its headway;
+        // background demand contributes none.
+        let mut net = OsmMap {
+            nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 500.0, 0.0)],
+            links: vec![LinkSpec::oneway(1, 2, 2, 13.0)],
+        }
+        .build();
+        net.attach_bus_stops(&[[240.0, 2.0]]);
+        let mut w = NetWorld::new(net, cfg());
+        let mut gen = DemandGenerator::new(&w, &[], 5);
+        gen.set_transit_lines(vec![TransitLine::new("ECR".into(), vec![LinkId(0)])]);
+        // The fallback day clock starts at 05:30 (headway 1800 s → 900 s at 06:00);
+        // run 40 sim-minutes and count buses.
+        let mut buses_seen = std::collections::HashSet::new();
+        for _ in 0..12_000 {
+            gen.step(&mut w, cfg().dt);
+            w.step();
+            for v in w.vehicles() {
+                if v.driver.vehicle_length >= 11.0 {
+                    buses_seen.insert(v.id);
+                }
+            }
+        }
+        assert!(
+            (1..=4).contains(&buses_seen.len()),
+            "the line runs on its headway (~2 departures in 40 min around 06:00): {}",
+            buses_seen.len()
+        );
+        assert!(w.exited() >= 1, "buses complete the route");
+    }
+
+    #[test]
     fn buses_dwell_at_stops_and_cars_pass_through() {
         // One street with a mid-block bus stop: a bus brakes to it, serves ~25 s,
         // then continues; a car sails past without stopping.
@@ -6099,6 +6308,51 @@ mod tests {
         assert!((20.0..40.0).contains(&dwell_secs), "the bus serves the stop ~25 s: {dwell_secs:.0}");
         assert!(car_stopped_ticks < 10, "cars don't stop for the bus stop: {car_stopped_ticks}");
         assert_eq!(w.exited(), 2, "both vehicles complete the street");
+    }
+
+    #[test]
+    fn rail_closure_preempts_the_adjacent_signal_to_flush_the_tracks() {
+        use super::super::map::SignalPlan;
+        // Crossing R 80 m before a signalized cross street: when the gates come
+        // down, the signal must switch to (and hold) the phase that greens the
+        // from-crossing approach, flushing traffic off the tracks.
+        let plan = SignalPlan { green_secs: 20.0, yellow_secs: 3.0, offset: 0.0 };
+        let mut nodes = vec![
+            NodeSpec::uncontrolled(1, -300.0, 0.0),
+            NodeSpec::uncontrolled(2, -80.0, 0.0),
+            NodeSpec::signalized(3, 0.0, 0.0, plan),
+            NodeSpec::uncontrolled(4, 300.0, 0.0),
+            NodeSpec::uncontrolled(5, 0.0, -250.0),
+            NodeSpec::uncontrolled(6, 0.0, 250.0),
+        ];
+        nodes[1].rail_crossing = true;
+        let mut links = vec![LinkSpec::oneway(1, 2, 1, 13.0), LinkSpec::oneway(2, 3, 1, 13.0), LinkSpec::oneway(3, 4, 1, 13.0)];
+        links.extend(LinkSpec::twoway(5, 3, 1, 12.0));
+        links.extend(LinkSpec::twoway(3, 6, 1, 12.0));
+        let net = OsmMap { nodes, links }.build();
+        let mut w = NetWorld::new(net, cfg());
+        assert!(!w.rail_preempts.is_empty(), "the crossing maps to a preemptable phase");
+        // The from-crossing approach's signalized movement.
+        let lane = w.network.link(LinkId(1)).lane_start;
+        let mid = MovementId(w.network.lane(lane).movement_start.0);
+        // Load cross-street demand so the actuated controller would otherwise
+        // cycle away, then close the gates mid-cross-phase.
+        let mut id = 100u32;
+        for t in 0..1200u32 {
+            // Midday timetable: closures start each 900 s; park the clock inside one.
+            w.set_day_secs(12.0 * 3600.0 + (t as f64 * 0.2) % 40.0);
+            if t % 25 == 0 {
+                if w.spawn_routed(id, vec![LinkId(3), LinkId(4)], 8.0, DriverConfig::car()) {
+                    id += 1;
+                }
+            }
+            w.step();
+        }
+        assert_eq!(
+            w.movement_state(mid),
+            SignalState::Green,
+            "during a closure the track-clearing phase holds green"
+        );
     }
 
     #[test]

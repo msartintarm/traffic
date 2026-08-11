@@ -35,6 +35,7 @@ struct Args {
     d_factor: f64,
     seed: u64,
     assert_gate: bool,
+    assert_floor: Option<f64>,
     dump_ref: Option<String>,
 }
 
@@ -50,6 +51,7 @@ fn parse_args() -> Args {
         d_factor: 0.55,
         seed: 0xC0FFEE,
         assert_gate: false,
+        assert_floor: None,
         dump_ref: None,
     };
     let mut it = std::env::args().skip(1);
@@ -66,6 +68,7 @@ fn parse_args() -> Args {
             "--d" => args.d_factor = val().parse().expect("d"),
             "--seed" => args.seed = val().parse().expect("seed"),
             "--assert" => args.assert_gate = true,
+            "--assert-floor" => args.assert_floor = Some(val().parse().expect("assert-floor")),
             "--dump-ref" => args.dump_ref = Some(val()),
             other => panic!("unknown arg {other}"),
         }
@@ -105,7 +108,8 @@ fn main() {
     let args = parse_args();
     let raw = std::fs::read_to_string(&args.map).expect("read map");
     let map = OsmMap::from_json(&raw).expect("parse map");
-    let net = map.build();
+    let mut net = map.build();
+    net.attach_bus_stops(&engine::sim::map::bus_stops_from_json(&raw));
     let mut world = NetWorld::new(net, SimConfig { seed: args.seed, ..SimConfig::default_config() });
 
     let commute = args.lodes.as_ref().map(|p| {
@@ -115,6 +119,13 @@ fn main() {
     let sources = DemandSources::with_rush_hour(true, true, true);
     let pairs = demand::od_pairs_with_commute(&world.network, args.seed, 48, sources, commute.as_ref());
     let mut gen = DemandGenerator::new(&world, &pairs, args.seed);
+    let lines: Vec<demand::TransitLine> = engine::sim::map::bus_routes_from_json(&raw)
+        .into_iter()
+        .filter_map(|(name, pts)| {
+            world.network.resolve_route_chain(&pts).map(|route| demand::TransitLine::new(name, route))
+        })
+        .collect();
+    gen.set_transit_lines(lines);
     gen.set_rush_hour(&world.network, true);
     gen.set_day_compression(args.compression);
     gen.resume_clock(args.start_hour * 3600.0 - args.warmup_day_mins * 60.0, 0);
@@ -289,5 +300,13 @@ fn main() {
     if args.assert_gate && obs_total > 0 && geh_share < 0.85 {
         eprintln!("GEH gate failed: {obs_pass}/{obs_total} observed links under 5 ({geh_share:.2} < 0.85)");
         std::process::exit(1);
+    }
+    // The interim regression floor: far below the aspirational 0.85 gate, but a
+    // hard stop against sliding back toward the pre-calibration ~0.01 era.
+    if let Some(floor) = args.assert_floor {
+        if obs_total > 0 && geh_share < floor {
+            eprintln!("GEH floor failed: share {geh_share:.3} < {floor:.3}");
+            std::process::exit(1);
+        }
     }
 }

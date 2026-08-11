@@ -389,9 +389,39 @@ struct RushRate {
     scale: f64,
 }
 
+/// A named bus line: a resolved link chain served on a day-clock headway.
+#[derive(Clone, Debug)]
+pub struct TransitLine {
+    pub name: String,
+    pub route: Vec<LinkId>,
+    /// Day-seconds of the next departure; `due` holds an undelivered departure
+    /// (entrance blocked) for retry.
+    next_departure: f64,
+    due: bool,
+}
+
+impl TransitLine {
+    pub fn new(name: String, route: Vec<LinkId>) -> Self {
+        Self { name, route, next_departure: 0.0, due: false }
+    }
+}
+
+/// Service headway (day-seconds) by hour: ~15 min through the service day
+/// (SamTrans ECR-class), 30 min early/late.
+fn transit_headway(day_secs: f64) -> f64 {
+    let h = day_secs.rem_euclid(86_400.0) / 3600.0;
+    if (6.0..20.0).contains(&h) {
+        900.0
+    } else {
+        1800.0
+    }
+}
+
 pub struct DemandGenerator {
     /// OD streams with at least one valid route.
     pairs: Vec<OdStream>,
+    /// Scheduled bus lines (fixed routes, day-clock headways).
+    transit: Vec<TransitLine>,
     seed: u64,
     tick: u64,
     next_id: u32,
@@ -494,11 +524,58 @@ impl DemandGenerator {
             })
             .collect();
         Self {
-            pairs, seed, tick: 0, next_id: 0, spawned: 0, dropped: 0,
+            pairs, transit: Vec::new(), seed, tick: 0, next_id: 0, spawned: 0, dropped: 0,
             rate_scale: 1.0, entry_speed_cap: f64::INFINITY, rush_clock: None,
             day_compression: DEFAULT_DAY_COMPRESSION,
             day: 0, sim_secs: 0.0, churn_epoch: 0,
             queues: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Install the map's named bus lines; each runs its fixed route on the
+    /// day-clock headway (buses come only from here — the background traffic
+    /// mix carries no random buses).
+    pub fn set_transit_lines(&mut self, lines: Vec<TransitLine>) {
+        self.transit = lines;
+    }
+
+    pub fn transit_lines(&self) -> &[TransitLine] {
+        &self.transit
+    }
+
+    /// Fire due transit departures: each line spawns a bus on its route when the
+    /// day clock passes the next departure; a blocked entrance retries until
+    /// admitted (schedules slip, they don't skip).
+    fn step_transit(&mut self, world: &mut NetWorld, day_secs: f64) {
+        let n_lines = self.transit.len();
+        for k in 0..n_lines {
+            let line = &mut self.transit[k];
+            if line.next_departure == 0.0 && !line.due {
+                // First call: phase departures across lines so they don't bunch.
+                line.next_departure =
+                    day_secs + transit_headway(day_secs) * (k as f64 + 1.0) / (n_lines as f64 + 1.0);
+            }
+            // Midnight wrap: pull a departure scheduled "yesterday" back into
+            // range rather than waiting a whole day for the clock to catch it.
+            if line.next_departure > day_secs + 43_200.0 {
+                line.next_departure -= 86_400.0;
+            }
+            if !line.due && day_secs >= line.next_departure {
+                line.due = true;
+                line.next_departure += transit_headway(day_secs);
+            }
+            if !line.due {
+                continue;
+            }
+            let route = self.transit[k].route.clone();
+            let id = self.next_id;
+            let driver = super::config::VehicleClass::Bus.driver().sample(self.seed, id);
+            let speed = 8.0f64.min(self.entry_speed_cap);
+            if world.spawn_routed(id, route, speed, driver) {
+                self.next_id += 1;
+                self.spawned += 1;
+                self.transit[k].due = false;
+            }
         }
     }
 
@@ -701,6 +778,9 @@ impl DemandGenerator {
                 }
             }
         }
+
+        let day_now = self.day_secs(world.time());
+        self.step_transit(world, day_now);
 
         if let Some(t) = &mut self.rush_clock {
             let next = (*t + dt * self.day_compression).rem_euclid(86_400.0);
@@ -1153,7 +1233,9 @@ const TRUCK_HOURLY_X100: [u16; 24] = [
 /// once used; when the day clock runs, the truck share follows
 /// [`TRUCK_HOURLY_X100`] — thin at the commute peaks, heavier overnight/midday.
 fn class_of(seed: u64, id: u32, highway: bool, day_secs: Option<f64>) -> VehicleClass {
-    let (mut truck, bus) = if highway { (0.05, 0.005) } else { (0.03, 0.02) };
+    // Buses are no longer a random background draw — the named transit lines
+    // (`set_transit_lines`) run them on real routes and schedules.
+    let (mut truck, bus) = if highway { (0.05, 0.0) } else { (0.03, 0.0) };
     if let Some(t) = day_secs {
         let h = (t.rem_euclid(86_400.0) / 3600.0) as usize % 24;
         truck = (truck * TRUCK_HOURLY_X100[h] as f64 / 100.0).min(0.3);

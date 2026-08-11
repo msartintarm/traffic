@@ -87,6 +87,8 @@ pub struct Simulation {
     /// Ramp-metering master switch; actual activation follows the day-clock
     /// peak windows (see `apply_meter_schedule`).
     metering_enabled: bool,
+    /// Named bus lines resolved from the map, carried across demand rebuilds.
+    transit_lines: Vec<demand::TransitLine>,
     /// A wreck-clearance duration the user expressed in day-clock minutes, so a
     /// compression change re-derives the sim-seconds value it maps to.
     wreck_clear_day_minutes: Option<f64>,
@@ -176,7 +178,14 @@ impl Simulation {
         let map = map::OsmMap::from_json_opts(json, split_junctions).map_err(|e| JsValue::from_str(&e))?;
         let mut net = map.build();
         net.attach_bus_stops(&map::bus_stops_from_json(json));
-        Ok(Self::assemble(net, seed))
+        let lines: Vec<demand::TransitLine> = map::bus_routes_from_json(json)
+            .into_iter()
+            .filter_map(|(name, pts)| net.resolve_route_chain(&pts).map(|route| demand::TransitLine::new(name, route)))
+            .collect();
+        let mut sim = Self::assemble(net, seed);
+        sim.transit_lines = lines;
+        sim.demand.set_transit_lines(sim.transit_lines.clone());
+        Ok(sim)
     }
 
     fn assemble(network: Network, seed: u32) -> Simulation {
@@ -196,7 +205,7 @@ impl Simulation {
         Simulation {
             world, clock, seed: cfg.seed, demand, demand_sources, commute: None, demand_rate, entry_speed_cap,
             day_compression: demand::DEFAULT_DAY_COMPRESSION, wreck_clear_day_minutes: None,
-            metering_enabled: true, camera,
+            metering_enabled: true, transit_lines: Vec::new(), camera,
             prev: PoseMap::default(), prev_lane: IntMap::default(), prev_crossing: IntMap::default(), selected: None, signal_heads,
             gpu: None, gpu_pending: None, gpu_relax: None, gpu_generation: 0, gpu_cost: Vec::new(), gpu_last: 0.0, gpu_fingerprint: 0,
             effective_speed: 0.0, throttled: false, last_advance_ms: 0.0, last_camera_ms: 0.0,
@@ -294,6 +303,7 @@ impl Simulation {
         );
         self.demand.set_next_id(next_id);
         self.demand.set_day_compression(self.day_compression);
+        self.demand.set_transit_lines(self.transit_lines.clone());
         if let Some((secs, day)) = clock {
             self.demand.resume_clock(secs, day);
         }

@@ -76,7 +76,18 @@ fn priority_cross_capacity_full(major_vph_per_dir: f64) -> (f64, f64, [u32; 2]) 
 
     let dt = SimConfig::default_config().dt;
     let driver = DriverConfig::car();
-    let major_period = (3600.0 / major_vph_per_dir / dt).round() as u64;
+    // Poisson arrivals (per-tick Bernoulli), independent per direction — the
+    // arrival process HCM's gap-acceptance capacity assumes. A deterministic
+    // synchronized metronome leaves *no* headway above the critical gap and
+    // (wrongly) proves the minor street can never cross.
+    let p_spawn = (major_vph_per_dir / 3600.0 * dt).min(1.0);
+    let rand01 = |a: u64, b: u64| {
+        let mut x = a.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(b);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        x ^= x >> 33;
+        (x >> 11) as f64 / (1u64 << 53) as f64
+    };
     let mut id = 0u32;
     let spawn = |world: &mut NetWorld, id: &mut u32, route: Vec<LinkId>, speed: f64| {
         if world.spawn_routed(*id, route, speed, driver) {
@@ -86,8 +97,10 @@ fn priority_cross_capacity_full(major_vph_per_dir: f64) -> (f64, f64, [u32; 2]) 
     // Warm up 200 s, then measure 900 s.
     let mut meas = None;
     for tick in 0..(5500u64) {
-        if major_period > 0 && tick % major_period == 0 {
+        if rand01(tick, 1) < p_spawn {
             spawn(&mut world, &mut id, vec![LinkId(0), LinkId(1)], 15.0);
+        }
+        if rand01(tick, 2) < p_spawn {
             spawn(&mut world, &mut id, vec![LinkId(2), LinkId(3)], 15.0);
         }
         // Saturated minor approach: refill whenever the entrance clears.
@@ -330,4 +343,27 @@ fn world_link(w: &NetWorld, link: u32) -> &f64 {
 
 fn w_lane_link(w: &NetWorld, v: &engine::sim::NetVehicle) -> u32 {
     w.network.lane(v.lane).link.0
+}
+
+/// The scraped bus-route traces resolve into usable link chains on the real map.
+#[test]
+fn real_map_bus_routes_resolve_to_chains() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+    let Ok(text) = std::fs::read_to_string(path) else { return };
+    let routes = engine::sim::map::bus_routes_from_json(&text);
+    if routes.is_empty() {
+        return; // map predates transit scraping
+    }
+    let net = engine::sim::OsmMap::from_json(&text).expect("map json").build();
+    let resolved: Vec<usize> = routes
+        .iter()
+        .filter_map(|(_, pts)| net.resolve_route_chain(pts).map(|c| c.len()))
+        .collect();
+    assert!(
+        resolved.len() * 2 >= routes.len(),
+        "most scraped lines resolve ({} of {})",
+        resolved.len(),
+        routes.len()
+    );
+    assert!(resolved.iter().all(|&n| n >= 3), "chains are real routes, not stubs");
 }

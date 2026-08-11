@@ -1186,7 +1186,7 @@ fn coordinate_green_waves(net: &mut Network) {
 
     // Compute every offset while only *reading* the network, then apply them — so the
     // read-only walk/lookup closures don't clash with mutating `net.programs`.
-    let offsets: Vec<(usize, f64)> = {
+    let offsets: Vec<(usize, f64, f64)> = {
         let mut sig: BTreeMap<u32, ProgramId> = BTreeMap::new();
         for (i, n) in net.nodes.iter().enumerate() {
             if let NodeControl::Signalized(p) = n.control {
@@ -1303,7 +1303,9 @@ fn coordinate_green_waves(net: &mut Network) {
                 let cycle = net.programs[pid.idx()].cycle_length();
                 if let (Some(link), true) = (link, cycle > 1.0) {
                     if let Some(sp) = through_start(n, link) {
-                        out.push((pid.idx(), (sp - cum).rem_euclid(cycle)));
+                        // AM plan: green opens `cum` later downstream (progression
+                        // along the walk); PM plan: the mirror (progression back).
+                        out.push((pid.idx(), (sp - cum).rem_euclid(cycle), (sp + cum).rem_euclid(cycle)));
                     }
                 }
             }
@@ -1311,9 +1313,13 @@ fn coordinate_green_waves(net: &mut Network) {
         out
     };
 
-    for (idx, offset) in offsets {
-        net.programs[idx].offset = offset;
+    net.am_offsets = net.programs.iter().map(|p| p.offset).collect();
+    net.pm_offsets = net.am_offsets.clone();
+    for (idx, am, pm) in offsets {
+        net.programs[idx].offset = am;
         net.programs[idx].coordinated = true;
+        net.am_offsets[idx] = am;
+        net.pm_offsets[idx] = pm;
     }
 }
 
@@ -1831,6 +1837,26 @@ pub fn bus_stops_from_json(s: &str) -> Vec<[f64; 2]> {
     serde_json::from_str::<Doc>(s).map(|d| d.bus_stops).unwrap_or_default()
 }
 
+/// Scraped bus-line traces from the map JSON's top-level `bus_routes`
+/// (`{name, pts}` per line), for [`Network::resolve_route_chain`].
+#[cfg(feature = "import")]
+pub fn bus_routes_from_json(s: &str) -> Vec<(String, Vec<[f64; 2]>)> {
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    struct Route {
+        name: String,
+        pts: Vec<[f64; 2]>,
+    }
+    #[derive(Deserialize)]
+    struct Doc {
+        #[serde(default)]
+        bus_routes: Vec<Route>,
+    }
+    serde_json::from_str::<Doc>(s)
+        .map(|d| d.bus_routes.into_iter().map(|r| (r.name, r.pts)).collect())
+        .unwrap_or_default()
+}
+
 impl OsmMap {
     /// Parse the OSM scraper's JSON (`tools/osm-scraper`) into an `OsmMap`,
     /// simplifying spurious pass-through nodes. Requires the `import` feature.
@@ -2288,6 +2314,56 @@ mod tests {
     }
 
     #[test]
+    fn pm_plan_reverses_the_green_wave() {
+        // The build stores both plans: AM offsets progress along the corridor
+        // walk; the PM set is its mirror, so the evening flush rides the other
+        // direction the way real corridor timing plans rotate.
+        let plan = SignalPlan { green_secs: 20.0, yellow_secs: 4.0, offset: 0.0 };
+        let road = |a, b, name: &str, lanes, sp| {
+            let mut v = LinkSpec::twoway(a, b, lanes, sp).to_vec();
+            for l in &mut v {
+                l.name = name.to_string();
+            }
+            v
+        };
+        let mut links = Vec::new();
+        for (a, b) in [(0, 1), (1, 2), (2, 3), (3, 4)] {
+            links.extend(road(a, b, "Main Street", 2, 15.0));
+        }
+        for (n, e, name) in [(1, 10, "Cross A"), (2, 11, "Cross B"), (3, 12, "Cross C")] {
+            links.extend(road(n, e, name, 1, 12.0));
+        }
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(0, -300.0, 0.0),
+                NodeSpec::signalized(1, 0.0, 0.0, plan),
+                NodeSpec::signalized(2, 300.0, 0.0, plan),
+                NodeSpec::signalized(3, 600.0, 0.0, plan),
+                NodeSpec::uncontrolled(4, 900.0, 0.0),
+                NodeSpec::uncontrolled(10, 0.0, -200.0),
+                NodeSpec::uncontrolled(11, 300.0, -200.0),
+                NodeSpec::uncontrolled(12, 600.0, -200.0),
+            ],
+            links,
+        }
+        .build();
+        assert_eq!(net.am_offsets.len(), net.programs.len());
+        assert_eq!(net.pm_offsets.len(), net.programs.len());
+        let coordinated: Vec<usize> =
+            (0..net.programs.len()).filter(|&p| net.programs[p].coordinated).collect();
+        assert!(coordinated.len() >= 3, "the corridor coordinates");
+        // The two plans genuinely differ (the corridor's non-root members carry
+        // mirrored offsets), and the loaded plan is the AM one.
+        assert!(
+            coordinated.iter().any(|&p| (net.am_offsets[p] - net.pm_offsets[p]).abs() > 1.0),
+            "AM and PM plans differ"
+        );
+        for &p in &coordinated {
+            assert!((net.programs[p].offset - net.am_offsets[p]).abs() < 1e-9);
+        }
+    }
+
+    #[test]
     fn corridor_cycles_harmonize_to_the_longest_member() {
         // Three signals on one named street with deliberately different plans:
         // without harmonization their cycles differ and any offset progression
@@ -2415,7 +2491,7 @@ mod tests {
             if us == SignalState::Green && ds != SignalState::Green {
                 staggered_instant = true;
             }
-            ctrl.advance(&net, &empty, 0.1);
+            ctrl.advance(&net, &empty, 0.1, &Default::default());
             clock += 0.1;
         }
         assert!(staggered_instant, "the wave reaches the upstream green before the downstream one");

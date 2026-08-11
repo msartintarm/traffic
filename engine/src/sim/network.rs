@@ -270,6 +270,12 @@ pub struct Network {
     /// Bus service positions `(link, arc)` resolved from scraped stop points —
     /// buses dwell here (see `attach_bus_stops`).
     pub bus_stops: Vec<(LinkId, f64)>,
+    /// Per-program green-wave offsets for the two daily plans: progression rides
+    /// the corridor's walk direction in the AM and reverses for the PM commute
+    /// (real corridors switch timing plans by time of day). Empty when no
+    /// coordination ran; the runtime swaps `programs[p].offset` between them.
+    pub am_offsets: Vec<f64>,
+    pub pm_offsets: Vec<f64>,
     /// Observed AADT per link (index-aligned with `links`; both directions,
     /// vehicles/day; `0.0` = unobserved). Real counts joined at import — demand
     /// calibrates gateway inflow and gravity attraction against these.
@@ -572,31 +578,38 @@ impl Network {
         &self.interiors[mid.idx()]
     }
 
+    /// Nearest surface (non-freeway) link to a point, with the arc along its
+    /// polyline and the projection distance — the resolver behind bus stops
+    /// and route traces.
+    pub fn nearest_surface_link(&self, p: [f64; 2]) -> Option<(LinkId, f64, f64)> {
+        let mut best: Option<(f64, LinkId, f64)> = None;
+        for li in 0..self.links.len() {
+            if matches!(self.links[li].kind, RoadKind::Freeway | RoadKind::Ramp) {
+                continue;
+            }
+            let mut arc = 0.0;
+            for w in self.polylines[li].windows(2) {
+                let seg = [w[1][0] - w[0][0], w[1][1] - w[0][1]];
+                let len2 = (seg[0] * seg[0] + seg[1] * seg[1]).max(1e-9);
+                let t = (((p[0] - w[0][0]) * seg[0] + (p[1] - w[0][1]) * seg[1]) / len2).clamp(0.0, 1.0);
+                let q = [w[0][0] + seg[0] * t, w[0][1] + seg[1] * t];
+                let d = (q[0] - p[0]).hypot(q[1] - p[1]);
+                if best.is_none_or(|(bd, ..)| d < bd) {
+                    best = Some((d, LinkId(li as u32), arc + len2.sqrt() * t));
+                }
+                arc += len2.sqrt();
+            }
+        }
+        best.map(|(d, l, a)| (l, a, d))
+    }
+
     /// Resolve scraped bus-stop points onto surface links: each stop lands on
-    /// the nearest non-freeway link's polyline (by vertex, within 25 m) as a
-    /// `(link, arc)` service position buses dwell at.
+    /// the nearest non-freeway link's polyline (within 25 m) as a `(link, arc)`
+    /// service position buses dwell at.
     pub fn attach_bus_stops(&mut self, pts: &[[f64; 2]]) {
         self.bus_stops.clear();
         for p in pts {
-            let mut best: Option<(f64, LinkId, f64)> = None;
-            for li in 0..self.links.len() {
-                if matches!(self.links[li].kind, RoadKind::Freeway | RoadKind::Ramp) {
-                    continue;
-                }
-                let mut arc = 0.0;
-                for w in self.polylines[li].windows(2) {
-                    let seg = [w[1][0] - w[0][0], w[1][1] - w[0][1]];
-                    let len2 = (seg[0] * seg[0] + seg[1] * seg[1]).max(1e-9);
-                    let t = (((p[0] - w[0][0]) * seg[0] + (p[1] - w[0][1]) * seg[1]) / len2).clamp(0.0, 1.0);
-                    let q = [w[0][0] + seg[0] * t, w[0][1] + seg[1] * t];
-                    let d = (q[0] - p[0]).hypot(q[1] - p[1]);
-                    if best.is_none_or(|(bd, ..)| d < bd) {
-                        best = Some((d, LinkId(li as u32), arc + len2.sqrt() * t));
-                    }
-                    arc += len2.sqrt();
-                }
-            }
-            if let Some((d, link, arc)) = best {
+            if let Some((link, arc, d)) = self.nearest_surface_link(*p) {
                 if d <= 25.0 {
                     self.bus_stops.push((link, arc));
                 }
@@ -606,6 +619,54 @@ impl Network {
         // Opposite-side stop pairs often project onto the same link a few metres
         // apart; one service position suffices (two would re-trap a bus).
         self.bus_stops.dedup_by(|b, a| b.0 == a.0 && (b.1 - a.1).abs() < 15.0);
+    }
+
+    /// Resolve a sampled route trace (a bus line's stitched way geometry) into a
+    /// connected chain of links: nearest link per sample (within 30 m), dedup,
+    /// then splice non-adjacent steps with short shortest-path repairs. `None`
+    /// when too little of the trace lands on the network.
+    pub fn resolve_route_chain(&self, pts: &[[f64; 2]]) -> Option<Vec<LinkId>> {
+        let mut raw: Vec<LinkId> = Vec::new();
+        for p in pts {
+            if let Some((link, _, d)) = self.nearest_surface_link(*p) {
+                if d <= 30.0 && raw.last() != Some(&link) {
+                    raw.push(link);
+                }
+            }
+        }
+        if raw.len() < 3 {
+            return None;
+        }
+        // Keep the longest connected run: trace noise (opposite-carriageway
+        // snaps, out-of-box gaps) breaks a route into fragments — the service
+        // the engine can actually run is the biggest one.
+        let connected = |a: LinkId, b: LinkId| self.link(a).to == self.link(b).from;
+        let mut best: Vec<LinkId> = Vec::new();
+        let mut chain: Vec<LinkId> = vec![raw[0]];
+        for &next in &raw[1..] {
+            let cur = *chain.last().unwrap();
+            if next == cur {
+                continue;
+            }
+            if connected(cur, next) {
+                chain.push(next);
+                continue;
+            }
+            if let Some(path) = self.route_links(cur, next) {
+                if path.len() <= 6 {
+                    chain.extend(path.into_iter().skip(1));
+                    continue;
+                }
+            }
+            if chain.len() > best.len() {
+                best = std::mem::take(&mut chain);
+            }
+            chain = vec![next];
+        }
+        if chain.len() > best.len() {
+            best = chain;
+        }
+        (best.len() >= 3).then_some(best)
     }
 
     /// Whether `lane` is HOV/express-restricted (OSM `hov:lanes`).

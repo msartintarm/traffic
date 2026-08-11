@@ -138,8 +138,10 @@ engineering references, or fitted to data — see `PLAN.md` for the full audit:
   (`tools/lodes/fit_gravity.py`); truck shares from Caltrans truck AADT.
 - **Infrastructure**: ALINEA ramp metering on freeway on-ramps (D4 peak
   windows), OSM `hov:lanes` express-lane restrictions, `railway=level_crossing`
-  timetable closures, pedestrian green floors in commercial areas, corridor
-  cycle harmonization + green-wave offsets.
+  timetable closures with adjacent-signal preemption, pedestrian green floors
+  in commercial areas, corridor cycle harmonization + green-wave offsets with
+  AM/PM plan rotation, and named bus lines (scraped `route=bus` relations)
+  running day-clock headways with curbside stop dwells.
 - **Validation**: `cargo test --features import` runs the unit tier
   (fundamental diagram, TWSC envelope, progression); CI runs the scorecard
   (`examples/scorecard.rs`) — windowed link flows vs AADT targets (GEH),

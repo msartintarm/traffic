@@ -149,7 +149,19 @@ impl SignalController {
     /// Advance actuated signals: hold green while its approaches keep demand,
     /// terminate on max-green or a gap-out with a conflicting approach waiting.
     /// `demand` is the set of link ids with a vehicle within [`DETECT`] of a line.
-    pub fn advance(&mut self, net: &Network, demand: &HashSet<u32>, dt: f64) {
+    /// `forced` preempts a program to a specific phase (rail preemption): the
+    /// current phase terminates after a short grace, clearance runs as normal,
+    /// and the controller jumps to — and holds — the forced phase.
+    pub fn advance(
+        &mut self,
+        net: &Network,
+        demand: &HashSet<u32>,
+        dt: f64,
+        forced: &std::collections::HashMap<usize, usize>,
+    ) {
+        /// Preemption grace before terminating the current green (real
+        /// controllers abbreviate, never instantly kill, a conflicting phase).
+        const PREEMPT_GRACE: f64 = 3.0;
         self.time += dt;
         for pid in 0..self.signals.len() {
             let (n_phases, green_mask, yellow_dur) = {
@@ -165,13 +177,14 @@ impl SignalController {
                     (green_mask & (1u64 << bit) != 0) == served && links.iter().any(|l| demand.contains(&l.0))
                 })
             };
+            let force = forced.get(&pid).copied().filter(|&t| t < n_phases);
             let mut rt = self.signals[pid];
             rt.elapsed += dt;
             if rt.all_red > 0.0 {
                 rt.all_red -= dt;
                 if rt.all_red <= 0.0 {
                     rt.all_red = 0.0;
-                    rt.phase = (rt.phase + 1) % n_phases;
+                    rt.phase = force.unwrap_or((rt.phase + 1) % n_phases);
                     rt.elapsed = 0.0;
                 }
             } else if rt.yellow {
@@ -180,6 +193,11 @@ impl SignalController {
                     rt.all_red = all_red_of(&net.programs[pid], rt.phase);
                     rt.elapsed = 0.0;
                 }
+            } else if force.is_some_and(|t| t == rt.phase) {
+                // Held by preemption: the track-clearing phase stays green.
+            } else if force.is_some_and(|t| t != rt.phase) && rt.elapsed >= PREEMPT_GRACE {
+                rt.yellow = true;
+                rt.elapsed = 0.0;
             } else if n_phases > 1
                 && rt.elapsed >= MIN_GREEN
                 && bit_has_demand(false)
@@ -287,7 +305,7 @@ mod tests {
         let demand: HashSet<u32> = (0..net.links.len() as u32).collect();
         let mut patterns: HashSet<Vec<bool>> = HashSet::new();
         for _ in 0..2000 {
-            ctrl.advance(&net, &demand, 0.2);
+            ctrl.advance(&net, &demand, 0.2, &Default::default());
             patterns.insert(ctrl.states(&net).iter().map(|s| *s == SignalState::Green).collect());
         }
         assert!(patterns.len() > 1, "the actuated signal cycles through phases, got {} pattern(s)", patterns.len());
