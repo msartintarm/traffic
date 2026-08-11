@@ -71,6 +71,12 @@ export type Sim = {
   // Real LODES commute flows (tools/lodes output); only on import-enabled builds.
   set_commute_od?(json: string): boolean;
   set_rush_hour(enabled: boolean): void;
+  // Day-clock speed (day-seconds per sim second); optional so a stale wasm build degrades.
+  set_day_compression?(x: number): void;
+  day_compression?(): number;
+  // Ramp-metering master switch (ALINEA meters on freeway on-ramps at peak).
+  set_ramp_metering?(enabled: boolean): void;
+  ramp_metering?(): boolean;
   demand_rush_hour(): boolean;
   rush_hour_time(): number;
   // Wall-clock time of day (hours 0-24); optional so a stale wasm build degrades to no clock.

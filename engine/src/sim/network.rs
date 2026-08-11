@@ -56,6 +56,9 @@ pub enum NodeControl {
 pub struct Node {
     pub position: [f64; 2],
     pub control: NodeControl,
+    /// A railway level crossing: closed to road traffic while a train passes
+    /// (the world gates movements here on the train timetable).
+    pub rail_crossing: bool,
 }
 
 /// Road class, distilled from the OSM `highway` tag. The grade-separated freeway
@@ -258,6 +261,15 @@ pub struct Network {
     /// direction; empty when unmapped. Channelizes the lane→movement assignment
     /// (`map::turn_lane_exits`) and paints the renderer's lane-use arrows.
     pub link_turn_lanes: Vec<String>,
+    /// OSM `hov:lanes` per link (index-aligned with `links`), this direction,
+    /// median outward; empty when unmapped. Resolved to per-lane flags by
+    /// [`build_hov_lanes`](Self::build_hov_lanes) — the US-101 express lanes.
+    pub link_hov_lanes: Vec<String>,
+    /// Per-lane HOV restriction, index-aligned with `lanes`.
+    lane_hov: Vec<bool>,
+    /// Bus service positions `(link, arc)` resolved from scraped stop points —
+    /// buses dwell here (see `attach_bus_stops`).
+    pub bus_stops: Vec<(LinkId, f64)>,
     /// Observed AADT per link (index-aligned with `links`; both directions,
     /// vehicles/day; `0.0` = unobserved). Real counts joined at import — demand
     /// calibrates gateway inflow and gravity attraction against these.
@@ -558,6 +570,63 @@ impl Network {
 
     pub fn interior(&self, mid: MovementId) -> &Interior {
         &self.interiors[mid.idx()]
+    }
+
+    /// Resolve scraped bus-stop points onto surface links: each stop lands on
+    /// the nearest non-freeway link's polyline (by vertex, within 25 m) as a
+    /// `(link, arc)` service position buses dwell at.
+    pub fn attach_bus_stops(&mut self, pts: &[[f64; 2]]) {
+        self.bus_stops.clear();
+        for p in pts {
+            let mut best: Option<(f64, LinkId, f64)> = None;
+            for li in 0..self.links.len() {
+                if matches!(self.links[li].kind, RoadKind::Freeway | RoadKind::Ramp) {
+                    continue;
+                }
+                let mut arc = 0.0;
+                for w in self.polylines[li].windows(2) {
+                    let seg = [w[1][0] - w[0][0], w[1][1] - w[0][1]];
+                    let len2 = (seg[0] * seg[0] + seg[1] * seg[1]).max(1e-9);
+                    let t = (((p[0] - w[0][0]) * seg[0] + (p[1] - w[0][1]) * seg[1]) / len2).clamp(0.0, 1.0);
+                    let q = [w[0][0] + seg[0] * t, w[0][1] + seg[1] * t];
+                    let d = (q[0] - p[0]).hypot(q[1] - p[1]);
+                    if best.is_none_or(|(bd, ..)| d < bd) {
+                        best = Some((d, LinkId(li as u32), arc + len2.sqrt() * t));
+                    }
+                    arc += len2.sqrt();
+                }
+            }
+            if let Some((d, link, arc)) = best {
+                if d <= 25.0 {
+                    self.bus_stops.push((link, arc));
+                }
+            }
+        }
+        self.bus_stops.sort_by(|a, b| a.0 .0.cmp(&b.0 .0).then(a.1.total_cmp(&b.1)));
+    }
+
+    /// Whether `lane` is HOV/express-restricted (OSM `hov:lanes`).
+    pub fn lane_is_hov(&self, lane: LaneId) -> bool {
+        self.lane_hov.get(lane.idx()).copied().unwrap_or(false)
+    }
+
+    /// Resolve the imported per-link `hov:lanes` strings into per-lane flags.
+    /// Tokens run median-outward like `turn:lanes`; call once after every link
+    /// and lane exists.
+    pub fn build_hov_lanes(&mut self) {
+        self.lane_hov = vec![false; self.lanes.len()];
+        for li in 0..self.links.len() {
+            let Some(spec) = self.link_hov_lanes.get(li) else { continue };
+            if spec.is_empty() {
+                continue;
+            }
+            let l = self.links[li];
+            for (k, tok) in spec.split('|').take(l.lane_count as usize).enumerate() {
+                if tok.trim() == "designated" {
+                    self.lane_hov[l.lane_start.idx() + k] = true;
+                }
+            }
+        }
     }
 
     /// Whether two movements have a crossing conflict point.
@@ -1471,7 +1540,7 @@ mod tests {
         // L-shaped link (0,0) → bend (100,0) → (100,100).
         let net = OsmMap {
             nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 100.0, 100.0)],
-            links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 1, speed_limit: 20.0, geometry: vec![[100.0, 0.0]], layer: 0, name: String::new(), road_class: String::new(), highway_ref: String::new(), turn_lanes: String::new(), aadt: 0.0, res_weight: 0.0, attr_weight: 0.0 }],
+            links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 1, speed_limit: 20.0, geometry: vec![[100.0, 0.0]], layer: 0, name: String::new(), road_class: String::new(), highway_ref: String::new(), turn_lanes: String::new(), hov_lanes: String::new(), aadt: 0.0, res_weight: 0.0, attr_weight: 0.0 }],
         }
         .build();
         let lane = LaneId(0);

@@ -61,6 +61,10 @@ wasm-bindgen-rayon = { version = "1", optional = true }
 web-sys = { version = "0.3", features = ["HtmlCanvasElement", "OffscreenCanvas", "Window", "WorkerGlobalScope", "Performance"] }
 wgpu = { version = "26", default-features = false, features = ["webgpu", "webgl", "wgsl"] }
 
+[[example]]
+name = "scorecard"
+required-features = ["import"]
+
 [dev-dependencies]
 # Native shader validation: parse + type-check meso.wgsl under `cargo test` so a
 # WGSL typo fails CI instead of silently producing a blank GPU pass in a browser

@@ -16,7 +16,9 @@ use super::signal::{SignalProgram, SignalState, DEFAULT_ALL_RED};
 /// conflicting approach is waiting. `DETECT` is how far back a stop-line detector
 /// senses demand.
 pub const DETECT: f64 = 35.0;
-const MIN_GREEN: f64 = 6.0;
+/// Typical actuated controllers hold 8–15 s minimum green; 6 s cycled phases
+/// faster than any real intersection.
+const MIN_GREEN: f64 = 8.0;
 const MAX_GREEN: f64 = 45.0;
 
 fn all_red_of(program: &SignalProgram, phase: usize) -> f64 {

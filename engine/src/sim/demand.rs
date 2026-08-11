@@ -315,10 +315,16 @@ fn calibrate_origin_inflow(pairs: &mut [OdPair]) {
 /// Hour of day (0–24) the rush-hour clock starts at — mid pre-peak build-up, so the
 /// morning ramp is imminent when the mode is switched on.
 const RUSH_START_HOUR: f64 = 5.5;
-/// Simulated day-seconds elapsed per second of sim time: the 24 h profile plays over
-/// ~24 min of sim time, fast enough to watch the peak build and fade while vehicles
-/// still have real time to form and clear the queues it creates.
-const RUSH_DAY_COMPRESSION: f64 = 60.0;
+/// Default simulated day-seconds elapsed per second of sim time: the 24 h profile
+/// plays over ~24 min of sim time, fast enough to watch the peak build and fade while
+/// vehicles still have real time to form and clear the queues it creates. Runtime
+/// range is [`MIN_DAY_COMPRESSION`]–[`MAX_DAY_COMPRESSION`]; 1.0 is real time, the
+/// accuracy mode validation runs use. Only day-clock quantities (diurnal rates, the
+/// weekend/day counter) scale with it — traffic dynamics, modulation epochs, churn,
+/// and wreck clearance stay in real sim seconds.
+pub const DEFAULT_DAY_COMPRESSION: f64 = 60.0;
+pub const MIN_DAY_COMPRESSION: f64 = 1.0;
+pub const MAX_DAY_COMPRESSION: f64 = 240.0;
 
 /// One origin→destination stream and how fast it spawns. Off-peak it fires at a
 /// fixed `base_rate`; under rush hour `rush` makes it follow the time of day.
@@ -357,6 +363,12 @@ struct RushRate {
     profile: &'static [u16; 24],
     /// This stream's fraction (1 / pairs-sharing-origin) of its gateway's inflow.
     share: f64,
+    /// Calibration to the gateway's *observed* AADT when counts are embedded in
+    /// the map: the PeMS curves are regional per-lane averages, which overfeed a
+    /// quiet corridor and starve a busy one (the audit measured I-280 at ~2× and
+    /// US-101 at ~¼ of their local volumes). Scales the curve so its daily total
+    /// matches the link's directional AADT share; 1.0 without counts.
+    scale: f64,
 }
 
 pub struct DemandGenerator {
@@ -372,8 +384,10 @@ pub struct DemandGenerator {
     /// origin road's limit and the driver's desired speed (the UI start-speed control).
     entry_speed_cap: f64,
     /// Simulated seconds-into-day while the rush-hour profile is driving the freeway
-    /// streams; `None` off-peak. Advances by [`RUSH_DAY_COMPRESSION`] each sim second.
+    /// streams; `None` off-peak. Advances by `day_compression` each sim second.
     rush_clock: Option<f64>,
+    /// Day-seconds per sim second the rush clock advances at (1.0 = real time).
+    day_compression: f64,
     /// Days the rush clock has wrapped since it was switched on: `day % 7 ≥ 5` is a
     /// weekend, and each day draws its own demand-level multiplier.
     day: u64,
@@ -403,11 +417,12 @@ const DAILY_SIGMA: f64 = 0.10;
 
 /// Share of surface firings that launch a platoon rather than a lone vehicle — the
 /// bunched fraction of Cowan's M3 arrival model, the signature of arrivals released
-/// by an upstream signal. Kept, with the 2-follower cap below, at the concentration
-/// the junction gap-acceptance envelope provably absorbs: denser bunches (0.3 with
-/// up to 4 followers) burst enough simultaneous demand into permissive boxes to
-/// re-expose the latent conflict-crash gap the gravity-β tuning also skirts
-/// (`real_map_boundary_demand_routes_live_and_stays_safe`).
+/// by an upstream signal. 0.25 sits at the low end of the observed urban arterial
+/// range (~0.25–0.6). The crash-artifact coupling that once capped it is fixed
+/// (`sober_real_map_burst_stays_junction_crash_free`), but denser bunches (0.3
+/// with up to 4 followers) still interlock complex junctions into spillback
+/// gridlock rings — raising this rides with the graded-yielding junction rework
+/// (PLAN P2.1), not ahead of it.
 const PLATOON_PROB: f64 = 0.25;
 /// Mean vehicles per firing given the extras distribution in [`platoon_extras`]
 /// (1 + 0.25 × 4/3); the firing rate is divided by this so volume is conserved.
@@ -460,9 +475,37 @@ impl DemandGenerator {
         Self {
             pairs, seed, tick: 0, next_id: 0, spawned: 0,
             rate_scale: 1.0, entry_speed_cap: f64::INFINITY, rush_clock: None,
+            day_compression: DEFAULT_DAY_COMPRESSION,
             day: 0, sim_secs: 0.0, churn_epoch: 0,
             queues: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Set how fast the simulated day plays (day-seconds per sim second, clamped to
+    /// [`MIN_DAY_COMPRESSION`]–[`MAX_DAY_COMPRESSION`]). Only the day clock scales;
+    /// traffic dynamics stay in real sim time.
+    pub fn set_day_compression(&mut self, x: f64) {
+        self.day_compression = x.clamp(MIN_DAY_COMPRESSION, MAX_DAY_COMPRESSION);
+    }
+
+    pub fn day_compression(&self) -> f64 {
+        self.day_compression
+    }
+
+    /// Continue a prior generator's day clock (a demand rebuild mid-day): restores the
+    /// seconds-into-day and day counter so the commute doesn't jump back to the start
+    /// hour. Only meaningful when rush hour is (or is being switched) on.
+    pub fn resume_clock(&mut self, day_secs: f64, day: u64) {
+        if self.rush_clock.is_some() {
+            self.rush_clock = Some(day_secs.rem_euclid(86_400.0));
+            self.day = day;
+        }
+    }
+
+    /// The wrapped-day counter, paired with [`rush_hour_day_secs`](Self::rush_hour_day_secs)
+    /// for carrying the clock across a demand rebuild.
+    pub fn day(&self) -> u64 {
+        self.day
     }
 
     /// Trips currently waiting at gateways to enter (demand the entrances can't yet
@@ -510,11 +553,16 @@ impl DemandGenerator {
                 // The gateway's travel direction picks the matching directional curve,
                 // so an inbound and an outbound freeway gate peak at different times.
                 let northbound = net.node(net.link(o).to).position[1] > net.node(net.link(o).from).position[1];
-                RushMode::Freeway(RushRate {
-                    lanes: net.link(o).lane_count as f64,
-                    profile: rush_hour::profile_for(net.link_ref(o), northbound),
-                    share: 1.0 / n as f64,
-                })
+                let lanes = net.link(o).lane_count as f64;
+                let profile = rush_hour::profile_for(net.link_ref(o), northbound);
+                let aadt = net.link_aadt(o);
+                let scale = if aadt > 0.0 {
+                    let curve_daily: f64 = profile.iter().map(|&v| v as f64).sum::<f64>() * lanes;
+                    (aadt * 0.5 / curve_daily.max(1.0)).clamp(0.1, 4.0)
+                } else {
+                    1.0
+                };
+                RushMode::Freeway(RushRate { lanes, profile, share: 1.0 / n as f64, scale })
             } else {
                 RushMode::Surface
             });
@@ -589,7 +637,7 @@ impl DemandGenerator {
             let s = &self.pairs[i];
             let rate = match (day, s.rush) {
                 (Some(t), Some(RushMode::Freeway(r))) => {
-                    r.lanes * rush_hour::freeway_flow(r.profile, weekend, t) / 3600.0 * r.share
+                    r.lanes * r.scale * rush_hour::freeway_flow(r.profile, weekend, t) / 3600.0 * r.share
                 }
                 (Some(t), Some(RushMode::Surface)) => s.base_rate * rush_hour::surface_factor(s.class, weekend, t),
                 _ => s.base_rate,
@@ -625,7 +673,7 @@ impl DemandGenerator {
         }
 
         if let Some(t) = &mut self.rush_clock {
-            let next = (*t + dt * RUSH_DAY_COMPRESSION).rem_euclid(86_400.0);
+            let next = (*t + dt * self.day_compression).rem_euclid(86_400.0);
             if next < *t {
                 self.day += 1;
             }
@@ -723,7 +771,7 @@ impl DemandGenerator {
         let free_flow = entry_speed(net, origin, driver);
         let speed = match (self.rush_clock, self.pairs[stream].rush) {
             (Some(t), Some(RushMode::Freeway(r))) => {
-                rush_hour::congested_entry_speed(free_flow, rush_hour::freeway_flow(r.profile, self.weekend(), t))
+                rush_hour::congested_entry_speed(free_flow, r.scale * rush_hour::freeway_flow(r.profile, self.weekend(), t))
             }
             _ => free_flow,
         };
@@ -863,11 +911,14 @@ fn pick(pool: &[LinkId], seed: u64, attempt: u64) -> Option<LinkId> {
     (!pool.is_empty()).then(|| pool[(rng::hash(seed, 61, attempt, Stream::RouteChoice) as usize) % pool.len()])
 }
 
-/// Gravity-model distance-decay exponent: trip attraction falls as `1/dist^β`. 1.0 is
-/// at the gentle end of the standard urban range (~1.0–2.0) — it still favours nearer,
-/// bigger roads, but a steeper decay over-concentrates trips onto a handful of nearby
-/// destinations, bursting demand into merges hard enough to expose collisions.
-const GRAVITY_BETA: f64 = 1.0;
+/// Gravity-model distance-decay exponent: trip attraction falls as `1/dist^β`.
+/// Fitted to real commute destination choice by maximum likelihood over the LODES
+/// OD data (`tools/lodes/fit_gravity.py`): β = 0.54–0.75 across the five shipped
+/// maps, commuter-weighted 0.68 — urban commuters barely distance-minimize within
+/// a metro box once the opportunity geography is controlled for. Errand/shopping
+/// trips decay faster in the literature (~1.5–2); a per-class β is a future
+/// refinement.
+const GRAVITY_BETA: f64 = 0.7;
 /// Distance floor (m) so co-located destinations don't get an unbounded weight.
 const GRAVITY_MIN_DIST: f64 = 40.0;
 
@@ -1029,12 +1080,13 @@ const TRUCK_HOURLY_X100: [u16; 24] = [
     95, 110, 125, 140,
 ];
 
-/// Vehicle-class mix: mostly cars, some trucks, a few buses. Freeways carry roughly
-/// twice the truck share of surface streets (and almost no buses); when the day
-/// clock runs, the truck share follows [`TRUCK_HOURLY_X100`] — thin at the commute
-/// peaks, heavier overnight and midday.
+/// Vehicle-class mix: mostly cars, some trucks, a few buses. Shares follow the
+/// Caltrans truck AADT for the peninsula corridors (US-101 in San Mateo County
+/// runs ≈5% trucks; surface streets less), not the generic urban ~12% the sim
+/// once used; when the day clock runs, the truck share follows
+/// [`TRUCK_HOURLY_X100`] — thin at the commute peaks, heavier overnight/midday.
 fn class_of(seed: u64, id: u32, highway: bool, day_secs: Option<f64>) -> VehicleClass {
-    let (mut truck, bus) = if highway { (0.12, 0.01) } else { (0.06, 0.03) };
+    let (mut truck, bus) = if highway { (0.05, 0.005) } else { (0.03, 0.02) };
     if let Some(t) = day_secs {
         let h = (t.rem_euclid(86_400.0) / 3600.0) as usize % 24;
         truck = (truck * TRUCK_HOURLY_X100[h] as f64 / 100.0).min(0.3);
@@ -1573,6 +1625,48 @@ mod tests {
     }
 
     #[test]
+    fn day_compression_is_parameterized_and_scales_only_the_day_clock() {
+        let net = corridor().build();
+        let mut world = NetWorld::new(net, SimConfig::default_config());
+        let pairs = [OdPair { origin: LinkId(0), dest: LinkId(1), rate_per_sec: 0.0, class: SurfaceClass::Through, anchored: false }];
+        let mut gen = DemandGenerator::new(&world, &pairs, 5);
+        world.install_router(&gen.destinations());
+        gen.set_rush_hour(&world.network, true);
+
+        assert_eq!(gen.day_compression(), DEFAULT_DAY_COMPRESSION);
+        gen.set_day_compression(0.01);
+        assert_eq!(gen.day_compression(), MIN_DAY_COMPRESSION);
+        gen.set_day_compression(1e9);
+        assert_eq!(gen.day_compression(), MAX_DAY_COMPRESSION);
+
+        // 1×: the day clock advances exactly with sim time; 60×: sixty day-seconds
+        // per sim second. Dynamics-time state (tick, sim_secs) advances identically.
+        gen.set_day_compression(1.0);
+        let t0 = gen.rush_hour_day_secs();
+        gen.step(&mut world, 0.5);
+        assert!((gen.rush_hour_day_secs() - t0 - 0.5).abs() < 1e-9);
+        gen.set_day_compression(60.0);
+        let t1 = gen.rush_hour_day_secs();
+        gen.step(&mut world, 0.5);
+        assert!((gen.rush_hour_day_secs() - t1 - 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resume_clock_carries_the_day_across_a_rebuild() {
+        let net = corridor().build();
+        let world = NetWorld::new(net, SimConfig::default_config());
+        let pairs = [OdPair { origin: LinkId(0), dest: LinkId(1), rate_per_sec: 0.0, class: SurfaceClass::Through, anchored: false }];
+        let mut gen = DemandGenerator::new(&world, &pairs, 5);
+        // Off-mode: nothing to resume onto (the clock stays off).
+        gen.resume_clock(43_200.0, 3);
+        assert!(!gen.rush_hour_active());
+        gen.set_rush_hour(&world.network, true);
+        gen.resume_clock(43_200.0, 3);
+        assert_eq!(gen.rush_hour_day_secs(), 43_200.0, "a rebuilt generator picks the day clock back up");
+        assert_eq!(gen.day(), 3);
+    }
+
+    #[test]
     fn origin_churn_swaps_same_class_surface_origins() {
         let net = line().build();
         let mut world = NetWorld::new(net, SimConfig::default_config());
@@ -1604,8 +1698,8 @@ mod tests {
         };
         let surface = share(false, None);
         let freeway = share(true, None);
-        assert!((0.04..0.08).contains(&surface), "surface trucks ≈ 6%: {surface}");
-        assert!((0.10..0.14).contains(&freeway), "freeway trucks ≈ 12%: {freeway}");
+        assert!((0.02..0.045).contains(&surface), "surface trucks ≈ 3%: {surface}");
+        assert!((0.035..0.065).contains(&freeway), "freeway trucks ≈ 5% (Caltrans truck AADT, US-101 SM): {freeway}");
         // Trucks thin out at the PM commute peak and thicken overnight.
         let peak = share(false, Some(17.0 * 3600.0));
         let night = share(false, Some(3.0 * 3600.0));

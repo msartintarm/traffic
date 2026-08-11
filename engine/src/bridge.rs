@@ -81,6 +81,15 @@ pub struct Simulation {
     /// so the UI's frequency / start-speed controls persist when sources are toggled.
     demand_rate: f64,
     entry_speed_cap: f64,
+    /// Day-seconds per sim second the simulated day plays at, carried across demand
+    /// rebuilds like the other demand controls. 1.0 = real time.
+    day_compression: f64,
+    /// Ramp-metering master switch; actual activation follows the day-clock
+    /// peak windows (see `apply_meter_schedule`).
+    metering_enabled: bool,
+    /// A wreck-clearance duration the user expressed in day-clock minutes, so a
+    /// compression change re-derives the sim-seconds value it maps to.
+    wreck_clear_day_minutes: Option<f64>,
     camera: Camera,
     /// `[x, y, heading, speed]` of each vehicle one tick ago, keyed by id, so the
     /// render interpolates pose between committed states (smooth at 60fps) and
@@ -165,7 +174,9 @@ impl Simulation {
     #[cfg(feature = "import")]
     pub fn from_map_json(json: &str, seed: u32, split_junctions: bool) -> Result<Simulation, JsValue> {
         let map = map::OsmMap::from_json_opts(json, split_junctions).map_err(|e| JsValue::from_str(&e))?;
-        Ok(Self::assemble(map.build(), seed))
+        let mut net = map.build();
+        net.attach_bus_stops(&map::bus_stops_from_json(json));
+        Ok(Self::assemble(net, seed))
     }
 
     fn assemble(network: Network, seed: u32) -> Simulation {
@@ -183,7 +194,9 @@ impl Simulation {
         clock.play();
         let signal_heads = geometry::signal_head_placements(&world.network);
         Simulation {
-            world, clock, seed: cfg.seed, demand, demand_sources, commute: None, demand_rate, entry_speed_cap, camera,
+            world, clock, seed: cfg.seed, demand, demand_sources, commute: None, demand_rate, entry_speed_cap,
+            day_compression: demand::DEFAULT_DAY_COMPRESSION, wreck_clear_day_minutes: None,
+            metering_enabled: true, camera,
             prev: PoseMap::default(), prev_lane: IntMap::default(), prev_crossing: IntMap::default(), selected: None, signal_heads,
             gpu: None, gpu_pending: None, gpu_relax: None, gpu_generation: 0, gpu_cost: Vec::new(), gpu_last: 0.0, gpu_fingerprint: 0,
             effective_speed: 0.0, throttled: false, last_advance_ms: 0.0, last_camera_ms: 0.0,
@@ -267,6 +280,10 @@ impl Simulation {
             .max()
             .map_or(0, |m| m + 1)
             .max(self.demand.next_id());
+        let clock = self
+            .demand
+            .rush_hour_active()
+            .then(|| (self.demand.rush_hour_day_secs(), self.demand.day()));
         self.demand = build_demand(
             &self.world,
             self.seed,
@@ -276,6 +293,10 @@ impl Simulation {
             self.commute.as_ref(),
         );
         self.demand.set_next_id(next_id);
+        self.demand.set_day_compression(self.day_compression);
+        if let Some((secs, day)) = clock {
+            self.demand.resume_clock(secs, day);
+        }
         let mut dests = self.demand.destinations();
         for v in self.world.vehicles() {
             if let Some(d) = v.dest {
@@ -345,6 +366,48 @@ impl Simulation {
 
     pub fn demand_rate(&self) -> f64 {
         self.demand_rate
+    }
+
+    /// Master ramp-metering switch (default on). Meters run only during the real
+    /// D4 metering windows (AM/PM peaks) when the day clock is live; with rush
+    /// hour off they follow the switch directly.
+    pub fn set_ramp_metering(&mut self, enabled: bool) {
+        self.metering_enabled = enabled;
+        self.apply_meter_schedule();
+    }
+
+    pub fn ramp_metering(&self) -> bool {
+        self.world.ramp_metering()
+    }
+
+    /// Apply the time-of-day metering schedule: within rush-hour mode the meters
+    /// switch with the simulated clock (6–10 h and 15–19 h, the Caltrans D4
+    /// pattern); otherwise the master switch alone decides.
+    fn apply_meter_schedule(&mut self) {
+        let on = self.metering_enabled
+            && (!self.demand.rush_hour_active() || {
+                let h = self.demand.rush_hour_day_secs() / 3600.0;
+                (6.0..10.0).contains(&h) || (15.0..19.0).contains(&h)
+            });
+        if on != self.world.ramp_metering() {
+            self.world.set_ramp_metering(on);
+        }
+    }
+
+    /// How fast the simulated day plays: day-seconds per sim second (1 = real time,
+    /// 60 = the default 24 h-in-24 min). Only the day clock scales — traffic dynamics
+    /// run in real sim time at any setting. Live, non-destructive, carried across
+    /// demand rebuilds; a day-clock-expressed wreck clearance is re-derived.
+    pub fn set_day_compression(&mut self, x: f64) {
+        self.demand.set_day_compression(x);
+        self.day_compression = self.demand.day_compression();
+        if let Some(mins) = self.wreck_clear_day_minutes {
+            self.world.set_wreck_clear_secs(mins * 60.0 / self.day_compression);
+        }
+    }
+
+    pub fn day_compression(&self) -> f64 {
+        self.day_compression
     }
 
     /// Cap the speed vehicles enter the map at (m/s); still never above the origin
@@ -446,6 +509,11 @@ impl Simulation {
         self.last_advance_ms = frame_ms;
 
         self.drive_gpu_routing();
+        self.apply_meter_schedule();
+        // Day-scheduled infrastructure (rail-crossing timetables) reads the
+        // simulated time of day.
+        let day = self.demand.day_secs(self.world.time());
+        self.world.set_day_secs(day);
         let ticks = self.clock.advance(real_elapsed_secs, MAX_CATCHUP_TICKS);
         let dt = self.clock.dt();
 
@@ -642,9 +710,24 @@ impl Simulation {
     }
 
     /// Wreck persistence: seconds a crashed vehicle stays on the road blocking
-    /// traffic (0 = removed instantly, the default).
+    /// traffic (0 = removed instantly, the default). Overrides any prior
+    /// day-clock-expressed duration.
     pub fn set_wreck_clear_secs(&mut self, secs: f64) {
+        self.wreck_clear_day_minutes = None;
         self.world.set_wreck_clear_secs(secs);
+    }
+
+    /// Wreck clearance expressed in *day-clock* minutes: "a 20-minute incident" means
+    /// 20 simulated-day minutes at any compression, so the sim-seconds duration is
+    /// `mins·60 / compression` and re-derives when the compression changes. 0 clears.
+    pub fn set_wreck_clear_day_minutes(&mut self, mins: f64) {
+        if mins <= 0.0 {
+            self.wreck_clear_day_minutes = None;
+            self.world.set_wreck_clear_secs(0.0);
+            return;
+        }
+        self.wreck_clear_day_minutes = Some(mins);
+        self.world.set_wreck_clear_secs(mins * 60.0 / self.day_compression);
     }
 
     pub fn wreck_clear_secs(&self) -> f64 {

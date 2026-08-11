@@ -35,23 +35,26 @@ pub struct NodeSpec {
     pub x: f64,
     pub y: f64,
     pub control: MapControl,
+    /// A railway level crossing (OSM `railway=level_crossing`): the engine
+    /// closes it to road traffic on the train timetable.
+    pub rail_crossing: bool,
 }
 
 impl NodeSpec {
     pub fn uncontrolled(osm_id: i64, x: f64, y: f64) -> Self {
-        Self { osm_id, x, y, control: MapControl::Uncontrolled }
+        Self { osm_id, x, y, control: MapControl::Uncontrolled, rail_crossing: false }
     }
 
     pub fn signalized(osm_id: i64, x: f64, y: f64, plan: SignalPlan) -> Self {
-        Self { osm_id, x, y, control: MapControl::Signal(plan) }
+        Self { osm_id, x, y, control: MapControl::Signal(plan), rail_crossing: false }
     }
 
     pub fn stop(osm_id: i64, x: f64, y: f64) -> Self {
-        Self { osm_id, x, y, control: MapControl::Stop }
+        Self { osm_id, x, y, control: MapControl::Stop, rail_crossing: false }
     }
 
     pub fn give_way(osm_id: i64, x: f64, y: f64) -> Self {
-        Self { osm_id, x, y, control: MapControl::Yield }
+        Self { osm_id, x, y, control: MapControl::Yield, rail_crossing: false }
     }
 }
 
@@ -83,6 +86,9 @@ pub struct LinkSpec {
     /// (e.g. `"left|through|through;right"`). Empty when unmapped — the renderer
     /// then falls back to arrows derived from the lane's actual movements.
     pub turn_lanes: String,
+    /// OSM `hov:lanes` (this direction, median outward, e.g. `"designated|no|no"`):
+    /// lanes restricted to HOV/express-eligible vehicles. Empty when unmapped.
+    pub hov_lanes: String,
     /// Observed Annual Average Daily Traffic for the road (both directions,
     /// vehicles/day), joined from real counts by `tools/counts attach_counts.py
     /// --write-map`; `0.0` = no observation. Calibrates demand to measured volumes
@@ -134,10 +140,10 @@ impl OsmMap {
             inc.entry(l.to_osm).or_default().push(i);
         }
         let uncontrolled: std::collections::HashSet<i64> =
-            self.nodes.iter().filter(|n| n.control == MapControl::Uncontrolled).map(|n| n.osm_id).collect();
+            self.nodes.iter().filter(|n| n.control == MapControl::Uncontrolled && !n.rail_crossing).map(|n| n.osm_id).collect();
         let mut removed: std::collections::HashSet<i64> = Default::default();
         let mut queue: VecDeque<i64> =
-            self.nodes.iter().filter(|n| n.control == MapControl::Uncontrolled).map(|n| n.osm_id).collect();
+            self.nodes.iter().filter(|n| n.control == MapControl::Uncontrolled && !n.rail_crossing).map(|n| n.osm_id).collect();
         while let Some(n) = queue.pop_front() {
             if removed.contains(&n) || !uncontrolled.contains(&n) {
                 continue;
@@ -224,6 +230,7 @@ impl OsmMap {
         // instead of a linear `self.nodes.iter().find` — an O(nodes²) scan (≈3 billion on a
         // whole-city map) that native's cache hides but wasm runs ~20× slower, dominating load.
         let control_of: HashMap<i64, MapControl> = self.nodes.iter().map(|n| (n.osm_id, n.control)).collect();
+        let rail_of: HashMap<i64, bool> = self.nodes.iter().map(|n| (n.osm_id, n.rail_crossing)).collect();
         let mut neigh: HashMap<i64, BTreeSet<i64>> = HashMap::new();
         for l in &self.links {
             neigh.entry(l.from_osm).or_default().insert(l.to_osm);
@@ -314,7 +321,8 @@ impl OsmMap {
                 }
             }
             let k = members.len() as f64;
-            nodes.push(NodeSpec { osm_id: rep_id, x: cx / k, y: cy / k, control });
+            let rail_crossing = members.iter().any(|m| rail_of.get(m).copied().unwrap_or(false));
+            nodes.push(NodeSpec { osm_id: rep_id, x: cx / k, y: cy / k, control, rail_crossing });
         }
         // `clusters` is a std HashMap, so its `.values()` order is randomly seeded per
         // process. The output node order fixes every NodeId (and downstream: junction cluster
@@ -341,6 +349,7 @@ impl OsmMap {
             net.nodes.push(Node {
                 position: [spec.x, spec.y],
                 control: NodeControl::Uncontrolled,
+                rail_crossing: spec.rail_crossing,
             });
         }
 
@@ -505,6 +514,7 @@ impl OsmMap {
             net.link_names.push(spec.name.clone());
             net.link_refs.push(spec.highway_ref.clone());
             net.link_turn_lanes.push(spec.turn_lanes.clone());
+            net.link_hov_lanes.push(spec.hov_lanes.clone());
             net.link_aadt.push(spec.aadt);
             net.link_res_weight.push(spec.res_weight);
             net.link_attr_weight.push(spec.attr_weight);
@@ -673,6 +683,7 @@ impl OsmMap {
                 };
             }
         }
+        net.build_hov_lanes();
         net.build_junctions();
         net.build_cross_junction_conflicts();
         net.build_conflict_index();
@@ -945,15 +956,30 @@ fn assign_signal_program(
             phase_mask[p] |= 1u64 << g;
         }
     }
+    // Pedestrian green floor where the land-use pass marks street activity
+    // (shops/jobs around the node): the walk runs parallel to a through phase,
+    // so that phase must hold green ≥ walk interval + crossing the widest road
+    // it runs beside at 1.1 m/s (the MUTCD clearance speed). Downtown cycles
+    // lengthen toward real signal timing; quiet residential crossings don't.
+    let commercial = group_link.iter().any(|&l| net.link_attr_weight(LinkId(l)) > 1.05);
     let phases = phase_groups
         .iter()
         .enumerate()
         .map(|(p, gs)| {
-            let green = if gs.iter().all(|&g| left_group[g]) {
+            let mut green = if gs.iter().all(|&g| left_group[g]) {
                 (plan.green_secs * 0.45).max(6.0)
             } else {
                 plan.green_secs
             };
+            if commercial && !gs.iter().all(|&g| left_group[g]) {
+                let crossing = group_link
+                    .iter()
+                    .enumerate()
+                    .filter(|(h, _)| !gs.contains(h))
+                    .map(|(_, &l)| net.link(LinkId(l)).lane_count as f64 * LANE_WIDTH * 2.0)
+                    .fold(0.0, f64::max);
+                green = green.max(5.0 + crossing / 1.1);
+            }
             let phase_movements: Vec<MovementId> =
                 gs.iter().flat_map(|&g| group_movements[g].iter().copied()).collect();
             let (yellow, all_red) = change_and_clearance_intervals(net, &phase_movements);
@@ -1079,6 +1105,50 @@ fn change_and_clearance_intervals(net: &Network, movements: &[MovementId]) -> (f
 /// travelling the corridor at road speed arrives. Best-effort along one direction per
 /// corridor; a mismatched cycle only degrades the coordination — the conflict-built
 /// phases (and thus safety) are never touched.
+/// Stretch every signal on a named street to the street's longest cycle: a green
+/// wave only repeats when cycle lengths match, so a corridor whose members run
+/// different cycles (protected-left stages, pedestrian floors) drifts in and out
+/// of progression each round. Greens scale up (never down) and conflict masks
+/// are untouched, so safety is unaffected — the offsets computed afterwards then
+/// hold every cycle.
+fn harmonize_corridor_cycles(net: &mut Network, sig: &std::collections::BTreeMap<u32, ProgramId>) {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut families: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+    for (i, l) in net.links.iter().enumerate() {
+        let name = net.link_names[i].as_str();
+        if name.is_empty() {
+            continue;
+        }
+        for nd in [l.from, l.to] {
+            if let Some(pid) = sig.get(&nd.0) {
+                families.entry(name.to_string()).or_default().insert(pid.idx());
+            }
+        }
+    }
+    for pids in families.values() {
+        if pids.len() < 2 {
+            continue;
+        }
+        let target = pids.iter().map(|&p| net.programs[p].cycle_length()).fold(0.0, f64::max);
+        for &p in pids {
+            let prog = &mut net.programs[p];
+            let cycle = prog.cycle_length();
+            if target - cycle < 0.1 {
+                continue;
+            }
+            let fixed: f64 = prog.phases.iter().map(|ph| ph.yellow_secs + ph.all_red_secs).sum();
+            let green: f64 = prog.phases.iter().map(|ph| ph.green_secs).sum();
+            if green <= 0.0 {
+                continue;
+            }
+            let f = (target - fixed) / green;
+            for ph in &mut prog.phases {
+                ph.green_secs *= f;
+            }
+        }
+    }
+}
+
 fn coordinate_green_waves(net: &mut Network) {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     const SPEED_FLOOR: f64 = 5.0; // m/s, so a slow arterial still gets a sane travel time
@@ -1097,6 +1167,7 @@ fn coordinate_green_waves(net: &mut Network) {
         if sig.len() < 2 {
             return;
         }
+        harmonize_corridor_cycles(net, &sig);
         let mut out_links: Vec<Vec<u32>> = vec![Vec::new(); net.nodes.len()];
         for i in 0..net.links.len() {
             let l = net.link(LinkId(i as u32));
@@ -1286,13 +1357,14 @@ fn join_pass_through(
     // The downstream segment (l2, ending at the merge's `to`) carries the turn:lanes
     // that matter at the stop line; fall back to l1 if it lacks them.
     let turn_lanes = if l2.turn_lanes.is_empty() { l1.turn_lanes.clone() } else { l2.turn_lanes.clone() };
+    let hov_lanes = if l2.hov_lanes.is_empty() { l1.hov_lanes.clone() } else { l2.hov_lanes.clone() };
     let nonzero = |a: f64, b: f64| if a > 0.0 { a } else { b };
     let (aadt, res_weight, attr_weight) = (
         nonzero(l1.aadt, l2.aadt),
         nonzero(l1.res_weight, l2.res_weight),
         nonzero(l1.attr_weight, l2.attr_weight),
     );
-    Some(LinkSpec { from_osm: from, to_osm: to, lanes, speed_limit, geometry, layer, name, road_class, highway_ref, turn_lanes, aadt, res_weight, attr_weight })
+    Some(LinkSpec { from_osm: from, to_osm: to, lanes, speed_limit, geometry, layer, name, road_class, highway_ref, turn_lanes, hov_lanes, aadt, res_weight, attr_weight })
 }
 
 /// Pull every lane back from its end nodes to the junction boundary so vehicles
@@ -1627,6 +1699,8 @@ mod json {
         control: String,
         #[serde(default)]
         signal: Option<JsonSignal>,
+        #[serde(default)]
+        rail_crossing: bool,
     }
 
     #[derive(Deserialize)]
@@ -1648,6 +1722,8 @@ mod json {
         highway_ref: String,
         #[serde(default)]
         turn_lanes: String,
+        #[serde(default)]
+        hov_lanes: String,
         #[serde(default)]
         aadt: f64,
         #[serde(default)]
@@ -1685,7 +1761,7 @@ mod json {
                     "yield" => MapControl::Yield,
                     _ => MapControl::Uncontrolled,
                 };
-                NodeSpec { osm_id: n.osm_id, x: n.x, y: n.y, control }
+                NodeSpec { osm_id: n.osm_id, x: n.x, y: n.y, control, rail_crossing: n.rail_crossing }
             })
             .collect();
         let links = raw
@@ -1702,6 +1778,7 @@ mod json {
                 road_class: l.road_class,
                 highway_ref: l.highway_ref,
                 turn_lanes: l.turn_lanes,
+                hov_lanes: l.hov_lanes,
                 aadt: l.aadt,
                 res_weight: l.res_weight,
                 attr_weight: l.attr_weight,
@@ -1709,6 +1786,20 @@ mod json {
             .collect();
         Ok(OsmMap { nodes, links })
     }
+}
+
+/// Scraped bus-stop points (projected metres) from the map JSON's top-level
+/// `bus_stops`, for [`Network::attach_bus_stops`]; empty when absent. Separate
+/// from [`OsmMap`] so the many hand-built map literals stay untouched.
+#[cfg(feature = "import")]
+pub fn bus_stops_from_json(s: &str) -> Vec<[f64; 2]> {
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    struct Doc {
+        #[serde(default)]
+        bus_stops: Vec<[f64; 2]>,
+    }
+    serde_json::from_str::<Doc>(s).map(|d| d.bus_stops).unwrap_or_default()
 }
 
 impl OsmMap {
@@ -2168,6 +2259,59 @@ mod tests {
     }
 
     #[test]
+    fn corridor_cycles_harmonize_to_the_longest_member() {
+        // Three signals on one named street with deliberately different plans:
+        // without harmonization their cycles differ and any offset progression
+        // drifts out of phase every round. The build stretches greens (never
+        // masks) so every member shares the corridor's longest cycle.
+        let plan = |g| SignalPlan { green_secs: g, yellow_secs: 4.0, offset: 0.0 };
+        let road = |a, b, name: &str, lanes, sp| {
+            let mut v = LinkSpec::twoway(a, b, lanes, sp).to_vec();
+            for l in &mut v {
+                l.name = name.to_string();
+            }
+            v
+        };
+        let mut links = Vec::new();
+        for (a, b) in [(0, 1), (1, 2), (2, 3), (3, 4)] {
+            links.extend(road(a, b, "Main Street", 2, 15.0));
+        }
+        for (n, e, name) in [(1, 10, "Cross A"), (2, 11, "Cross B"), (3, 12, "Cross C")] {
+            links.extend(road(n, e, name, 1, 12.0));
+        }
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(0, -300.0, 0.0),
+                NodeSpec::signalized(1, 0.0, 0.0, plan(14.0)),
+                NodeSpec::signalized(2, 300.0, 0.0, plan(26.0)),
+                NodeSpec::signalized(3, 600.0, 0.0, plan(18.0)),
+                NodeSpec::uncontrolled(4, 900.0, 0.0),
+                NodeSpec::uncontrolled(10, 0.0, -200.0),
+                NodeSpec::uncontrolled(11, 300.0, -200.0),
+                NodeSpec::uncontrolled(12, 600.0, -200.0),
+            ],
+            links,
+        }
+        .build();
+        let cycles: Vec<f64> = net
+            .nodes
+            .iter()
+            .filter_map(|n| match n.control {
+                NodeControl::Signalized(p) => Some(net.programs[p.idx()].cycle_length()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cycles.len(), 3);
+        let max = cycles.iter().fold(0.0f64, |a, &b| a.max(b));
+        for c in &cycles {
+            assert!((c - max).abs() < 0.1, "every corridor member shares the longest cycle: {cycles:?}");
+        }
+        for p in &net.programs {
+            assert!(p.coordinated, "harmonized corridors carry coordinated offsets");
+        }
+    }
+
+    #[test]
     fn actuated_controller_honors_coordination_offsets_at_runtime() {
         use super::super::junction::SignalController;
         use super::super::signal::SignalState;
@@ -2426,7 +2570,7 @@ mod tests {
             ],
             links: vec![
                 LinkSpec::oneway(1, 2, 1, 20.0), // surface road, crosses origin
-                LinkSpec { from_osm: 3, to_osm: 4, lanes: 1, speed_limit: 25.0, geometry: Vec::new(), layer: 1, name: String::new(), road_class: String::new(), highway_ref: String::new(), turn_lanes: String::new(), aadt: 0.0, res_weight: 0.0, attr_weight: 0.0 }, // bridge over it
+                LinkSpec { from_osm: 3, to_osm: 4, lanes: 1, speed_limit: 25.0, geometry: Vec::new(), layer: 1, name: String::new(), road_class: String::new(), highway_ref: String::new(), turn_lanes: String::new(), hov_lanes: String::new(), aadt: 0.0, res_weight: 0.0, attr_weight: 0.0 }, // bridge over it
             ],
         }
         .build();

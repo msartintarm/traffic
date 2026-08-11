@@ -120,6 +120,33 @@ The bounding box is an input (flag, file, or `TRAFFIC_BBOX`).
 field names line up 1:1 with `NodeSpec`/`LinkSpec` — and `build_demand` samples OD
 pairs whose routes cross ≥1 intersection.
 
+## Realism: data provenance and validation
+
+Every behavioural parameter is either measured, taken from the standard
+engineering references, or fitted to data — see `PLAN.md` for the full audit:
+
+- **Car-following** (`config.rs`): IDM with T = 1.2 s, a = 1.5, b = 2.0 —
+  calibrated so ring-road capacity lands in the observed US-101 queue-discharge
+  band (1,900–2,300 veh/h/ln; asserted in `tests/validation.rs`). Reaction
+  0.7 s = empirical brake PRT. Speeds exceed posted limits like real traffic
+  (mean ≈ +5%, aggressive tail to +15 mph).
+- **Gap acceptance** (`net_world.rs`): HCM 6th-ed critical headways per movement
+  (4.1/6.2/6.5/7.1 s, +1 s heavy), floored by the physical clearance time.
+- **Demand**: Caltrans PeMS directional diurnals (freeways), Census LODES
+  commute OD, Caltrans AADT embedded per link (`tools/counts --write-map`)
+  calibrating gateway inflow; gravity decay β = 0.7 fitted to LODES
+  (`tools/lodes/fit_gravity.py`); truck shares from Caltrans truck AADT.
+- **Infrastructure**: ALINEA ramp metering on freeway on-ramps (D4 peak
+  windows), OSM `hov:lanes` express-lane restrictions, `railway=level_crossing`
+  timetable closures, pedestrian green floors in commercial areas, corridor
+  cycle harmonization + green-wave offsets.
+- **Validation**: `cargo test --features import` runs the unit tier
+  (fundamental diagram, TWSC envelope, progression); CI runs the scorecard
+  (`examples/scorecard.rs`) — windowed link flows vs AADT targets (GEH),
+  corridor travel-time ratios, crashes per 100M VMT — and publishes the report
+  as an artifact. The day clock is parameterized (1× = accuracy mode, 60× =
+  the watchable default).
+
 ## Build order / roadmap
 
 1. ✅ Fixed-tick CPU micro core; fundamental-diagram + behaviour regressions.

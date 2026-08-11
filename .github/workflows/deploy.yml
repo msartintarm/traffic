@@ -15,7 +15,70 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Engine tests + the validation scorecard. The tests are a hard gate: a
+  # behavioural/model regression must never ship (fail loud, never degrade).
+  # The scorecard — real Millbrae map through a simulated AM peak, link flows
+  # scored against Caltrans count targets (GEH), corridor travel-time ratios,
+  # crash rate per 100M VMT — is a soft gate published as an artifact; it flips
+  # to a hard gate (`--assert`) once it passes consistently.
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            engine/target
+          key: ${{ runner.os }}-cargo-validate-${{ hashFiles('engine/Cargo.lock') }}
+
+      - name: Engine tests
+        run: cargo test --features import
+        working-directory: engine
+
+      # Count targets: AADT from the public Caltrans ArcGIS service (no key),
+      # embedded into a CI-local copy of the map (`--write-map`) so targets ride
+      # the links through the engine's topology transforms — raw link indices
+      # don't survive the build, so an index-joined counts file cannot work.
+      # Best-effort: a fetch outage skips GEH scoring, never the scorecard.
+      - name: Fetch Caltrans AADT (San Mateo county)
+        run: python3 fetch_caltrans.py --county SM --out caltrans.csv || echo "caltrans fetch failed; scoring without counts"
+        working-directory: tools/counts
+      - name: Embed counts in a map copy
+        run: |
+          cp ../../web/public/map.json /tmp/map.scored.json
+          if [ -f caltrans.csv ]; then
+            python3 attach_counts.py --map /tmp/map.scored.json --counts caltrans.csv --write-map --out /tmp/counts.json
+          fi
+        working-directory: tools/counts
+
+      - name: Validation scorecard (soft gate)
+        run: |
+          gunzip -kf ../web/public/map.lodes.json.gz
+          cargo run --release --example scorecard --features import -- \
+            --map /tmp/map.scored.json \
+            --lodes ../web/public/map.lodes.json \
+            --compression 12 --start-hour 6.5 --end-hour 9.5 \
+            > /tmp/scorecard.json
+          python3 - <<'EOF'
+          import json
+          r = json.load(open("/tmp/scorecard.json"))
+          g, t = r["geh"], r["totals"]
+          print("GEH<5 share (observed links):", g["share_under_5"], f"({g['observed_pass']}/{g['observed_links']})")
+          print("crashes/100M VMT:", t["crashes_per_100m_vmt"], f"(vmt {t['vmt']:.0f})")
+          for c in r["corridors"]:
+              print(f"corridor {c['ref']}: {c['ratio']:.2f}x free flow ({c['live_secs']:.0f}s)")
+          EOF
+        working-directory: engine
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scorecard
+          path: /tmp/scorecard.json
+
   build:
+    needs: validate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

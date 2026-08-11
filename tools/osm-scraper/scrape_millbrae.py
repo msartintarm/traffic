@@ -262,7 +262,10 @@ def build(raw, bbox, place, drivable=DRIVABLE, landuse=None):
             usage[nid] += 1
 
     def is_junction(nid):
-        return usage[nid] >= 2 or nodes[nid].get("tags", {}).get("highway") == "traffic_signals"
+        tags = nodes[nid].get("tags", {})
+        # A level crossing must survive as a first-class node (like a signal):
+        # the engine gates traffic there on the train timetable.
+        return usage[nid] >= 2 or tags.get("highway") == "traffic_signals" or tags.get("railway") == "level_crossing"
 
     lat0 = (bbox[0] + bbox[2]) / 2
     lon0 = (bbox[1] + bbox[3]) / 2
@@ -286,6 +289,9 @@ def build(raw, bbox, place, drivable=DRIVABLE, landuse=None):
         out_nodes[nid] = {"osm_id": nid, "x": x, "y": y, "control": control}
         if signal:
             out_nodes[nid]["signal"] = signal
+        if tags.get("railway") == "level_crossing":
+            # The engine closes these to road traffic on the train timetable.
+            out_nodes[nid]["rail_crossing"] = True
 
     def geom_of(node_ids):
         return [list(project(nodes[nid]["lat"], nodes[nid]["lon"], lat0, lon0)) for nid in node_ids]
@@ -325,7 +331,7 @@ def build(raw, bbox, place, drivable=DRIVABLE, landuse=None):
                 stack.append((imax, hi))
         return [p for p, k in zip(pts, keep) if k]
 
-    def emit_link(a, b, lanes, speed, geometry, name, ref, layer, road_class, turn_lanes):
+    def emit_link(a, b, lanes, speed, geometry, name, ref, layer, road_class, turn_lanes, hov_lanes=None):
         if (a, b) in emitted:
             return
         emitted.add((a, b))
@@ -349,6 +355,11 @@ def build(raw, bbox, place, drivable=DRIVABLE, landuse=None):
             # OSM turn:lanes for this direction, e.g. "left|through|through;right" —
             # the renderer paints the lane-use arrows from it.
             link["turn_lanes"] = turn_lanes
+        if hov_lanes:
+            # OSM hov:lanes for this direction ("designated|no|no…"), median
+            # outward — the engine restricts those lanes to eligible vehicles
+            # (the US-101 express/HOV lanes).
+            link["hov_lanes"] = hov_lanes
         if landuse:
             # Trip production/attraction weights from the land-use grid at the
             # link's midpoint — the engine tilts demand origins toward homes and
@@ -371,6 +382,13 @@ def build(raw, bbox, place, drivable=DRIVABLE, landuse=None):
         # two-way way splits it into :forward / :backward; a oneway carries it bare.
         tl_forward = tags.get("turn:lanes:forward") or (tags.get("turn:lanes") if oneway else None)
         tl_backward = tags.get("turn:lanes:backward")
+        # Per-lane HOV designation, same left→right per-direction convention as
+        # turn:lanes; a bare `hov=designated` marks the whole way (rare).
+        hov_forward = tags.get("hov:lanes:forward") or (tags.get("hov:lanes") if oneway else None)
+        hov_backward = tags.get("hov:lanes:backward")
+        if not hov_forward and tags.get("hov") == "designated":
+            hov_forward = "|".join(["designated"] * lanes)
+            hov_backward = hov_backward or hov_forward
 
         seq = way["nodes"]
         block_start = 0
@@ -382,9 +400,9 @@ def build(raw, bbox, place, drivable=DRIVABLE, landuse=None):
                 emit_node(a)
                 emit_node(b)
                 mid = geom_of(seq[block_start + 1 : i])  # intermediate bend points
-                emit_link(a, b, lanes, speed, mid, name, ref, layer, highway, tl_forward)
+                emit_link(a, b, lanes, speed, mid, name, ref, layer, highway, tl_forward, hov_forward)
                 if not oneway:
-                    emit_link(b, a, lanes, speed, list(reversed(mid)), name, ref, layer, highway, tl_backward)
+                    emit_link(b, a, lanes, speed, list(reversed(mid)), name, ref, layer, highway, tl_backward, hov_backward)
             block_start = i
 
     return {
@@ -438,6 +456,15 @@ def main():
         landuse = LandUseGrid(raw, lat0, lon0)
         print(f"land use: {len(landuse.res)} residential cells, {len(landuse.attr)} attraction cells")
     graph = build(fetch(bbox, classes), bbox, args.place, classes or DRIVABLE, landuse)
+    if not args.highways_only:
+        # Curbside bus stops: the engine dwells buses at these service positions.
+        lat0, lon0 = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+        s, w, n, e = bbox
+        stops = fetch_query(f'[out:json][timeout:60]; node["highway"="bus_stop"]({s},{w},{n},{e}); out;')
+        graph["bus_stops"] = [
+            list(project(el["lat"], el["lon"], lat0, lon0)) for el in stops.get("elements", [])
+        ]
+        print(f"bus stops: {len(graph['bus_stops'])}")
     with open(args.out, "w") as f:
         json.dump(graph, f, separators=(",", ":"))
     print(f"wrote {args.out}: {len(graph['nodes'])} nodes, {len(graph['links'])} links")

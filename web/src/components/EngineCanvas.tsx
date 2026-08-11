@@ -56,6 +56,9 @@ function Collapsible({
 
 const ZOOM_RANGE = 60; // fit-out … max-in ratio driving the slider
 
+// Day-clock speeds the slider snaps to (day-seconds per sim second); 1 = real time.
+const DAY_COMPRESSION_STEPS = [1, 5, 15, 30, 60, 120, 240];
+
 export default function EngineCanvas() {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -84,6 +87,8 @@ export default function EngineCanvas() {
   const [highwayTraffic, setHighwayTraffic] = useState(true);
   const [surfaceTraffic, setSurfaceTraffic] = useState(true);
   const [rushHour, setRushHour] = useState(false);
+  const [dayCompression, setDayCompression] = useState(60); // engine DEFAULT_DAY_COMPRESSION
+  const [rampMetering, setRampMetering] = useState(true); // engine default: on (D4 peak windows)
   const rushClockRef = useRef<HTMLSpanElement>(null);
   const [accelBackend, setAccelBackend] = useState("serial");
   const [parThreshold, setParThreshold] = useState(500); // matches engine DEFAULT_PAR_THRESHOLD
@@ -552,6 +557,36 @@ export default function EngineCanvas() {
               Rush hour
               {rushHour && highwayTraffic && <span ref={rushClockRef} className={styles.rushClock} />}
             </label>
+            <label className={styles.zoomLabel} title="ALINEA ramp meters on the freeway on-ramps: one car per green, paced by mainline occupancy. Under rush hour they run the real Caltrans D4 peak windows (6–10 h, 15–19 h).">
+              <input
+                type="checkbox"
+                checked={rampMetering}
+                disabled={!ready}
+                onChange={(e) => {
+                  sessionRef.current?.applyControl({ type: "rampMetering", value: e.target.checked });
+                  setRampMetering(e.target.checked);
+                }}
+              />
+              Ramp meters
+            </label>
+            {rushHour && (
+              <label className={styles.zoomLabel} title="How fast the simulated day plays: 1× is real time (accuracy mode), 60× plays the 24 h in ~24 min. Only the day clock scales — traffic dynamics always run in real time.">
+                Day {dayCompression}×
+                <input
+                  type="range"
+                  min={0}
+                  max={DAY_COMPRESSION_STEPS.length - 1}
+                  step={1}
+                  value={DAY_COMPRESSION_STEPS.indexOf(dayCompression)}
+                  disabled={!ready}
+                  onChange={(e) => {
+                    const v = DAY_COMPRESSION_STEPS[Number(e.target.value)];
+                    sessionRef.current?.applyControl({ type: "dayCompression", value: v });
+                    setDayCompression(v);
+                  }}
+                />
+              </label>
+            )}
             <label className={styles.zoomLabel} title="Spawn-rate multiplier applied to every enabled traffic stream.">
               Rate {demandRate.toFixed(2)}×
               <input

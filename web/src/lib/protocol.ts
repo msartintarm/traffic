@@ -29,6 +29,8 @@ export type Control =
   | { type: "speed"; value: number }
   | { type: "demandRate"; value: number }
   | { type: "rushHour"; value: boolean }
+  | { type: "dayCompression"; value: number }
+  | { type: "rampMetering"; value: boolean }
   | { type: "sleepScheduler"; value: boolean }
   | { type: "schedulerThreadLimit"; value: number }
   | { type: "parThreshold"; value: number }
@@ -54,7 +56,7 @@ export type Control =
 export type ControlType = Control["type"];
 
 export const CONTROL_TYPES: ReadonlySet<ControlType> = new Set([
-  "speed", "demandRate", "rushHour", "sleepScheduler", "schedulerThreadLimit",
+  "speed", "demandRate", "rushHour", "dayCompression", "rampMetering", "sleepScheduler", "schedulerThreadLimit",
   "parThreshold", "parallelRouting", "cacheSort", "showCrashes", "clearCrashes", "entrySpeedCap", "congestionEngage", "congestionEnabled",
   "demandSources", "fit", "metersPerPixel", "zoomAt", "panBy", "resize", "select",
   "hover", "play", "pause", "frameBudget",

@@ -6,7 +6,12 @@ use super::rng::{self, Stream};
 
 /// IDM car-following parameters. Fields carry SI units: speeds m/s,
 /// accelerations m/s², headway s, gaps/length m. Defaults are Treiber's
-/// passenger-car values.
+/// passenger-car values recalibrated to observed US freeway queue discharge:
+/// T = 1.2 s / a = 1.5 / b = 2.0 puts lane capacity at ≈ 2,130 veh/h/ln
+/// (US-101 discharges 2,000–2,300), where the original T = 1.5 s capped it
+/// near 1,780 — a road that jammed ~20% too early. Reaction 0.7 s is the
+/// empirical brake PRT mean; a and b also govern the urban launch and the
+/// stop-line service time the junction fixtures measure.
 // `#[repr(C)]` + `Pod` so it can be embedded in the flat, GPU-uploadable
 // per-vehicle accel context (`net_world::VehicleContext`); all fields are `f64`.
 #[repr(C)]
@@ -38,13 +43,13 @@ impl DriverConfig {
     pub const fn car() -> Self {
         Self {
             desired_speed: 30.0,
-            time_headway: 1.5,
-            max_accel: 1.0,
-            comfort_decel: 1.5,
+            time_headway: 1.2,
+            max_accel: 1.5,
+            comfort_decel: 2.0,
             accel_exponent: 4.0,
             min_gap: 2.0,
             vehicle_length: 5.0,
-            reaction_time: 0.5,
+            reaction_time: 0.7,
             accel_noise: 0.2,
             politeness: 0.3,
             critical_gap: 4.0,
@@ -68,9 +73,17 @@ impl DriverConfig {
         }
     }
 
+    /// The driver's desired speed on a road with this posted limit. Real free-flow
+    /// traffic runs *over* the limit — Californian freeway means sit ~3–7% above
+    /// posted with aggressive tails near +15 mph — so instead of a hard clamp the
+    /// limit scales by the driver's aggression (their sampled desired-speed ratio,
+    /// clamped 0.90–1.20), bounded by the absolute +15 mph envelope and the
+    /// driver's own open-road preference. Slow classes (governed trucks) land at
+    /// ~90% of the limit.
     pub fn capped_to(&self, speed_limit: f64) -> Self {
+        let target = speed_limit * (1.05 * (self.desired_speed / 30.0)).clamp(0.90, 1.20);
         Self {
-            desired_speed: self.desired_speed.min(speed_limit),
+            desired_speed: self.desired_speed.min(target.min(speed_limit + 6.7)),
             ..*self
         }
     }
@@ -91,15 +104,17 @@ impl VehicleClass {
             VehicleClass::Car => DriverConfig::car(),
             VehicleClass::Truck => DriverConfig {
                 desired_speed: 25.0,
-                max_accel: 0.6,
-                comfort_decel: 1.1,
+                time_headway: 1.8,
+                max_accel: 0.8,
+                comfort_decel: 1.3,
                 vehicle_length: 10.0,
                 ..DriverConfig::car()
             },
             VehicleClass::Bus => DriverConfig {
                 desired_speed: 22.0,
-                max_accel: 0.7,
-                comfort_decel: 1.2,
+                time_headway: 1.6,
+                max_accel: 0.9,
+                comfort_decel: 1.4,
                 vehicle_length: 12.0,
                 ..DriverConfig::car()
             },
@@ -211,10 +226,24 @@ mod tests {
     }
 
     #[test]
-    fn capped_to_never_raises_desired_speed() {
+    fn capped_to_speeds_realistically_over_the_limit() {
+        // A slow driver keeps their own preference.
         let slow = DriverConfig { desired_speed: 10.0, ..DriverConfig::car() };
         assert_eq!(slow.capped_to(20.0).desired_speed, 10.0);
+        // The mean driver runs ~5% over the posted limit, never at the hard clamp.
+        let mean = DriverConfig::car().capped_to(20.0).desired_speed;
+        assert!((mean - 21.0).abs() < 0.01, "mean driver ≈ +5% over, got {mean}");
+        // An aggressive driver exceeds further but stays inside +15 mph absolute.
         let fast = DriverConfig { desired_speed: 40.0, ..DriverConfig::car() };
-        assert_eq!(fast.capped_to(20.0).desired_speed, 20.0);
+        let v = fast.capped_to(29.0).desired_speed;
+        assert!(v > 29.0 && v <= 29.0 + 6.7 + 1e-9, "aggressive over the limit within the envelope: {v}");
+        // The population mean on a freeway limit lands ~3–7% over posted.
+        let base = DriverConfig::car();
+        let n = 10_000u32;
+        let mean_v: f64 = (0..n).map(|id| base.sample(4, id).capped_to(29.0).desired_speed).sum::<f64>() / n as f64;
+        assert!((29.6..30.9).contains(&mean_v), "population free-flow mean ≈ +3–7% over 29 m/s, got {mean_v}");
+        // Governed heavy classes sit under the limit.
+        let truck = VehicleClass::Truck.driver().capped_to(29.0).desired_speed;
+        assert!(truck < 29.0 * 0.95, "trucks run below the limit: {truck}");
     }
 }

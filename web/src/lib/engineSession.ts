@@ -308,6 +308,8 @@ export async function startEngineSession(
       case "speed": sim.set_speed(c.value); break;
       case "demandRate": sim.set_demand_rate(c.value); break;
       case "rushHour": sim.set_rush_hour(c.value); break;
+      case "dayCompression": sim.set_day_compression?.(c.value); break;
+      case "rampMetering": sim.set_ramp_metering?.(c.value); break;
       case "sleepScheduler": sim.set_sleep_scheduler(c.value); break;
       case "schedulerThreadLimit": sim.set_scheduler_thread_limit(c.value); break;
       case "parThreshold": sim.set_par_threshold(c.value); break;

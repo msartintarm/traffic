@@ -43,3 +43,15 @@ dents the sampled fabric, while a metro box dominates it):
 
 Through-traffic and non-work trips stay on the sampled boundary categories
 (LODES covers jobs only).
+
+## Gravity decay fit (`fit_gravity.py`)
+
+Fits the engine's gravity distance-decay exponent β by destination-choice
+maximum likelihood over the fetched OD flows (opportunity-controlled, so β
+isolates pure distance decay). Across the five shipped maps: β = 0.54–0.75,
+commuter-weighted 0.68 → `GRAVITY_BETA = 0.7` in `engine/src/sim/demand.rs`.
+Re-run after refreshing LODES data:
+
+```
+python3 fit_gravity.py ../../web/public/*.lodes.json*
+```
