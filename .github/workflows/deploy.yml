@@ -34,6 +34,11 @@ jobs:
             engine/target
           key: ${{ runner.os }}-cargo-validate-${{ hashFiles('engine/Cargo.lock') }}
 
+      # The commute-OD artifacts ship compressed; the suite validates the
+      # inflated siblings (the app inflates them in-page the same way).
+      - name: Inflate commute-OD artifacts
+        run: gunzip -kf web/public/*.lodes.json.gz
+
       - name: Engine tests
         run: cargo test --features import
         working-directory: engine
