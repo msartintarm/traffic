@@ -240,20 +240,37 @@ mod realism {
         (net, r)
     }
 
-    /// The busiest node — the crossing itself — where a real intersection's box is.
-    fn crossing_center(net: &Network) -> [f64; 2] {
+    /// Candidate middles of the crossing. The busiest node names the junction,
+    /// but with split (unmerged) clusters neither the node nor the footprint
+    /// centroid is guaranteed to sit mid-pavement — the node can be at the box's
+    /// edge, the centroid over a real median island of a divided transition —
+    /// so the solid-core probe takes the best of node, centroid, and midpoint.
+    fn crossing_centers(net: &Network) -> Vec<[f64; 2]> {
         let degree = |n: NodeId| net.links.iter().filter(|l| l.from == n || l.to == n).count();
         let node = (0..net.nodes.len() as u32).map(NodeId).max_by_key(|&n| degree(n)).unwrap();
-        net.node(node).position
+        let p = net.node(node).position;
+        match net.node_junction(node) {
+            Some(j) => {
+                let fp = net.junction(j).footprint;
+                let c = [
+                    fp.iter().map(|q| q[0]).sum::<f64>() / 4.0,
+                    fp.iter().map(|q| q[1]).sum::<f64>() / 4.0,
+                ];
+                vec![p, c, [(p[0] + c[0]) * 0.5, (p[1] + c[1]) * 0.5]]
+            }
+            None => vec![p],
+        }
     }
 
     #[test]
     fn the_crossing_core_is_solid_pavement() {
-        // Right at the crossing, the pavement is unbroken (no median splits the box
-        // there) — the strongest "this reads as an intersection" signal.
+        // Somewhere in the middle of the crossing the pavement is unbroken — the
+        // strongest "this reads as an intersection" signal. (A divided transition
+        // keeps real median islands, so it's the best candidate centre that must
+        // be solid, not every one.)
         for n in 0..3 {
             let (net, r) = render(n);
-            let f = r.fill_ratio(crossing_center(&net), 8.0);
+            let f = crossing_centers(&net).iter().map(|&c| r.fill_ratio(c, 8.0)).fold(0.0f64, f64::max);
             // >83%: a solid crossing box (skew crossings lose a little to acute
             // corners). Well clear of the ~72% a gappy star-fill scored.
             assert!(f > 0.83, "junction {n}: crossing core only {:.0}% paved — a real intersection box is solid pavement", f * 100.0);

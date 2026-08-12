@@ -105,6 +105,58 @@ Each item notes the fix and, where one exists, the nearby test to validate again
 
 ---
 
+## Network & intersection architecture
+
+From the 2026-08-12 geometry remodel (stage 1 landed: junction clusters carry intersection
+identity, one-way axes recentred, merge-lane topology fixed). Ideas drawn from how
+SUMO and Lanelet2 model networks; each names the machinery it builds on.
+
+- [ ] **[H] Stage 2 — junction-owned arm mouths.**
+  `Junction` (network.rs) should compute each arm's stop-line cross-section (position,
+  direction, lane span) and reconcile through-lane correspondence across the box, with
+  links plugging into mouths rather than node points. Partially started: the
+  through-alignment pass. Validate against
+  `el_camino_through_lanes_stay_laterally_continuous`.
+
+- [ ] **[H] Stage 3 — lane-boundary geometry (Lanelet2's core idea).**
+  Store each lane's left/right boundary polylines, shared between neighbours, instead of
+  centreline + `(index + 0.5)·LANE_WIDTH` offsets (`Network::lane_lateral_offset`).
+  Adjacent lanes then *cannot* misalign — the entire offset-drift bug class becomes
+  unrepresentable. Big refactor; do after stage 2 settles.
+
+- [ ] **[H] Lane-level routing graph (Lanelet2).**
+  Route over lanes with lane-change edges and costs, not links
+  (`Network::route_links` is link-level). Cars pre-position for turns blocks early,
+  fixing last-second turn-lane misses at the root — the principled superset of the
+  urgency-scaled mandatory lane change item above.
+
+- [ ] **[M] Zipper merges (SUMO's `zipper` junction type).**
+  Now that `spread_merge_feeders` makes a ramp share the curb lane at merges, add an
+  alternating-priority rule at the shared-lane merge point instead of pure gap
+  acceptance — realistic fairness at lane drops and on-ramps.
+
+- [ ] **[M] Mid-box waiting positions for permissive lefts (SUMO internal junctions).**
+  A left-turner advances into the box and waits at its conflict point, clearing on
+  yellow. Builds on interior commit + slot admission; pairs with the
+  protected-permissive left item above.
+
+- [ ] **[M] Curvature-limited interior speeds.**
+  Apply `v = √(a_lat·r)` to interior Bézier curvature the way `min_radius_ahead`
+  already limits link curves — sharp turns through boxes slow down naturally (SUMO does
+  this on internal lanes).
+
+- [ ] **[M] Queue-based mesoscopic links (SUMO meso) for the 1M+ goal.**
+  Beyond the per-car congestion LOD: uncongested links become event-driven FIFO queues
+  with capacity servers, no per-car integration. SUMO's ~10–100×; likely the only path
+  to a million vehicles. The active-set scheduler is a step in this direction.
+
+- [ ] **[L] Online flow calibrators (SUMO).**
+  Devices that nudge gateway inflows toward observed link counts *during* the run — the
+  direct lever for raising the scorecard's GEH<5 share from ~11% toward the 0.85
+  aspirational gate.
+
+---
+
 ## Do NOT destabilize (already solid)
 
 Ballistic integrator with sub-tick stop handling, the min-of-constraints longitudinal

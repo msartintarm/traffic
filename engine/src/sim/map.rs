@@ -666,15 +666,31 @@ impl OsmMap {
                     } else if let Some(t) = through_targets(&net, onward[exit_i].0, onward[exit_i].1) {
                         // A through arrival lands on the receiver's *through-marked* lanes
                         // (its `turn:lanes`), so a widening that opens a turn pocket feeds
-                        // the pocket only from turning traffic — an upstream through lane
-                        // continues onto the through lane beside it.
-                        t[(k).min(t.len() - 1)]
+                        // the pocket only from turning traffic. A sender with its own tag
+                        // maps by rank *within its through set* — its through lanes continue
+                        // onto the receiver's through lanes 1:1, and a tagged turn lane
+                        // continuing anyway (its exit is at a later node of the cluster)
+                        // holds its lateral index, landing in the receiver's matching bay
+                        // instead of swerving onto a through lane mid-box.
+                        match through_marked_lanes(&net, in_li) {
+                            Some(s) => match s.iter().position(|&x| x == k as u32) {
+                                Some(rank) => t[rank.min(t.len() - 1)],
+                                None => (k as u32).min(out.lane_count - 1),
+                            },
+                            None => t[(k).min(t.len() - 1)],
+                        }
                     } else {
                         // A lane drop maps excess lanes onto the curb (the rightmost exit lane
                         // ends and merges left — a realistic single-lane drop). The pathological
                         // *multi*-lane drop is the toll-plaza fan, which the lane-fan cap in
                         // `build` pulls down first, so it never reaches here as an 8→1 dog-pile.
-                        (k as u32).min(out.lane_count - 1)
+                        // A tagged sender's through lanes count from their *rank*, so a
+                        // pocket-flanked core narrows onto an untagged receiver from its
+                        // median edge rather than dog-piling the curb lane.
+                        let rank = through_marked_lanes(&net, in_li)
+                            .and_then(|s| s.iter().position(|&x| x == k as u32))
+                            .unwrap_or(k);
+                        (rank as u32).min(out.lane_count - 1)
                     };
                     movements.push(Movement {
                         from_lane: LaneId(lane_id),
@@ -690,6 +706,7 @@ impl OsmMap {
         net.movements = movements;
         spread_merge_feeders(&mut net);
         assign_turn_pockets(&mut net);
+        align_through_seams(&mut net);
         net.build_interiors();
 
         let plans = relocate_signals_to_junctions(&net, &self.nodes);
@@ -846,20 +863,15 @@ fn turn_lane_exits(
     Some(sets)
 }
 
-/// The receiving link's through-marked lane indices, for landing a *through*
-/// arrival (`|ang| ≤ 0.5`) on its through lanes: a receiver whose `turn:lanes`
-/// opens turn pockets keeps them for turning traffic. `None` (no tag, no
-/// through-marked lanes, or a turning arrival) keeps the plain index mapping.
-fn through_targets(net: &Network, out_li: usize, ang: f64) -> Option<Vec<u32>> {
-    if ang.abs() > 0.5 {
-        return None;
-    }
-    let spec = net.link_turn_lanes.get(out_li)?.as_str();
+/// A link's through-marked lane indices from its own `turn:lanes` tag. `None`
+/// when the tag is absent, malformed, or marks no through lane.
+fn through_marked_lanes(net: &Network, li: usize) -> Option<Vec<u32>> {
+    let spec = net.link_turn_lanes.get(li)?.as_str();
     if spec.is_empty() {
         return None;
     }
     let entries: Vec<&str> = spec.split('|').collect();
-    if entries.len() != net.links[out_li].lane_count as usize {
+    if entries.len() != net.links[li].lane_count as usize {
         return None;
     }
     let through: Vec<u32> = entries
@@ -871,6 +883,17 @@ fn through_targets(net: &Network, out_li: usize, ang: f64) -> Option<Vec<u32>> {
         .map(|(k, _)| k as u32)
         .collect();
     (!through.is_empty()).then_some(through)
+}
+
+/// The receiving link's through-marked lane indices, for landing a *through*
+/// arrival (`|ang| ≤ 0.5`) on its through lanes: a receiver whose `turn:lanes`
+/// opens turn pockets keeps them for turning traffic. `None` (no tag, no
+/// through-marked lanes, or a turning arrival) keeps the plain index mapping.
+fn through_targets(net: &Network, out_li: usize, ang: f64) -> Option<Vec<u32>> {
+    if ang.abs() > 0.5 {
+        return None;
+    }
+    through_marked_lanes(net, out_li)
 }
 
 /// Flag dedicated turn lanes as physical turn pockets. A contiguous block of
@@ -1688,6 +1711,114 @@ fn center_oneway_axes(net: &mut Network) {
             f.min(t)
         });
     }
+}
+
+/// Reconcile through-lane geometry across seams and junction boxes: where a
+/// road's through movements land laterally off the line they left (an OSM way
+/// redrawn mid-carriageway at a width change, an unmapped `turn:lanes` falling
+/// back to the symmetric shift), nudge the two link ends toward each other with
+/// tapered lateral shifts so the through path runs straight. The junction —
+/// not either link alone — is what knows both sides of the box, which makes
+/// this the geometry-owning step of the intersection-as-entity model. Bounded:
+/// sub-lane offsets always correct; up to half a carriageway corrects only when
+/// both links carry the same road name (the road itself continuing); anything
+/// larger is a genuine dogleg or a parallel service way and stays.
+fn align_through_seams(net: &mut Network) {
+    const TAPER: f64 = 40.0;
+    const NOISE_BOUND: f64 = 0.6 * LANE_WIDTH;
+    let two_way: HashSet<(u32, u32)> = net.links.iter().map(|l| (l.to.0, l.from.0)).collect();
+    let one_way = |li: u32| !two_way.contains(&(net.links[li as usize].from.0, net.links[li as usize].to.0));
+
+    // Mean lateral jog per through-joined ordered link pair, measured by
+    // extrapolating each lane line straight to the pair's midpoint — so the gap
+    // between stop line and exit mouth (and half its curvature) drops out and a
+    // collinear continuation measures zero at any distance.
+    let mut pairs: HashMap<(u32, u32), (f64, u32)> = HashMap::new();
+    for m in 0..net.movements.len() as u32 {
+        let mid = MovementId(m);
+        let mv = *net.movement(mid);
+        let (a, b) = (net.lane(mv.from_lane).link, net.lane(mv.to_lane).link);
+        if a == b || net.movement_turn(mid) != TurnType::Through || !one_way(a.0) || !one_way(b.0) {
+            continue;
+        }
+        let (da, db) = (net.arrival_dir(a), net.departure_dir(b));
+        if da[0] * db[0] + da[1] * db[1] < 0.7 {
+            continue; // an angled "through" at a Y — not a seam to straighten
+        }
+        let entry = net.lane_point(mv.from_lane, net.lane(mv.from_lane).length);
+        let exit = net.lane_point(mv.to_lane, 0.0);
+        let mid_pt = [(entry[0] + exit[0]) * 0.5, (entry[1] + exit[1]) * 0.5];
+        let project = |p: [f64; 3], d: [f64; 2]| {
+            let t = (mid_pt[0] - p[0]) * d[0] + (mid_pt[1] - p[1]) * d[1];
+            [p[0] + d[0] * t, p[1] + d[1] * t]
+        };
+        let (qa, qb) = (project(entry, da), project(exit, db));
+        let mean = [da[0] + db[0], da[1] + db[1]];
+        let n = (mean[0] * mean[0] + mean[1] * mean[1]).sqrt().max(1e-9);
+        let left = [-mean[1] / n, mean[0] / n];
+        let delta = (qb[0] - qa[0]) * left[0] + (qb[1] - qa[1]) * left[1];
+        let e = pairs.entry((a.0, b.0)).or_insert((0.0, 0));
+        e.0 += delta;
+        e.1 += 1;
+    }
+
+    // One partner per link end — the pair carrying the most through movements —
+    // so a parallel service way merging in can't drag the mainline's correction.
+    // (partner, mean delta, score); higher score wins, lower partner id on ties.
+    let mut best_out: HashMap<u32, (u32, f64, (u32, u32))> = HashMap::new();
+    let mut best_in: HashMap<u32, (u32, f64, (u32, u32))> = HashMap::new();
+    for (&(a, b), &(sum, cnt)) in &pairs {
+        let score = (cnt, net.links[a as usize].lane_count.min(net.links[b as usize].lane_count));
+        let delta = sum / cnt as f64;
+        for (map, key, partner) in [(&mut best_out, a, b), (&mut best_in, b, a)] {
+            match map.get(&key) {
+                Some(&(p, _, s)) if s > score || (s == score && p < partner) => {}
+                _ => {
+                    map.insert(key, (partner, delta, score));
+                }
+            }
+        }
+    }
+
+    let allowed = |a: u32, b: u32, delta: f64| -> bool {
+        if delta.abs() <= NOISE_BOUND {
+            return true;
+        }
+        // A named road continuing across its own box: offsets up to ~a
+        // carriageway's reach are mapping noise (a way redrawn mid-pavement at a
+        // width change stacks on the pocket skew), not a real dogleg.
+        let (na, nb) = (&net.link_names[a as usize], &net.link_names[b as usize]);
+        let wide = net.links[a as usize].lane_count.max(net.links[b as usize].lane_count) as f64 * LANE_WIDTH;
+        !na.is_empty() && na == nb && delta.abs() <= wide * 0.6
+    };
+
+    // Each seam splits its correction between the two ends, so chains of
+    // segments settle toward each other instead of one link absorbing the
+    // whole error at both of its ends.
+    let mut end_shift: HashMap<(u32, bool), f64> = HashMap::new(); // (link, at_start) → leftward shift
+    for (&b, &(a, delta, _)) in &best_in {
+        if best_out.get(&a).is_some_and(|&(bb, ..)| bb == b) && allowed(a, b, delta) {
+            end_shift.insert((a, false), delta * 0.5);
+            end_shift.insert((b, true), -delta * 0.5);
+        }
+    }
+
+    if end_shift.is_empty() {
+        return;
+    }
+    for li in 0..net.links.len() {
+        let s_start = end_shift.get(&(li as u32, true)).copied().unwrap_or(0.0);
+        let s_end = end_shift.get(&(li as u32, false)).copied().unwrap_or(0.0);
+        if s_start == 0.0 && s_end == 0.0 {
+            continue;
+        }
+        shift_polyline_left(&mut net.polylines[li], |d_start, d_end| {
+            s_start * (1.0 - d_start / TAPER).max(0.0) + s_end * (1.0 - d_end / TAPER).max(0.0)
+        });
+    }
+    // Arc lengths and box-edge headings moved a little; recompute the setbacks,
+    // drivable spans, and the end-direction cache from the settled geometry.
+    set_junction_setbacks(net);
 }
 
 fn offset_ramps_to_curb(net: &mut Network) {

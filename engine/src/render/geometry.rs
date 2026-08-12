@@ -206,6 +206,24 @@ pub fn junction_mesh(net: &Network) -> StaticMesh {
             fill_fan(&mut mesh, r.apex, &r.core, ROAD_COLOR);
         }
     }
+    // An interior link's own pavement, unclipped: the setbacks trim its drawn
+    // carriageway to a sliver, and where it bends (a divided road converging on
+    // an undivided crossing) its band can leave both the fan and the convex core
+    // — paving the real strip closes those notches with true geometry.
+    for i in 0..net.links.len() {
+        let l = net.link(LinkId(i as u32));
+        let (a, b) = (rings.cluster[l.from.idx()], rings.cluster[l.to.idx()]);
+        if a.is_none() || a != b {
+            continue;
+        }
+        let c = l.lane_count as f64 * LANE_WIDTH / 2.0;
+        for seg in net.polylines[i].windows(2) {
+            let d = norm2(sub(seg[1], seg[0]));
+            let n = [d[1] * c, -d[0] * c];
+            let mid = |p: [f64; 2]| [p[0] + n[0], p[1] + n[1]];
+            mesh.push_ribbon(mid(seg[0]), mid(seg[1]), c, ROAD_COLOR, 0.0);
+        }
+    }
     mesh
 }
 
