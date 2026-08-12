@@ -9,7 +9,7 @@
 //! node, skipping U-turns. A link carrying OSM `turn:lanes` channelizes its lanes
 //! from that tag (`turn_lane_exits`); the rest split their exits by angular slice.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::network::*;
 use super::signal::{Phase, SignalProgram};
@@ -250,13 +250,19 @@ impl OsmMap {
                 }
             }
             // Mergeable links, shortest first with a stable tie-break so the greedy is deterministic.
+            // Only sub-`INTERIOR_MAX` fragments merge here: a longer stub joining two
+            // junction nodes (a divided road's median crossing, ~16-19 m on El Camino
+            // Real) is a real piece of carriageway whose end nodes are the true
+            // crossing points — collapsing them to a centroid kinks every approach.
+            // The junction clustering in `build_junctions` already unifies such
+            // crossings for signals, box gating, and conflicts, so geometry can keep
+            // the split nodes.
             let mut cand: Vec<(f64, i64, i64)> = self
                 .links
                 .iter()
                 .filter_map(|l| {
                     let d = distance(pos[&l.from_osm], pos[&l.to_osm]);
-                    let junctions = degree(l.from_osm) >= 3 && degree(l.to_osm) >= 3;
-                    (d < INTERIOR_MAX || (d < STUB_MAX && junctions)).then_some((d, l.from_osm, l.to_osm))
+                    (d < INTERIOR_MAX).then_some((d, l.from_osm, l.to_osm))
                 })
                 .collect();
             cand.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
@@ -330,12 +336,27 @@ impl OsmMap {
         // — and thus the sim — non-reproducible run to run. Sort by the stable rep osm_id.
         nodes.sort_by_key(|n| n.osm_id);
 
+        let rep_pos: HashMap<i64, [f64; 2]> = nodes.iter().map(|n| (n.osm_id, [n.x, n.y])).collect();
         let mut links = Vec::new();
         for l in &self.links {
             let (from_osm, to_osm) = (rep_of[&l.from_osm], rep_of[&l.to_osm]);
-            if from_osm != to_osm {
-                links.push(LinkSpec { from_osm, to_osm, ..l.clone() });
+            if from_osm == to_osm {
+                continue;
             }
+            let mut geometry = l.geometry.clone();
+            // A surface link keeps its true end position as a geometry vertex when its
+            // node moves to a cluster centroid: the road runs straight to the real
+            // crossing point and only the final jag (clipped inside the junction box)
+            // reaches the merged node, instead of the whole last segment veering.
+            if RoadKind::from_osm(&l.road_class).is_surface() {
+                if distance(pos[&l.from_osm], rep_pos[&from_osm]) > 2.0 {
+                    geometry.insert(0, pos[&l.from_osm]);
+                }
+                if distance(pos[&l.to_osm], rep_pos[&to_osm]) > 2.0 {
+                    geometry.push(pos[&l.to_osm]);
+                }
+            }
+            links.push(LinkSpec { from_osm, to_osm, geometry, ..l.clone() });
         }
         OsmMap { nodes, links }
     }
@@ -520,6 +541,7 @@ impl OsmMap {
             net.link_attr_weight.push(spec.attr_weight);
         }
 
+        center_oneway_axes(&mut net);
         offset_ramps_to_curb(&mut net);
         set_junction_setbacks(&mut net);
 
@@ -1407,19 +1429,20 @@ fn join_pass_through(
 /// to the movements' crossing paths. A node's setback is half the widest
 /// carriageway meeting it; clamped so short links keep a positive drivable span.
 /// Slide each ramp's freeway end out to the curb. OSM attaches a ramp at the
-/// freeway *centreline* node, but the renderer treats a carriageway's polyline as
-/// its left (median) edge and offsets lanes rightward — so a narrow ramp sharing
-/// that node is drawn on the freeway's inner lanes instead of peeling off the
-/// outside. Shifting the ramp end laterally by the freeway's remaining width
-/// (tapered back to its own alignment over `TRANSITION` m) makes the ramp diverge
-/// from / merge onto the curb edge, matching how the lanes are wired.
+/// freeway *centreline* node, so a narrow ramp sharing that node is drawn across
+/// the freeway's middle lanes instead of peeling off the outside. Shifting the
+/// ramp end laterally by half the width difference (tapered back to its own
+/// alignment over `TRANSITION` m) makes the ramp diverge from / merge onto the
+/// curb edge, matching how the lanes are wired.
 /// Spread the feeders of a grade-separated merge across the exit link's lanes by their lateral
-/// order, so N parallel feeders — toll-booth lanes, a freeway on-ramp beside the mainline —
-/// land in N distinct lanes (left-to-right) instead of every mainline feeder independently
-/// mapping onto lane 0 (the median). That per-link `min(k, out-1)` mapping was what made the
-/// Golden Gate toll plaza's lanes all converge onto one lane. Scoped to freeway/ramp exits;
-/// surface intersections keep their turn-angle channelisation (feeders there come from different
-/// directions, where a lateral spread would be wrong).
+/// order, so N parallel feeders — toll-booth lanes — land in N distinct lanes (left-to-right)
+/// instead of every mainline feeder independently mapping onto lane 0 (the median). That
+/// per-link `min(k, out-1)` mapping was what made the Golden Gate toll plaza's lanes all
+/// converge onto one lane. On-ramp feeders are handled separately: a ramp takes a genuinely
+/// added exit lane if one exists, else it merges into (shares) its nearest mainline feeder's
+/// lane. Scoped to freeway/ramp exits; surface intersections keep their turn-angle
+/// channelisation (feeders there come from different directions, where a lateral spread would
+/// be wrong).
 fn spread_merge_feeders(net: &mut Network) {
     let mut by_exit: HashMap<u32, Vec<usize>> = HashMap::new();
     for (mi, m) in net.movements.iter().enumerate() {
@@ -1449,16 +1472,221 @@ fn spread_merge_feeders(net: &mut Network) {
             })
             .collect();
         ordered.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let f = ordered.len();
+        // The continuing carriageway (non-ramp feeders) spreads across the exit
+        // lanes; a merging on-ramp only gets a lane of its own when the exit
+        // genuinely adds one (an acceleration lane) — otherwise it shares its
+        // nearest mainline feeder's target. A ramp must never claim an exit lane
+        // exclusively by lateral accident: single-fed, that lane would read as a
+        // seamless corridor continuation and the merge would lose its yield.
+        let is_ramp = |fl: u32| net.link(net.lane(LaneId(fl)).link).kind == RoadKind::Ramp;
+        let mains: Vec<(f64, u32)> = ordered.iter().copied().filter(|&(_, fl)| !is_ramp(fl)).collect();
+        let ramps: Vec<(f64, u32)> = ordered.iter().copied().filter(|&(_, fl)| is_ramp(fl)).collect();
+        let spread = |ranked: &[(f64, u32)], lane_of: &mut HashMap<u32, u32>| {
+            let f = ranked.len();
+            for (rank, &(_, fl)) in ranked.iter().enumerate() {
+                let idx = if f == 1 {
+                    0
+                } else {
+                    ((rank as f64) * (exit.lane_count - 1) as f64 / (f - 1) as f64).round() as u32
+                };
+                lane_of.insert(fl, idx);
+            }
+        };
         let mut lane_of: HashMap<u32, u32> = HashMap::new();
-        for (rank, &(_, fl)) in ordered.iter().enumerate() {
-            let idx = ((rank as f64) * (exit.lane_count - 1) as f64 / (f - 1) as f64).round() as u32;
-            lane_of.insert(fl, idx);
+        if mains.is_empty() || ramps.is_empty() || mains.len() > exit.lane_count as usize {
+            spread(&ordered, &mut lane_of);
+        } else {
+            // The continuing carriageway lands each lane on its laterally nearest
+            // exit lane (monotone, collision-free), so the added lane a merge
+            // brings in stays open exactly where the pavement puts it.
+            let exit_proj: Vec<f64> = (0..exit.lane_count)
+                .map(|k| {
+                    let p = net.lane_point(LaneId(exit.lane_start.0 + k), 0.0);
+                    p[0] * right[0] + p[1] * right[1]
+                })
+                .collect();
+            let n = exit.lane_count as i64;
+            let mut prev: i64 = -1;
+            for (rank, &(p, fl)) in mains.iter().enumerate() {
+                let hi = n - (mains.len() - rank) as i64;
+                let idx = ((prev + 1)..=hi)
+                    .min_by(|&a, &b| (exit_proj[a as usize] - p).abs().total_cmp(&(exit_proj[b as usize] - p).abs()))
+                    .unwrap();
+                lane_of.insert(fl, idx as u32);
+                prev = idx;
+            }
+            let taken: std::collections::BTreeSet<u32> = lane_of.values().copied().collect();
+            let mut leftover: Vec<u32> = (0..exit.lane_count).filter(|k| !taken.contains(k)).collect();
+            for &(p, fl) in &ramps {
+                let target = if leftover.is_empty() {
+                    let (_, nearest) = mains
+                        .iter()
+                        .copied()
+                        .min_by(|a, b| (a.0 - p).abs().total_cmp(&(b.0 - p).abs()))
+                        .unwrap();
+                    lane_of[&nearest]
+                } else {
+                    let k = (0..leftover.len())
+                        .min_by(|&a, &b| {
+                            (exit_proj[leftover[a] as usize] - p)
+                                .abs()
+                                .total_cmp(&(exit_proj[leftover[b] as usize] - p).abs())
+                        })
+                        .unwrap();
+                    leftover.remove(k)
+                };
+                lane_of.insert(fl, target);
+            }
         }
         for &mi in &mvs {
             let fl = net.movements[mi].from_lane.0;
             net.movements[mi].to_lane = LaneId(exit.lane_start.0 + lane_of[&fl]);
         }
+    }
+}
+
+/// Whether every `;`-separated part of a `turn:lanes` token is the given kind of
+/// turn — a lane serving *only* that direction (a pocket candidate).
+fn pure_turn_token(tok: &str, kinds: &[&str]) -> bool {
+    let mut any = false;
+    for p in tok.split(';') {
+        if !kinds.contains(&p.trim()) {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
+/// Median-side (`left`) and curb-side (`right`) dedicated-turn lane counts from a
+/// link's `turn:lanes`, or `(0, 0)` when the tag is absent, doesn't match the
+/// lane count, or leaves no through core to anchor on.
+fn pocket_counts(turn_lanes: &str, lane_count: u32) -> (u32, u32) {
+    if turn_lanes.is_empty() {
+        return (0, 0);
+    }
+    let toks: Vec<&str> = turn_lanes.split('|').collect();
+    if toks.len() != lane_count as usize {
+        return (0, 0);
+    }
+    let lefts = ["left", "slight_left", "sharp_left", "reverse"];
+    let rights = ["right", "slight_right", "sharp_right"];
+    let l = toks.iter().take_while(|t| pure_turn_token(t, &lefts)).count() as u32;
+    let r = toks.iter().rev().take_while(|t| pure_turn_token(t, &rights)).count() as u32;
+    if l + r >= lane_count {
+        return (0, 0); // a pure turn roadway, not a widened approach
+    }
+    (l, r)
+}
+
+/// Laterally offset a polyline to the *left* of its travel direction, using
+/// averaged vertex normals so bends stay connected. `mag(d_start, d_end)` gives
+/// the shift at a vertex from its arc distances to the two ends, so the offset
+/// can taper where the mapped line is already correct (a divided→undivided seam).
+fn shift_polyline_left(poly: &mut [[f64; 2]], mag: impl Fn(f64, f64) -> f64) {
+    let k = poly.len();
+    if k < 2 {
+        return;
+    }
+    let seg_dir = |a: [f64; 2], b: [f64; 2]| -> [f64; 2] {
+        let d = [b[0] - a[0], b[1] - a[1]];
+        let n = (d[0] * d[0] + d[1] * d[1]).sqrt();
+        if n < 1e-9 {
+            [0.0, 0.0]
+        } else {
+            [d[0] / n, d[1] / n]
+        }
+    };
+    let dirs: Vec<[f64; 2]> = (0..k - 1).map(|i| seg_dir(poly[i], poly[i + 1])).collect();
+    let mut arc = vec![0.0f64; k];
+    for i in 1..k {
+        arc[i] = arc[i - 1] + distance(poly[i - 1], poly[i]);
+    }
+    let full = arc[k - 1];
+    let shifted: Vec<[f64; 2]> = (0..k)
+        .map(|i| {
+            let a = if i == 0 { [0.0, 0.0] } else { dirs[i - 1] };
+            let b = if i == k - 1 { [0.0, 0.0] } else { dirs[i] };
+            let sum = [a[0] + b[0], a[1] + b[1]];
+            let n = (sum[0] * sum[0] + sum[1] * sum[1]).sqrt();
+            let d = if n < 1e-9 { [1.0, 0.0] } else { [sum[0] / n, sum[1] / n] };
+            let s = mag(arc[i], full - arc[i]);
+            [poly[i][0] - d[1] * s, poly[i][1] + d[0] * s]
+        })
+        .collect();
+    poly.copy_from_slice(&shifted);
+}
+
+/// Recentre every one-way carriageway on its OSM way line. OSM draws a way down
+/// the middle of its pavement; the engine's placement convention is polyline =
+/// the carriageway's left (median) edge with lanes offset rightward — exact for
+/// the two directions of a two-way road sharing one centreline, but half a
+/// carriageway off for a one-way link (a divided arterial like El Camino Real, a
+/// freeway mainline, a ramp). Shift those polylines left by half their width so
+/// the drawn and driven lanes straddle the mapped line. `turn:lanes` skews the
+/// shift by the dedicated-turn lanes on each side, because a left-turn pocket
+/// widens the carriageway on the median side, not the curb: the through core
+/// then stays laterally continuous across the lane-count change instead of
+/// jogging a full lane width at every pocket.
+fn center_oneway_axes(net: &mut Network) {
+    /// Length over which an end-of-link shift correction blends back to the
+    /// link's own mid-block shift.
+    const TAPER: f64 = 40.0;
+    let two_way: HashSet<(u32, u32)> = net.links.iter().map(|l| (l.to.0, l.from.0)).collect();
+    let is_two_way = |li: usize| two_way.contains(&(net.links[li].from.0, net.links[li].to.0));
+    // Raw end headings, taken before any polyline moves.
+    let end_dir = |li: usize, at_from: bool| -> [f64; 2] {
+        let p = &net.polylines[li];
+        let d = if at_from {
+            [p[1][0] - p[0][0], p[1][1] - p[0][1]]
+        } else {
+            let k = p.len();
+            [p[k - 1][0] - p[k - 2][0], p[k - 1][1] - p[k - 2][1]]
+        };
+        let n = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-9);
+        [d[0] / n, d[1] / n]
+    };
+    let mut at_node: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (li, l) in net.links.iter().enumerate() {
+        at_node.entry(l.from.0).or_default().push(li);
+        at_node.entry(l.to.0).or_default().push(li);
+    }
+    // A one-way link's end continues into a two-way road when some other link at
+    // the node runs on in (roughly) the same direction and has a reverse twin.
+    // There the mapped line is already the median edge — the ways split/join at
+    // that node — so the recentring shift must fade out or it kinks the seam.
+    let seam_end = |li: usize, node: u32, own: [f64; 2]| -> bool {
+        at_node[&node].iter().any(|&lj| {
+            if lj == li || !is_two_way(lj) {
+                return false;
+            }
+            let l = net.links[lj];
+            let d = end_dir(lj, l.from.0 == node);
+            (own[0] * d[0] + own[1] * d[1]).abs() > 0.7
+        })
+    };
+    let shifts: Vec<Option<(f64, f64, f64)>> = (0..net.links.len())
+        .map(|li| {
+            let l = net.links[li];
+            if is_two_way(li) {
+                return None;
+            }
+            let (lp, rp) = pocket_counts(&net.link_turn_lanes[li], l.lane_count);
+            let s = (l.lane_count + lp - rp) as f64 * LANE_WIDTH * 0.5;
+            let s_from = if seam_end(li, l.from.0, end_dir(li, true)) { 0.0 } else { s };
+            let s_to = if seam_end(li, l.to.0, end_dir(li, false)) { 0.0 } else { s };
+            Some((s, s_from, s_to))
+        })
+        .collect();
+    for (li, sh) in shifts.into_iter().enumerate() {
+        let Some((s, s_from, s_to)) = sh else { continue };
+        shift_polyline_left(&mut net.polylines[li], |d_start, d_end| {
+            let f = s + (s_from - s) * (1.0 - d_start / TAPER).max(0.0);
+            let t = s + (s_to - s) * (1.0 - d_end / TAPER).max(0.0);
+            // Whichever end correction reaches this vertex dominates; on a short
+            // link both do, and the smaller (more corrected) shift wins.
+            f.min(t)
+        });
     }
 }
 
@@ -1496,7 +1724,10 @@ fn offset_ramps_to_curb(net: &mut Network) {
                 continue; // nothing wider to peel off from
             }
             let right = [fdir[1], -fdir[0]]; // curb side of the freeway
-            let mag = (flanes - ramp_lanes) * LANE_WIDTH;
+            // Both polylines are centred on their own carriageways (see
+            // `center_oneway_axes`), so aligning the ramp's pavement with the
+            // freeway's curb-most lanes takes half the width difference.
+            let mag = (flanes - ramp_lanes) * LANE_WIDTH / 2.0;
             let shift = [right[0] * mag, right[1] * mag];
             // Cumulative arc distance of each point from this (freeway-connected) end.
             let poly = net.polylines[li].clone();
@@ -1551,10 +1782,12 @@ fn set_junction_setbacks(net: &mut Network) {
         }
     }
     net.render_setback = box_r.clone();
+    // Approach headings sampled at the box edge, past any end-of-link jag, so the
+    // bands below (and every later consumer) see the road's real stop-line direction.
+    net.build_end_dirs();
 
     let full_len: Vec<f64> = net.polylines.iter().map(|p| p.windows(2).map(|w| distance(w[0], w[1])).sum()).collect();
     let n = net.nodes.len();
-    let pos: Vec<[f64; 2]> = net.nodes.iter().map(|nd| nd.position).collect();
 
     // Cluster nodes exactly as `build_junctions` will (short internal links between
     // intersection nodes are one junction), so an approach's stop line clears every
@@ -1612,8 +1845,9 @@ fn set_junction_setbacks(net: &mut Network) {
     }
 
     // Carriageway bands at each node: for every link end, the strip its lanes occupy —
-    // anchored at the node, along the link's local direction, `lanes · LANE_WIDTH`
-    // wide on the right of travel. `side` marks which longitudinal half-plane is the
+    // anchored at the polyline end (the pavement's median edge, wherever the axis
+    // was shifted), along the link's local direction, `lanes · LANE_WIDTH` wide on
+    // the right of travel. `side` marks which longitudinal half-plane is the
     // band's *junction* side (+1: traffic continues past the anchor into the box —
     // an arriving end; −1: the box is behind — a departing end); the street side is
     // the other half. (link, anchor, travel dir, width, layer, side).
@@ -1621,8 +1855,8 @@ fn set_junction_setbacks(net: &mut Network) {
     for (i, l) in net.links.iter().enumerate() {
         let w = l.lane_count as f64 * LANE_WIDTH;
         let lid = LinkId(i as u32);
-        bands[l.from.idx()].push((i, pos[l.from.idx()], net.departure_dir(lid), w, l.layer, -1.0));
-        bands[l.to.idx()].push((i, pos[l.to.idx()], net.arrival_dir(lid), w, l.layer, 1.0));
+        bands[l.from.idx()].push((i, net.polylines[i][0], net.departure_dir(lid), w, l.layer, -1.0));
+        bands[l.to.idx()].push((i, *net.polylines[i].last().unwrap(), net.arrival_dir(lid), w, l.layer, 1.0));
     }
 
     let setbacks: Vec<(f64, f64)> = {
@@ -1633,11 +1867,10 @@ fn set_junction_setbacks(net: &mut Network) {
         // the own band's breadth by al; corners suffice by linearity): exact for
         // straight crossings at any angle — a perpendicular road demands its full
         // width, a skew one proportionally more.
-        let clear_of = |link: usize, node: usize, away: [f64; 2], n_tr: [f64; 2], w_own: f64| -> f64 {
+        let clear_of = |link: usize, node: usize, p: [f64; 2], away: [f64; 2], n_tr: [f64; 2], w_own: f64| -> f64 {
             if !is_ix(node) {
                 return 0.0; // a bend or lane-count change crosses nothing
             }
-            let p = pos[node];
             let mut need = 0.0f64;
             for &m in &members[&root[node]] {
                 for &(bl, q, d, w, layer, side) in &bands[m] {
@@ -1687,10 +1920,10 @@ fn set_junction_setbacks(net: &mut Network) {
                 let mut r0 = box_r[fi];
                 let mut r1 = box_r[ti];
                 if !interchange[fi] {
-                    r0 = r0.max(clear_of(i, fi, dep, [dep[1], -dep[0]], w_own));
+                    r0 = r0.max(clear_of(i, fi, net.polylines[i][0], dep, [dep[1], -dep[0]], w_own));
                 }
                 if !interchange[ti] {
-                    r1 = r1.max(clear_of(i, ti, [-arr[0], -arr[1]], [arr[1], -arr[0]], w_own));
+                    r1 = r1.max(clear_of(i, ti, *net.polylines[i].last().unwrap(), [-arr[0], -arr[1]], [arr[1], -arr[0]], w_own));
                 }
                 (r0, r1)
             })
@@ -2053,8 +2286,15 @@ mod import_tests {
         for i in 0..net.links.len() {
             let link = net.link(LinkId(i as u32));
             let poly = &net.polylines[i];
-            assert_eq!(poly[0], net.node(link.from).position, "polyline starts at its link's from-node");
-            assert_eq!(*poly.last().unwrap(), net.node(link.to).position, "polyline ends at its link's to-node");
+            // A one-way link's axis is recentred on its carriageway, so its ends sit
+            // beside the node laterally — never further than the carriageway's width.
+            let near = |p: [f64; 2], nd: NodeId| {
+                let n = net.node(nd).position;
+                let w = link.lane_count as f64 * LANE_WIDTH;
+                (p[0] - n[0]).hypot(p[1] - n[1]) <= w
+            };
+            assert!(near(poly[0], link.from), "polyline starts beside its link's from-node");
+            assert!(near(*poly.last().unwrap(), link.to), "polyline ends beside its link's to-node");
         }
 
         // Names survive the transforms and land on the right links.
@@ -2996,10 +3236,16 @@ mod tests {
             links: vec![hw(1, 2, 6, 29.0), hw(2, 3, 5, 29.0), ramp(2, 4, 1, 25.0)],
         }
         .build();
-        // The freeway carriageway spans y ∈ [-6·W, 0] (median at 0, curb at -21).
-        // The ramp start began at the node (y=0) and must be pushed toward the curb.
+        // The recentred freeway carriageway spans y ∈ [-10.5, 10.5] (node on the
+        // mapped mid-carriageway line). The ramp start began near the node and must
+        // be slid into the curb-side lanes — around the curb lane's own span, well
+        // clear of the median half.
         let ramp_start = net.polylines[2][0];
-        assert!(ramp_start[1] < -10.0, "the off-ramp peels off the curb edge, start y = {}", ramp_start[1]);
+        assert!(
+            (-11.0..=-6.0).contains(&ramp_start[1]),
+            "the off-ramp peels off within the curb lane's span, start y = {}",
+            ramp_start[1]
+        );
     }
 
     #[test]

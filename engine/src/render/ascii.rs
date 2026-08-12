@@ -407,9 +407,10 @@ mod tests {
         draw_world(&w.network, &[pose], &mut a);
         println!("\nvehicle on a one-way link:\n{}", a.render());
         assert_eq!(a.count('@'), 1, "the vehicle is rasterised");
-        // Its cell neighbourhood is paved (it sits on the carriageway).
-        let paved = a.cell_at_world([pose[0], pose[1] + 2.0]) == Some('#')
-            || a.cell_at_world([pose[0], pose[1] - 2.0]) == Some('#');
+        // The cells just up/down the road from it are paved (it sits on the
+        // carriageway, which is centred on the mapped line).
+        let paved = a.cell_at_world([pose[0] + 4.0, pose[1]]) == Some('#')
+            || a.cell_at_world([pose[0] - 4.0, pose[1]]) == Some('#');
         assert!(paved, "the vehicle is on the carriageway");
     }
 

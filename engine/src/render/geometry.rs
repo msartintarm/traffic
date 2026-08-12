@@ -202,15 +202,22 @@ pub fn junction_mesh(net: &Network) -> StaticMesh {
         if r.ring.len() >= 3 {
             fill_fan(&mut mesh, r.apex, &r.ring, ROAD_COLOR);
         }
+        if r.core.len() >= 3 {
+            fill_fan(&mut mesh, r.apex, &r.core, ROAD_COLOR);
+        }
     }
     mesh
 }
 
 /// One junction cluster's paved region: the rounded boundary `ring` (fanned from
-/// `apex`).
+/// `apex`), plus — for a multi-node cluster — the solid `core` box where the
+/// streets' width bands cross. The fan alone dips back through the apex between
+/// distant arms, which can leave the far carriageway of a divided crossing
+/// unpaved; the core box fills the crossing solid, median gap included.
 struct ClusterRing {
     apex: [f64; 2],
     ring: Vec<[f64; 2]>,
+    core: Vec<[f64; 2]>,
 }
 
 /// Every cluster's boundary ring plus the node→cluster map, so both the fill and
@@ -265,14 +272,17 @@ fn junction_rings(net: &Network) -> JunctionRings {
         // obliquely). A multi-node cluster — a divided arterial or a
         // sprawling interchange whose arms stagger — can't be one convex box
         // without leaving arms or the core unpaved, so it uses the arm-mouth fan.
-        let ring = if arms[ci].len() < 2 || apex_deg[ci] == 0 {
-            Vec::new()
+        let (ring, core) = if arms[ci].len() < 2 || apex_deg[ci] == 0 {
+            (Vec::new(), Vec::new())
         } else if ccount[ci] == 1 {
-            round_corners(&junction_box(&arms[ci], c), CURB_RADIUS)
+            (round_corners(&junction_box(&arms[ci], c), CURB_RADIUS), Vec::new())
         } else {
-            round_corners(&junction_fan_ring(&arms[ci], c), CURB_RADIUS)
+            (
+                round_corners(&junction_fan_ring(&arms[ci], c), CURB_RADIUS),
+                round_corners(&junction_box(&arms[ci], c), CURB_RADIUS),
+            )
         };
-        rings.push(ClusterRing { apex: c, ring });
+        rings.push(ClusterRing { apex: c, ring, core });
     }
     JunctionRings { cluster, rings }
 }

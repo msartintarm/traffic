@@ -294,6 +294,11 @@ pub struct Network {
     /// and in minutes. Rebuilt by [`Network::build_conflict_index`] whenever conflicts
     /// change.
     conflict_pairs: std::collections::HashSet<u64>,
+    /// Cached `(departure, arrival)` unit direction per link, sampled at the
+    /// junction boundaries rather than the raw polyline ends (see
+    /// [`build_end_dirs`](Self::build_end_dirs)). Empty until built; the dir
+    /// accessors fall back to the raw end segments.
+    end_dirs: Vec<([f64; 2], [f64; 2])>,
 }
 
 fn movement_pair_key(a: MovementId, b: MovementId) -> u64 {
@@ -626,10 +631,18 @@ impl Network {
     /// then splice non-adjacent steps with short shortest-path repairs. `None`
     /// when too little of the trace lands on the network.
     pub fn resolve_route_chain(&self, pts: &[[f64; 2]]) -> Option<Vec<LinkId>> {
+        // A junction-internal link (both ends in one cluster) is never a route
+        // anchor: a trace sample inside a split intersection would otherwise snap
+        // to a perpendicular median stub and break the chain. The shortest-path
+        // repairs cover junction interiors.
+        let internal = |l: LinkId| {
+            let a = self.node_junction(self.link(l).from);
+            a.is_some() && a == self.node_junction(self.link(l).to)
+        };
         let mut raw: Vec<LinkId> = Vec::new();
         for p in pts {
             if let Some((link, _, d)) = self.nearest_surface_link(*p) {
-                if d <= 30.0 && raw.last() != Some(&link) {
+                if d <= 30.0 && !internal(link) && raw.last() != Some(&link) {
                     raw.push(link);
                 }
             }
@@ -653,7 +666,9 @@ impl Network {
                 continue;
             }
             if let Some(path) = self.route_links(cur, next) {
-                if path.len() <= 6 {
+                // Generous enough to thread the internal links of a split
+                // multi-node junction, still local enough to reject trace jumps.
+                if path.len() <= 12 {
                     chain.extend(path.into_iter().skip(1));
                     continue;
                 }
@@ -847,12 +862,25 @@ impl Network {
             if a.is_none() || a != self.node_junction(self.link(link).to) {
                 return link;
             }
+            // Follow only the *straightest* Through feeder: an internal lane can
+            // catch Through-classified landings from more than one approach, and
+            // the grouping walk must trace the geometric through-chain. A lane fed
+            // only by turns is a turn-path's continuation, not part of any
+            // approach's through-path — keying it to the turn's own approach would
+            // seat a crossing movement in that approach's signal group and evict
+            // the genuine throughs into conflicting groups. Stop and key on the
+            // internal link itself instead.
             let feeders = &feeders_of[lane.idx()];
+            let own = self.departure_dir(link);
+            let align = |p: MovementId| {
+                let d = self.arrival_dir(self.lane(self.movement(p).from_lane).link);
+                d[0] * own[0] + d[1] * own[1]
+            };
             let pred = feeders
                 .iter()
                 .copied()
-                .find(|&p| self.movement_turn(p) == TurnType::Through)
-                .or_else(|| feeders.first().copied());
+                .filter(|&p| self.movement_turn(p) == TurnType::Through)
+                .max_by(|&a, &b| align(a).total_cmp(&align(b)));
             match pred {
                 Some(p) => lane = self.movement(p).from_lane,
                 None => return link,
@@ -1200,18 +1228,47 @@ impl Network {
         [pt[0] + n[0] * off, pt[1] + n[1] * off, dir[1].atan2(dir[0])]
     }
 
-    /// Unit direction of a link's final segment (heading as it reaches its
-    /// downstream node).
+    /// Unit direction of a link as it reaches its downstream junction. Cached at
+    /// the junction boundary once [`build_end_dirs`](Self::build_end_dirs) has
+    /// run; before that, the raw final polyline segment.
     pub fn arrival_dir(&self, link: LinkId) -> [f64; 2] {
+        if let Some(d) = self.end_dirs.get(link.idx()) {
+            return d.1;
+        }
         let poly = &self.polylines[link.idx()];
         unit(sub(poly[poly.len() - 1], poly[poly.len() - 2]))
     }
 
-    /// Unit direction of a link's first segment (heading as it leaves its
-    /// upstream node).
+    /// Unit direction of a link as it leaves its upstream junction (cached like
+    /// [`arrival_dir`](Self::arrival_dir)).
     pub fn departure_dir(&self, link: LinkId) -> [f64; 2] {
+        if let Some(d) = self.end_dirs.get(link.idx()) {
+            return d.0;
+        }
         let poly = &self.polylines[link.idx()];
         unit(sub(poly[1], poly[0]))
+    }
+
+    /// Cache each link's end directions, sampled just inside the junction
+    /// boundary (at least `MIN_DIR_SAMPLE` in from the polyline end) instead of
+    /// on the raw end segment. The last few metres of an imported link can jag —
+    /// a merged node's centroid re-point, dense survey noise at a crossing — and
+    /// everything that reads an approach heading (turn classification, interior
+    /// tangents, lane fans, footprint axes, stop-line bands) wants the direction
+    /// the road actually holds at the stop line, not the jag's.
+    pub fn build_end_dirs(&mut self) {
+        const MIN_DIR_SAMPLE: f64 = 8.0;
+        self.end_dirs = (0..self.links.len())
+            .map(|i| {
+                let l = &self.links[i];
+                let poly = &self.polylines[i];
+                let full: f64 = poly.windows(2).map(|w| norm(sub(w[1], w[0]))).sum();
+                let sb = |n: NodeId| self.render_setback.get(n.idx()).copied().unwrap_or(0.0);
+                let s0 = sb(l.from).max(MIN_DIR_SAMPLE).min(full * 0.45);
+                let s1 = sb(l.to).max(MIN_DIR_SAMPLE).min(full * 0.45);
+                (point_along(poly, s0).1, point_along(poly, full - s1).1)
+            })
+            .collect();
     }
 
     /// A movement is a *free-flow interchange* when both the road it leaves and the
@@ -1466,12 +1523,23 @@ mod tests {
             let Some((m_in, m_out)) = pair else { continue };
             checked += 1;
             let mut t = 0.0;
+            let mut found = false;
             while t < 200.0 {
                 if net.movement_state(m_in, t) == SignalState::Green && net.movement_state(m_out, t) == SignalState::Green {
                     ok += 1;
+                    found = true;
                     break;
                 }
                 t += 0.5;
+            }
+            if !found {
+                let prog = |m: MovementId| net.movement(m).signal_group.map(|g| (net.groups[g.idx()].program.0, net.groups[g.idx()].bit));
+                let j = net.node_junction(net.link(li).from).unwrap();
+                eprintln!(
+                    "no joint green: link {} in junction {} ({} nodes, {} approaches): in {:?} out {:?}",
+                    li.0, j.0, net.junction(j).nodes.len(), net.junction(j).approaches.len(),
+                    prog(m_in), prog(m_out),
+                );
             }
         }
         eprintln!("internal through-paths: {ok}/{checked} reach simultaneous green");
@@ -1559,6 +1627,46 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "import")]
+    fn el_camino_through_lanes_stay_laterally_continuous() {
+        // The Millbrae regression this build's geometry passes exist for: El Camino
+        // Real's dual carriageways are one-way OSM ways whose lane counts churn
+        // 3→4→5→3 around intersections. Recentred axes + turn:lanes pocket skew
+        // must keep a through movement's exit laterally near its entry at plain
+        // lane-count seams, and the divided crossings must keep their split nodes
+        // (one junction cluster, real crossing points) instead of centroid-merging.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        let Ok(txt) = std::fs::read_to_string(path) else { return };
+        let net = OsmMap::from_json(&txt).unwrap().build();
+        let ecr = |l: LinkId| net.link_names[l.idx()].contains("El Camino");
+        let mut seam: Vec<f64> = Vec::new();
+        for m in 0..net.movements.len() as u32 {
+            let mid = MovementId(m);
+            let mv = net.movement(mid);
+            let (fl, tl) = (net.lane(mv.from_lane).link, net.lane(mv.to_lane).link);
+            if !ecr(fl) || !ecr(tl) || net.movement_turn(mid) != TurnType::Through || net.node_junction(mv.node).is_some() {
+                continue;
+            }
+            let it = net.interior(mid);
+            let d = net.arrival_dir(fl);
+            seam.push(((it.exit[0] - it.entry[0]) * d[1] - (it.exit[1] - it.entry[1]) * d[0]).abs());
+        }
+        assert!(seam.len() >= 20, "enough plain ECR seams to measure ({})", seam.len());
+        let mean = seam.iter().sum::<f64>() / seam.len() as f64;
+        let max = seam.iter().fold(0.0f64, |a, &b| a.max(b));
+        eprintln!("ECR seam through jogs: n={} mean={mean:.2} max={max:.2}", seam.len());
+        assert!(mean < 1.0, "seam through-lanes drift {mean:.2} m on average — recentring regressed");
+        assert!(max < 3.0, "worst seam through-jog {max:.2} m — a through lane jumps lanes at a seam");
+
+        let split = net
+            .junctions
+            .iter()
+            .filter(|j| j.nodes.len() >= 2 && j.approaches.iter().any(|&l| ecr(l)))
+            .count();
+        assert!(split >= 8, "ECR's divided crossings keep their split nodes, got {split} multi-node junctions");
+    }
+
+    #[test]
     fn signal_states_cover_every_group_once() {
         let net = map::corridor_with_signal();
         let states = net.signal_states(0.0);
@@ -1596,7 +1704,7 @@ mod tests {
         assert!((end[0] - (l.start_offset + l.length)).abs() < 1e-9);
         assert!(l.start_offset > 0.0 && l.length < 100.0, "setback shortens the drivable span");
         assert!((start[2]).abs() < 1e-9, "eastbound heading is 0 rad");
-        assert!(start[1] < 0.0, "right-hand lane offset is negative-y for +x travel");
+        assert!(start[1].abs() < 1e-9, "a one-way carriageway is centred on its mapped line");
     }
 
     #[test]
@@ -1609,9 +1717,10 @@ mod tests {
         .build();
         let lane = LaneId(0);
         let l = *net.lane(lane);
-        // Full arc is ~200; the drivable span is that minus the two setbacks.
-        assert!((l.start_offset + l.length - (200.0 - l.start_offset)).abs() < 1.0, "span ends a setback short of the far node");
-        let mid = net.lane_point(lane, 100.0 - l.start_offset);
+        // The drivable span is the (recentred) polyline's arc minus the two setbacks.
+        let full: f64 = net.polylines[0].windows(2).map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])).sum();
+        assert!((l.start_offset + l.length - (full - l.start_offset)).abs() < 1.0, "span ends a setback short of the far node");
+        let mid = net.lane_point(lane, full / 2.0 - l.start_offset);
         assert!((mid[0] - 100.0).abs() < 5.0 && mid[1].abs() < 5.0, "midpoint near the bend: {mid:?}");
         assert!(net.min_radius_ahead(lane, 0.0, 200.0).is_finite(), "a bend has finite radius");
     }
@@ -1656,20 +1765,21 @@ mod tests {
 
     #[test]
     fn drivable_polyline_stops_at_the_junction_boundaries() {
-        // The trimmed centreline must sit inside the node endpoints by the
+        // The trimmed centreline must sit inside the polyline ends by the
         // setback, so road fill and markings never cross into the intersection.
         let net = map::corridor_with_signal();
         for i in 0..net.links.len() {
             let link = net.link(LinkId(i as u32));
             let poly = net.drivable_polyline(LinkId(i as u32));
-            let from = net.node(link.from).position;
-            let to = net.node(link.to).position;
+            let axis = &net.polylines[i];
+            let from = axis[0];
+            let to = *axis.last().unwrap();
             let d0 = (poly[0][0] - from[0]).hypot(poly[0][1] - from[1]);
             let d1 = (poly[poly.len() - 1][0] - to[0]).hypot(poly[poly.len() - 1][1] - to[1]);
             // The drawn carriageway stops at the junction-box edge (render setback),
             // which is inside the stop line (that adds a crosswalk margin).
             assert!((d0 - net.render_setback[link.from.idx()]).abs() < 1e-6, "starts at the box edge");
-            assert!(d1 > 0.5, "ends short of the downstream node: {d1}");
+            assert!(d1 > 0.5, "ends short of the downstream end: {d1}");
             assert!(net.render_setback[link.from.idx()] < net.lane(link.lane_start).start_offset, "box edge is inside the stop line");
         }
     }
