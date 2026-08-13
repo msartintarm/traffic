@@ -69,108 +69,15 @@ fn road_ribbons(net: &Network, layer_min: i32, layer_max: i32) -> StaticMesh {
     mesh
 }
 
-/// Two intersection nodes belong to the same junction when the road between them
-/// is barely longer than the two junction boxes it spans — i.e. there's almost no
-/// open carriageway between them, so they're really one crossing (the case a
-/// divided arterial's split signal nodes fall into). Metres of open road below
-/// which the boxes are merged.
-const MERGE_GAP: f64 = 14.0;
-
-/// Distinct number of road neighbours at each node. A pass-through vertex on a
-/// two-way road has 2 (a link each way to each side counts once per neighbour);
-/// a real intersection has ≥ 3.
-fn node_neighbours(net: &Network) -> Vec<std::collections::BTreeSet<u32>> {
-    let mut nb = vec![std::collections::BTreeSet::new(); net.nodes.len()];
-    for l in &net.links {
-        if l.layer != 0 {
-            continue;
-        }
-        nb[l.from.idx()].insert(l.to.0);
-        nb[l.to.idx()].insert(l.from.0);
-    }
-    nb
-}
-
-/// Group nodes into junction *clusters*. Only true intersection nodes (≥ 3
-/// neighbours) get a cluster; adjacent ones joined by a near-zero-length link are
-/// merged into one (so a divided arterial's split crossing reads as a single
-/// intersection). Returns `(node → Some(cluster) | None, cluster_count)`.
+/// Node → junction-cluster map, straight from the network's own junction
+/// entities ([`Network::build_junctions`]) — the render draws the same
+/// intersections the movement, signal, and conflict layers run on, instead of
+/// re-deriving its own clustering.
 fn intersection_clusters(net: &Network) -> (Vec<Option<usize>>, usize) {
-    let nb = node_neighbours(net);
-    let is_ix = |n: usize| nb[n].len() >= 3;
-    let mut parent: Vec<usize> = (0..net.nodes.len()).collect();
-    fn find(parent: &mut [usize], x: usize) -> usize {
-        let mut r = x;
-        while parent[r] != r {
-            r = parent[r];
-        }
-        let mut c = x;
-        while parent[c] != r {
-            let n = parent[c];
-            parent[c] = r;
-            c = n;
-        }
-        r
-    }
-    // Merge two nodes when the open road between them is negligible and at least
-    // one end is a real intersection — this pulls the short, wide approach stubs
-    // that flare a junction (turn-lane widenings on degree-2 nodes right at the
-    // crossing) into the junction, instead of leaving them as stray wide slabs.
-    for i in 0..net.links.len() {
-        let l = net.link(LinkId(i as u32));
-        if l.layer != 0 {
-            continue;
-        }
-        let (a, b) = (l.from.idx(), l.to.idx());
-        if !is_ix(a) && !is_ix(b) {
-            continue;
-        }
-        let full: f64 = net.polylines[i].windows(2).map(|w| norm(sub(w[1], w[0]))).sum();
-        let gap = full - net.render_setback.get(a).copied().unwrap_or(0.0) - net.render_setback.get(b).copied().unwrap_or(0.0);
-        if gap < MERGE_GAP {
-            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
-            parent[ra] = rb;
-        }
-    }
-    // A component is a junction cluster iff it contains a real intersection node.
-    let mut has_ix: std::collections::HashMap<usize, bool> = std::collections::HashMap::new();
-    for n in 0..net.nodes.len() {
-        let root = find(&mut parent, n);
-        *has_ix.entry(root).or_insert(false) |= is_ix(n);
-    }
-    let mut id = vec![None; net.nodes.len()];
-    let mut map: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
-    let mut next = 0;
-    for n in 0..net.nodes.len() {
-        let root = find(&mut parent, n);
-        if has_ix[&root] {
-            let ci = *map.entry(root).or_insert_with(|| {
-                let v = next;
-                next += 1;
-                v
-            });
-            id[n] = Some(ci);
-        }
-    }
-    (id, next)
-}
-
-/// The two edge corners (median-side, then outer-side) where an approach link
-/// meets a junction box at node `end_is_to ? l.to : l.from`, taken at the box
-/// boundary (the drivable clip).
-fn arm_mouth(net: &Network, link: LinkId, end_is_to: bool) -> ([f64; 2], [f64; 2]) {
-    let l = net.link(link);
-    let dp = net.drivable_polyline(link);
-    let k = dp.len();
-    let (end, travel) = if end_is_to {
-        (dp[k - 1], norm2(sub(dp[k - 1], dp[k - 2]))) // heading into the node
-    } else {
-        (dp[0], norm2(sub(dp[0], dp[1]))) // heading back toward the node from inside
-    };
-    let right = [travel[1], -travel[0]];
-    let full = l.lane_count as f64 * LANE_WIDTH;
-    let outer = [end[0] + right[0] * full, end[1] + right[1] * full];
-    (end, outer) // median edge, outer edge
+    let id = (0..net.nodes.len())
+        .map(|n| net.node_junction(NodeId(n as u32)).map(|j| j.idx()))
+        .collect();
+    (id, net.junctions.len())
 }
 
 /// Whether each link is *interior* to a junction cluster (both ends in the same
@@ -247,57 +154,27 @@ struct JunctionRings {
 
 fn junction_rings(net: &Network) -> JunctionRings {
     let (cluster, ncl) = intersection_clusters(net);
-    let nb = node_neighbours(net);
-    let mut arms: Vec<Vec<([f64; 2], [f64; 2])>> = vec![Vec::new(); ncl];
-    // Fan apex per cluster: the busiest (highest-degree) node — the actual
-    // crossing point — not the average position, which for an asymmetric cluster
-    // can sit off to one side and thin the pavement over the real crossing.
-    let mut apex = vec![[0.0f64; 2]; ncl];
-    let mut apex_deg = vec![0usize; ncl];
-    let mut ccount = vec![0usize; ncl];
-    for n in 0..net.nodes.len() {
-        if let Some(ci) = cluster[n] {
-            ccount[ci] += 1;
-            if nb[n].len() >= apex_deg[ci] {
-                apex_deg[ci] = nb[n].len();
-                apex[ci] = net.node(NodeId(n as u32)).position;
-            }
-        }
-    }
-    for i in 0..net.links.len() as u32 {
-        let l = net.link(LinkId(i));
-        if l.layer != 0 {
-            continue;
-        }
-        let (ca, cb) = (cluster[l.from.idx()], cluster[l.to.idx()]);
-        if ca.is_some() && ca == cb {
-            continue; // interior link — absorbed by the region
-        }
-        if let Some(ci) = ca {
-            let (m, o) = arm_mouth(net, LinkId(i), false);
-            arms[ci].push((m, o));
-        }
-        if let Some(ci) = cb {
-            let (m, o) = arm_mouth(net, LinkId(i), true);
-            arms[ci].push((m, o));
-        }
-    }
     let mut rings = Vec::with_capacity(ncl);
     for ci in 0..ncl {
-        let c = apex[ci];
+        let j = net.junction(crate::sim::network::JunctionId(ci as u32));
+        // The junction owns its arm mouths; the region is built straight from
+        // them. Fan apex = the junction's centre (its busiest node — the actual
+        // crossing point, not an average that sits off to one side).
+        let arms: Vec<([f64; 2], [f64; 2])> = j.mouths.iter().map(|m| (m.anchor, m.outer)).collect();
+        let c = j.center;
         // A lone crossing gets the street-band box (the crossing streets' width
         // bands clipped against each other — a parallelogram when they meet
         // obliquely). A multi-node cluster — a divided arterial or a
         // sprawling interchange whose arms stagger — can't be one convex box
         // without leaving arms or the core unpaved, so it uses the arm-mouth fan.
-        let (ring, core) = if arms[ci].len() < 2 || apex_deg[ci] == 0 {
+        let (ring, core) = if arms.len() < 2 {
             (Vec::new(), Vec::new())
-        } else if ccount[ci] == 1 {
-            (round_corners(&junction_box(&arms[ci], c), CURB_RADIUS), Vec::new())
+        } else if j.nodes.len() == 1 {
+            (round_corners(&junction_box(&arms, c), CURB_RADIUS), Vec::new())
         } else {
             (
-                round_corners(&junction_fan_ring(&arms[ci], c), CURB_RADIUS),
-                round_corners(&junction_box(&arms[ci], c), CURB_RADIUS),
+                round_corners(&junction_fan_ring(&arms, c), CURB_RADIUS),
+                round_corners(&junction_box(&arms, c), CURB_RADIUS),
             )
         };
         rings.push(ClusterRing { apex: c, ring, core });

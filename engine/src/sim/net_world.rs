@@ -242,6 +242,10 @@ pub struct NetWorld {
     /// (curve speed ≥ its limit)? Precomputed from fixed geometry; lets the active-set
     /// scheduler's free-car path skip the per-tick curve scan on straight links.
     link_straight: Vec<bool>,
+    /// Per-movement curvature-limited interior speed (`√(a_lat·r)` over the
+    /// interior Bézier, `INFINITY` when unconstrained) — precomputed, since the
+    /// cap is read in the per-vehicle passes.
+    turn_caps: Vec<f64>,
     /// Per-lane: does this lane feed a merge point? A car here can face a moving cross-merger
     /// (`merge_conflict`) that the synthesized sleeper contexts don't see, so the free-car
     /// path excludes it (e.g. freeway mainline lanes an on-ramp merges into).
@@ -814,6 +818,10 @@ const LANE_POSITION_MIN: f64 = 40.0;
 const YELLOW_RUN_SALT: u64 = 0x59_4c_57;
 const RED_RUN_SALT: u64 = 0x52_45_44;
 const LANE_CHANGE_DURATION: f64 = 2.0;
+/// Cap on how many stacked positioning windows a multi-lane fix opens
+/// (`best_lane_change`): even a car four-plus lanes out starts at three windows,
+/// so mid-block driving isn't dominated by far-off turn preparation.
+const MAX_POSITION_WINDOWS: f64 = 3.0;
 
 /// A vehicle's decision state for the active-set scheduler. `Free` and `Frozen` are the
 /// analytically-predictable states that may sleep; `Deciding` must run the full step.
@@ -962,6 +970,27 @@ impl NetWorld {
             })
             .collect();
 
+        // Curvature-limited interior speed per movement, the same lateral-comfort
+        // law the link curve scan applies (`v = √(a_lat·r)`), from each interior
+        // Bézier's tightest radius. A hooked right onto a narrow street crawls,
+        // a sweeping channelized turn flows — instead of one flat cap per turn
+        // direction. Floored so a degenerate sliver interior can't demand a
+        // crawl, ceilinged at box speed (an intersection is never open road).
+        let turn_caps = (0..network.movements.len() as u32)
+            .map(|m| {
+                let mid = MovementId(m);
+                if network.is_interchange_movement(mid) {
+                    return f64::INFINITY;
+                }
+                let r = network.interior_min_radius(mid);
+                if r.is_finite() {
+                    (A_LAT * r).sqrt().clamp(2.5, 10.0)
+                } else {
+                    f64::INFINITY
+                }
+            })
+            .collect();
+
         // The through approach of each link: of the links feeding it, the one that
         // continues most directly — same road kind first (mainline over ramp), then
         // straightest, then widest, then lowest id for determinism.
@@ -1007,7 +1036,7 @@ impl NetWorld {
         let congestion = CongestionLod::new(network.links.len());
         Self {
             network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0, crashed_by: [0; 2], crash_log: Vec::new(),
-            merges, link_straight, merge_feeder_lane, through_next, corridor_of, corridor_offset, seam_primary, signals, link_entries, router: None, external_reroute: false,
+            merges, link_straight, turn_caps, merge_feeder_lane, through_next, corridor_of, corridor_offset, seam_primary, signals, link_entries, router: None, external_reroute: false,
             meters: Vec::new(), metering_on: false, day_secs: 0.0, pm_plan: false, rail_preempts,
             stops_by_link, bus_dwell: HashMap::new(), movement_conflicted,
             route_fingerprint: 0, route_cycle_tick: 0, parallel_routing: true, cache_sort: true, junctions,
@@ -2040,9 +2069,15 @@ impl NetWorld {
         // within positioning distance of the node. A freeway exit lane is exit-only, so a
         // through car in it must move over (possibly across an intervening exit lane) before
         // the gore; far upstream it may still use that lane, so this stays quiet there.
+        // The window scales with how many lanes remain to cross — one full window
+        // apiece — so a car three lanes from its pocket starts working over early
+        // instead of weaving everything into the last forty metres.
         let to_node = lane.length - v.position;
         let position_dist = (v.speed * LANE_POSITION_LEAD).max(LANE_POSITION_MIN);
-        let need = (to_node < position_dist).then(|| self.lanes_to_serving(v)).flatten();
+        let need = (to_node < position_dist * MAX_POSITION_WINDOWS)
+            .then(|| self.lanes_to_serving(v))
+            .flatten()
+            .filter(|d| to_node < position_dist * (d.abs() as f64).max(1.0));
 
         let mut best: Option<(f64, LaneId)> = None;
         for delta in [-1i64, 1] {
@@ -2087,7 +2122,19 @@ impl NetWorld {
             if !mandatory && to_node < position_dist && self.lane_serves_route(v, target) == Some(false) {
                 continue; // near the gore, don't drift into a lane that won't carry the route
             }
-            let params = MobilParams::new(v.driver.politeness);
+            let params = {
+                let mut p = MobilParams::new(v.driver.politeness);
+                if mandatory {
+                    // Forcing urgency mirrors gap-acceptance impatience
+                    // (`effective_critical_gap`): with the junction closing in
+                    // and lanes still to cross, the driver accepts imposing
+                    // harder braking on the new follower rather than missing
+                    // the turn.
+                    let urgency = (1.0 - to_node / position_dist).clamp(0.0, 1.0);
+                    p.safe_braking += 2.0 * urgency;
+                }
+                p
+            };
             let bias = if mandatory {
                 0.0
             } else if delta > 0 {
@@ -3288,14 +3335,10 @@ impl NetWorld {
         };
         let turn = intended
             .and_then(|mid| {
-                if self.network.is_interchange_movement(mid) {
-                    return None; // free-flow diverge/merge; the ramp curve slows it
-                }
-                match self.network.movement_turn(mid) {
-                    TurnType::Left => Some(6.0),
-                    TurnType::Right => Some(5.0),
-                    TurnType::Through => None,
-                }
+                // Interchange movements stay uncapped (the ramp curve slows them);
+                // everything else brakes toward its interior's curvature speed.
+                let cap = self.turn_speed_cap(mid);
+                cap.is_finite().then_some(cap)
             })
             .map(|speed| SpeedTarget { speed, distance: to_line.max(12.0) });
         let curve = match (geom_curve, turn) {
@@ -4021,14 +4064,7 @@ impl NetWorld {
     /// and freeway diverge/merge ramps run at road speed (the ramp's own limit
     /// and curvature slow those, not a hard crawl through the gore).
     fn turn_speed_cap(&self, mid: MovementId) -> f64 {
-        if self.network.is_interchange_movement(mid) {
-            return f64::INFINITY;
-        }
-        match self.network.movement_turn(mid) {
-            TurnType::Left => 6.0,
-            TurnType::Right => 5.0,
-            TurnType::Through => f64::INFINITY,
-        }
+        self.turn_caps[mid.idx()]
     }
 
     fn left_is_permissive(&self, mid: MovementId) -> bool {
@@ -7946,6 +7982,43 @@ mod tests {
         assert!(f.position > s.position, "and overtake the slow one: {} vs {}", f.position, s.position);
     }
 
+    #[cfg(feature = "import")]
+    #[test]
+    fn interior_speed_caps_follow_curvature() {
+        // Turn speeds derive from each interior's tightest radius (v = √(a_lat·r)),
+        // not one flat number per turn direction: a hooked turn crawls, a sweeping
+        // one flows, and every cap stays inside the box-speed band.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let net = super::super::map::OsmMap::from_json(&text).expect("map json").build();
+        let world = NetWorld::new(net, cfg());
+        let mut by_radius: Vec<(f64, f64)> = (0..world.network.movements.len() as u32)
+            .filter_map(|m| {
+                let mid = MovementId(m);
+                if world.network.is_interchange_movement(mid) {
+                    return None;
+                }
+                let cap = world.turn_speed_cap(mid);
+                let r = world.network.interior_min_radius(mid);
+                (cap.is_finite() && world.network.movement_turn(mid) != TurnType::Through).then_some((r, cap))
+            })
+            .collect();
+        assert!(by_radius.len() > 30, "enough capped turns to measure ({})", by_radius.len());
+        for &(r, cap) in &by_radius {
+            assert!((2.5..=10.0).contains(&cap), "cap {cap:.1} outside the box-speed band (r={r:.1})");
+        }
+        by_radius.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let tight = &by_radius[..by_radius.len() / 4];
+        let sweep = &by_radius[by_radius.len() * 3 / 4..];
+        let mean = |s: &[(f64, f64)]| s.iter().map(|&(_, c)| c).sum::<f64>() / s.len() as f64;
+        assert!(
+            mean(tight) + 1.0 < mean(sweep),
+            "sharp turns are slower than sweeping ones: {:.1} vs {:.1}",
+            mean(tight),
+            mean(sweep)
+        );
+    }
+
     /// A busy scenario (mixed classes, signals, multi-lane, merges, curves-capable
     /// network) plus its demand, for property/invariant regressions.
     fn busy_scenario(seed: u64) -> (NetWorld, super::super::demand::DemandGenerator) {
@@ -8159,6 +8232,50 @@ mod tests {
         assert_eq!(world.crashed(), 0, "weaving stays collision-free");
         assert_eq!(world.exited(), 1, "the car completes its left turn");
         assert_eq!(min_idx, 0, "it weaved across all lanes into the left-turn pocket");
+    }
+
+    #[test]
+    fn a_multi_lane_fix_starts_one_window_per_lane_early() {
+        // Two lanes from the turn pocket, the positioning window doubles: the car
+        // must already be in its serving lane well before the last single window
+        // — not weaving everything into the final forty metres.
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, 0.0, 0.0),
+                NodeSpec::uncontrolled(2, 600.0, 0.0),
+                NodeSpec::uncontrolled(3, 1200.0, 0.0),
+                NodeSpec::uncontrolled(4, 600.0, 300.0),
+            ],
+            links: vec![
+                LinkSpec::oneway(1, 2, 3, 15.0), // 3-lane surface approach
+                LinkSpec::oneway(2, 3, 2, 15.0), // straight exit
+                LinkSpec::oneway(2, 4, 1, 15.0), // left-turn exit (channelised to lane 0)
+            ],
+        }
+        .build();
+        let mut world = NetWorld::new(net, cfg());
+        world.install_router(&[LinkId(2)]);
+        let right_lane = LaneId(world.network.link(LinkId(0)).lane_start.0 + 2);
+        world.spawn_to_in_lane(1, right_lane, 10.0, LinkId(2), 15.0, DriverConfig { accel_noise: 0.0, ..DriverConfig::car() });
+        let mut serving_at = None;
+        for _ in 0..600 {
+            world.step();
+            if let Some(v) = world.vehicle(1) {
+                if serving_at.is_none()
+                    && !v.is_crossing()
+                    && world.network.lane(v.lane).link == LinkId(0)
+                    && world.network.lane(v.lane).index_in_link == 0
+                {
+                    serving_at = Some(world.network.lane(v.lane).length - v.position);
+                }
+            }
+        }
+        let to_node = serving_at.expect("the car reached its turn lane");
+        assert_eq!(world.exited(), 1, "the car completes its left turn");
+        assert!(
+            to_node > 150.0,
+            "two lanes out, positioning starts a window early: reached the pocket only {to_node:.0} m before the node"
+        );
     }
 
     #[test]

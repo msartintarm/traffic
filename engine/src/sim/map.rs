@@ -705,8 +705,13 @@ impl OsmMap {
         }
         net.movements = movements;
         spread_merge_feeders(&mut net);
+        untangle_parallel_movements(&mut net);
         assign_turn_pockets(&mut net);
+        retarget_pocket_landings(&mut net);
+        untangle_parallel_movements(&mut net);
         align_through_seams(&mut net);
+        net.build_lane_bounds();
+        stitch_seam_bounds(&mut net);
         net.build_interiors();
 
         let plans = relocate_signals_to_junctions(&net, &self.nodes);
@@ -894,6 +899,70 @@ fn through_targets(net: &Network, out_li: usize, ang: f64) -> Option<Vec<u32>> {
         return None;
     }
     through_marked_lanes(net, out_li)
+}
+
+/// Re-land through movements that were wired into a turn pocket. Pockets are
+/// assigned *after* movements exist, so an untagged receiver's bay lane can be
+/// holding a plain index-mapped through stream — and a bay is merged shut at
+/// the seam, so that stream would sidestep a lane width onto its neighbour's
+/// centreline (two uncoupled streams sharing one physical line). Landing it on
+/// the nearest genuine through lane instead makes the confluence an explicit,
+/// modeled merge; bay users reach the pocket the way real drivers do, by
+/// changing into it where it opens. A *tagged* turn lane continuing across a
+/// cluster into its matching bay keeps its lateral index (the stage-2 bay→bay
+/// chains); only tagged-through and untagged senders re-land.
+fn retarget_pocket_landings(net: &mut Network) {
+    let mut moves: Vec<(usize, LaneId)> = Vec::new();
+    for (mi, mv) in net.movements.iter().enumerate() {
+        let to = net.lane(mv.to_lane);
+        if to.pocket_taper <= 0.0
+            || net.lane(mv.from_lane).pocket_taper > 0.0
+            || net.movement_turn(MovementId(mi as u32)) != TurnType::Through
+        {
+            continue;
+        }
+        let from = net.lane(mv.from_lane);
+        if let Some(marked) = through_marked_lanes(net, from.link.idx()) {
+            if !marked.contains(&from.index_in_link) {
+                continue; // a tagged turn lane continuing into its matching bay
+            }
+        }
+        let link = net.link(to.link);
+        let nearest = (0..link.lane_count)
+            .filter(|&k| net.lane(LaneId(link.lane_start.0 + k)).pocket_taper <= 0.0)
+            .min_by_key(|&k| k.abs_diff(to.index_in_link));
+        if let Some(k) = nearest {
+            moves.push((mi, LaneId(link.lane_start.0 + k)));
+        }
+    }
+    for (mi, to) in moves {
+        net.movements[mi].to_lane = to;
+    }
+}
+
+/// Make each movement group between one link pair *monotone*: the movements from
+/// link A to link B, ordered by their approach lane, land on non-decreasing exit
+/// lanes. Any wiring pass can leave a crossed pair (lane 3→4 beside lane 4→3),
+/// and two side-by-side cars would then swap lanes across each other inside the
+/// box — parallel paths through a junction never cross on a real road. Keeps
+/// each group's multiset of exit lanes; only the pairing is straightened.
+fn untangle_parallel_movements(net: &mut Network) {
+    let mut groups: HashMap<(u32, u32, u32), Vec<usize>> = HashMap::new();
+    for (mi, mv) in net.movements.iter().enumerate() {
+        let key = (net.lane(mv.from_lane).link.0, net.lane(mv.to_lane).link.0, mv.node.0);
+        groups.entry(key).or_default().push(mi);
+    }
+    for members in groups.values_mut() {
+        if members.len() < 2 {
+            continue;
+        }
+        members.sort_by_key(|&mi| net.movements[mi].from_lane.0);
+        let mut tos: Vec<LaneId> = members.iter().map(|&mi| net.movements[mi].to_lane).collect();
+        tos.sort_by_key(|l| l.0);
+        for (&mi, &to) in members.iter().zip(&tos) {
+            net.movements[mi].to_lane = to;
+        }
+    }
 }
 
 /// Flag dedicated turn lanes as physical turn pockets. A contiguous block of
@@ -1723,17 +1792,16 @@ fn center_oneway_axes(net: &mut Network) {
 /// sub-lane offsets always correct; up to half a carriageway corrects only when
 /// both links carry the same road name (the road itself continuing); anything
 /// larger is a genuine dogleg or a parallel service way and stays.
-fn align_through_seams(net: &mut Network) {
-    const TAPER: f64 = 40.0;
-    const NOISE_BOUND: f64 = 0.6 * LANE_WIDTH;
+/// Mutual-primary through-seam partners: ordered one-way link pairs joined by
+/// aligned through movements where *each* end elects the other as its main
+/// continuation (most through movements, then widest carriageway, lowest id on
+/// ties) — so a parallel service way merging in can't drag the mainline. Both
+/// the axis-level seam alignment and the exact boundary stitch reconcile the
+/// same partnerships.
+fn through_seam_partners(net: &Network) -> Vec<(u32, u32, Vec<MovementId>)> {
     let two_way: HashSet<(u32, u32)> = net.links.iter().map(|l| (l.to.0, l.from.0)).collect();
     let one_way = |li: u32| !two_way.contains(&(net.links[li as usize].from.0, net.links[li as usize].to.0));
-
-    // Mean lateral jog per through-joined ordered link pair, measured by
-    // extrapolating each lane line straight to the pair's midpoint — so the gap
-    // between stop line and exit mouth (and half its curvature) drops out and a
-    // collinear continuation measures zero at any distance.
-    let mut pairs: HashMap<(u32, u32), (f64, u32)> = HashMap::new();
+    let mut pairs: HashMap<(u32, u32), Vec<MovementId>> = HashMap::new();
     for m in 0..net.movements.len() as u32 {
         let mid = MovementId(m);
         let mv = *net.movement(mid);
@@ -1745,59 +1813,81 @@ fn align_through_seams(net: &mut Network) {
         if da[0] * db[0] + da[1] * db[1] < 0.7 {
             continue; // an angled "through" at a Y — not a seam to straighten
         }
-        let entry = net.lane_point(mv.from_lane, net.lane(mv.from_lane).length);
-        let exit = net.lane_point(mv.to_lane, 0.0);
-        let mid_pt = [(entry[0] + exit[0]) * 0.5, (entry[1] + exit[1]) * 0.5];
-        let project = |p: [f64; 3], d: [f64; 2]| {
-            let t = (mid_pt[0] - p[0]) * d[0] + (mid_pt[1] - p[1]) * d[1];
-            [p[0] + d[0] * t, p[1] + d[1] * t]
-        };
-        let (qa, qb) = (project(entry, da), project(exit, db));
-        let mean = [da[0] + db[0], da[1] + db[1]];
-        let n = (mean[0] * mean[0] + mean[1] * mean[1]).sqrt().max(1e-9);
-        let left = [-mean[1] / n, mean[0] / n];
-        let delta = (qb[0] - qa[0]) * left[0] + (qb[1] - qa[1]) * left[1];
-        let e = pairs.entry((a.0, b.0)).or_insert((0.0, 0));
-        e.0 += delta;
-        e.1 += 1;
+        pairs.entry((a.0, b.0)).or_default().push(mid);
     }
-
-    // One partner per link end — the pair carrying the most through movements —
-    // so a parallel service way merging in can't drag the mainline's correction.
-    // (partner, mean delta, score); higher score wins, lower partner id on ties.
-    let mut best_out: HashMap<u32, (u32, f64, (u32, u32))> = HashMap::new();
-    let mut best_in: HashMap<u32, (u32, f64, (u32, u32))> = HashMap::new();
-    for (&(a, b), &(sum, cnt)) in &pairs {
-        let score = (cnt, net.links[a as usize].lane_count.min(net.links[b as usize].lane_count));
-        let delta = sum / cnt as f64;
+    let mut best_out: HashMap<u32, (u32, (usize, u32))> = HashMap::new();
+    let mut best_in: HashMap<u32, (u32, (usize, u32))> = HashMap::new();
+    for (&(a, b), mids) in &pairs {
+        let score = (mids.len(), net.links[a as usize].lane_count.min(net.links[b as usize].lane_count));
         for (map, key, partner) in [(&mut best_out, a, b), (&mut best_in, b, a)] {
             match map.get(&key) {
-                Some(&(p, _, s)) if s > score || (s == score && p < partner) => {}
+                Some(&(p, s)) if s > score || (s == score && p < partner) => {}
                 _ => {
-                    map.insert(key, (partner, delta, score));
+                    map.insert(key, (partner, score));
                 }
             }
         }
     }
+    let mut out: Vec<(u32, u32, Vec<MovementId>)> = best_in
+        .iter()
+        .filter(|&(&b, &(a, _))| best_out.get(&a).is_some_and(|&(bb, _)| bb == b))
+        .map(|(&b, &(a, _))| (a, b, pairs[&(a, b)].clone()))
+        .collect();
+    out.sort_by_key(|&(a, b, _)| (a, b));
+    out
+}
 
-    let allowed = |a: u32, b: u32, delta: f64| -> bool {
-        if delta.abs() <= NOISE_BOUND {
-            return true;
-        }
-        // A named road continuing across its own box: offsets up to ~a
-        // carriageway's reach are mapping noise (a way redrawn mid-pavement at a
-        // width change stacks on the pocket skew), not a real dogleg.
-        let (na, nb) = (&net.link_names[a as usize], &net.link_names[b as usize]);
-        let wide = net.links[a as usize].lane_count.max(net.links[b as usize].lane_count) as f64 * LANE_WIDTH;
-        !na.is_empty() && na == nb && delta.abs() <= wide * 0.6
+/// Whether a measured seam offset is small enough to correct: sub-noise always;
+/// up to ~a carriageway's reach when the same named road continues across its
+/// own box (a way redrawn mid-pavement at a width change stacks on the pocket
+/// skew — mapping noise, not a real dogleg).
+fn seam_shift_allowed(net: &Network, a: u32, b: u32, delta: f64) -> bool {
+    const NOISE_BOUND: f64 = 0.6 * LANE_WIDTH;
+    if delta.abs() <= NOISE_BOUND {
+        return true;
+    }
+    let (na, nb) = (&net.link_names[a as usize], &net.link_names[b as usize]);
+    let wide = net.links[a as usize].lane_count.max(net.links[b as usize].lane_count) as f64 * LANE_WIDTH;
+    !na.is_empty() && na == nb && delta.abs() <= wide * 0.6
+}
+
+/// Midpoint-extrapolated leftward jog from point `pa` (leaving along `da`) to
+/// point `pb` (continuing along `db`): each is run straight to their midpoint,
+/// so the longitudinal gap (and half its curvature) drops out and a collinear
+/// continuation measures zero at any distance.
+fn seam_jog(pa: [f64; 2], da: [f64; 2], pb: [f64; 2], db: [f64; 2]) -> f64 {
+    let mid_pt = [(pa[0] + pb[0]) * 0.5, (pa[1] + pb[1]) * 0.5];
+    let project = |p: [f64; 2], d: [f64; 2]| {
+        let t = (mid_pt[0] - p[0]) * d[0] + (mid_pt[1] - p[1]) * d[1];
+        [p[0] + d[0] * t, p[1] + d[1] * t]
     };
+    let (qa, qb) = (project(pa, da), project(pb, db));
+    let mean = [da[0] + db[0], da[1] + db[1]];
+    let n = (mean[0] * mean[0] + mean[1] * mean[1]).sqrt().max(1e-9);
+    let left = [-mean[1] / n, mean[0] / n];
+    (qb[0] - qa[0]) * left[0] + (qb[1] - qa[1]) * left[1]
+}
+
+fn align_through_seams(net: &mut Network) {
+    const TAPER: f64 = 40.0;
 
     // Each seam splits its correction between the two ends, so chains of
     // segments settle toward each other instead of one link absorbing the
     // whole error at both of its ends.
     let mut end_shift: HashMap<(u32, bool), f64> = HashMap::new(); // (link, at_start) → leftward shift
-    for (&b, &(a, delta, _)) in &best_in {
-        if best_out.get(&a).is_some_and(|&(bb, ..)| bb == b) && allowed(a, b, delta) {
+    for (a, b, mids) in through_seam_partners(net) {
+        let (da, db) = (net.arrival_dir(LinkId(a)), net.departure_dir(LinkId(b)));
+        let delta = mids
+            .iter()
+            .map(|&mid| {
+                let mv = net.movement(mid);
+                let entry = net.lane_point(mv.from_lane, net.lane(mv.from_lane).length);
+                let exit = net.lane_point(mv.to_lane, 0.0);
+                seam_jog([entry[0], entry[1]], da, [exit[0], exit[1]], db)
+            })
+            .sum::<f64>()
+            / mids.len() as f64;
+        if seam_shift_allowed(net, a, b, delta) {
             end_shift.insert((a, false), delta * 0.5);
             end_shift.insert((b, true), -delta * 0.5);
         }
@@ -1819,6 +1909,181 @@ fn align_through_seams(net: &mut Network) {
     // Arc lengths and box-edge headings moved a little; recompute the setbacks,
     // drivable spans, and the end-direction cache from the settled geometry.
     set_junction_setbacks(net);
+}
+
+/// Close every through seam *exactly*, at the boundary level. The axis pass
+/// (`align_through_seams`) reconciles carriageways in the mean; what survives it
+/// is per-lane: lanes of one seam disagreeing after a width change, corrections
+/// truncated by its bounds. Here each shared lane boundary crossing a
+/// mutual-primary seam is measured by the same midpoint extrapolation and the
+/// two ends are pulled onto each other — half each, tapered upstream — directly
+/// in the stored [`LaneBounds`]. The axis polylines stay put (arc lengths,
+/// headings, and routing are untouched); the boundary chart, which is what
+/// vehicles, markings, and mouths read, is what closes.
+fn stitch_seam_bounds(net: &mut Network) {
+    const MAX_SHIFT: f64 = 0.75 * LANE_WIDTH; // per boundary; more means "not the same lane"
+    const PINCH: f64 = 0.8 * LANE_WIDTH; // adjacent corrections disagreeing more: distrust the wiring
+
+    // (link, at downstream end, per-boundary leftward shift, shift direction).
+    let mut plan: Vec<(usize, bool, Vec<f64>, [f64; 2])> = Vec::new();
+    for (a, b, mids) in through_seam_partners(net) {
+        let (ai, bi) = (a as usize, b as usize);
+        let (na, nb) = (net.links[ai].lane_count as usize, net.links[bi].lane_count as usize);
+        let (Some(lba), Some(lbb)) = (net.lane_bounds.get(ai), net.lane_bounds.get(bi)) else { continue };
+        if lba.stations.len() < 2 || lbb.stations.len() < 2 {
+            continue;
+        }
+        let (da, db) = (net.arrival_dir(LinkId(a)), net.departure_dir(LinkId(b)));
+        let mean = {
+            let m = [da[0] + db[0], da[1] + db[1]];
+            let n = (m[0] * m[0] + m[1] * m[1]).sqrt().max(1e-9);
+            [m[0] / n, m[1] / n]
+        };
+        let left = [-mean[1], mean[0]];
+
+        // Measure against the *base* (unpocketed) cross-section at each end's
+        // stop line — the arc where the interiors attach and where the applied
+        // basis is pinned at full strength; the box-edge stations beyond it sit
+        // past a curve's last sweep and would misstate the jog the vehicles see.
+        // Base, because a closed bay collapses its boundaries onto the through
+        // edge, and pairing those points would read the bay's shape as a seam
+        // error (a rigid half-lane offset came out as ±a lane width, defeating
+        // the guards). The through anchors are the bay-free boundaries; base
+        // points respace from them at a lane width apiece. The applied shift
+        // then moves the stored chart — bay geometry and all — rigidly onto the
+        // corrected base.
+        let base_cross = |li: usize, at_end: bool| -> Vec<[f64; 2]> {
+            let l = &net.links[li];
+            let n = l.lane_count as usize;
+            let pocket = |k: usize| net.lanes[l.lane_start.idx() + k].pocket_taper > 0.0;
+            let ml = (0..n).take_while(|&k| pocket(k)).count();
+            let mr = (0..n).rev().take_while(|&k| pocket(k)).count().min(n - ml);
+            let lane = &net.lanes[l.lane_start.idx()];
+            let stop = if at_end { lane.start_offset + lane.length } else { lane.start_offset };
+            let lb = &net.lane_bounds[li];
+            let i = lb.stations.partition_point(|&x| x < stop).clamp(1, lb.stations.len() - 1);
+            let t = ((stop - lb.stations[i - 1]) / (lb.stations[i] - lb.stations[i - 1]).max(1e-9)).clamp(0.0, 1.0);
+            let sample = |k: usize| {
+                let (p, q) = (lb.bounds[k][i - 1], lb.bounds[k][i]);
+                [p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t]
+            };
+            let (lo, hi) = (sample(ml), sample(n - mr));
+            let right = {
+                let d = [hi[0] - lo[0], hi[1] - lo[1]];
+                let len = d[0].hypot(d[1]).max(1e-9);
+                [d[0] / len, d[1] / len]
+            };
+            (0..=n)
+                .map(|k| {
+                    let off = (k as f64 - ml as f64) * LANE_WIDTH;
+                    [lo[0] + right[0] * off, lo[1] + right[1] * off]
+                })
+                .collect()
+        };
+        let (base_a, base_b) = (base_cross(ai, true), base_cross(bi, false));
+
+        // Per-boundary jogs, keyed independently on each side's boundary index
+        // (the through wiring maps lane i → j, so boundaries i→j and i+1→j+1).
+        // A *cleanly* wired movement — no merge sharing its target, no fork
+        // splitting its source — is authoritative for its boundaries; merge and
+        // fork correspondences (which disagree with the core by construction)
+        // only speak where no clean movement does.
+        let (mut up, mut dn) = (vec![[(0.0, 0u32); 2]; na + 1], vec![[(0.0, 0u32); 2]; nb + 1]);
+        for &mid in &mids {
+            let mv = net.movement(mid);
+            let clean = !mids.iter().any(|&o| {
+                o != mid && (net.movement(o).to_lane == mv.to_lane || net.movement(o).from_lane == mv.from_lane)
+            });
+            let tier = if clean { 0 } else { 1 };
+            let (i, j) = (net.lane(mv.from_lane).index_in_link as usize, net.lane(mv.to_lane).index_in_link as usize);
+            for (bi_k, bj_k) in [(i, j), (i + 1, j + 1)] {
+                if bi_k > na || bj_k > nb {
+                    continue;
+                }
+                let d = seam_jog(base_a[bi_k], da, base_b[bj_k], db);
+                up[bi_k][tier] = (up[bi_k][tier].0 + d, up[bi_k][tier].1 + 1);
+                dn[bj_k][tier] = (dn[bj_k][tier].0 + d, dn[bj_k][tier].1 + 1);
+            }
+        }
+        let resolve = |acc: Vec<[(f64, u32); 2]>| -> Option<Vec<f64>> {
+            let known: Vec<Option<f64>> = acc
+                .iter()
+                .map(|&[(cs, cc), (ms, mc)]| {
+                    if cc > 0 {
+                        Some(cs / cc as f64)
+                    } else if mc > 0 {
+                        Some(ms / mc as f64)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            known.iter().any(Option::is_some).then(|| {
+                // Boundaries the wiring doesn't cover (bay edges, dropped lanes)
+                // follow their nearest stitched neighbour.
+                let nearest = |k: usize| {
+                    (0..known.len())
+                        .filter_map(|m| known[m].map(|v| (k.abs_diff(m), v)))
+                        .min_by_key(|&(dist, _)| dist)
+                        .map(|(_, v)| v)
+                        .unwrap()
+                };
+                let filled: Vec<f64> = (0..known.len()).map(|k| known[k].unwrap_or_else(|| nearest(k))).collect();
+                // The rigid part of the correction is vetted by
+                // `seam_shift_allowed` below; per-boundary *deviation* from it
+                // (lane fan-out at a width change) is capped, and wild adjacent
+                // disagreement means the wiring can't be trusted lane-by-lane —
+                // stitch rigidly then.
+                let mean = filled.iter().sum::<f64>() / filled.len() as f64;
+                if filled.windows(2).any(|w| (w[1] - w[0]).abs() > PINCH) {
+                    return vec![mean; filled.len()];
+                }
+                filled.iter().map(|&v| mean + (v - mean).clamp(-MAX_SHIFT, MAX_SHIFT)).collect()
+            })
+        };
+        let (Some(up), Some(dn)) = (resolve(up), resolve(dn)) else { continue };
+        let pair_mean = up.iter().sum::<f64>() / up.len() as f64;
+        let gated = !seam_shift_allowed(net, a, b, pair_mean);
+        if std::env::var("STITCH_DEBUG").is_ok() && (gated || pair_mean.abs() > 0.05) {
+            eprintln!(
+                "ST {a}->{b} mean={pair_mean:.2} up={:?} gated={gated} ({} / {})",
+                up.iter().map(|d| (d * 100.0).round() / 100.0).collect::<Vec<_>>(),
+                net.link_names[ai],
+                net.link_names[bi],
+            );
+        }
+        if gated {
+            continue;
+        }
+        plan.push((ai, true, up.iter().map(|d| d * 0.5).collect(), left));
+        plan.push((bi, false, dn.iter().map(|d| -d * 0.5).collect(), left));
+    }
+
+    // Each end's correction rides an affine basis over the link: full strength
+    // from its stop line out to its box edge, fading linearly to exactly zero
+    // at the *opposite* stop line. The two ends of a link therefore decouple —
+    // a link corrected at both ends shears gently between two exact values —
+    // where a taper-with-hold field made overlapping setbacks fight and
+    // oscillate on short links. Interiors attach at the stop lines, which is
+    // exactly where the basis is pinned. One pass closes every seam; a second
+    // would misread the shear this pass legitimately leaves in a merge seam's
+    // cross-section.
+    for (li, at_end, shifts, left) in plan {
+        let lane = net.lanes[net.links[li].lane_start.idx()];
+        let (stop0, stop1) = (lane.start_offset, lane.start_offset + lane.length);
+        let lb = &mut net.lane_bounds[li];
+        for si in 0..lb.stations.len() {
+            let u = ((lb.stations[si] - stop0) / (stop1 - stop0).max(1e-9)).clamp(0.0, 1.0);
+            let w = if at_end { u } else { 1.0 - u };
+            if w <= 0.0 {
+                continue;
+            }
+            for (k, &shift) in shifts.iter().enumerate() {
+                lb.bounds[k][si][0] += left[0] * shift * w;
+                lb.bounds[k][si][1] += left[1] * shift * w;
+            }
+        }
+    }
 }
 
 fn offset_ramps_to_curb(net: &mut Network) {
@@ -2594,6 +2859,149 @@ pub fn millbrae_sample() -> Network {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore] // diagnostic dump
+    #[cfg(feature = "import")]
+    fn dump_seam_residuals() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        let Ok(txt) = std::fs::read_to_string(path) else { return };
+        let net = OsmMap::from_json(&txt).unwrap().build();
+        let partners = through_seam_partners(&net);
+        println!("partners: {}", partners.len());
+        let mut residuals: Vec<(f64, u32, u32, usize)> = Vec::new();
+        for (a, b, mids) in &partners {
+            let (ai, bi) = (*a as usize, *b as usize);
+            let (lba, lbb) = (&net.lane_bounds[ai], &net.lane_bounds[bi]);
+            let (da, db) = (net.arrival_dir(LinkId(*a)), net.departure_dir(LinkId(*b)));
+            let (na, nb) = (net.links[ai].lane_count as usize, net.links[bi].lane_count as usize);
+            for &mid in mids {
+                let mv = net.movement(mid);
+                let (i, j) = (net.lane(mv.from_lane).index_in_link as usize, net.lane(mv.to_lane).index_in_link as usize);
+                for (bk, bj) in [(i, j), (i + 1, j + 1)] {
+                    if bk > na || bj > nb {
+                        continue;
+                    }
+                    let d = seam_jog(*lba.bounds[bk].last().unwrap(), da, lbb.bounds[bj][0], db);
+                    residuals.push((d.abs(), *a, *b, bk));
+                }
+            }
+        }
+        residuals.sort_by(|x, y| y.0.total_cmp(&x.0));
+        let mean = residuals.iter().map(|r| r.0).sum::<f64>() / residuals.len() as f64;
+        println!("boundary residuals: n={} mean={mean:.3}", residuals.len());
+        for (d, a, b, k) in residuals.iter().take(15) {
+            println!(
+                "  {d:.2} m  {a}->{b} boundary {k}  ({} / {})",
+                net.link_names[*a as usize], net.link_names[*b as usize]
+            );
+        }
+        // The el_camino metric's own movement set, midpoint-projected.
+        let ecr = |l: LinkId| net.link_names[l.idx()].contains("El Camino");
+        for m in 0..net.movements.len() as u32 {
+            let mid = MovementId(m);
+            let mv = net.movement(mid);
+            let (fl, tl) = (net.lane(mv.from_lane).link, net.lane(mv.to_lane).link);
+            if !ecr(fl) || !ecr(tl) || net.movement_turn(mid) != TurnType::Through || net.node_junction(mv.node).is_some() {
+                continue;
+            }
+            let it = net.interior(mid);
+            let (da, db) = (net.arrival_dir(fl), net.departure_dir(tl));
+            let jog = seam_jog(it.entry, da, it.exit, db);
+            let chord = ((it.exit[0] - it.entry[0]) * da[1] - (it.exit[1] - it.entry[1]) * da[0]).abs();
+            let stitched = partners.iter().any(|&(a, b, _)| a == fl.0 && b == tl.0);
+            println!("ECR seam {}->{} chord={chord:.2} midjog={jog:.2} stitched={stitched}", fl.0, tl.0);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "import")]
+    fn through_seams_are_stitched_shut_across_the_map() {
+        // The lane-boundary stitch's contract: wherever a one-way road continues
+        // into its mutual-primary partner, a *uniquely wired* through movement
+        // (no merge sharing its target, no bay landing) leaves one link's lane
+        // and enters the next with no lateral step — measured by midpoint
+        // extrapolation, so curvature and the junction gap drop out. This is the
+        // "misalignment is unrepresentable" guarantee over the whole real map,
+        // not just El Camino.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        let Ok(txt) = std::fs::read_to_string(path) else { return };
+        let net = OsmMap::from_json(&txt).unwrap().build();
+        let mut jogs: Vec<f64> = Vec::new();
+        for (a, b, mids) in through_seam_partners(&net) {
+            let (da, db) = (net.arrival_dir(LinkId(a)), net.departure_dir(LinkId(b)));
+            for &mid in &mids {
+                let mv = net.movement(mid);
+                let shared = mids.iter().any(|&o| o != mid && net.movement(o).to_lane == mv.to_lane);
+                if shared || net.lane(mv.to_lane).pocket_taper > 0.0 || net.lane(mv.from_lane).pocket_taper > 0.0 {
+                    continue;
+                }
+                let it = net.interior(mid);
+                jogs.push(seam_jog(it.entry, da, it.exit, db).abs());
+            }
+        }
+        jogs.sort_by(f64::total_cmp);
+        let mean = jogs.iter().sum::<f64>() / jogs.len() as f64;
+        let share = |bound: f64| jogs.iter().filter(|&&j| j < bound).count() as f64 / jogs.len() as f64;
+        eprintln!(
+            "stitched seams: n={} mean={mean:.3} <5cm={:.2} <20cm={:.2} <50cm={:.2} p95={:.2} max={:.2}",
+            jogs.len(),
+            share(0.05),
+            share(0.2),
+            share(0.5),
+            jogs[(jogs.len() * 95) / 100],
+            jogs.last().copied().unwrap_or(0.0)
+        );
+        assert!(jogs.len() >= 300, "enough uniquely-wired through seams to measure ({})", jogs.len());
+        // Not every seam may stitch — a genuine dogleg past `seam_shift_allowed`
+        // stays put by design — but the overwhelming share must close to nothing
+        // (at this writing: 81% under 5 cm, 98% under 20 cm, p95 = 0.12 m).
+        assert!(share(0.05) > 0.75, "only {:.2} of through seams are stitched shut — the boundary stitch regressed", share(0.05));
+        assert!(share(0.2) > 0.9, "only {:.2} of through seams within 20 cm — the boundary stitch regressed", share(0.2));
+    }
+
+    #[test]
+    fn through_streams_never_land_in_a_closed_bay() {
+        // A 2-lane road continues into a 3-lane approach whose flanking lanes are
+        // dedicated turn pockets (left/through/right exits channelise them). The
+        // through streams must land on the genuine through lane — a bay is merged
+        // shut at the seam, so landing there is a lane-width sidestep onto its
+        // neighbour's line — and the confluence becomes an explicit merge.
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, 0.0, 0.0),
+                NodeSpec::uncontrolled(2, 300.0, 0.0),
+                NodeSpec::uncontrolled(3, 400.0, 0.0),
+                NodeSpec::uncontrolled(4, 400.0, 200.0),  // left exit
+                NodeSpec::uncontrolled(5, 500.0, 0.0),    // through exit
+                NodeSpec::uncontrolled(6, 400.0, -200.0), // right exit
+            ],
+            links: vec![
+                LinkSpec::oneway(1, 2, 2, 15.0),
+                LinkSpec::oneway(2, 3, 3, 15.0),
+                LinkSpec::oneway(3, 4, 1, 15.0),
+                LinkSpec::oneway(3, 5, 1, 15.0),
+                LinkSpec::oneway(3, 6, 1, 15.0),
+            ],
+        }
+        .build();
+        let bay_count = net
+            .lanes_of(LinkId(1))
+            .filter(|&l| net.lane(l).pocket_taper > 0.0)
+            .count();
+        assert_eq!(bay_count, 2, "the flanking lanes are turn pockets");
+        for m in 0..net.movements.len() as u32 {
+            let mv = net.movement(MovementId(m));
+            let (fl, tl) = (net.lane(mv.from_lane).link, net.lane(mv.to_lane).link);
+            if fl == LinkId(0) && tl == LinkId(1) {
+                assert_eq!(
+                    net.lane(mv.to_lane).pocket_taper,
+                    0.0,
+                    "a through stream lands on the through lane, not a closed bay"
+                );
+            }
+        }
+    }
 
     #[test]
     fn signalized_corridor_is_coordinated_into_a_green_wave() {

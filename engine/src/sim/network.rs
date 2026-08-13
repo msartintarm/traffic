@@ -221,6 +221,21 @@ pub struct ConflictPoint {
     pub sb: f64,
 }
 
+/// Where one external arm plugs into a junction: the cross-section of the
+/// carriageway at the box boundary. `anchor` is the median-edge corner, `outer`
+/// the curb-edge corner (`lane_count · LANE_WIDTH` to the right of travel), and
+/// `dir` the travel direction there — arrival for an inbound arm, departure for
+/// an outbound one. The junction owns these; renderers and geometry passes read
+/// them instead of re-deriving arm ends from node positions.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mouth {
+    pub link: LinkId,
+    pub inbound: bool,
+    pub anchor: [f64; 2],
+    pub outer: [f64; 2],
+    pub dir: [f64; 2],
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Junction {
     pub nodes: Vec<NodeId>,
@@ -228,7 +243,25 @@ pub struct Junction {
     pub footprint: [[f64; 2]; 4],
     pub approaches: Vec<LinkId>,
     pub exits: Vec<LinkId>,
+    /// One mouth per external arm (every approach and exit), in arm order.
+    pub mouths: Vec<Mouth>,
     pub program: Option<ProgramId>,
+}
+
+/// Lanelet2-style lane geometry for one link: shared boundary polylines instead
+/// of centreline-plus-offset. `stations` are arc-lengths along the link polyline
+/// covering the drivable span (box edge to box edge); `bounds[k]` is boundary
+/// `k`'s world point at each station — boundary 0 the median edge, boundary
+/// `lane_count` the curb edge, lane `k` the strip between `bounds[k]` and
+/// `bounds[k+1]`. Neighbouring lanes *share* one boundary polyline, so they
+/// cannot drift apart, and the seam stitch moves a boundary once for both its
+/// lanes. Turn-pocket bays live here as edge geometry: the bay-side boundaries
+/// converge onto the through edge upstream of the bay, so the median (or curb)
+/// line tapers open the way a painted bay does.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LaneBounds {
+    pub stations: Vec<f64>,
+    pub bounds: Vec<Vec<[f64; 2]>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -299,6 +332,11 @@ pub struct Network {
     /// [`build_end_dirs`](Self::build_end_dirs)). Empty until built; the dir
     /// accessors fall back to the raw end segments.
     end_dirs: Vec<([f64; 2], [f64; 2])>,
+    /// Shared lane-boundary polylines per link (index-aligned with `links`; see
+    /// [`LaneBounds`]). Empty until [`build_lane_bounds`](Self::build_lane_bounds)
+    /// runs; vehicle placement, dividers, strips, and mouths fall back to the
+    /// centreline-offset model until then.
+    pub lane_bounds: Vec<LaneBounds>,
 }
 
 fn movement_pair_key(a: MovementId, b: MovementId) -> u64 {
@@ -732,6 +770,37 @@ impl Network {
         [p[0], p[1], d[1].atan2(d[0])]
     }
 
+    /// Smallest turn radius (m) along a movement's interior Bézier — analytic
+    /// curvature `|B'×B''| / |B'|³` sampled across the curve, `INFINITY` for a
+    /// straight path. What a curve-speed limit through the box reads, the way
+    /// [`min_radius_ahead`](Self::min_radius_ahead) serves link curves.
+    pub fn interior_min_radius(&self, mid: MovementId) -> f64 {
+        let it = self.interior(mid);
+        let (p0, p1, p2, p3) = (it.entry, it.c1, it.c2, it.exit);
+        let mut best = f64::INFINITY;
+        for i in 0..=16 {
+            let t = i as f64 / 16.0;
+            let u = 1.0 - t;
+            let d1 = [
+                3.0 * (u * u * (p1[0] - p0[0]) + 2.0 * u * t * (p2[0] - p1[0]) + t * t * (p3[0] - p2[0])),
+                3.0 * (u * u * (p1[1] - p0[1]) + 2.0 * u * t * (p2[1] - p1[1]) + t * t * (p3[1] - p2[1])),
+            ];
+            let d2 = [
+                6.0 * (u * (p2[0] - 2.0 * p1[0] + p0[0]) + t * (p3[0] - 2.0 * p2[0] + p1[0])),
+                6.0 * (u * (p2[1] - 2.0 * p1[1] + p0[1]) + t * (p3[1] - 2.0 * p2[1] + p1[1])),
+            ];
+            let speed2 = d1[0] * d1[0] + d1[1] * d1[1];
+            if speed2 < 1e-6 {
+                continue;
+            }
+            let cross = (d1[0] * d2[1] - d1[1] * d2[0]).abs();
+            if cross > 1e-9 {
+                best = best.min(speed2.powf(1.5) / cross);
+            }
+        }
+        best
+    }
+
     /// Compute each movement's interior path and all cross-movement conflict
     /// points. Called once at build time; `interiors` is index-aligned with
     /// `movements`. Two movements conflict when they arrive from different links,
@@ -760,10 +829,29 @@ impl Network {
                 }
                 // Control handles lie along the arrival and departure road
                 // directions, a third of the chord out, so the path leaves and
-                // arrives tangent to each road (straight when collinear).
+                // arrives tangent to each road (straight when collinear). At a
+                // genuine corner the handles are clamped to the tangent
+                // intersection: the Bézier hull then stays inside the triangle
+                // (entry, corner, exit), so a right turn hugs its curb return
+                // instead of swinging metres outside the box when the two stop
+                // lines sit far apart.
                 let k = norm(sub(exit, entry)) / 3.0;
-                let c1 = [entry[0] + arr[0] * k, entry[1] + arr[1] * k];
-                let c2 = [exit[0] - dep[0] * k, exit[1] - dep[1] * k];
+                let (mut k1, mut k2) = (k, k);
+                let cross = arr[0] * dep[1] - arr[1] * dep[0];
+                if cross.abs() > 0.05 {
+                    let d = sub(exit, entry);
+                    let t = (d[0] * dep[1] - d[1] * dep[0]) / cross;
+                    let s = (arr[0] * d[1] - arr[1] * d[0]) / cross;
+                    if t > 0.0 && s > 0.0 {
+                        // Floored so a degenerate corner (a stop line nearly on
+                        // the tangent crossing) can't collapse a handle to zero
+                        // and rotate the end tangency off its road.
+                        k1 = (t * 0.85).clamp(k * 0.45, k);
+                        k2 = (s * 0.85).clamp(k * 0.45, k);
+                    }
+                }
+                let c1 = [entry[0] + arr[0] * k1, entry[1] + arr[1] * k1];
+                let c2 = [exit[0] - dep[0] * k2, exit[1] - dep[1] * k2];
                 let mut it = Interior { entry, c1, c2, exit, len: 0.0 };
                 it.len = interior_polyline(&it).last().map_or(0.0, |&(_, s)| s);
                 it
@@ -912,6 +1000,12 @@ impl Network {
 
     fn arm_mouth(&self, link: LinkId, end_is_to: bool) -> ([f64; 2], [f64; 2]) {
         let l = self.link(link);
+        if let Some(lb) = self.link_bounds(link) {
+            // The mouth *is* the boundary chart's end cross-section: median and
+            // curb boundary endpoints, stitched corrections included.
+            let si = if end_is_to { lb.stations.len() - 1 } else { 0 };
+            return (lb.bounds[0][si], lb.bounds[l.lane_count as usize][si]);
+        }
         let dp = self.drivable_polyline(link);
         let k = dp.len();
         if k < 2 {
@@ -1028,6 +1122,7 @@ impl Network {
                 }
             }
         }
+        let mut mouths: Vec<Vec<Mouth>> = vec![Vec::new(); ncl];
         for i in 0..self.links.len() as u32 {
             let l = self.link(LinkId(i));
             if l.layer != 0 {
@@ -1043,19 +1138,23 @@ impl Network {
             if let Some(ci) = cb {
                 approaches[ci].push(LinkId(i));
                 let (m, o) = self.arm_mouth(LinkId(i), true);
+                let dir = self.arrival_dir(LinkId(i));
+                mouths[ci].push(Mouth { link: LinkId(i), inbound: true, anchor: m, outer: o, dir });
                 if near_member(m, ci) < FOOTPRINT_RADIUS {
                     arm_pts[ci].push(m);
                     arm_pts[ci].push(o);
-                    arm_dirs[ci].push((self.arrival_dir(LinkId(i)), l.lane_count as f64));
+                    arm_dirs[ci].push((dir, l.lane_count as f64));
                 }
             }
             if let Some(ci) = ca {
                 exits[ci].push(LinkId(i));
                 let (m, o) = self.arm_mouth(LinkId(i), false);
+                let dir = self.departure_dir(LinkId(i));
+                mouths[ci].push(Mouth { link: LinkId(i), inbound: false, anchor: m, outer: o, dir });
                 if near_member(m, ci) < FOOTPRINT_RADIUS {
                     arm_pts[ci].push(m);
                     arm_pts[ci].push(o);
-                    arm_dirs[ci].push((self.departure_dir(LinkId(i)), l.lane_count as f64));
+                    arm_dirs[ci].push((dir, l.lane_count as f64));
                 }
             }
         }
@@ -1087,6 +1186,7 @@ impl Network {
                     footprint,
                     approaches: std::mem::take(&mut approaches[ci]),
                     exits: std::mem::take(&mut exits[ci]),
+                    mouths: std::mem::take(&mut mouths[ci]),
                     program: program[ci],
                 }
             })
@@ -1218,12 +1318,35 @@ impl Network {
 
     /// World `[x, y, heading]` of a point `position` metres along `lane`,
     /// laterally offset for the lane's index. Pure geometry the renderer uses to
-    /// place vehicle instances.
+    /// place vehicle instances. Once [`build_lane_bounds`](Self::build_lane_bounds)
+    /// has run, the scalar offset is read *through the boundary chart*: the
+    /// offset picks which pair of stored boundary polylines brackets the point
+    /// and interpolates between them — so wherever a boundary was stitched or a
+    /// bay tapers, every lane and every vehicle follows the same shared line.
+    /// Before that (hand-built test networks), the raw centreline-offset model.
     pub fn lane_point(&self, lane: LaneId, position: f64) -> [f64; 3] {
         let l = self.lane(lane);
+        let pos = position.clamp(0.0, l.length);
+        let off = self.lane_lateral_offset(l, pos);
+        if let Some(lb) = self.link_bounds(l.link) {
+            let n = self.link(l.link).lane_count as usize;
+            let s = l.start_offset + pos;
+            let i = lb.stations.partition_point(|&x| x < s).clamp(1, lb.stations.len() - 1);
+            let (sa, sb) = (lb.stations[i - 1], lb.stations[i]);
+            let t = (s - sa) / (sb - sa).max(1e-9);
+            let f = (off / LANE_WIDTH).clamp(0.0, n as f64);
+            let j = (f as usize).min(n - 1);
+            let frac = f - j as f64;
+            let at = |si: usize| {
+                let (a, b) = (lb.bounds[j][si], lb.bounds[j + 1][si]);
+                [a[0] + (b[0] - a[0]) * frac, a[1] + (b[1] - a[1]) * frac]
+            };
+            let (pa, pb) = (at(i - 1), at(i));
+            let d = unit(sub(pb, pa));
+            return [pa[0] + (pb[0] - pa[0]) * t, pa[1] + (pb[1] - pa[1]) * t, d[1].atan2(d[0])];
+        }
         let poly = &self.polylines[l.link.idx()];
-        let (pt, dir) = point_along(poly, l.start_offset + position.clamp(0.0, l.length));
-        let off = self.lane_lateral_offset(l, position.clamp(0.0, l.length));
+        let (pt, dir) = point_along(poly, l.start_offset + pos);
         let n = [dir[1], -dir[0]]; // right-hand normal
         [pt[0] + n[0] * off, pt[1] + n[1] * off, dir[1].atan2(dir[0])]
     }
@@ -1269,6 +1392,125 @@ impl Network {
                 (point_along(poly, s0).1, point_along(poly, full - s1).1)
             })
             .collect();
+    }
+
+    /// Build the shared lane-boundary polylines ([`LaneBounds`]) for every link
+    /// from the settled axis, setbacks, and turn pockets. Stations cover the
+    /// drivable span: its ends, every axis vertex inside it, and a fine
+    /// subdivision across any pocket-bay taper so the converging edge is a curve
+    /// rather than one long chord. Vertices offset along averaged (mitred)
+    /// normals, so a lane line bends smoothly at an axis bend instead of
+    /// stepping sideways.
+    pub fn build_lane_bounds(&mut self) {
+        const BAY_STEP: f64 = 2.0;
+        self.lane_bounds = (0..self.links.len())
+            .map(|i| {
+                let l = self.links[i];
+                let poly = &self.polylines[i];
+                if poly.len() < 2 {
+                    return LaneBounds::default();
+                }
+                let mut arcs = vec![0.0f64; poly.len()];
+                for j in 1..poly.len() {
+                    arcs[j] = arcs[j - 1] + norm(sub(poly[j], poly[j - 1]));
+                }
+                let full = arcs[poly.len() - 1];
+                let n = l.lane_count as usize;
+                let lane = |k: usize| &self.lanes[l.lane_start.idx() + k];
+                // Cover the drivable render span *and* the lane span: a sliver
+                // link squeezed by its setbacks can have its stop lines outside
+                // the box-edge clip (the setback rescale), and every consumer —
+                // vehicle placement, seam measurement, interiors — must sample
+                // the chart there, never extrapolate off a kinked half-metre.
+                let (l0, l1) = (lane(0).start_offset, lane(0).start_offset + lane(0).length);
+                let s0 = self.render_setback.get(l.from.idx()).copied().unwrap_or(0.0).min(l0).max(0.0);
+                let s1 = (full - self.render_setback.get(l.to.idx()).copied().unwrap_or(0.0)).max(l1).max(s0 + 0.5).min(full);
+                // Edge bay blocks: consecutive pocket lanes from the median
+                // (left bay) and from the curb (right bay); their boundaries
+                // collapse onto the adjacent through edge when the bay closes.
+                let ml = (0..n).take_while(|&k| lane(k).pocket_taper > 0.0).count();
+                let mr = (0..n).rev().take_while(|&k| lane(k).pocket_taper > 0.0).count().min(n - ml);
+                let taper_l = (0..ml).map(|k| lane(k).pocket_taper).fold(0.0f64, f64::max);
+                let taper_r = (n - mr..n).map(|k| lane(k).pocket_taper).fold(0.0f64, f64::max);
+                let stop = lane(0).start_offset + lane(0).length;
+
+                let mut stations = vec![s0, s1];
+                stations.extend(arcs.iter().copied().filter(|&a| a > s0 + 1e-6 && a < s1 - 1e-6));
+                let taper_max = taper_l.max(taper_r);
+                if taper_max > 0.0 {
+                    let (za, zb) = ((stop - POCKET_OPEN - taper_max).max(s0), (stop - POCKET_OPEN).min(s1));
+                    let mut s = za;
+                    while s < zb {
+                        stations.push(s);
+                        s += BAY_STEP;
+                    }
+                    stations.push(zb);
+                }
+                stations.sort_by(|a, b| a.total_cmp(b));
+                stations.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+
+                // Point and mitred right-hand normal at each station.
+                let seg_dir = |j: usize| unit(sub(poly[j + 1], poly[j]));
+                let geom: Vec<([f64; 2], [f64; 2])> = stations
+                    .iter()
+                    .map(|&s| {
+                        let j = arcs[..poly.len() - 1].partition_point(|&a| a <= s + 1e-9).saturating_sub(1);
+                        let t = ((s - arcs[j]) / (arcs[j + 1] - arcs[j]).max(1e-9)).clamp(0.0, 1.0);
+                        let pt = [
+                            poly[j][0] + (poly[j + 1][0] - poly[j][0]) * t,
+                            poly[j][1] + (poly[j + 1][1] - poly[j][1]) * t,
+                        ];
+                        let at_vertex = (s - arcs[j]).abs() < 1e-6 && j > 0;
+                        let d = if at_vertex {
+                            unit([seg_dir(j - 1)[0] + seg_dir(j)[0], seg_dir(j - 1)[1] + seg_dir(j)[1]])
+                        } else {
+                            seg_dir(j)
+                        };
+                        (pt, [d[1], -d[0]])
+                    })
+                    .collect();
+
+                // The bay-open fraction at a station: 1 at the stop line, 0 once
+                // the bay has merged into its through lane upstream.
+                let open = |s: f64, taper: f64| -> f64 {
+                    let to_line = stop - s;
+                    if to_line <= POCKET_OPEN {
+                        1.0
+                    } else if to_line >= POCKET_OPEN + taper {
+                        0.0
+                    } else {
+                        (POCKET_OPEN + taper - to_line) / taper
+                    }
+                };
+                let bounds = (0..=n)
+                    .map(|k| {
+                        stations
+                            .iter()
+                            .zip(&geom)
+                            .map(|(&s, &(pt, right))| {
+                                let base = k as f64 * LANE_WIDTH;
+                                let off = if k < ml {
+                                    let closed = ml as f64 * LANE_WIDTH;
+                                    closed + (base - closed) * open(s, taper_l)
+                                } else if k > n - mr {
+                                    let closed = (n - mr) as f64 * LANE_WIDTH;
+                                    closed + (base - closed) * open(s, taper_r)
+                                } else {
+                                    base
+                                };
+                                [pt[0] + right[0] * off, pt[1] + right[1] * off]
+                            })
+                            .collect()
+                    })
+                    .collect();
+                LaneBounds { stations, bounds }
+            })
+            .collect();
+    }
+
+    /// The stored boundary chart for a link, when built and usable.
+    fn link_bounds(&self, link: LinkId) -> Option<&LaneBounds> {
+        self.lane_bounds.get(link.idx()).filter(|lb| lb.stations.len() >= 2)
     }
 
     /// A movement is a *free-flow interchange* when both the road it leaves and the
@@ -1369,10 +1611,28 @@ impl Network {
     }
 
     /// Filled carriageway quads `[cx0, cy0, cx1, cy1, width]`, one per polyline
-    /// segment of each link (curved roads become several quads).
+    /// segment of each link (curved roads become several quads). With lane
+    /// bounds built, each quad spans the median and curb boundaries — so the
+    /// carriageway (and the edge lines painted on it) follows a pocket bay's
+    /// taper and any stitched seam correction.
     pub fn road_strips(&self) -> Vec<[f64; 5]> {
         let mut out = Vec::new();
         for i in 0..self.links.len() {
+            if let Some(lb) = self.link_bounds(LinkId(i as u32)) {
+                let n = self.links[i].lane_count as usize;
+                for si in 1..lb.stations.len() {
+                    let (m0, c0) = (lb.bounds[0][si - 1], lb.bounds[n][si - 1]);
+                    let (m1, c1) = (lb.bounds[0][si], lb.bounds[n][si]);
+                    let w = (norm(sub(c0, m0)) + norm(sub(c1, m1))) * 0.5;
+                    if w < 1e-6 {
+                        continue;
+                    }
+                    let mid = |a: [f64; 2], b: [f64; 2]| [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
+                    let (a, b) = (mid(m0, c0), mid(m1, c1));
+                    out.push([a[0], a[1], b[0], b[1], w]);
+                }
+                continue;
+            }
             let w = self.links[i].lane_count as f64 * LANE_WIDTH;
             let c = w / 2.0;
             for seg in self.drivable_polyline(LinkId(i as u32)).windows(2) {
@@ -1384,15 +1644,34 @@ impl Network {
         out
     }
 
-    /// Interior lane-divider segments `[x0, y0, x1, y1]`, per polyline segment. A
-    /// divider tracks the boundary between its two lanes; where a turn pocket
-    /// widens an approach the adjacent boundary tapers (the bay-taper line),
-    /// sampled finely so the marking follows the opening bay.
+    /// Interior lane-divider segments `[x0, y0, x1, y1]`. With lane bounds built
+    /// these are the shared boundary polylines themselves — a bay's tapering
+    /// edge included — minus any stretch where a boundary has collapsed onto the
+    /// carriageway edge (a closed bay), which the edge line already draws.
     pub fn lane_dividers(&self) -> Vec<[f64; 4]> {
         let mut out = Vec::new();
         for i in 0..self.links.len() {
             let link = self.links[i];
             let lanes = link.lane_count;
+            if let Some(lb) = self.link_bounds(LinkId(i as u32)) {
+                let n = lanes as usize;
+                for k in 1..n {
+                    for si in 1..lb.stations.len() {
+                        let (a, b) = (lb.bounds[k][si - 1], lb.bounds[k][si]);
+                        let on_edge = |p: [f64; 2], q: [f64; 2]| norm(sub(p, q)) < 0.3;
+                        if on_edge(a, lb.bounds[0][si - 1]) && on_edge(b, lb.bounds[0][si]) {
+                            continue;
+                        }
+                        if on_edge(a, lb.bounds[n][si - 1]) && on_edge(b, lb.bounds[n][si]) {
+                            continue;
+                        }
+                        if norm(sub(a, b)) > 1e-6 {
+                            out.push([a[0], a[1], b[0], b[1]]);
+                        }
+                    }
+                }
+                continue;
+            }
             let taper = |k: u32| self.lane(LaneId(link.lane_start.0 + k)).pocket_taper;
             let has_pocket = (0..lanes).any(|k| taper(k) > 0.0);
             let poly = self.drivable_polyline(LinkId(i as u32));
@@ -1628,6 +1907,87 @@ mod tests {
 
     #[test]
     #[cfg(feature = "import")]
+    fn junction_interiors_hug_their_corners_and_never_swap_lanes() {
+        // Two geometric guarantees of the stage-3 remodel, on the real map:
+        // a cornered turn's interior stays inside its tangent triangle (entry,
+        // tangent crossing, exit) — it hugs the curb return instead of swinging
+        // outside the box — and parallel movements between one link pair land in
+        // lateral order, so side-by-side cars never swap lanes across each other
+        // mid-box. (One floored degenerate corner and one sliver-link dual-left
+        // are tolerated.)
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
+        let Ok(txt) = std::fs::read_to_string(path) else { return };
+        let net = OsmMap::from_json(&txt).unwrap().build();
+
+        let (mut checked, mut bulged) = (0, 0);
+        let mut deepest = 0.0f64;
+        for m in 0..net.movements.len() as u32 {
+            let mid = MovementId(m);
+            let mv = net.movement(mid);
+            if net.node_junction(mv.node).is_none() || net.movement_turn(mid) == TurnType::Through {
+                continue;
+            }
+            let it = net.interior(mid);
+            let (fl, tl) = (net.lane(mv.from_lane).link, net.lane(mv.to_lane).link);
+            let (arr, dep) = (net.arrival_dir(fl), net.departure_dir(tl));
+            let cross = arr[0] * dep[1] - arr[1] * dep[0];
+            if cross.abs() < 0.05 {
+                continue;
+            }
+            let d = sub(it.exit, it.entry);
+            let t = (d[0] * dep[1] - d[1] * dep[0]) / cross;
+            let s = (arr[0] * d[1] - arr[1] * d[0]) / cross;
+            if t <= 0.0 || s <= 0.0 {
+                continue;
+            }
+            checked += 1;
+            let c = [it.entry[0] + arr[0] * t, it.entry[1] + arr[1] * t];
+            let tri = [it.entry, c, it.exit];
+            let mut worst = 0.0f64;
+            for i in 0..=16 {
+                let p = net.interior_point(mid, it.len * i as f64 / 16.0);
+                let mut outside = f64::MIN;
+                for k in 0..3 {
+                    let (a, b) = (tri[k], tri[(k + 1) % 3]);
+                    let e = sub(b, a);
+                    let sd = ((p[0] - a[0]) * e[1] - (p[1] - a[1]) * e[0]) / norm(e).max(1e-9);
+                    outside = outside.max(if cross > 0.0 { sd } else { -sd });
+                }
+                worst = worst.max(outside);
+            }
+            if worst > 0.5 {
+                bulged += 1;
+            }
+            deepest = deepest.max(worst);
+        }
+        eprintln!("cornered turns: {checked} checked, {bulged} bulge > 0.5 m, deepest {deepest:.2} m");
+        assert!(checked > 1000, "enough cornered turns to exercise ({checked})");
+        // The 0.45·k tangency floor lets a degenerate corner poke out by a
+        // sub-metre sliver; what the clamp must guarantee is that no turn takes
+        // the multi-metre swing across neighbouring lanes it used to.
+        assert!(bulged <= 8, "{bulged} turn interiors swing outside their tangent triangle");
+        assert!(deepest < 1.2, "a turn interior bulges {deepest:.2} m outside its tangent triangle");
+
+        let mut groups: std::collections::HashMap<(u32, u32, u32), Vec<(u32, u32)>> = Default::default();
+        for mv in &net.movements {
+            let key = (net.lane(mv.from_lane).link.0, net.lane(mv.to_lane).link.0, mv.node.0);
+            groups.entry(key).or_default().push((mv.from_lane.0, mv.to_lane.0));
+        }
+        for (key, mut g) in groups {
+            g.sort();
+            for w in g.windows(2) {
+                assert!(
+                    w[1].1 >= w[0].1,
+                    "movements {key:?} pair out of lateral order: {:?} then {:?}",
+                    w[0],
+                    w[1],
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "import")]
     fn el_camino_through_lanes_stay_laterally_continuous() {
         // The Millbrae regression this build's geometry passes exist for: El Camino
         // Real's dual carriageways are one-way OSM ways whose lane counts churn
@@ -1647,6 +2007,14 @@ mod tests {
             if !ecr(fl) || !ecr(tl) || net.movement_turn(mid) != TurnType::Through || net.node_junction(mv.node).is_some() {
                 continue;
             }
+            // A movement landing in a turn pocket isn't a through-lane
+            // continuation: the bay is deliberately merged into its neighbour at
+            // the seam (the car rides the through lane until the bay opens), so
+            // its designed lane-width offset would drown the drift this metric
+            // guards against.
+            if net.lane(mv.to_lane).pocket_taper > 0.0 {
+                continue;
+            }
             let it = net.interior(mid);
             let d = net.arrival_dir(fl);
             seam.push(((it.exit[0] - it.entry[0]) * d[1] - (it.exit[1] - it.entry[1]) * d[0]).abs());
@@ -1655,8 +2023,8 @@ mod tests {
         let mean = seam.iter().sum::<f64>() / seam.len() as f64;
         let max = seam.iter().fold(0.0f64, |a, &b| a.max(b));
         eprintln!("ECR seam through jogs: n={} mean={mean:.2} max={max:.2}", seam.len());
-        assert!(mean < 1.0, "seam through-lanes drift {mean:.2} m on average — recentring regressed");
-        assert!(max < 3.0, "worst seam through-jog {max:.2} m — a through lane jumps lanes at a seam");
+        assert!(mean < 0.5, "seam through-lanes drift {mean:.2} m on average — seam stitching regressed");
+        assert!(max < 2.5, "worst seam through-jog {max:.2} m — a through lane jumps lanes at a seam");
 
         let split = net
             .junctions
@@ -1753,7 +2121,9 @@ mod tests {
     #[test]
     fn road_geometry_matches_lane_counts() {
         let net = map::corridor_with_signal();
-        assert_eq!(net.road_strips().len(), net.links.len());
+        // At least one strip per link; the boundary chart subdivides a link with
+        // a tapering pocket bay into several quads.
+        assert!(net.road_strips().len() >= net.links.len());
         // One divider per interior lane boundary; a turn-pocket approach subdivides
         // its dividers to follow the tapering bay, so that only adds segments.
         let dividers = net.lane_dividers().len();

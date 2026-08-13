@@ -5,155 +5,138 @@ real life. References are by **file + function/symbol** (stable across the comme
 comment-free copies), not line numbers.
 
 Priority legend: **[H]** high realism impact · **[M]** medium · **[L]** low / calibration.
-Each item notes the fix and, where one exists, the nearby test to validate against.
+Checked items are landed and name the symbol and guarding test — audit them against the
+code, not this file, if in doubt.
 
 ---
 
-## High impact
+## Landed (audited 2026-08-12)
 
-- [ ] **[H] Apply green-wave coordination at runtime.**
-  `map::coordinate_green_waves` computes a per-program `offset`, but the live actuated
-  controller (`junction::SignalController`) never reads `offset` — every signal boots at
-  `phase 0, elapsed 0` (`SignalController::build`) and drifts independently. Net effect:
-  **no platooning / green waves**, the dominant factor in arterial travel time.
-  - Cheap first step: seed each `SignalRuntime` from the coordinated offset at build so
-    signals at least *start* phase-aligned.
-  - Real fix: coordinated-actuated control — a background cycle length with a fixed
-    force-off/yield point for the coordinated phase; actuation floats only the
-    non-coordinated phases.
-  - Note: `SignalProgram::state_of` (offset-aware, `signal.rs`) is currently used only by
-    build-time tests, not the sim path.
+- [x] **[H] Green-wave coordination at runtime.**
+  `map::coordinate_green_waves` + `harmonize_corridor_cycles` mark corridor programs
+  `coordinated`; the controller (`junction::SignalController::group_state`) runs those
+  offset-aware fixed-time (`SignalProgram::state_of`), with AM/PM plan swap at runtime
+  (`NetWorld::pm_plan`, `Network::{am,pm}_offsets`). Actuation still owns uncoordinated
+  signals. Tests: `signalized_corridor_is_coordinated_into_a_green_wave`,
+  `real_map_signals_are_linked_and_not_all_green`, the coordinated-runtime-offset test.
+  *Residual refinement:* coordinated-actuated hybrid (force-off/yield point, actuation
+  floating only non-coordinated phases) — real corridors are semi-actuated, ours are
+  fixed-time while coordinated.
 
-- [ ] **[H] Make acceleration noise zero-mean.**
-  `constraint::accel_noise` returns `-sigma * uniform01(...)` ∈ (−σ, 0] — it only ever
-  *subtracts* acceleration (mean ≈ −σ/2), systematically depressing fleet speed and never
-  seeding the small over-accelerations behind realistic stop-and-go waves. Switch to
-  zero-mean, ideally temporally correlated (Ornstein–Uhlenbeck) so it reads as throttle
-  drift rather than white jitter. Validate mean speed against the ring fundamental-diagram
-  tests in `world.rs`.
+- [x] **[H] Zero-mean, temporally correlated acceleration noise.**
+  `constraint::accel_noise`: ±σ-bounded, zero-mean, piecewise-linear across ~2 s noise
+  buckets (stateless hash, CPU/GPU identical). Tests:
+  `accel_noise_is_zero_mean_two_sided_and_bounded`, `accel_noise_drifts_rather_than_flickers`,
+  `acceleration_noise_fluctuates_around_desired_without_downward_bias`.
 
-- [ ] **[H] Derive signal change/clearance intervals kinematically (ITE).**
-  Yellow is taken straight from the plan; all-red is a constant `ALL_RED = 2.5`
-  (`junction.rs`) regardless of approach speed or intersection width.
-  - Yellow ≈ `t_perception + v / (2·(a + g·grade))` (≈3.0 s @ 25 mph, ≈4.3 s @ 45 mph).
-  - All-red ≈ `(W + L) / v`.
-  - Both derivable from the approach lane `speed_limit` + node geometry. Improves
-    dilemma-zone behavior (interacts with `can_stop_before`) and capacity.
+- [x] **[H] Kinematic (ITE) change and clearance intervals.**
+  `map::change_and_clearance_intervals`: yellow = reaction + v/2a clamped [3, 6] s from
+  the approach speed limit; all-red = (crossing + car length)/v plus compound-junction
+  internal continuation, clamped — per phase, from the same geometry the box model uses.
 
-- [ ] **[H] Protected-permissive left turns + right-turn-on-red.**
-  `map::assign_signal_program` gives conflicting left groups their own protected phase
-  (green scaled to `0.45×`). Real signals mostly run protected-**permissive** or
-  permissive-only lefts (turn on green, yield to oncoming). Also, `Red` is currently an
-  absolute stop for every movement in `gather_context` (no RTOR).
-  - Model a permissive left as a green movement that must yield to oncoming through, reusing
-    the existing gap-acceptance machinery (`conflicting_priority_traffic` / `merge_conflict`).
-  - Allow right-turn-on-red after a full stop when a gap exists.
+- [x] **[H] Protected-permissive lefts + right-turn-on-red.**
+  `NetWorld::{is_permissive, left_is_permissive, permissive_must_yield, is_rtor}` reuse
+  the conflict-point and gap-acceptance machinery; RTOR requires a full stop first.
+  Tests: `permissive_left_yields_to_oncoming_then_clears_without_colliding`,
+  `right_turn_on_red_clears_before_a_through_that_waits_for_green`,
+  `sober_platoon_bursts_through_permissive_lefts_stay_junction_crash_free`.
 
----
+- [x] **[M] Start-up lost time / reaction lag at signals.**
+  Tests: `a_stopped_car_takes_a_startup_reaction_to_launch_on_green`,
+  `reaction_delay_causes_start_up_lag`.
 
-## Medium impact
+- [x] **[M] Urgency-scaled mandatory lane changes.** *(2026-08-12)*
+  `best_lane_change`: the positioning window scales with lanes still to cross (one full
+  window apiece, capped by `MAX_POSITION_WINDOWS`), and a mandatory change under a
+  closing window relaxes MOBIL `safe_braking` with urgency — mirroring
+  `effective_critical_gap` impatience. Tests:
+  `a_multi_lane_fix_starts_one_window_per_lane_early`,
+  `a_surface_car_weaves_across_lanes_to_reach_its_turn_pocket`.
 
-- [ ] **[M] Apply reaction-time lag to signals/stop-lines, not just the leader.**
-  `gather_context` delays the *leader's* perceived gap/speed by `reaction_time/dt` ticks,
-  but signal onset, stop lines, and yield lines use instantaneous state — so queues discharge
-  with zero start-up latency. Add the same perception-reaction lag (or an explicit per-driver
-  green-startup delay) to reproduce real **start-up lost time (~2 s)** and **saturation
-  headway (~1.9 s/veh)**. Also note the delay is coarsely quantized (`(0.5/0.2).round()` = 2
-  ticks = 0.4 s).
+- [x] **[M] Right-turners yield on approach.**
+  `should_yield_to`: crossing streams defer by approach priority key for every turn type;
+  opposing streams put the left behind. Test: `minor_road_right_turn_yields_to_the_major_through`.
 
-- [ ] **[M] Earlier, urgency-scaled mandatory lane changes.**
-  `mandatory_change` only fires when the *adjacent* lane serves the route, and the MOBIL
-  threshold in `best_lane_change` is a constant with no distance-to-turn term — so a car
-  several lanes from its turn pocket weaves at the last second and can miss the turn. Mirror
-  the gap-acceptance impatience already in `effective_critical_gap`: propagate
-  `lanes-to-cross × urgency(distance_to_turn)` so the change threshold decays as the junction
-  nears.
+- [x] **[M] Keep-right / passing-lane asymmetry.**
+  `KEEP_RIGHT_BIAS` through `mobil::should_change`'s bias term; suppressed near gores so
+  it can't nudge a through car into an exit-only lane. Tests:
+  `keep_right_drifts_an_unobstructed_car_to_the_curb_lane`, MOBIL bias unit test.
 
-- [ ] **[M] Right-turners should yield on approach.**
-  `should_yield_to` returns `false` for `my_turn == Right`, so a right-turn from a
-  minor/stop approach never yields to major through traffic before entering; it's only
-  arbitrated mid-crossing by first-to-conflict-point + id tiebreak, which ignores
-  right-of-way. Make right-turn-from-minor yield to conflicting major through/left.
+- [x] **[M] FIFO ordering at all-way stops.**
+  Tests: `all_way_stop_serves_the_first_to_stop_first`,
+  `all_way_stop_does_not_deadlock_when_the_first_car_is_blocked`.
 
-- [ ] **[M] Add lane-usage asymmetry (keep-right / passing-lane bias).**
-  MOBIL (`mobil.rs` + `best_lane_change`) is symmetric — no lane preference. Add Treiber's
-  asymmetric bias term so slower traffic settles right and overtaking uses the left,
-  producing realistic lane distributions and less pointless symmetric churn.
+- [x] **[M] Curvature-limited interior speeds.** *(2026-08-12)*
+  `Network::interior_min_radius` (analytic Bézier curvature) → per-movement
+  `NetWorld::turn_caps` = √(a_lat·r) clamped [2.5, 10] m/s; approach braking and every
+  crossing-speed consumer read the same cap; interchange movements stay exempt. Replaces
+  the flat Left=6 / Right=5. Test: `interior_speed_caps_follow_curvature`.
 
-- [ ] **[M] FIFO ordering at all-way stops.**
-  Service is decided by `priority_key` (speed limit, lane count) + time-to-arrival, not
-  first-come-first-served — the actual all-way-stop rule. Stamp arrival time on full stop and
-  serve in order.
+- [x] **[M] Zipper merges.**
+  `constraint::merge_yield` follows the first-to-the-merge-point conflicting vehicle as a
+  leader (cooperative, not gap-gated); `NetWorld::merges` marks multi-feeder lanes. Test:
+  `two_lanes_zipper_merge_without_colliding`.
 
----
+- [x] **[L] Lateral lane-change transition.**
+  `LaneChange { from, progress }` over `LANE_CHANGE_DURATION` (2 s) blends the rendered
+  pose; also reused by the seam-landing blend. Test:
+  `a_lane_change_slides_the_pose_across_gradually`.
 
-## Low impact / calibration
+- [x] **[L] `max_accel` recalibrated.** `DriverConfig::car()` is 1.5 m/s² (±25% jitter).
 
-- [ ] **[L] Lateral lane-change transition.**
-  Lane changes teleport to the target lane at the same arc position in one tick. Real changes
-  take ~2–4 s and occupy both lanes; add a lateral-transition duration (mostly visual + small
-  capacity effect) when touching the renderer.
+- [x] **[L] Probabilistic yellow/red running.**
+  `yellow_run_prob` (aggression-scaled, committed-speed gated) and `SimConfig::red_run_prob`
+  feed the crash model. Test: `a_bounded_minority_of_aggressive_drivers_run_a_stoppable_yellow`.
 
-- [ ] **[L] Revisit `max_accel = 1.0 m/s²` for cars** (`config::DriverConfig::car`).
-  On the low side (comfortable ≈ 1.5–2.5). Livelier launches, but entangled with
-  saturation-flow calibration — tune against the fundamental-diagram / discharge tests, not
-  blind.
-
-- [ ] **[L] Probabilistic yellow/red-running for aggressive drivers.**
-  `can_stop_before` is a clean binary. Let a small fraction of high-`desired_speed` samples
-  run late yellows to add realistic variance.
+- [x] **[L] Through streams never land in a closed bay.** *(2026-08-12)*
+  `map::retarget_pocket_landings`: a through movement wired into a turn pocket (merged
+  shut at the seam) re-lands on the nearest genuine through lane — the confluence becomes
+  an explicit modeled merge instead of two uncoupled streams sharing one centreline; bay
+  users enter the pocket by lane change where it opens. Tagged bay→bay cluster chains are
+  preserved. Test: `through_streams_never_land_in_a_closed_bay`.
 
 ---
 
-## Network & intersection architecture
+## Open
 
-From the 2026-08-12 geometry remodel (stage 1 landed: junction clusters carry intersection
-identity, one-way axes recentred, merge-lane topology fixed). Ideas drawn from how
-SUMO and Lanelet2 model networks; each names the machinery it builds on.
-
-- [ ] **[H] Stage 2 — junction-owned arm mouths.**
-  `Junction` (network.rs) should compute each arm's stop-line cross-section (position,
-  direction, lane span) and reconcile through-lane correspondence across the box, with
-  links plugging into mouths rather than node points. Partially started: the
-  through-alignment pass. Validate against
-  `el_camino_through_lanes_stay_laterally_continuous`.
-
-- [ ] **[H] Stage 3 — lane-boundary geometry (Lanelet2's core idea).**
-  Store each lane's left/right boundary polylines, shared between neighbours, instead of
-  centreline + `(index + 0.5)·LANE_WIDTH` offsets (`Network::lane_lateral_offset`).
-  Adjacent lanes then *cannot* misalign — the entire offset-drift bug class becomes
-  unrepresentable. Big refactor; do after stage 2 settles.
+- [ ] **[M] Mid-box waiting positions for permissive lefts (SUMO internal junctions).**
+  A permissive left currently yields *at the stop line* (`soft_yield` via
+  `permissive_must_yield`); real drivers advance into the box, wait at the conflict
+  point, and clear on yellow — worth ~1–2 extra lefts per cycle. Requires three
+  coordinated changes, none safe alone:
+  1. `box_entry_blocked` + the stop-line soft yield must admit a green permissive left
+     into the box while oncoming flows (bounded — one waiter per conflict point).
+  2. An in-box hold: clamp the left at `conflict_arc − 1` while oncoming is within its
+     window; release on gap or oncoming yellow/red (the all-red already covers the exit).
+  3. The in-box avoidance's first-to-the-point rule (`they_go_first = their_dist <
+     my_dist`) must treat a *stationary* waiter as not claiming the point — today a
+     parked left would brake every oncoming through (box gridlock), and without the
+     hold in (2) the nearest-first rule would instead let the left barge. Interacts with
+     the crash model (a waiter is a realistic amber-runner target) — validate against
+     the sober-burst gates and `permissive_left_yields_to_oncoming_then_clears_without_colliding`.
 
 - [ ] **[H] Lane-level routing graph (Lanelet2).**
   Route over lanes with lane-change edges and costs, not links
   (`Network::route_links` is link-level). Cars pre-position for turns blocks early,
   fixing last-second turn-lane misses at the root — the principled superset of the
-  urgency-scaled mandatory lane change item above.
-
-- [ ] **[M] Zipper merges (SUMO's `zipper` junction type).**
-  Now that `spread_merge_feeders` makes a ramp share the curb lane at merges, add an
-  alternating-priority rule at the shared-lane merge point instead of pure gap
-  acceptance — realistic fairness at lane drops and on-ramps.
-
-- [ ] **[M] Mid-box waiting positions for permissive lefts (SUMO internal junctions).**
-  A left-turner advances into the box and waits at its conflict point, clearing on
-  yellow. Builds on interior commit + slot admission; pairs with the
-  protected-permissive left item above.
-
-- [ ] **[M] Curvature-limited interior speeds.**
-  Apply `v = √(a_lat·r)` to interior Bézier curvature the way `min_radius_ahead`
-  already limits link curves — sharp turns through boxes slow down naturally (SUMO does
-  this on internal lanes).
+  (landed) urgency-scaled window. Rearchitecture: touches the flow-field router,
+  demand, and the GPU field solver.
 
 - [ ] **[M] Queue-based mesoscopic links (SUMO meso) for the 1M+ goal.**
-  Beyond the per-car congestion LOD: uncongested links become event-driven FIFO queues
-  with capacity servers, no per-car integration. SUMO's ~10–100×; likely the only path
-  to a million vehicles. The active-set scheduler is a step in this direction.
+  Beyond the per-car congestion LOD (`meso.rs`): uncongested links become event-driven
+  FIFO queues with capacity servers, no per-car integration. SUMO's ~10–100×; likely the
+  only path to a million vehicles. The active-set scheduler is a step in this direction.
 
 - [ ] **[L] Online flow calibrators (SUMO).**
   Devices that nudge gateway inflows toward observed link counts *during* the run — the
-  direct lever for raising the scorecard's GEH<5 share from ~11% toward the 0.85
-  aspirational gate.
+  direct lever for the scorecard's GEH<5 share. Note before building: that share moves
+  6–14/72 links on seed alone (measured 2026-08-12), so the calibrator and its evaluation
+  must be variance-aware (multi-seed) or it will chase noise.
+
+- [ ] **[L] Coordinated-actuated signal control.**
+  The residual from the green-wave item: background cycle with force-off/yield points,
+  actuation floating only the non-coordinated phases (`SignalController` currently runs
+  coordinated programs fixed-time).
 
 ---
 
@@ -166,7 +149,24 @@ the fundamental-diagram validation in `world.rs`. Change these only against thei
 
 ---
 
+## Network & intersection geometry (2026-08-12 remodel — landed)
+
+Stage 1: junction clusters carry intersection identity; one-way axes recentred
+(`center_oneway_axes`); end-direction cache; entry-link signal grouping. Stage 2:
+junction-owned arm mouths (`Junction::mouths`); through-rank wiring; `align_through_seams`;
+corner-clamped interiors; `untangle_parallel_movements`. Stage 3: Lanelet2-style shared
+lane boundaries (`Network::lane_bounds`) as the single geometry authority (vehicles,
+dividers, strips, edge lines, mouths); pocket bays as real edge geometry;
+`map::stitch_seam_bounds` closes mutual-primary through seams exactly (85% < 5 cm,
+98% < 20 cm). Guarded by `el_camino_through_lanes_stay_laterally_continuous`,
+`junction_interiors_hug_their_corners_and_never_swap_lanes`,
+`through_seams_are_stitched_shut_across_the_map`, and the golden junction screenshots.
+
+---
+
 ## Suggested order
 
-Start with **green-wave offsets** and **zero-mean noise** — both small, high-impact, and each
-has nearby test scaffolding to validate against.
+**Mid-box permissive lefts** is the highest-value bounded item (capacity + realism at
+every signalized left); its three-part design above is ready to build against existing
+tests. The two rearchitectures (lane-level routing, meso queues) each deserve a dedicated
+plan; calibrators only pay off with multi-seed evaluation.
