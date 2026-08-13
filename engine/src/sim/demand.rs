@@ -451,11 +451,73 @@ pub struct DemandGenerator {
     /// here instead of being dropped, and are released FIFO as lanes clear — a real
     /// metered gateway queue that conserves demand and grows/dissipates with the peak.
     queues: std::collections::BTreeMap<u32, std::collections::VecDeque<(usize, u32)>>,
+    /// Online flow calibration toward observed AADT counts (see
+    /// [`FlowCalibrator`]); `None` (the default) leaves demand untouched.
+    calibrator: Option<FlowCalibrator>,
 }
 
 /// Max backlog held per gateway before further trips spill (are dropped) — the
 /// off-map storage a gateway queue can represent before it backs out of the region.
 const MAX_QUEUE: usize = 400;
+
+/// How often the flow calibrator corrects, in *day* seconds (compression-aware):
+/// long enough for a stable windowed count, short enough for several corrections
+/// across a peak.
+const CAL_WINDOW_DAY_SECS: f64 = 900.0;
+/// Correction gain per window (`ratio.powf(GAIN)`), and the bounds a corridor's
+/// cumulative correction may reach — a calibrator trims systematic bias, it must
+/// never manufacture or erase a corridor's demand outright.
+const CAL_GAIN: f64 = 0.5;
+const CAL_MIN: f64 = 0.5;
+const CAL_MAX: f64 = 2.0;
+
+/// Online flow calibration (SUMO's calibrators, at corridor grain): observed
+/// links (`Network::link_aadt`) are grouped by route ref / road name, each group
+/// carrying the same hourly expectation model the scorecard judges GEH against;
+/// every window the group's simulated flow is compared to its target and the
+/// spawn rates of the demand streams *originating* on that corridor are nudged
+/// by a bounded, damped multiplier. Per-link detector grain (and mid-map
+/// injection, SUMO's other half) stays out of scope: gateway-rate nudging is
+/// the lever this demand model actually has.
+struct FlowCalibrator {
+    /// Per group: observed links with their (time-shaped) hourly target factory.
+    groups: Vec<CalGroup>,
+    /// stream index → group correcting it.
+    stream_group: Vec<Option<usize>>,
+    /// Cumulative correction per group (1.0 = untouched).
+    factor: Vec<f64>,
+    /// `link_entry_counts` snapshot at the last correction.
+    last_entries: Vec<u32>,
+    /// Sim seconds at the last correction.
+    last_secs: f64,
+    /// K factor of the arterial peak-hour expectation (the directional split
+    /// cancels out of the two-way mean target).
+    k_factor: f64,
+}
+
+struct CalGroup {
+    /// Observed member links: `(link, aadt, is_highway)`.
+    links: Vec<(u32, f64, bool)>,
+}
+
+impl FlowCalibrator {
+    /// Directional hourly target for one observed link at day-time `t` — the
+    /// scorecard's expectation model: highways take their peak share from the
+    /// PeMS diurnal shape (time-flat); arterials scale K·D by the diurnal
+    /// factor's ratio to the daily peak. Direction unknowable per link, so the
+    /// mean of the two directional splits.
+    fn target_vph(&self, aadt: f64, highway: bool, day_secs: f64) -> f64 {
+        if highway {
+            let shape = &super::rush_hour::FALLBACK;
+            let k_dir = shape.iter().map(|&v| v as f64).fold(0.0, f64::max)
+                / shape.iter().map(|&v| v as f64).sum::<f64>();
+            return aadt * 0.5 * k_dir;
+        }
+        let day_peak = (0..96).map(|k| super::rush_hour::arterial_factor(k as f64 * 900.0)).fold(0.0f64, f64::max);
+        let tod = (super::rush_hour::arterial_factor(day_secs) / day_peak.max(1e-9)).min(1.0);
+        aadt * self.k_factor * 0.5 * tod
+    }
+}
 
 /// Window length for the doubly-stochastic rate modulation: long enough that a
 /// level reads as a "spell" of heavier/lighter traffic, short enough to see it turn
@@ -529,6 +591,7 @@ impl DemandGenerator {
             day_compression: DEFAULT_DAY_COMPRESSION,
             day: 0, sim_secs: 0.0, churn_epoch: 0,
             queues: std::collections::BTreeMap::new(),
+            calibrator: None,
         }
     }
 
@@ -702,6 +765,98 @@ impl DemandGenerator {
         self.entry_speed_cap = cap.max(0.0);
     }
 
+    /// Switch on online flow calibration: observed links (`link_aadt` > 0) are
+    /// grouped by route ref / road name, and each window the spawn rates of the
+    /// streams originating on a group's corridor are nudged toward its hourly
+    /// target (bounded, damped — see [`FlowCalibrator`]). `k_factor` is the
+    /// arterial peak-hour share of AADT the targets are judged by.
+    pub fn enable_flow_calibration(&mut self, world: &NetWorld, k_factor: f64) {
+        use std::collections::BTreeMap;
+        let net = &world.network;
+        let key_of = |l: usize| -> Option<String> {
+            let r = net.link_refs.get(l).map(String::as_str).unwrap_or("");
+            if !r.is_empty() {
+                return Some(r.to_string());
+            }
+            let n = net.link_names.get(l).map(String::as_str).unwrap_or("");
+            (!n.is_empty()).then(|| n.to_string())
+        };
+        let mut index: BTreeMap<String, usize> = BTreeMap::new();
+        let mut groups: Vec<CalGroup> = Vec::new();
+        for l in 0..net.links.len() {
+            let aadt = net.link_aadt(LinkId(l as u32));
+            if aadt <= 0.0 {
+                continue;
+            }
+            let Some(key) = key_of(l) else { continue };
+            let gi = *index.entry(key).or_insert_with(|| {
+                groups.push(CalGroup { links: Vec::new() });
+                groups.len() - 1
+            });
+            groups[gi].links.push((l as u32, aadt, boundary::is_highway_link(net, LinkId(l as u32))));
+        }
+        let stream_group = self
+            .pairs
+            .iter()
+            .map(|s| key_of(s.origin.idx()).and_then(|k| index.get(&k).copied()))
+            .collect();
+        self.calibrator = Some(FlowCalibrator {
+            factor: vec![1.0; groups.len()],
+            groups,
+            stream_group,
+            last_entries: world.link_entry_counts().to_vec(),
+            last_secs: self.sim_secs,
+            k_factor,
+        });
+    }
+
+    /// The calibration multiplier for stream `i` (1.0 when calibration is off or
+    /// the stream's corridor carries no observed counts).
+    fn cal_factor(&self, i: usize) -> f64 {
+        self.calibrator
+            .as_ref()
+            .and_then(|c| c.stream_group[i].map(|g| c.factor[g]))
+            .unwrap_or(1.0)
+    }
+
+    /// Periodic calibration step: once per window (day-time), difference the
+    /// link-entry counters into windowed flows and nudge each group's factor
+    /// toward its target.
+    fn update_calibration(&mut self, world: &NetWorld) {
+        let compression = if self.rush_clock.is_some() { self.day_compression } else { 1.0 };
+        let day_now = self.day_secs(self.sim_secs);
+        let sim_secs = self.sim_secs;
+        let Some(cal) = self.calibrator.as_mut() else { return };
+        let elapsed_day = (sim_secs - cal.last_secs) * compression;
+        if elapsed_day < CAL_WINDOW_DAY_SECS {
+            return;
+        }
+        let entries = world.link_entry_counts();
+        let hours = elapsed_day / 3600.0;
+        let ratios: Vec<f64> = cal
+            .groups
+            .iter()
+            .map(|g| {
+                let (mut sim, mut tgt) = (0.0f64, 0.0f64);
+                for &(l, aadt, hw) in &g.links {
+                    sim += entries[l as usize].saturating_sub(cal.last_entries[l as usize]) as f64 / hours;
+                    tgt += cal.target_vph(aadt, hw, day_now);
+                }
+                if tgt <= 1.0 {
+                    return 1.0;
+                }
+                // A silent corridor reads as a bounded shortfall, not a
+                // divide-by-zero demand explosion.
+                (tgt / sim.max(tgt * 0.1)).powf(CAL_GAIN)
+            })
+            .collect();
+        for (f, r) in cal.factor.iter_mut().zip(&ratios) {
+            *f = (*f * r).clamp(CAL_MIN, CAL_MAX);
+        }
+        cal.last_entries = entries.to_vec();
+        cal.last_secs = sim_secs;
+    }
+
     /// The distinct destinations demanded — the destination set to build a
     /// [`NetWorld`] flow-field router over.
     pub fn destinations(&self) -> Vec<LinkId> {
@@ -712,6 +867,7 @@ impl DemandGenerator {
     }
 
     pub fn step(&mut self, world: &mut NetWorld, dt: f64) {
+        self.update_calibration(world);
         let costs = world.live_link_costs();
         let day = self.rush_clock;
         let weekend = self.weekend();
@@ -745,7 +901,7 @@ impl DemandGenerator {
                 (Some(t), Some(RushMode::Surface)) => s.base_rate * rush_hour::surface_factor(s.class, weekend, t),
                 _ => s.base_rate,
             };
-            let mut rate = rate * daily * self.modulation(i);
+            let mut rate = rate * daily * self.modulation(i) * self.cal_factor(i);
             if s.surface {
                 rate /= PLATOON_MEAN_SIZE;
             }
@@ -1283,6 +1439,40 @@ mod tests {
         assert!(demand.spawned() >= 8 && demand.spawned() <= 36,
             "≈0.4/s over 60 s, throttled by the entrance, got {}", demand.spawned());
         assert!(world.exited() > 0, "spawned vehicles should reach the destination");
+    }
+
+    #[test]
+    fn flow_calibration_boosts_an_underfed_observed_corridor() {
+        // "Route 9" carries an observed count far above what its configured
+        // demand delivers; with calibration on, its stream's spawn rate is
+        // nudged up (bounded), so the corridor carries measurably more traffic
+        // than the uncalibrated baseline. An unnamed corridor is untouched.
+        let build = |calibrate: bool| -> u32 {
+            let mut map = corridor();
+            for l in &mut map.links {
+                l.name = "Route 9".into();
+                l.aadt = 30_000.0; // demands ~vph the 0.02/s stream can't deliver
+            }
+            let net = map.build();
+            let pairs = [OdPair { origin: LinkId(0), dest: LinkId(1), rate_per_sec: 0.02, class: SurfaceClass::Through, anchored: false }];
+            let mut world = NetWorld::new(net, SimConfig::default_config());
+            let mut gen = DemandGenerator::new(&world, &pairs, 7);
+            world.install_router(&gen.destinations());
+            if calibrate {
+                gen.enable_flow_calibration(&world, 0.09);
+            }
+            // Long enough for several 900-day-second windows at 1:1 time.
+            for _ in 0..22_000 {
+                gen.step(&mut world, 0.2);
+                world.step();
+            }
+            gen.spawned()
+        };
+        let (base, calibrated) = (build(false), build(true));
+        assert!(
+            calibrated as f64 > base as f64 * 1.4,
+            "calibration lifts the underfed corridor: {base} → {calibrated}"
+        );
     }
 
     #[test]

@@ -95,48 +95,78 @@ code, not this file, if in doubt.
   users enter the pocket by lane change where it opens. Tagged bay→bay cluster chains are
   preserved. Test: `through_streams_never_land_in_a_closed_bay`.
 
+- [x] **[M] Mid-box waiting for permissive lefts.** *(2026-08-12)*
+  A green permissive left that fits inside the box is admitted as a *waiter*
+  (`permissive_waiter_hold`): it advances past the line, stands `PERMISSIVE_HOLD_MARGIN`
+  short of its first live conflict point while `permissive_pressure` (the shared
+  midpoint-window logic, now impatience-aware) holds, and sweeps on when the gap or the
+  change interval arrives. The stationary-waiter rule — a car standing still short of a
+  point doesn't claim it — is applied uniformly in the admission gate, the in-box
+  avoidance, and the pressure scan, so the opposing flow streams past the waiter's nose.
+  One waiter per movement. Tests: `permissive_left_advances_into_the_box_and_waits_at_its_conflict_point`,
+  the original yields-then-clears test, and the sober-burst gates.
+
+- [x] **[L] Coordinated-actuated signal control.** *(2026-08-12)*
+  Coordinated programs now run through the actuated runtime (`SignalController`) under a
+  cycle-clock discipline: the progression phase (`SignalProgram::coordinated_phase`, set
+  by `coordinate_green_waves`) is guaranteed its scheduled window (side phases are forced
+  to clear before it opens), gaps out only past the window to phases with demand — judged
+  per *phase mask*, since protected-permissive programs serve every group in the
+  coordinated phase — and rests in green when nothing is waiting. Boot state is
+  offset-aligned. Tests: `actuated_controller_honors_coordination_offsets_at_runtime`
+  (window guarantee + stagger), `a_coordinated_signal_rests_in_green_without_side_demand`.
+
+- [x] **[L] Online flow calibrators — built, evaluated, default off.** *(2026-08-12)*
+  `DemandGenerator::enable_flow_calibration` groups observed links by ref/name, compares
+  windowed sim flow to the scorecard's own AADT expectation (compression-aware), and
+  nudges the corridor's origin streams by a damped, bounded factor; scorecard
+  `--calibrate`. Kept off by default: see the follow-up item below for the honest
+  multi-seed verdict. Test: `flow_calibration_boosts_an_underfed_observed_corridor`.
+
+- [x] **[H] Lane-level routing, first step: two-hop lane preference.** *(2026-08-12)*
+  `lanes_to_serving` judges a lane by whether its *landing lane on the next link*
+  continues toward the hop after that (`second_link_on_path`: route or flow-field), so a
+  car pre-positions a block early for a turn off a short block instead of landing and
+  weaving; falls back to next-link service when no clean chain exists. Test:
+  `lane_choice_prepositions_for_the_turn_after_next`.
+
 ---
 
 ## Open
 
-- [ ] **[M] Mid-box waiting positions for permissive lefts (SUMO internal junctions).**
-  A permissive left currently yields *at the stop line* (`soft_yield` via
-  `permissive_must_yield`); real drivers advance into the box, wait at the conflict
-  point, and clear on yellow — worth ~1–2 extra lefts per cycle. Requires three
-  coordinated changes, none safe alone:
-  1. `box_entry_blocked` + the stop-line soft yield must admit a green permissive left
-     into the box while oncoming flows (bounded — one waiter per conflict point).
-  2. An in-box hold: clamp the left at `conflict_arc − 1` while oncoming is within its
-     window; release on gap or oncoming yellow/red (the all-red already covers the exit).
-  3. The in-box avoidance's first-to-the-point rule (`they_go_first = their_dist <
-     my_dist`) must treat a *stationary* waiter as not claiming the point — today a
-     parked left would brake every oncoming through (box gridlock), and without the
-     hold in (2) the nearest-first rule would instead let the left barge. Interacts with
-     the crash model (a waiter is a realistic amber-runner target) — validate against
-     the sober-burst gates and `permissive_left_yields_to_oncoming_then_clears_without_colliding`.
+- [ ] **[H] Lane-level routing graph (Lanelet2) — remainder.**
+  The first step landed (see below): lane preference now looks one junction deeper
+  (`lanes_to_serving` prefers lanes whose landing lane continues toward the hop after
+  next). The full item — routing over lanes with lane-change edges and costs
+  (`Network::route_links` is link-level) — remains a rearchitecture touching the
+  flow-field router, demand, and the GPU field solver; a k-hop generalization of the
+  landed step is the incremental path.
 
-- [ ] **[H] Lane-level routing graph (Lanelet2).**
-  Route over lanes with lane-change edges and costs, not links
-  (`Network::route_links` is link-level). Cars pre-position for turns blocks early,
-  fixing last-second turn-lane misses at the root — the principled superset of the
-  (landed) urgency-scaled window. Rearchitecture: touches the flow-field router,
-  demand, and the GPU field solver.
+- [ ] **[M] Scale within pure microsimulation (design decision 2026-08-12: no meso —
+  every car is modeled distinctly, always).**
+  The 1M+ goal therefore runs entirely through making the per-car step cheaper, never
+  through aggregating cars away. The existing levers, none exhausted:
+  - **Active-set scheduler** (`sleep_scheduler`): halves the serial step at gridlock but
+    is off by default and auto-gated off under parallel threads — making it compose with
+    the threads backend is the single biggest sleeping win.
+  - **GPU accel backend** (native): wired but the binding-fold pass is only part of the
+    step; widening what runs on-device (neighbor gather, curve scan) extends it.
+  - **Threads backend**: bit-for-bit parallel today; scaling profile beyond ~5k cars on
+    big maps hasn't been re-measured since the boundary-chart work.
+  - **Congestion LOD** (`meso.rs` — despite the filename, a cheap *per-car* follower on
+    jammed links, consistent with the no-aggregation rule): off by default; measure and
+    promote if it keeps fidelity.
+  - Data layout: `lane_point` is now binary-search over the boundary chart; the
+    remaining per-tick scans (neighbor maps, conflict gathers) are the profile's tail.
 
-- [ ] **[M] Queue-based mesoscopic links (SUMO meso) for the 1M+ goal.**
-  Beyond the per-car congestion LOD (`meso.rs`): uncongested links become event-driven
-  FIFO queues with capacity servers, no per-car integration. SUMO's ~10–100×; likely the
-  only path to a million vehicles. The active-set scheduler is a step in this direction.
-
-- [ ] **[L] Online flow calibrators (SUMO).**
-  Devices that nudge gateway inflows toward observed link counts *during* the run — the
-  direct lever for the scorecard's GEH<5 share. Note before building: that share moves
-  6–14/72 links on seed alone (measured 2026-08-12), so the calibrator and its evaluation
-  must be variance-aware (multi-seed) or it will chase noise.
-
-- [ ] **[L] Coordinated-actuated signal control.**
-  The residual from the green-wave item: background cycle with force-off/yield points,
-  actuation floating only the non-coordinated phases (`SignalController` currently runs
-  coordinated programs fixed-time).
+- [ ] **[L] Calibrator follow-up: capacity, not inflow.**
+  The online calibrator exists (`DemandGenerator::enable_flow_calibration`, scorecard
+  `--calibrate`), is default-off, and its honest multi-seed A/B says inflow scaling is
+  the wrong lever: GEH stays inside seed noise ({3,8,10}→{5,3,8}/72) while a boosted
+  corridor's travel-time ratio degrades ~1.2→2.0 — the injected demand queues at
+  junctions that cannot discharge it. The observed-count gap is *supply-side*
+  (junction capacity / signal service / demand placement), so the next lever is
+  saturation-flow calibration at signalized approaches, not more gateway volume.
 
 ---
 
@@ -164,9 +194,25 @@ dividers, strips, edge lines, mouths); pocket bays as real edge geometry;
 
 ---
 
+- [ ] **[M] Per-lane signal detection (protected-left calls).**
+  Demand reaching `SignalController::advance` is per *link*, so a left-turn bay's call
+  is indistinguishable from through demand on the same approach — surfaced while
+  building semi-actuated coordination (a protected-left phase is "called" by any car on
+  the link). Feed per-lane presence (car within `DETECT` of the line, keyed by lane →
+  group via the movement wiring) so protected windows serve only when a turner is
+  actually waiting. Directly improves corridor capacity under coordination.
+
+- [ ] **[L] Revisit platoon density (`PLATOON_PROB`).**
+  Held at 0.25 (low end of the observed 0.25–0.6 urban range) because denser bunches
+  interlocked complex junctions into spillback rings — a caveat written *before* graded
+  yielding, slot admission, and now mid-box waiters landed. Re-run the sober-burst and
+  gridlock gates at 0.35–0.45 with 3–4-car bunches; if they hold, arterial arrivals get
+  realistically lumpier for free.
+
 ## Suggested order
 
-**Mid-box permissive lefts** is the highest-value bounded item (capacity + realism at
-every signalized left); its three-part design above is ready to build against existing
-tests. The two rearchitectures (lane-level routing, meso queues) each deserve a dedicated
-plan; calibrators only pay off with multi-seed evaluation.
+The behavioral backlog is closed and meso is ruled out by design. The highest-value
+remaining items: **per-lane signal detection** (small, bounded, pays into the landed
+coordination), then **saturation-flow calibration** (the supply-side GEH lever), then the
+**scheduler×threads composition** for scale; **k-hop lane preference** and the platoon
+revisit ride behind those.

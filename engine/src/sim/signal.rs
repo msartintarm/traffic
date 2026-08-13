@@ -49,11 +49,16 @@ pub struct SignalProgram {
     pub offset: f64,
     pub phases: Vec<Phase>,
     pub coordinated: bool,
+    /// Which phase the corridor's progression is anchored to (the arterial
+    /// through phase the offset opens on platoon arrival). Only meaningful when
+    /// `coordinated`; the semi-actuated controller guarantees this phase its
+    /// scheduled window and returns unused side time to it.
+    pub coordinated_phase: usize,
 }
 
 impl SignalProgram {
     pub fn new(offset: f64, phases: Vec<Phase>) -> Self {
-        Self { offset, phases, coordinated: false }
+        Self { offset, phases, coordinated: false, coordinated_phase: 0 }
     }
 
     /// Two non-overlapping approaches (bit 0 and bit 1) alternating, a common
@@ -81,6 +86,11 @@ impl SignalProgram {
 
     pub fn cycle_length(&self) -> f64 {
         self.phases.iter().map(Phase::length).sum()
+    }
+
+    /// Seconds into the cycle at which `phase`'s slot begins.
+    pub fn phase_start(&self, phase: usize) -> f64 {
+        self.phases[..phase.min(self.phases.len())].iter().map(Phase::length).sum()
     }
 
     pub fn state_of(&self, bit: u8, sim_time: f64) -> SignalState {

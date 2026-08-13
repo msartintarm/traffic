@@ -37,6 +37,7 @@ struct Args {
     assert_gate: bool,
     assert_floor: Option<f64>,
     dump_ref: Option<String>,
+    calibrate: bool,
 }
 
 fn parse_args() -> Args {
@@ -53,6 +54,7 @@ fn parse_args() -> Args {
         assert_gate: false,
         assert_floor: None,
         dump_ref: None,
+        calibrate: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -68,6 +70,7 @@ fn parse_args() -> Args {
             "--d" => args.d_factor = val().parse().expect("d"),
             "--seed" => args.seed = val().parse().expect("seed"),
             "--assert" => args.assert_gate = true,
+            "--calibrate" => args.calibrate = true,
             "--assert-floor" => args.assert_floor = Some(val().parse().expect("assert-floor")),
             "--dump-ref" => args.dump_ref = Some(val()),
             other => panic!("unknown arg {other}"),
@@ -128,6 +131,9 @@ fn main() {
     gen.set_transit_lines(lines);
     gen.set_rush_hour(&world.network, true);
     gen.set_day_compression(args.compression);
+    if args.calibrate {
+        gen.enable_flow_calibration(&world, args.k_factor);
+    }
     gen.resume_clock(args.start_hour * 3600.0 - args.warmup_day_mins * 60.0, 0);
     world.install_router(&gen.destinations());
 

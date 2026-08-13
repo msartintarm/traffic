@@ -822,6 +822,10 @@ const LANE_CHANGE_DURATION: f64 = 2.0;
 /// (`best_lane_change`): even a car four-plus lanes out starts at three windows,
 /// so mid-block driving isn't dominated by far-off turn preparation.
 const MAX_POSITION_WINDOWS: f64 = 3.0;
+/// How far short of its first live conflict point a mid-box permissive-left
+/// waiter stands (front bumper): enough that an oncoming through's swept
+/// corridor clears the waiter's nose with a real margin at any crossing angle.
+const PERMISSIVE_HOLD_MARGIN: f64 = 3.0;
 
 /// A vehicle's decision state for the active-set scheduler. `Free` and `Frozen` are the
 /// analytically-predictable states that may sleep; `Deciding` must run the full step.
@@ -1179,11 +1183,15 @@ impl NetWorld {
             }
             let veh = &self.fleet.rows[i];
             let node = self.network.link(self.network.lane(veh.lane).link).to;
+            // A green permissive left that can stand inside the box short of its
+            // first live conflict point is admitted as a *waiter* rather than
+            // held at the line — its in-box hold takes the yield over.
+            let hold = self.permissive_waiter_hold(i, mid, node, nb);
             // The cluster-exit gate binds the *admission* too, not just the approach
             // braking: a car that still reaches the line (creep, hot arrival) must
             // hold there rather than enter a junction it cannot clear.
-            self.box_conflict_on_path(veh, mid, node, nb)
-                || (self.is_permissive(mid) && self.permissive_must_yield(i, mid, node, nb))
+            self.box_conflict_on_path_holding(veh, mid, node, nb, hold)
+                || (hold.is_none() && self.is_permissive(mid) && self.permissive_must_yield(i, mid, node, nb))
                 || self.junction_exit_blocked(veh, mid, node, nb)
                 || self.rail_closed(node)
                 // The gather's priority yield must also bind at the admission
@@ -1458,6 +1466,29 @@ impl NetWorld {
         self.link_entries[first.idx()] += 1;
         self.fleet.push(NetVehicle {
             id, lane, position: 0.0, speed, driver, route, route_idx: 0, dest: None,
+            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None,
+        });
+        true
+    }
+
+    /// Spawn on a specific lane at `pos` with an explicit route — for scenarios
+    /// that need a known starting lane rather than the pre-positioned default.
+    pub fn spawn_routed_in_lane(
+        &mut self,
+        id: u32,
+        route: Vec<LinkId>,
+        lane: LaneId,
+        pos: f64,
+        speed: f64,
+        driver: DriverConfig,
+    ) -> bool {
+        let Some(&first) = route.first() else { return false };
+        if self.network.lane(lane).link != first {
+            return false;
+        }
+        self.link_entries[first.idx()] += 1;
+        self.fleet.push(NetVehicle {
+            id, lane, position: pos, speed, driver, route, route_idx: 0, dest: None,
             stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None,
         });
         true
@@ -2179,10 +2210,26 @@ impl NetWorld {
         let next = self.next_link_on_path(veh)?;
         let link = self.network.link(self.network.lane(veh.lane).link);
         let cur = self.network.lane(veh.lane).index_in_link as i64;
-        let serves = |k: i64| {
+        // One junction deeper than "reaches the next link": a lane serves the
+        // route *cleanly* when its landing lane on `next` continues toward the
+        // hop after that — otherwise the car lands owing another forced weave
+        // on the next block (the last-second turn-lane miss, one hop earlier).
+        // Falls back to plain next-link service when no lane offers the clean
+        // chain (the weave on `next` is then genuinely unavoidable). The first
+        // step of lane-level routing; the full lane graph remains open.
+        let next2 = self.second_link_on_path(veh, next);
+        let serves_via = |k: i64, deep: bool| {
             let l = LaneId(link.lane_start.0 + k as u32);
-            self.network.movements_of(l).iter().any(|m| self.network.lane(m.to_lane).link == next)
+            self.network.movements_of(l).iter().any(|m| {
+                self.network.lane(m.to_lane).link == next
+                    && (!deep
+                        || next2.is_none_or(|n2| {
+                            self.network.movements_of(m.to_lane).iter().any(|m2| self.network.lane(m2.to_lane).link == n2)
+                        }))
+            })
         };
+        let deep = (0..link.lane_count as i64).any(|k| serves_via(k, true));
+        let serves = |k: i64| serves_via(k, deep);
         if serves(cur) {
             return Some(0);
         }
@@ -2190,6 +2237,16 @@ impl NetWorld {
             .filter(|&k| serves(k))
             .min_by_key(|&k| (k - cur).abs())
             .map(|k| k - cur)
+    }
+
+    /// The link after `next` on this vehicle's path — the second hop, for lane
+    /// preference one junction deeper than the immediate movement.
+    fn second_link_on_path(&self, veh: &NetVehicle, next: LinkId) -> Option<LinkId> {
+        if !veh.route.is_empty() {
+            return (veh.route_idx + 2 < veh.route.len()).then(|| veh.route[veh.route_idx + 2]);
+        }
+        let (dest, router) = (veh.dest?, self.router.as_ref()?);
+        router.next_hop(dest, next)
     }
 
     fn lane_serves_route(&self, veh: &NetVehicle, lane: LaneId) -> Option<bool> {
@@ -3472,7 +3529,9 @@ impl NetWorld {
         // Never enter a box occupied by conflicting crossing traffic (at-grade nodes);
         // additionally, at unsignalized nodes defer to higher-priority approaching
         // traffic by right-of-way.
-        let box_yield = !free_flow && intended.is_some_and(|mid| self.box_conflict_on_path(veh, mid, node, nb));
+        let waiter_hold = intended.and_then(|mid| self.permissive_waiter_hold(i, mid, node, nb));
+        let box_yield = !free_flow
+            && intended.is_some_and(|mid| self.box_conflict_on_path_holding(veh, mid, node, nb, waiter_hold));
         // At an all-way stop, an *armed* driver (their stop served, FIFO turn
         // theirs) does not gap-accept against approaching traffic — arrivals must
         // serve their own sign. With HCM-sized gaps, yielding to every mover
@@ -3482,8 +3541,8 @@ impl NetWorld {
             && !armed_all_way
             && matches!(control, NodeControl::Uncontrolled | NodeControl::Stop | NodeControl::Yield)
             && self.conflicting_priority_traffic(i, veh.lane, node, nb).is_some();
-        let permissive_yield = intended
-            .is_some_and(|mid| self.is_permissive(mid) && self.permissive_must_yield(i, mid, node, nb));
+        let permissive_yield = waiter_hold.is_none()
+            && intended.is_some_and(|mid| self.is_permissive(mid) && self.permissive_must_yield(i, mid, node, nb));
         let fifo_yield = matches!(control, NodeControl::Stop)
             && veh.stopped_at == Some(node)
             && intended.is_some_and(|mid| self.earlier_stopped_conflict(i, mid, node, nb));
@@ -3577,11 +3636,34 @@ impl NetWorld {
             }
         }
 
+        let node = self.network.movement(c.movement).node;
+        // Mid-box waiter: a signalized permissive left stands
+        // `PERMISSIVE_HOLD_MARGIN` short of its first live conflict point while
+        // oncoming still owns the window, and sweeps on when the pressure lifts
+        // — a gap, or the change interval stopping the opposing flow. Only
+        // *before* the first point: once committed past it, the first-to-the-
+        // point avoidance below arbitrates like any other crosser.
+        if self.network.movement_turn(c.movement) == TurnType::Left
+            && self.network.movement(c.movement).signal_group.is_some()
+        {
+            if let Some(first) = self.first_live_conflict_arc(c.movement, node) {
+                let hold = first - PERMISSIVE_HOLD_MARGIN;
+                if c_s < hold - 0.1 {
+                    let d = veh.driver.capped_to(self.network.lane(to_lane).speed_limit);
+                    let pressed = self.permissive_pressure(i, c.movement, node, nb, &|my_s| {
+                        (my_s > c_s + 0.3).then(|| my_s - c_s)
+                    });
+                    if pressed {
+                        accel = accel.min(idm::acceleration(&d, veh.speed, veh.speed, (hold - c_s).max(0.05)));
+                    }
+                }
+            }
+        }
+
         // In-intersection avoidance: if a vehicle on a conflicting movement will
         // reach a shared conflict point first, brake to stop short of it. This is
         // the crash-avoidant behaviour; a driver already too close/fast to stop
         // (within the grip bound) sweeps on, and the body-overlap detector decides.
-        let node = self.network.movement(c.movement).node;
         for &ci in self.junctions.conflict_ids(node) {
             let cp = &self.network.conflicts[ci as usize];
             let (my_s, other_mv, other_s) = if cp.a == c.movement {
@@ -3601,6 +3683,12 @@ impl NetWorld {
                 // The point is clear only once their whole body is past it — the
                 // arc tracks the front, so the tail lingers a vehicle length.
                 if their_dist < -(o.driver.vehicle_length + 1.0) {
+                    continue;
+                }
+                // A stationary car genuinely short of the point — a mid-box
+                // waiter standing its hold — doesn't claim it; the moment it
+                // launches it is a mover again and contests normally.
+                if o.speed < 0.5 && their_dist > 1.5 {
                     continue;
                 }
                 let they_go_first = their_dist < my_dist || (their_dist == my_dist && o.id < veh.id);
@@ -3767,6 +3855,7 @@ impl NetWorld {
         dist_to_line: f64,
         node: NodeId,
         nb: &Neighbors,
+        hold: Option<f64>,
     ) -> bool {
         let key = self.network.intersection_key(node);
         let conflict_ids = self.junctions.conflict_ids(node);
@@ -3803,9 +3892,22 @@ impl NetWorld {
                     continue;
                 };
                 timed_any = true;
+                // A point at or beyond this car's declared hold arc is never
+                // contested: the mid-box waiter stops short of it, so its
+                // arrival window there is empty by construction.
+                if hold.is_some_and(|h| my_s >= h) {
+                    continue;
+                }
                 let tail_clear = o_s + o.driver.vehicle_length + 1.0;
                 if o_arc >= tail_clear {
                     continue; // their body is past this point
+                }
+                // A crosser standing still short of the point — a mid-box waiter
+                // holding its yield — doesn't claim it; timed at the crawl floor
+                // it would read as a ~12 s occupation and gate the whole
+                // opposing flow at the line.
+                if o.speed < 0.5 && o_s - o_arc > 1.5 {
+                    continue;
                 }
                 let t_clear = (tail_clear - o_arc) / o.speed.max(0.8);
                 let cap = self.turn_speed_cap(mid).min(veh.driver.desired_speed);
@@ -3830,9 +3932,20 @@ impl NetWorld {
     /// the outer gate must clear the whole path, not just the entry stub, or a
     /// fast through is waved in only to meet a crosser mid-cluster with no
     /// stopping distance.
-    fn box_conflict_on_path(&self, veh: &NetVehicle, mid: MovementId, node: NodeId, nb: &Neighbors) -> bool {
+    /// The whole-path box-conflict gate, waiter-aware: `hold` is the interior
+    /// arc a mid-box waiter will stand short of, so shared points at or beyond
+    /// it are not contested at admission (the in-box hold owns them); `None`
+    /// gates every point on the committed path as before.
+    fn box_conflict_on_path_holding(
+        &self,
+        veh: &NetVehicle,
+        mid: MovementId,
+        node: NodeId,
+        nb: &Neighbors,
+        hold: Option<f64>,
+    ) -> bool {
         let dist_to_line = (self.network.lane(veh.lane).length - veh.position).max(0.0);
-        if self.box_conflict_graded(veh, mid, dist_to_line, node, nb) {
+        if self.box_conflict_graded(veh, mid, dist_to_line, node, nb, hold) {
             return true;
         }
         let mut lane = self.network.movement(mid).to_lane;
@@ -4091,6 +4204,50 @@ impl NetWorld {
         }
     }
 
+    /// Interior arc of `mid`'s first conflict point against a currently live
+    /// (non-red) movement — where a mid-box waiter stands short of.
+    fn first_live_conflict_arc(&self, mid: MovementId, node: NodeId) -> Option<f64> {
+        let mut first = f64::INFINITY;
+        for &ci in self.junctions.conflict_ids(node) {
+            let cp = &self.network.conflicts[ci as usize];
+            let (my_s, other) = if cp.a == mid {
+                (cp.sa, cp.b)
+            } else if cp.b == mid {
+                (cp.sb, cp.a)
+            } else {
+                continue;
+            };
+            if self.movement_state(other) != SignalState::Red {
+                first = first.min(my_s);
+            }
+        }
+        first.is_finite().then_some(first)
+    }
+
+    /// The interior arc a green permissive left may advance to and *wait* at
+    /// while oncoming still owns the window — the box-committed left every
+    /// driver performs — or `None` when it must keep yielding at the line. The
+    /// interior must be deep enough to stand `PERMISSIVE_HOLD_MARGIN` short of
+    /// the first live conflict point, and only one waiter per movement is
+    /// admitted (a queue in the box could not clear on the change interval).
+    fn permissive_waiter_hold(&self, i: usize, mid: MovementId, node: NodeId, nb: &Neighbors) -> Option<f64> {
+        if self.network.movement_turn(mid) != TurnType::Left || !self.is_permissive(mid) {
+            return None;
+        }
+        let hold = self.first_live_conflict_arc(mid, node)? - PERMISSIVE_HOLD_MARGIN;
+        if hold < 1.0 {
+            return None; // too shallow to stand in
+        }
+        let key = self.network.intersection_key(node);
+        let taken = nb
+            .crossing_at
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .any(|&j| j != i && self.fleet.rows[j].crossing.is_some_and(|c| c.movement == mid));
+        (!taken).then_some(hold)
+    }
+
     /// Whether the lane a movement feeds into is occupied right at its entrance, so a vehicle
     /// taking it couldn't land and must hold at the line. Shared by the stop-line gate and the
     /// all-way-stop FIFO (which must not keep yielding to a car that itself can't move).
@@ -4147,6 +4304,26 @@ impl NetWorld {
 
     fn permissive_must_yield(&self, i: usize, mid: MovementId, node: NodeId, nb: &Neighbors) -> bool {
         let me = &self.fleet.rows[i];
+        let my_line = (self.network.lane(me.lane).length - me.position).max(0.0);
+        self.permissive_pressure(i, mid, node, nb, &|my_s| Some(my_line + my_s))
+    }
+
+    /// Whether any of `mid`'s conflict points still demands waiting: a crosser
+    /// inside the box owning a shared point during this driver's arrival window,
+    /// or approaching conflict traffic inside the accepted gap. `dist_of(my_s)`
+    /// is this driver's remaining distance to a conflict point at interior arc
+    /// `my_s` (`None`: already past it) — measured from the stop line for the
+    /// gap-acceptance yield, from the current interior arc for the mid-box
+    /// waiter's hold.
+    fn permissive_pressure(
+        &self,
+        i: usize,
+        mid: MovementId,
+        node: NodeId,
+        nb: &Neighbors,
+        dist_of: &dyn Fn(f64) -> Option<f64>,
+    ) -> bool {
+        let me = &self.fleet.rows[i];
         let key = self.network.intersection_key(node);
         self.junctions.conflict_ids(node).iter().any(|&ci| {
             let cp = &self.network.conflicts[ci as usize];
@@ -4161,12 +4338,17 @@ impl NetWorld {
             if other_state == SignalState::Red {
                 return false;
             }
+            let Some(my_dist) = dist_of(my_s) else {
+                return false; // already past this point
+            };
             // A conflicting car inside the box blocks only while it still owns
             // the shared point during our own arrival window (graded — a crosser
             // whose tail has swept past frees the movement immediately). Future
             // cluster hops onto `other` stay binary.
-            let my_line = (self.network.lane(me.lane).length - me.position).max(0.0);
             for &j in nb.crossing_at.get(&key).into_iter().flatten() {
+                if j == i {
+                    continue;
+                }
                 let o = &self.fleet.rows[j];
                 let cm = o.crossing.unwrap().movement;
                 if cm != other {
@@ -4190,9 +4372,14 @@ impl NetWorld {
                 if o_arc >= tail_clear {
                     continue;
                 }
+                // A stationary waiter short of the point doesn't claim it (the
+                // same rule the admission gate and in-box avoidance apply).
+                if o.speed < 0.5 && other_s - o_arc > 1.5 {
+                    continue;
+                }
                 let t_clear = (tail_clear - o_arc) / o.speed.max(0.8);
                 let cap_me = self.turn_speed_cap(mid).min(me.driver.desired_speed);
-                let t_reach = travel_time(my_line + my_s, me.speed.max(1.0), me.driver.max_accel, cap_me);
+                let t_reach = travel_time(my_dist, me.speed.max(1.0), me.driver.max_accel, cap_me);
                 if t_reach < t_clear + 0.6 {
                     return true;
                 }
@@ -4205,9 +4392,15 @@ impl NetWorld {
             // green flow is the HCM major-left case; an RTOR faces cross traffic
             // like a minor right.
             let cap = self.turn_speed_cap(mid).min(me.driver.desired_speed);
-            let t_clear = travel_time(my_s + me.driver.vehicle_length, me.speed.max(1.0), me.driver.max_accel, cap);
+            let t_clear = travel_time(my_dist + me.driver.vehicle_length, me.speed.max(1.0), me.driver.max_accel, cap);
             let minor = self.network.movement_turn(mid) == TurnType::Right;
-            let needed = (t_clear + 1.0).max(hcm_critical_gap(self.network.movement_turn(mid), minor, &me.driver));
+            // Impatience shrinks the accepted gap as the wait grows, exactly as
+            // the priority-yield path does — a sneaker eventually takes the 3 s
+            // headway a fresh arrival wouldn't — floored by the physical
+            // crossing time, which no amount of waiting can shave.
+            let waited = me.wait_ticks as f64 * self.cfg.dt;
+            let base_gap = hcm_critical_gap(self.network.movement_turn(mid), minor, &me.driver);
+            let needed = (t_clear + 1.0).max(effective_critical_gap(base_gap, waited));
             let from_link = self.network.lane(self.network.movement(other).from_lane).link;
             nb.approaching.get(&key).into_iter().flatten().any(|&j| {
                 let o = &self.fleet.rows[j];
@@ -5931,6 +6124,39 @@ mod tests {
     }
 
     #[test]
+    fn permissive_left_advances_into_the_box_and_waits_at_its_conflict_point() {
+        // Under a continuous sub-critical oncoming stream, the green permissive
+        // left no longer camps at the stop line: it advances into the box, stands
+        // short of the oncoming path, and completes when the pressure lifts —
+        // without a collision and without gating the opposing flow.
+        let mut w = NetWorld::new(signalized_four_way().build(), cfg());
+        let d = DriverConfig { accel_noise: 0.0, ..DriverConfig::car() };
+        assert!(w.spawn_routed(1, vec![LinkId(4), LinkId(1)], 8.0, d.clone()));
+        let mut next = 100u32;
+        let mut waited_in_box = 0u32;
+        let mut oncoming_through = 0u32;
+        for t in 0..900 {
+            // A continuous sub-critical stream while the (actuated, unchallenged)
+            // green holds — then it ends, and the waiter's gap arrives.
+            if t % 15 == 0 && t < 450 {
+                w.spawn_routed(next, vec![LinkId(6), LinkId(5)], 8.0, d.clone());
+                next += 1;
+            }
+            w.step();
+            if let Some(v) = w.vehicle(1) {
+                if v.is_crossing() && v.speed < 0.5 {
+                    waited_in_box += 1;
+                }
+                oncoming_through = w.exited();
+            }
+        }
+        assert!(waited_in_box >= 10, "the left stood inside the box awaiting its window ({waited_in_box} ticks)");
+        assert!(w.vehicle(1).is_none(), "the waiter completed its turn (no box deadlock)");
+        assert!(oncoming_through >= 5, "the opposing flow kept moving past the waiter ({oncoming_through} cleared)");
+        assert_eq!(w.crashed(), 0, "waiting mid-box stays collision-free");
+    }
+
+    #[test]
     fn minor_road_yields_to_the_major_road_then_goes() {
         // Minor goes *straight across* (south→north) the major (west→east), so the
         // crossing conflict rule makes it defer to the higher-priority major. The
@@ -6658,7 +6884,7 @@ mod tests {
         if let Some(mid) = intended {
             println!("  state {:?}", world.movement_state(mid));
             println!("  box_entry_blocked {}", world.box_entry_blocked(i, Some(mid), &nb));
-            println!("  box_conflict_on_path {}", world.box_conflict_on_path(v, mid, node, &nb));
+            println!("  box_conflict_on_path {}", world.box_conflict_on_path_holding(v, mid, node, &nb, None));
             println!("  junction_exit_blocked {}", world.junction_exit_blocked(v, mid, node, &nb));
             println!("  downstream_blocked {}", world.movement_downstream_blocked(mid, &v.driver, &nb));
             println!("  earlier_stopped_conflict {}", world.earlier_stopped_conflict(i, mid, node, &nb));
@@ -6785,7 +7011,7 @@ mod tests {
             println!("  downstream_blocked {}", w.movement_downstream_blocked(mid, &v.driver, &nb));
             println!("  box_entry_blocked {}", w.box_entry_blocked(i, Some(mid), &nb));
             let node = w.downstream_node(v.lane);
-            println!("  box_conflict_on_path {}", w.box_conflict_on_path(v, mid, node, &nb));
+            println!("  box_conflict_on_path {}", w.box_conflict_on_path_holding(v, mid, node, &nb, None));
             println!("  junction_exit_blocked {}", w.junction_exit_blocked(v, mid, node, &nb));
             println!("  is_permissive {}", w.is_permissive(mid));
             println!(
@@ -6848,7 +7074,7 @@ mod tests {
             println!("  is_intra_corridor={}", world.is_intra_corridor(mid));
             println!("  free_flow_interchange={}", world.free_flow_interchange(mid));
             println!("  box_entry_blocked={}", world.box_entry_blocked(i, Some(mid), &nb));
-            println!("  box_conflict_on_path={}", world.box_conflict_on_path(v, mid, node, &nb));
+            println!("  box_conflict_on_path={}", world.box_conflict_on_path_holding(v, mid, node, &nb, None));
             println!("  junction_exit_blocked={}", world.junction_exit_blocked(v, mid, node, &nb));
             println!("  movement_downstream_blocked={}", world.movement_downstream_blocked(mid, &v.driver, &nb));
             println!("  meter_red={} rail_closed={}", world.meter_red(ln.link), world.rail_closed(node));
@@ -8276,6 +8502,44 @@ mod tests {
             to_node > 150.0,
             "two lanes out, positioning starts a window early: reached the pocket only {to_node:.0} m before the node"
         );
+    }
+
+    #[test]
+    fn lane_choice_prepositions_for_the_turn_after_next() {
+        // The route turns left off link B, whose turn lane is only fed by A's
+        // lane 0. Judging lanes by "reaches B" alone, A's lane 1 looks fine and
+        // the car lands on B owing a forced weave; judging one hop deeper, it
+        // moves over while still on A.
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, 0.0, 0.0),
+                NodeSpec::uncontrolled(2, 400.0, 0.0),
+                NodeSpec::uncontrolled(3, 440.0, 0.0),
+                NodeSpec::uncontrolled(4, 440.0, 300.0),  // left exit off B
+                NodeSpec::uncontrolled(5, 740.0, 0.0),    // straight exit off B
+            ],
+            links: vec![
+                LinkSpec::oneway(1, 2, 2, 15.0), // A
+                LinkSpec::oneway(2, 3, 2, 15.0), // B: a short block — too short to weave on
+                LinkSpec::oneway(3, 4, 1, 15.0), // C: left, fed by B lane 0
+                LinkSpec::oneway(3, 5, 1, 15.0), // D: straight, fed by B lane 1
+            ],
+        }
+        .build();
+        let mut world = NetWorld::new(net, cfg());
+        let curb = LaneId(world.network.link(LinkId(0)).lane_start.0 + 1);
+        world.spawn_routed_in_lane(1, vec![LinkId(0), LinkId(1), LinkId(2)], curb, 50.0, 12.0, DriverConfig { accel_noise: 0.0, ..DriverConfig::car() });
+        let mut lane_at_a_end = None;
+        for _ in 0..600 {
+            world.step();
+            if let Some(v) = world.vehicle(1) {
+                if !v.is_crossing() && world.network.lane(v.lane).link == LinkId(0) {
+                    lane_at_a_end = Some(world.network.lane(v.lane).index_in_link);
+                }
+            }
+        }
+        assert_eq!(world.exited(), 1, "the car completes the route");
+        assert_eq!(lane_at_a_end, Some(0), "it pre-positioned on A for the turn off B");
     }
 
     #[test]

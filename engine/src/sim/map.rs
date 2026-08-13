@@ -1300,7 +1300,7 @@ fn coordinate_green_waves(net: &mut Network) {
 
     // Compute every offset while only *reading* the network, then apply them — so the
     // read-only walk/lookup closures don't clash with mutating `net.programs`.
-    let offsets: Vec<(usize, f64, f64)> = {
+    let offsets: Vec<(usize, f64, f64, usize)> = {
         let mut sig: BTreeMap<u32, ProgramId> = BTreeMap::new();
         for (i, n) in net.nodes.iter().enumerate() {
             if let NodeControl::Signalized(p) = n.control {
@@ -1352,9 +1352,11 @@ fn coordinate_green_waves(net: &mut Network) {
             None
         };
 
-        // Green-start time (into the cycle) of the corridor's through phase at `node`,
-        // found via a straight-through movement along `corridor_link`.
-        let through_start = |node: u32, corridor_link: u32| -> Option<f64> {
+        // Green-start time (into the cycle) and phase index of the corridor's
+        // through phase at `node`, found via a straight-through movement along
+        // `corridor_link`. The index is stored on the program so the
+        // semi-actuated controller knows which phase the progression anchors to.
+        let through_start = |node: u32, corridor_link: u32| -> Option<(f64, usize)> {
             let prog = &net.programs[sig.get(&node)?.idx()];
             for m in 0..net.movements.len() {
                 let mv = net.movements[m];
@@ -1366,9 +1368,9 @@ fn coordinate_green_waves(net: &mut Network) {
                 }
                 let bit = net.groups[mv.signal_group?.idx()].bit;
                 let mut acc = 0.0;
-                for ph in &prog.phases {
+                for (pi, ph) in prog.phases.iter().enumerate() {
                     if ph.green_mask & (1u64 << bit) != 0 {
-                        return Some(acc);
+                        return Some((acc, pi));
                     }
                     acc += ph.length();
                 }
@@ -1416,10 +1418,10 @@ fn coordinate_green_waves(net: &mut Network) {
                 let pid = sig[&n];
                 let cycle = net.programs[pid.idx()].cycle_length();
                 if let (Some(link), true) = (link, cycle > 1.0) {
-                    if let Some(sp) = through_start(n, link) {
+                    if let Some((sp, phase)) = through_start(n, link) {
                         // AM plan: green opens `cum` later downstream (progression
                         // along the walk); PM plan: the mirror (progression back).
-                        out.push((pid.idx(), (sp - cum).rem_euclid(cycle), (sp + cum).rem_euclid(cycle)));
+                        out.push((pid.idx(), (sp - cum).rem_euclid(cycle), (sp + cum).rem_euclid(cycle), phase));
                     }
                 }
             }
@@ -1429,9 +1431,10 @@ fn coordinate_green_waves(net: &mut Network) {
 
     net.am_offsets = net.programs.iter().map(|p| p.offset).collect();
     net.pm_offsets = net.am_offsets.clone();
-    for (idx, am, pm) in offsets {
+    for (idx, am, pm, phase) in offsets {
         net.programs[idx].offset = am;
         net.programs[idx].coordinated = true;
+        net.programs[idx].coordinated_phase = phase;
         net.am_offsets[idx] = am;
         net.pm_offsets[idx] = pm;
     }
@@ -3195,12 +3198,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn actuated_controller_honors_coordination_offsets_at_runtime() {
-        use super::super::junction::SignalController;
-        use super::super::signal::SignalState;
-        use std::collections::HashSet;
-
+    /// A two-signal Main-Street corridor with a cross street at each signal —
+    /// coordination's minimal fixture.
+    fn coordinated_corridor_net() -> Network {
         let plan = SignalPlan { green_secs: 20.0, yellow_secs: 4.0, offset: 0.0 };
         let road = |a, b, name: &str, lanes, sp| {
             let mut v = LinkSpec::twoway(a, b, lanes, sp).to_vec();
@@ -3216,7 +3216,7 @@ mod tests {
         for (n, e, name) in [(1, 10, "Cross A"), (2, 11, "Cross B")] {
             links.extend(road(n, e, name, 1, 12.0));
         }
-        let net = OsmMap {
+        OsmMap {
             nodes: vec![
                 NodeSpec::uncontrolled(0, -300.0, 0.0),
                 NodeSpec::signalized(1, 0.0, 0.0, plan),
@@ -3227,8 +3227,34 @@ mod tests {
             ],
             links,
         }
-        .build();
+        .build()
+    }
 
+    /// The upstream signal's Main-Street through group: (program, bit, movement).
+    fn corridor_through(net: &Network) -> (usize, u8, MovementId) {
+        (0..net.movements.len() as u32)
+            .find_map(|m| {
+                let mv = net.movement(MovementId(m));
+                let (fl, tl) = (net.lane(mv.from_lane).link, net.lane(mv.to_lane).link);
+                (mv.node == NodeId(1)
+                    && net.movement_turn(MovementId(m)) == TurnType::Through
+                    && net.link_names[fl.idx()] == "Main Street"
+                    && net.link_names[tl.idx()] == "Main Street")
+                    .then(|| {
+                        let g = net.groups[mv.signal_group.unwrap().idx()];
+                        (g.program.idx(), g.bit, MovementId(m))
+                    })
+            })
+            .expect("a Main-Street through movement")
+    }
+
+    #[test]
+    fn actuated_controller_honors_coordination_offsets_at_runtime() {
+        use super::super::junction::SignalController;
+        use super::super::signal::SignalState;
+        use std::collections::HashSet;
+
+        let net = coordinated_corridor_net();
         let coordinated = net.programs.iter().filter(|p| p.coordinated).count();
         assert_eq!(coordinated, 2, "both corridor signals are coordinated");
 
@@ -3252,28 +3278,85 @@ mod tests {
         let down = through(NodeId(2));
         assert_ne!(net.programs[up.2].offset, net.programs[down.2].offset, "offsets are staggered");
 
+        // Semi-actuated coordination's contract: whenever the offset schedule has
+        // the through phase green (well inside the window, clear of clearance
+        // rounding), the live controller must be green too — side phases may
+        // borrow or return the rest of the cycle, but the progression window is
+        // inviolate. Full demand keeps every side phase competing, and the
+        // staggered offsets must still show as staggered green instants.
         let cycle = net.programs[up.2].cycle_length();
-        let steps = (cycle / 0.1).ceil() as usize + 4;
+        let steps = 2 * (cycle / 0.1).ceil() as usize + 4;
         let mut ctrl = SignalController::build(&net);
-        let empty = HashSet::new();
+        let demand: HashSet<u32> = (0..net.links.len() as u32).collect();
         let mut clock = 0.0;
+        // One warm-up cycle so the seeded runtime settles onto the schedule.
+        while clock < cycle {
+            ctrl.advance(&net, &demand, 0.1, &Default::default());
+            clock += 0.1;
+        }
         let mut staggered_instant = false;
         for _ in 0..steps {
             for (mid, bit, pid) in [up, down] {
-                assert_eq!(
-                    ctrl.movement_state(&net, mid),
-                    net.programs[pid].state_of(bit, clock),
-                    "coordinated runtime state must follow the offset schedule at t={clock}",
-                );
+                let sched = |t: f64| net.programs[pid].state_of(bit, t) == SignalState::Green;
+                if sched(clock - 0.5) && sched(clock) && sched(clock + 0.5) {
+                    assert_eq!(
+                        ctrl.movement_state(&net, mid),
+                        SignalState::Green,
+                        "the progression window is guaranteed green at t={clock}",
+                    );
+                }
             }
             let (us, ds) = (ctrl.movement_state(&net, up.0), ctrl.movement_state(&net, down.0));
+            if (clock * 10.0).round() as i64 % 20 == 0 {
+                eprintln!("t={clock:.1} up={us:?} down={ds:?}");
+            }
             if us == SignalState::Green && ds != SignalState::Green {
                 staggered_instant = true;
             }
-            ctrl.advance(&net, &empty, 0.1, &Default::default());
+            ctrl.advance(&net, &demand, 0.1, &Default::default());
             clock += 0.1;
         }
         assert!(staggered_instant, "the wave reaches the upstream green before the downstream one");
+    }
+
+    #[test]
+    fn a_coordinated_signal_rests_in_green_without_side_demand() {
+        // The actuated half of semi-actuated coordination: with nobody on the
+        // side street, the corridor keeps its green (the side phase is skipped)
+        // instead of cycling on the fixed schedule; a real side arrival is still
+        // served within a cycle.
+        use super::super::junction::SignalController;
+        use super::super::signal::SignalState;
+        use std::collections::HashSet;
+        let net = coordinated_corridor_net();
+        let (pid, _bit, mid) = corridor_through(&net);
+        let cycle = net.programs[pid].cycle_length();
+        let mut ctrl = SignalController::build(&net);
+        // Demand only on the through movement's own approach: detectors are
+        // per-link, and the opposite Main approach also feeds a protected-left
+        // phase — a genuine (if coarse) left call this test must not place.
+        let main: HashSet<u32> = HashSet::from([net.lane(net.movement(mid).from_lane).link.0]);
+        let mut clock = 0.0;
+        // Warm-up cycle, then measure green share over two cycles.
+        while clock < cycle {
+            ctrl.advance(&net, &main, 0.1, &Default::default());
+            clock += 0.1;
+        }
+        let steps = 2 * (cycle / 0.1).ceil() as usize;
+        let mut green = 0usize;
+        for _ in 0..steps {
+            if ctrl.movement_state(&net, mid) == SignalState::Green {
+                green += 1;
+            }
+            ctrl.advance(&net, &main, 0.1, &Default::default());
+        }
+        let share = green as f64 / steps as f64;
+        let scheduled = net.programs[pid].phases[net.programs[pid].coordinated_phase].green_secs / cycle;
+        assert!(
+            share > scheduled + 0.15,
+            "resting in green beats the fixed schedule: live {share:.2} vs scheduled {scheduled:.2}"
+        );
+        assert_eq!(net.programs[pid].coordinated, true, "the corridor program is coordinated");
     }
 
     /// A signalized four-way with every in/out leg, centre node on a signal.

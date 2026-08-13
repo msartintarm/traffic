@@ -68,7 +68,27 @@ pub struct SignalController {
 
 impl SignalController {
     pub fn build(net: &Network) -> Self {
-        let signals = vec![SignalRuntime { phase: 0, elapsed: 0.0, yellow: false, all_red: 0.0 }; net.programs.len()];
+        // A coordinated program boots on its *scheduled* phase (offset-aware), so
+        // corridor progression is aligned from the first cycle instead of every
+        // signal starting at phase 0 in unison.
+        let signals = net
+            .programs
+            .iter()
+            .map(|p| {
+                let mut rt = SignalRuntime { phase: 0, elapsed: 0.0, yellow: false, all_red: 0.0 };
+                if p.coordinated && p.cycle_length() > 0.0 {
+                    let mut t = p.offset.rem_euclid(p.cycle_length());
+                    for (i, ph) in p.phases.iter().enumerate() {
+                        if t < ph.length() {
+                            rt.phase = i;
+                            break;
+                        }
+                        t -= ph.length();
+                    }
+                }
+                rt
+            })
+            .collect();
         let mut approaches: Vec<Vec<Vec<LinkId>>> = vec![Vec::new(); net.programs.len()];
         for g in &net.groups {
             let bits = &mut approaches[g.program.idx()];
@@ -91,11 +111,7 @@ impl SignalController {
 
     fn group_state(&self, net: &Network, program: ProgramId, bit: u8) -> SignalState {
         let prog = &net.programs[program.idx()];
-        if prog.coordinated {
-            prog.state_of(bit, self.time)
-        } else {
-            self.signals[program.idx()].state_of(bit, prog)
-        }
+        self.signals[program.idx()].state_of(bit, prog)
     }
 
     /// Signal state of a movement (`Green` if it carries no signal group).
@@ -122,27 +138,12 @@ impl SignalController {
         let group = net.groups[gid.idx()];
         let program = &net.programs[group.program.idx()];
         let mask = 1u64 << group.bit;
-        if program.coordinated {
-            let cycle = program.cycle_length();
-            if cycle <= 0.0 {
-                return 0.0;
-            }
-            let mut t = (self.time + program.offset).rem_euclid(cycle);
-            for phase in &program.phases {
-                if t < phase.length() {
-                    return if phase.green_mask & mask != 0 && t < phase.green_secs { t } else { 0.0 };
-                }
-                t -= phase.length();
-            }
-            0.0
+        let rt = self.signals[group.program.idx()];
+        let served = program.phases.get(rt.phase).is_some_and(|ph| ph.green_mask & mask != 0);
+        if served && !rt.yellow && rt.all_red <= 0.0 {
+            rt.elapsed
         } else {
-            let rt = self.signals[group.program.idx()];
-            let served = program.phases.get(rt.phase).is_some_and(|ph| ph.green_mask & mask != 0);
-            if served && !rt.yellow && rt.all_red <= 0.0 {
-                rt.elapsed
-            } else {
-                0.0
-            }
+            0.0
         }
     }
 
@@ -166,15 +167,37 @@ impl SignalController {
         for pid in 0..self.signals.len() {
             let (n_phases, green_mask, yellow_dur) = {
                 let program = &net.programs[pid];
-                if program.phases.is_empty() || program.coordinated {
+                if program.phases.is_empty() {
                     continue;
                 }
                 let ph = program.phases[self.signals[pid].phase];
                 (program.phases.len(), ph.green_mask, ph.yellow_secs)
             };
+            let phase_demand = |mask: u64| {
+                self.approaches[pid].iter().enumerate().any(|(bit, links)| {
+                    mask & (1u64 << bit) != 0 && links.iter().any(|l| demand.contains(&l.0))
+                })
+            };
             let bit_has_demand = |served: bool| {
                 self.approaches[pid].iter().enumerate().any(|(bit, links)| {
                     (green_mask & (1u64 << bit) != 0) == served && links.iter().any(|l| demand.contains(&l.0))
+                })
+            };
+            // Semi-actuated coordination: the progression phase is guaranteed its
+            // scheduled window on the cycle clock (force-on: side phases must
+            // clear before it opens; force-off: it only yields once the window
+            // has passed and a side phase is waiting), and time no side phase
+            // claims returns to it (rest-in-green). Everything else — clearance
+            // sequencing, preemption, gap-out — is the shared machinery below.
+            let coord = {
+                let program = &net.programs[pid];
+                (program.coordinated && n_phases > 1 && program.cycle_length() > 0.0).then(|| {
+                    let cp = program.coordinated_phase.min(n_phases - 1);
+                    let cycle = program.cycle_length();
+                    let t_c = (self.time + program.offset).rem_euclid(cycle);
+                    let start_c = program.phase_start(cp);
+                    let green_c = program.phases[cp].green_secs;
+                    (cp, cycle, t_c, start_c, green_c)
                 })
             };
             let force = forced.get(&pid).copied().filter(|&t| t < n_phases);
@@ -184,7 +207,24 @@ impl SignalController {
                 rt.all_red -= dt;
                 if rt.all_red <= 0.0 {
                     rt.all_red = 0.0;
-                    rt.phase = force.unwrap_or((rt.phase + 1) % n_phases);
+                    rt.phase = force.unwrap_or_else(|| match coord {
+                        // Inside (or at) the progression window: the coordinated
+                        // phase, unconditionally. Otherwise the next demanded
+                        // side phase in ring order, falling back to coordinated
+                        // rest-in-green when nothing is waiting.
+                        Some((cp, cycle, t_c, start_c, green_c)) => {
+                            let in_window = (t_c - start_c).rem_euclid(cycle) < green_c;
+                            if in_window {
+                                cp
+                            } else {
+                                (1..=n_phases)
+                                    .map(|k| (rt.phase + k) % n_phases)
+                                    .find(|&p| p == cp || phase_demand(net.programs[pid].phases[p].green_mask))
+                                    .unwrap_or(cp)
+                            }
+                        }
+                        None => (rt.phase + 1) % n_phases,
+                    });
                     rt.elapsed = 0.0;
                 }
             } else if rt.yellow {
@@ -198,6 +238,32 @@ impl SignalController {
             } else if force.is_some_and(|t| t != rt.phase) && rt.elapsed >= PREEMPT_GRACE {
                 rt.yellow = true;
                 rt.elapsed = 0.0;
+            } else if let Some((cp, cycle, t_c, start_c, green_c)) = coord {
+                let terminate = if rt.phase == cp {
+                    // Hold green through the scheduled window; past it, yield
+                    // only to a phase somebody is actually waiting for (else
+                    // rest in green). Demand is judged per *phase mask*, not by
+                    // served-vs-unserved bits: in a protected-permissive program
+                    // the coordinated phase serves every group permissively, and
+                    // a protected-left phase is a strict subset of it — the
+                    // waiting left is "served", but its protected window is
+                    // still owed.
+                    let in_window = (t_c - start_c).rem_euclid(cycle) < green_c;
+                    let side_demand = (0..n_phases)
+                        .any(|p| p != cp && phase_demand(net.programs[pid].phases[p].green_mask));
+                    !in_window && rt.elapsed >= MIN_GREEN && side_demand
+                } else {
+                    // A side phase gaps out like any actuated phase, and must be
+                    // clear (yellow + all-red) by the progression window's start.
+                    let clearance = yellow_dur + all_red_of(&net.programs[pid], rt.phase);
+                    let force_off = (start_c - t_c).rem_euclid(cycle) <= clearance;
+                    rt.elapsed >= MIN_GREEN
+                        && (force_off || rt.elapsed >= MAX_GREEN || !bit_has_demand(true))
+                };
+                if terminate {
+                    rt.yellow = true;
+                    rt.elapsed = 0.0;
+                }
             } else if n_phases > 1
                 && rt.elapsed >= MIN_GREEN
                 && bit_has_demand(false)
