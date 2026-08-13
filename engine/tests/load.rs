@@ -267,7 +267,6 @@ fn bench_scheduler_vs_threads() {
         for (label, backend, sleep) in cases {
             let mut world = NetWorld::new(net.clone(), SimConfig { sleep_scheduler: sleep, ..cfg0 });
             world.set_accel_backend(backend);
-            world.set_scheduler_thread_limit(usize::MAX); // keep the scheduler on under threads, so threads+scheduler is measurable
             let pairs = demand::od_pairs(&world.network, 1, 600, DemandSources::new(true, true));
             let mut gen = DemandGenerator::new(&world, &pairs, 1);
             world.install_router(&gen.destinations());

@@ -657,17 +657,6 @@ impl Simulation {
         self.world.par_threshold() as u32
     }
 
-    /// Vehicle count at/above which the active-set scheduler yields to plain multi-core
-    /// parallelism under CPU threads (below it, the scheduler runs even threaded). Its own
-    /// lever so the threads↔scheduler crossover is tunable independently of the
-    /// serial↔threads one. Only affects the `Threads` backend.
-    pub fn set_scheduler_thread_limit(&mut self, n: u32) {
-        self.world.set_scheduler_thread_limit(n as usize);
-    }
-
-    pub fn scheduler_thread_limit(&self) -> u32 {
-        self.world.scheduler_thread_limit() as u32
-    }
 
     /// Toggle solving several routing (flow-field) recompute destinations at once across the
     /// worker pool vs. one at a time. On by default; exposed so the parallel routing speed-up

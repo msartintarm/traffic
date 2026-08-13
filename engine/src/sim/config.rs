@@ -44,7 +44,11 @@ impl DriverConfig {
         Self {
             desired_speed: 30.0,
             time_headway: 1.2,
-            max_accel: 1.5,
+            // Mid comfortable range (≈1.5–2.5): tuned against the signalized
+            // queue-discharge test (`queue_discharge_hits_real_saturation_flow`)
+            // — launch kinematics are the accel-sensitive half of saturation
+            // flow, and 1.5 measurably under-discharged every stop line.
+            max_accel: 2.0,
             comfort_decel: 2.0,
             accel_exponent: 4.0,
             min_gap: 2.0,

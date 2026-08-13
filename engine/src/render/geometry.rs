@@ -320,8 +320,18 @@ fn junction_box(arms: &[([f64; 2], [f64; 2])], c: [f64; 2]) -> Vec<[f64; 2]> {
 /// single convex box can't when the arms stagger.
 fn junction_fan_ring(arms: &[([f64; 2], [f64; 2])], c: [f64; 2]) -> Vec<[f64; 2]> {
     let ang = |p: &[f64; 2]| (p[1] - c[1]).atan2(p[0] - c[0]);
-    let mut ordered: Vec<([f64; 2], [f64; 2])> =
-        arms.iter().map(|&(m, o)| if ang(&m) <= ang(&o) { (m, o) } else { (o, m) }).collect();
+    // Orient each mouth's corner pair counter-clockwise about the centre by the
+    // cross product, not by comparing raw angles — a mouth straddling atan2's
+    // ±π cut (an arm due west) compares reversed, which crossed the ring over
+    // itself there and measured the curb gap to the next arm from the wrong
+    // corner.
+    let mut ordered: Vec<([f64; 2], [f64; 2])> = arms
+        .iter()
+        .map(|&(m, o)| {
+            let cross = (m[0] - c[0]) * (o[1] - c[1]) - (m[1] - c[1]) * (o[0] - c[0]);
+            if cross >= 0.0 { (m, o) } else { (o, m) }
+        })
+        .collect();
     ordered.sort_by(|a, b| {
         let ca = ang(&[(a.0[0] + a.1[0]) * 0.5, (a.0[1] + a.1[1]) * 0.5]);
         let cb = ang(&[(b.0[0] + b.1[0]) * 0.5, (b.0[1] + b.1[1]) * 0.5]);
@@ -597,6 +607,11 @@ fn stop_yield_markings(net: &Network, interior: &[bool], stop: &[f64], mesh: &mu
             if net.link(LinkId(link)).to != NodeId(n) || interior[link as usize] {
                 continue;
             }
+            // At a two-way stop only the signed approaches carry the bar and
+            // octagon; the major street rolls through unmarked.
+            if is_stop && !net.approach_stops(LinkId(link)) {
+                continue;
+            }
             let spos = stop[link as usize];
             for lane in net.lanes_of(LinkId(link)) {
                 let p = net.lane_point(lane, spos); // stop point
@@ -806,6 +821,48 @@ fn dashed_line(mesh: &mut StaticMesh, a: [f64; 2], b: [f64; 2], dash: f64, gap: 
 mod tests {
     use super::*;
     use crate::sim::map::{self, LinkSpec, NodeSpec, OsmMap};
+    use crate::sim::network::LinkSign;
+
+    #[test]
+    fn fan_ring_keeps_every_mouth_inside_even_across_the_angle_cut() {
+        // Four cardinal arms, each mouth 6 m wide at 10 m out, corner pairs
+        // deliberately scrambled. The west arm's corners straddle atan2's ±π
+        // branch cut: ordering them by raw angle reverses their sweep and
+        // pinches the ring into a bowtie across that mouth — every mouth
+        // interior must instead sit inside the ring.
+        let c = [0.0, 0.0];
+        let arms: Vec<([f64; 2], [f64; 2])> = vec![
+            ([3.0, 10.0], [-3.0, 10.0]),   // N
+            ([10.0, -3.0], [10.0, 3.0]),   // E
+            ([-3.0, -10.0], [3.0, -10.0]), // S
+            ([-10.0, 3.0], [-10.0, -3.0]), // W — the branch-cut straddler
+        ];
+        let ring = junction_fan_ring(&arms, c);
+        for (p, arm) in [([0.0, 9.0], "north"), ([9.0, 0.0], "east"), ([0.0, -9.0], "south"), ([-9.0, 0.0], "west")]
+        {
+            assert!(point_in_ring(&ring, p), "{arm} mouth interior fell outside the fan ring: {ring:?}");
+        }
+        // The ring must walk the eight corners in one angular sweep — each
+        // arm's pair in counter-clockwise order, the west pair included. The
+        // raw-angle ordering reversed exactly that pair (its corners straddle
+        // ±π), crossing the ring over itself and mismeasuring the curb gap to
+        // the next arm.
+        let expect = [
+            [-3.0, -10.0],
+            [3.0, -10.0],
+            [10.0, -3.0],
+            [10.0, 3.0],
+            [3.0, 10.0],
+            [-3.0, 10.0],
+            [-10.0, 3.0],
+            [-10.0, -3.0],
+        ];
+        assert_eq!(ring.len(), expect.len(), "no spurious centre dips: {ring:?}");
+        let start = ring.iter().position(|p| *p == expect[0]).expect("corner present");
+        for (k, e) in expect.iter().enumerate() {
+            assert_eq!(ring[(start + k) % ring.len()], *e, "ring order breaks at {k}: {ring:?}");
+        }
+    }
 
     #[test]
     fn road_mesh_has_a_quad_per_link() {
@@ -850,8 +907,8 @@ mod tests {
                 NodeSpec::uncontrolled(4, 0.0, 100.0),
             ],
             links: vec![
-                LinkSpec { from_osm: 1, to_osm: 2, lanes: 1, speed_limit: 20.0, geometry: Vec::new(), layer: 0, name: String::new(), road_class: String::new(), highway_ref: String::new(), turn_lanes: String::new(), hov_lanes: String::new(), aadt: 0.0, res_weight: 0.0, attr_weight: 0.0 },
-                LinkSpec { from_osm: 3, to_osm: 4, lanes: 1, speed_limit: 25.0, geometry: Vec::new(), layer: 1, name: String::new(), road_class: String::new(), highway_ref: String::new(), turn_lanes: String::new(), hov_lanes: String::new(), aadt: 0.0, res_weight: 0.0, attr_weight: 0.0 },
+                LinkSpec { from_osm: 1, to_osm: 2, lanes: 1, speed_limit: 20.0, geometry: Vec::new(), layer: 0, name: String::new(), road_class: String::new(), highway_ref: String::new(), turn_lanes: String::new(), hov_lanes: String::new(), aadt: 0.0, res_weight: 0.0, attr_weight: 0.0, sign: LinkSign::None },
+                LinkSpec { from_osm: 3, to_osm: 4, lanes: 1, speed_limit: 25.0, geometry: Vec::new(), layer: 1, name: String::new(), road_class: String::new(), highway_ref: String::new(), turn_lanes: String::new(), hov_lanes: String::new(), aadt: 0.0, res_weight: 0.0, attr_weight: 0.0, sign: LinkSign::None },
             ],
         }
         .build();
@@ -1017,7 +1074,7 @@ mod tests {
         // not strips. A curved (multi-segment) link must produce in-range indices.
         let net = OsmMap {
             nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 200.0, 100.0)],
-            links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 2, speed_limit: 20.0, geometry: vec![[100.0, 0.0], [150.0, 50.0]], layer: 0, name: String::new(), road_class: String::new(), highway_ref: String::new(), turn_lanes: String::new(), hov_lanes: String::new(), aadt: 0.0, res_weight: 0.0, attr_weight: 0.0 }],
+            links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 2, speed_limit: 20.0, geometry: vec![[100.0, 0.0], [150.0, 50.0]], layer: 0, name: String::new(), road_class: String::new(), highway_ref: String::new(), turn_lanes: String::new(), hov_lanes: String::new(), aadt: 0.0, res_weight: 0.0, attr_weight: 0.0, sign: LinkSign::None }],
         }
         .build();
         let mesh = occupancy_mesh(&net, &[999], None); // link 0 heavily congested

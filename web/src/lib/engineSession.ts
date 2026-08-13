@@ -311,7 +311,6 @@ export async function startEngineSession(
       case "dayCompression": sim.set_day_compression?.(c.value); break;
       case "rampMetering": sim.set_ramp_metering?.(c.value); break;
       case "sleepScheduler": sim.set_sleep_scheduler(c.value); break;
-      case "schedulerThreadLimit": sim.set_scheduler_thread_limit(c.value); break;
       case "parThreshold": sim.set_par_threshold(c.value); break;
       case "parallelRouting": sim.set_parallel_routing(c.value); break;
       case "cacheSort": sim.set_cache_sort(c.value); break;

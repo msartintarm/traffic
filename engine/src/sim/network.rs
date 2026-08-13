@@ -52,6 +52,18 @@ pub enum NodeControl {
     Signalized(ProgramId),
 }
 
+/// A posted sign controlling one approach alone (OSM `highway=stop`/`give_way`
+/// mapped on the way at its stop line, rather than on the junction node) —
+/// how a two-way stop's minor street is surveyed. Ordered by control strength
+/// so merges keep the stronger sign.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LinkSign {
+    #[default]
+    None,
+    Yield,
+    Stop,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Node {
     pub position: [f64; 2],
@@ -319,6 +331,19 @@ pub struct Network {
     /// Land-use trip-attraction weight per link (`0.0` = no data → neutral 1.0):
     /// shops/jobs/campuses attract trips.
     pub link_attr_weight: Vec<f64>,
+    /// Per-approach sign per link (index-aligned with `links`): the OSM
+    /// stop/give_way surveyed on the way into its downstream node.
+    pub link_signs: Vec<LinkSign>,
+    /// Whether each approach faces a stop line at its downstream node — the one
+    /// authority the driver model reads. Node-level stop control (a sign on the
+    /// junction node, or the all-way cluster promote) lines every approach;
+    /// a per-link sign lines only its own. Empty (a hand-built network) = every
+    /// approach at a Stop node serves the line, the historical behaviour.
+    pub link_stop_line: Vec<bool>,
+    /// Whether a Stop node is a genuine all-way stop (every approach lined) —
+    /// gates the FIFO turn-taking protocol; at a two-way stop the minor street
+    /// must keep gap-accepting against the major road instead. Empty = all-way.
+    pub node_all_way: Vec<bool>,
     pub junctions: Vec<Junction>,
     pub node_junction: Vec<Option<JunctionId>>,
     /// O(1) membership index over `conflicts` (unordered movement-id pair packed into
@@ -585,6 +610,19 @@ impl Network {
     /// road has no attached count.
     pub fn link_aadt(&self, id: LinkId) -> f64 {
         self.link_aadt.get(id.idx()).copied().unwrap_or(0.0)
+    }
+
+    /// Whether this approach faces a stop line at its downstream node. `true`
+    /// on a network without the computed table (hand-built fixtures): every
+    /// approach at a Stop node then serves the line.
+    pub fn approach_stops(&self, id: LinkId) -> bool {
+        self.link_stop_line.get(id.idx()).copied().unwrap_or(true)
+    }
+
+    /// Whether a Stop node is a genuine all-way stop (every approach lined);
+    /// `true` without the computed table — the historical all-way assumption.
+    pub fn all_way_stop(&self, node: NodeId) -> bool {
+        self.node_all_way.get(node.idx()).copied().unwrap_or(true)
     }
 
     /// Land-use trip-production weight of a link; neutral 1.0 without data.
@@ -2080,7 +2118,7 @@ mod tests {
         // L-shaped link (0,0) → bend (100,0) → (100,100).
         let net = OsmMap {
             nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 100.0, 100.0)],
-            links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 1, speed_limit: 20.0, geometry: vec![[100.0, 0.0]], layer: 0, name: String::new(), road_class: String::new(), highway_ref: String::new(), turn_lanes: String::new(), hov_lanes: String::new(), aadt: 0.0, res_weight: 0.0, attr_weight: 0.0 }],
+            links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 1, speed_limit: 20.0, geometry: vec![[100.0, 0.0]], layer: 0, name: String::new(), road_class: String::new(), highway_ref: String::new(), turn_lanes: String::new(), hov_lanes: String::new(), aadt: 0.0, res_weight: 0.0, attr_weight: 0.0, sign: LinkSign::None }],
         }
         .build();
         let lane = LaneId(0);

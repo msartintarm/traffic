@@ -50,7 +50,10 @@ local.
       "signal": { "green_secs": 25.0, "yellow_secs": 4.0, "offset": 0.0 } }
   ],
   "links": [
-    { "from_osm": 123, "to_osm": 456, "lanes": 2, "speed_limit": 15.6 }
+    { "from_osm": 123, "to_osm": 456, "lanes": 2, "speed_limit": 15.6, "sign": "stop" }
+  ],
+  "restrictions": [
+    { "from": [123, 456], "to": [456, 789], "kind": "no_left_turn" }
   ]
 }
 ```
@@ -59,6 +62,14 @@ local.
   (engine geometry is planar).
 - `control` ∈ `uncontrolled | signal | stop | yield`; `signal` timing is a
   placeholder plan until real signal data / calibration is available.
+  Pedestrian signals (`traffic_signals=pedestrian_crossing`) are not junction
+  controllers and stay uncontrolled.
+- `sign` (optional, on a link) ∈ `stop | yield`: a stop/give_way surveyed on
+  the *way* controls that one approach — the engine models a two-way stop
+  (minor street lines up, cross street rolls). The controlled direction comes
+  from the node's `direction` tag, else the sign binds toward the nearer block
+  end. Signs surveyed on the junction node itself stay node-level `control`
+  (all-way semantics).
 - `links` are **directed** — a two-way street becomes two links — matching
   `LinkSpec`. Ways are split at every intersection node so one link is one block.
 
@@ -82,8 +93,8 @@ into an `OsmMap`; the field names above line up 1:1 with `NodeSpec`/`LinkSpec`.
 
 ## Known limitations (tracked for later)
 
-- Link length is straight-line between intersection endpoints; curved-geometry
-  arc length is dropped. Add polyline geometry to preserve it.
-- Turn restrictions and `turn:lanes` are not yet parsed; the builder currently
-  permits all non-U-turn movements.
-- Signal phasing is a default two/round-robin plan, not real controller timing.
+- Signal phasing is a default plan, not real controller timing; the engine
+  rebuilds phases from its conflict graph and coordinates corridors itself.
+- Turn restrictions resolve best-effort: conditional (time-of-day) relations,
+  multi-way vias, and vias interior to an unsplit two-way way are skipped
+  (each scrape prints the counts).

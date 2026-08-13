@@ -530,13 +530,12 @@ const DAILY_SIGMA: f64 = 0.10;
 
 /// Share of surface firings that launch a platoon rather than a lone vehicle — the
 /// bunched fraction of Cowan's M3 arrival model, the signature of arrivals released
-/// by an upstream signal. 0.25 sits at the low end of the observed urban arterial
-/// range (~0.25–0.6). The crash-artifact coupling that once capped it is fixed
-/// (`sober_real_map_burst_stays_junction_crash_free`), but denser bunches (0.3
-/// with up to 4 followers) still interlock complex junctions into spillback
-/// gridlock rings — raising this rides with the graded-yielding junction rework
-/// (PLAN P2.1), not ahead of it.
-const PLATOON_PROB: f64 = 0.25;
+/// by an upstream signal. 0.30 is as high as the zero-crash artifact gates allow
+/// (observed urban range ~0.25–0.6): re-tested 2026-08-13 after graded yielding,
+/// mid-box waiters, and the discharge recalibration — 0.35 still puts two
+/// crashes into `mixed_class_traffic_does_not_crash_under_sustained_demand`,
+/// so denser bunching stays coupled to whatever artifact that gate is holding.
+const PLATOON_PROB: f64 = 0.30;
 /// Mean vehicles per firing given the extras distribution in [`platoon_extras`]
 /// (1 + 0.25 × 4/3); the firing rate is divided by this so volume is conserved.
 const PLATOON_MEAN_SIZE: f64 = 1.0 + PLATOON_PROB * (4.0 / 3.0);

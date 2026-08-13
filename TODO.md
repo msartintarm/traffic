@@ -12,6 +12,25 @@ code, not this file, if in doubt.
 
 ## Landed (audited 2026-08-12)
 
+- [x] **[H] OSM-data accuracy: turn restrictions, two-way stops, pedestrian-signal
+  filter.** *(2026-08-14)* The scraper resolves `type=restriction` relations to
+  emitted-link node pairs (`resolve_restrictions`; conditional/exempt/complex-via
+  skipped and counted) and the engine prunes movement wiring with them
+  (`OsmMap::build_with_restrictions`; `no_*` bans an exit, `only_*` bans the rest,
+  fail-open so no approach strands; pairs rewritten through both topology transforms).
+  Way-mapped stop/give_way become per-approach `LinkSpec::sign` → `Network::
+  {approach_stops, all_way_stop}`: the minor street lines up, the major street rolls
+  (`two_way_stop_halts_the_minor_street_and_not_the_major`); stand-alone stop-line
+  nodes relocate junction-ward (`relocate_sign_nodes` + `join_pass_through` sign
+  merge). `traffic_signals=pedestrian_crossing` no longer becomes a junction signal.
+  `junction_fan_ring` orients mouth corners by cross product (an arm due west of the
+  centre used to reverse across atan2's ±π cut — bowtie ring, wrong curb gap). Tests:
+  `turn_restrictions_prune_movements_across_the_collapse`,
+  `via_way_restrictions_bind_once_the_junction_merges`, `stranding_restrictions_fail_open`,
+  `way_mapped_stop_signs_make_a_two_way_stop`, `stop_line_nodes_relocate_to_their_junction`,
+  `fan_ring_keeps_every_mouth_inside_even_across_the_angle_cut`. Maps need a re-scrape
+  to carry `restrictions`/`sign`; old extracts run unchanged.
+
 - [x] **[H] Green-wave coordination at runtime.**
   `map::coordinate_green_waves` + `harmonize_corridor_cycles` mark corridor programs
   `coordinated`; the controller (`junction::SignalController::group_state`) runs those
@@ -82,7 +101,8 @@ code, not this file, if in doubt.
   pose; also reused by the seam-landing blend. Test:
   `a_lane_change_slides_the_pose_across_gradually`.
 
-- [x] **[L] `max_accel` recalibrated.** `DriverConfig::car()` is 1.5 m/s² (±25% jitter).
+- [x] **[L] `max_accel` recalibrated.** `DriverConfig::car()` is 2.0 m/s² (±25% jitter)
+  since the 2026-08-13 saturation-flow tune; see the discharge item below.
 
 - [x] **[L] Probabilistic yellow/red running.**
   `yellow_run_prob` (aggression-scaled, committed-speed gated) and `SimConfig::red_run_prob`
@@ -130,43 +150,80 @@ code, not this file, if in doubt.
   weaving; falls back to next-link service when no clean chain exists. Test:
   `lane_choice_prepositions_for_the_turn_after_next`.
 
+- [x] **[M] Scheduler × threads composition.** *(2026-08-13)*
+  The active-set scheduler now composes with every backend (the Threads auto-gate is
+  gone, with its dead `scheduler_thread_limit` knob removed end-to-end): sleep
+  classification rides the fused parallel pass, sleeping queued cars also skip the
+  MOBIL scan on a staggered cadence (`SLEEPER_LC_PERIOD`, via the row's `slept` flag),
+  and the light passes (lane-change scan, in-lane integrate) got their own measured
+  parallel crossover (`LIGHT_PAR_THRESHOLD` — their rayon arms *lost* below ~8k cars,
+  the integrate arm by 8×). Bench (`examples/stepbench.rs`, loaded real map): threads
+  went from a net loss (7.4 ms vs 6.1 serial at 5k) to the fastest config at 4.3 ms;
+  at 7k-car gridlock, 8.6 → 5.0 ms. Backend-independent sleep also removes a latent
+  serial↔threads divergence. Gates: `sleep_scheduler_matches_the_all_cars_step`,
+  `threads_backend_matches_serial_bit_for_bit`.
+
+- [x] **[M] Per-lane signal detection.** *(2026-08-13)*
+  `SignalController` approaches and the world's demand set are keyed by *lane*
+  (movements' from-lanes) — real stop-line loops sense metal in a lane, so a through
+  queue can no longer call the adjacent bay's protected-left window. Test:
+  `a_protected_left_is_called_by_the_bay_not_the_through_queue`.
+
+- [x] **[M] Saturation flow measured + launch recalibrated.** *(2026-08-13)*
+  New ground-truth test `queue_discharge_hits_real_saturation_flow` (standing queue
+  discharging through a resting green). Findings: a routing artifact first (unrouted
+  cars "intending" the left turn measured the left's 2.7 m/s curvature cap — correct
+  behavior, wrong fixture); the clean through measure was ~3.3 s/veh, acceleration-
+  sensitive. `DriverConfig::car().max_accel` 1.5 → 2.0 (mid comfortable range, the tune
+  the old TODO anticipated) brings ~3.05 s (≈1180 veh/h/lane); the residual vs real
+  ~1.9 s is the launch time-gap stack — see the open item. `DEPARTING_SPEED` was
+  A/B-measured a no-op on clean discharge and left at 3.0.
+
+- [x] **[L] Platoon density raised to the artifact ceiling.** *(2026-08-13)*
+  `PLATOON_PROB` 0.25 → 0.30 with all gates green; 0.35 still crashes the zero-crash
+  `mixed_class_traffic_does_not_crash_under_sustained_demand` gate, so the coupling the
+  old comment warned about persists above 0.30 — documented at the constant.
+
 ---
 
 ## Open
 
 - [ ] **[H] Lane-level routing graph (Lanelet2) — remainder.**
-  The first step landed (see below): lane preference now looks one junction deeper
-  (`lanes_to_serving` prefers lanes whose landing lane continues toward the hop after
-  next). The full item — routing over lanes with lane-change edges and costs
-  (`Network::route_links` is link-level) — remains a rearchitecture touching the
-  flow-field router, demand, and the GPU field solver; a k-hop generalization of the
-  landed step is the incremental path.
+  On-demand lane preference is now k-hop (see below): `lanes_to_serving` scores each
+  lane by its landing-chain depth along the next `LANE_ROUTE_DEPTH` (3) hops, with
+  per-depth fallback, and the keep-right/gore guard speaks the same depth measure so
+  discretionary drift can't fight pre-positioning. What remains is the *standing*
+  lane-graph route search — link costs that know lane-change friction
+  (`Network::route_links` is link-level) — a rearchitecture touching the flow-field
+  router, demand, and the GPU field solver.
 
 - [ ] **[M] Scale within pure microsimulation (design decision 2026-08-12: no meso —
   every car is modeled distinctly, always).**
-  The 1M+ goal therefore runs entirely through making the per-car step cheaper, never
-  through aggregating cars away. The existing levers, none exhausted:
-  - **Active-set scheduler** (`sleep_scheduler`): halves the serial step at gridlock but
-    is off by default and auto-gated off under parallel threads — making it compose with
-    the threads backend is the single biggest sleeping win.
-  - **GPU accel backend** (native): wired but the binding-fold pass is only part of the
-    step; widening what runs on-device (neighbor gather, curve scan) extends it.
-  - **Threads backend**: bit-for-bit parallel today; scaling profile beyond ~5k cars on
-    big maps hasn't been re-measured since the boundary-chart work.
+  Scheduler × threads composition LANDED (see below): threads+sleep is now the fastest
+  configuration (−42% step time at 5k cars, −43% at 7k gridlock vs the old gated
+  arrangement on the bench machine; `examples/stepbench.rs` measures the matrix).
+  Remaining levers, none exhausted:
+  - **GPU accel backend** (native): the binding-fold pass is only part of the step;
+    widening what runs on-device (neighbor gather, curve scan) extends it.
+  - **Per-pass parallel thresholds**: the light passes (MOBIL scan, in-lane integrate)
+    now stay serial below `LIGHT_PAR_THRESHOLD` (8k) — measured crossover on the real
+    map; re-measure on a bigger region where they should flip parallel.
   - **Congestion LOD** (`meso.rs` — despite the filename, a cheap *per-car* follower on
     jammed links, consistent with the no-aggregation rule): off by default; measure and
     promote if it keeps fidelity.
-  - Data layout: `lane_point` is now binary-search over the boundary chart; the
-    remaining per-tick scans (neighbor maps, conflict gathers) are the profile's tail.
+  - The profile's tail after composition: neighbor maps, per-group sorts, and the
+    lane-change scan (~1.0–1.2 ms of a 4.3 ms step at 5k).
 
-- [ ] **[L] Calibrator follow-up: capacity, not inflow.**
-  The online calibrator exists (`DemandGenerator::enable_flow_calibration`, scorecard
-  `--calibrate`), is default-off, and its honest multi-seed A/B says inflow scaling is
-  the wrong lever: GEH stays inside seed noise ({3,8,10}→{5,3,8}/72) while a boosted
-  corridor's travel-time ratio degrades ~1.2→2.0 — the injected demand queues at
-  junctions that cannot discharge it. The observed-count gap is *supply-side*
-  (junction capacity / signal service / demand placement), so the next lever is
-  saturation-flow calibration at signalized approaches, not more gateway volume.
+- [ ] **[L] Saturation flow: close the residual time-gap stack.**
+  The supply side is now measured and partially calibrated (see below): stop-line
+  discharge was ~3.3 s/veh, is ~3.05 s after the `max_accel` 2.0 recalibration —
+  against the real ~1.9 s (~1900 veh/h/lane). The residual is structural: IDM's
+  time headway plus the perception-reaction delay both apply in full during queue
+  discharge, where real drivers anticipate the launch wave. Closing it means a
+  launch-anticipation mechanism (not IDM-param surgery — those are guarded), then
+  tightening `queue_discharge_hits_real_saturation_flow`'s band toward 2 s. This,
+  not inflow scaling, is the GEH lever (the calibrator A/B proved inflow just
+  queues at junctions).
 
 ---
 
@@ -194,25 +251,8 @@ dividers, strips, edge lines, mouths); pocket bays as real edge geometry;
 
 ---
 
-- [ ] **[M] Per-lane signal detection (protected-left calls).**
-  Demand reaching `SignalController::advance` is per *link*, so a left-turn bay's call
-  is indistinguishable from through demand on the same approach — surfaced while
-  building semi-actuated coordination (a protected-left phase is "called" by any car on
-  the link). Feed per-lane presence (car within `DETECT` of the line, keyed by lane →
-  group via the movement wiring) so protected windows serve only when a turner is
-  actually waiting. Directly improves corridor capacity under coordination.
-
-- [ ] **[L] Revisit platoon density (`PLATOON_PROB`).**
-  Held at 0.25 (low end of the observed 0.25–0.6 urban range) because denser bunches
-  interlocked complex junctions into spillback rings — a caveat written *before* graded
-  yielding, slot admission, and now mid-box waiters landed. Re-run the sober-burst and
-  gridlock gates at 0.35–0.45 with 3–4-car bunches; if they hold, arterial arrivals get
-  realistically lumpier for free.
-
 ## Suggested order
 
-The behavioral backlog is closed and meso is ruled out by design. The highest-value
-remaining items: **per-lane signal detection** (small, bounded, pays into the landed
-coordination), then **saturation-flow calibration** (the supply-side GEH lever), then the
-**scheduler×threads composition** for scale; **k-hop lane preference** and the platoon
-revisit ride behind those.
+What remains: the **launch-anticipation saturation residual** (the honest GEH lever),
+the **standing lane-graph route search**, and the **GPU/profile-tail scale work** —
+each scoped in its item above.

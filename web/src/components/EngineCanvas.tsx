@@ -92,7 +92,6 @@ export default function EngineCanvas() {
   const rushClockRef = useRef<HTMLSpanElement>(null);
   const [accelBackend, setAccelBackend] = useState("serial");
   const [parThreshold, setParThreshold] = useState(500); // matches engine DEFAULT_PAR_THRESHOLD
-  const [schedThreadLimit, setSchedThreadLimit] = useState(2000);
   const [parallelRouting, setParallelRouting] = useState(true); // on by default (see net_world default)
   const [demandRate, setDemandRate] = useState(1);
   const [congestionEnabled, setCongestionEnabled] = useState(false);
@@ -680,27 +679,6 @@ export default function EngineCanvas() {
                     }}
                   />
                   cars → threads
-                </label>
-                <label
-                  className={styles.zoomLabel}
-                  title="Threads ↔ idle-car scheduler crossover: below this car count the idle-car scheduler runs even while threaded; at/above it, it yields to plain multi-core parallelism. Raise it to keep idle-skipping active under threads (measure threads+scheduler); lower it to hand off to threads sooner. Independent of the parallelize threshold and only matters under CPU threads with idle-car skipping on."
-                >
-                  Idle-skip &lt;
-                  <input
-                    className={styles.button}
-                    type="number"
-                    min={0}
-                    step={500}
-                    value={schedThreadLimit}
-                    disabled={!ready || !sleepScheduler}
-                    style={{ width: "5.5em" }}
-                    onChange={(e) => {
-                      const v = Math.max(0, Math.floor(Number(e.target.value) || 0));
-                      sessionRef.current?.applyControl({ type: "schedulerThreadLimit", value: v });
-                      setSchedThreadLimit(v);
-                    }}
-                  />
-                  cars
                 </label>
                 <label
                   className={styles.zoomLabel}

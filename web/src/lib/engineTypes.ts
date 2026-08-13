@@ -59,8 +59,6 @@ export type Sim = {
   set_threads_ready(ready: boolean): void;
   set_par_threshold(n: number): void;
   par_threshold(): number;
-  set_scheduler_thread_limit(n: number): void;
-  scheduler_thread_limit(): number;
   set_parallel_routing(on: boolean): void;
   parallel_routing(): boolean;
   set_cache_sort(on: boolean): void;

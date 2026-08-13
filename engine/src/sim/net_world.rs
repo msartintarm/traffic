@@ -44,6 +44,10 @@ pub struct NetVehicle {
     /// destination lane (`position` rebased to the new lane's frame).
     crossing: Option<Crossing>,
     lane_change: Option<LaneChange>,
+    /// Whether the active-set scheduler classified this car as sleeping on the
+    /// last step — read by the next step's lane-change pass to stagger the
+    /// (slow-timescale) queue-jump evaluation of parked cars.
+    slept: bool,
     /// Ticks until this wreck is cleared from the road. `None` = not crashed. A
     /// wreck holds its pose at speed 0 and blocks traffic like any stopped car
     /// (leader chains, box occupancy) until the timer removes it.
@@ -322,11 +326,6 @@ pub struct NetWorld {
     congestion_cfg: CongestionConfig,
     /// Vehicles the active-set scheduler skipped last step (diagnostic; 0 when off).
     asleep_last: usize,
-    /// Car count at/above which the active-set scheduler yields to plain multi-core
-    /// parallelism under the `Threads` backend (below it, the scheduler runs even threaded).
-    /// Independent of [`par_threshold`](Self::par_threshold) so both crossovers are tunable;
-    /// `usize::MAX` keeps the scheduler on at any threaded load, `0` always yields.
-    scheduler_thread_limit: usize,
 }
 
 /// Sim seconds between flow-field rebuilds — often enough that routing tracks
@@ -428,11 +427,6 @@ fn threads_available() -> bool {
 /// browser choppy maps lock to a smooth speed once this trips), so [`map_collect`] stays
 /// serial even on the `Threads` backend below it. Adjustable at runtime.
 pub const DEFAULT_PAR_THRESHOLD: usize = 500;
-
-/// Default for [`NetWorld::scheduler_thread_limit`]: the idle-car scheduler stands down at or
-/// above this count on the `Threads` backend (the parallel step subsumes it). Kept at its own
-/// tuned point rather than following [`DEFAULT_PAR_THRESHOLD`], which trips earlier.
-pub const DEFAULT_SCHEDULER_THREAD_LIMIT: usize = 2000;
 
 /// Cap on retained crash-site positions (for the overlay). A long run can accumulate many
 /// wrecks; keep the most recent so the overlay stays bounded in memory and upload size.
@@ -724,6 +718,17 @@ const STOP_QUEUE_GAP: f64 = 12.0;
 /// still rolling — even slowly — takes the full gather, where `queue_context` would
 /// diverge (no reaction delay, no curve/merge/yield terms).
 const SLEEP_SPEED_EPS: f64 = 0.02;
+/// Ticks between a sleeping queued car's lane-change (queue-jump) evaluations —
+/// staggered by vehicle id. ~1 s at the 0.2 s step: parked-queue decisions are
+/// slow-timescale, and skipping the MOBIL scan for sleepers is a third of the
+/// lane-change pass at gridlock.
+const SLEEPER_LC_PERIOD: u64 = 5;
+/// Parallel crossover (vehicle count) for the *light* per-car passes — the
+/// MOBIL lane-change scan and the in-lane integrate. Their per-car work is far
+/// below the accel gather's, so rayon's dispatch+collect overhead only pays
+/// much later than [`DEFAULT_PAR_THRESHOLD`]: measured on the loaded real map,
+/// both parallel arms lose below ~8k cars (the integrate arm by 8×).
+const LIGHT_PAR_THRESHOLD: usize = 8000;
 /// Beyond this distance to the next node (m), and with no slower zone downstream, no node
 /// constraint (signal/box/yield/stop) can yet bind — [`NetWorld::gather_context`] LOD-skips
 /// the node stack, and the active-set scheduler's free-car path applies from here out.
@@ -768,7 +773,13 @@ const RAIL_CLOSURE_SECS: f64 = 45.0;
 /// Curbside service time a bus spends at each stop.
 const BUS_DWELL_SECS: f64 = 25.0;
 /// Speed at which a receiving-lane occupant counts as *departing* — a leader to
-/// car-follow rather than a blockage the box gates must hold for.
+/// car-follow rather than a blockage the box gates must hold for. Walking pace:
+/// a tail genuinely rolling off, not a stop-and-go twitch. This must sit *below*
+/// the speeds a discharging queue crosses the line at (~2.5–3 m/s), or the gate
+/// flaps on every launch and re-serializes the queue to one car per ~4.6 s —
+/// measured: the flap held saturation flow to ~1080 veh/h/lane against the real
+/// ~1900, invariant to driver acceleration (see
+/// `queue_discharge_hits_real_saturation_flow`).
 const DEPARTING_SPEED: f64 = 3.0;
 
 /// Bumper margin demanded behind a departing tail: a following distance the
@@ -822,6 +833,10 @@ const LANE_CHANGE_DURATION: f64 = 2.0;
 /// (`best_lane_change`): even a car four-plus lanes out starts at three windows,
 /// so mid-block driving isn't dominated by far-off turn preparation.
 const MAX_POSITION_WINDOWS: f64 = 3.0;
+/// How many junctions deep lane preference follows the route's landing-lane
+/// chain (`lanes_to_serving`): 3 covers a turn two short blocks ahead — the
+/// closely-spaced-signals case — without scanning the whole route.
+const LANE_ROUTE_DEPTH: usize = 3;
 /// How far short of its first live conflict point a mid-box permissive-left
 /// waiter stands (front bumper): enough that an oncoming through's swept
 /// corridor clears the waiter's nose with a real margin at any crossing angle.
@@ -1051,7 +1066,6 @@ impl NetWorld {
             par_threshold: DEFAULT_PAR_THRESHOLD,
             congestion, congestion_cfg: CongestionConfig::disabled(),
             asleep_last: 0,
-            scheduler_thread_limit: DEFAULT_SCHEDULER_THREAD_LIMIT,
         }
     }
 
@@ -1198,11 +1212,15 @@ impl NetWorld {
                 // line, or a slow roll past the paint enters across traffic the
                 // driver was told to wait for. All-way stops are exempt: there
                 // the FIFO turn-taking protocol is the arbiter, and this veto
-                // deadlocked two creeping fronts against each other.
-                || (matches!(
+                // deadlocked two creeping fronts against each other. A two-way
+                // stop is not exempt — its major road never arms the FIFO, so
+                // the minor street's creep must still respect priority.
+                || ((matches!(
                     self.network.node(node).control,
                     NodeControl::Uncontrolled | NodeControl::Yield
-                ) && self.conflicting_priority_traffic(i, veh.lane, node, nb).is_some())
+                ) || (matches!(self.network.node(node).control, NodeControl::Stop)
+                    && !self.network.all_way_stop(node)))
+                    && self.conflicting_priority_traffic(i, veh.lane, node, nb).is_some())
         })
     }
 
@@ -1360,17 +1378,6 @@ impl NetWorld {
         self.cfg.sleep_scheduler = on;
     }
 
-    /// Car count at/above which the active-set scheduler yields to multi-core parallelism
-    /// under the `Threads` backend (see the field). `usize::MAX` keeps it on at any threaded
-    /// load; `0` always yields. Independent of [`par_threshold`](Self::par_threshold).
-    pub fn set_scheduler_thread_limit(&mut self, n: usize) {
-        self.scheduler_thread_limit = n;
-    }
-
-    pub fn scheduler_thread_limit(&self) -> usize {
-        self.scheduler_thread_limit
-    }
-
     pub fn router_knows(&self, dest: LinkId) -> bool {
         self.router.as_ref().is_some_and(|r| r.knows(dest))
     }
@@ -1436,7 +1443,7 @@ impl NetWorld {
         self.link_entries[self.network.lane(lane).link.idx()] += 1;
         self.fleet.push(NetVehicle {
             id, lane, position, speed, driver, route: Vec::new(), route_idx: 0, dest: None,
-            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None,
+            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
         });
     }
 
@@ -1466,7 +1473,7 @@ impl NetWorld {
         self.link_entries[first.idx()] += 1;
         self.fleet.push(NetVehicle {
             id, lane, position: 0.0, speed, driver, route, route_idx: 0, dest: None,
-            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None,
+            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
         });
         true
     }
@@ -1489,7 +1496,7 @@ impl NetWorld {
         self.link_entries[first.idx()] += 1;
         self.fleet.push(NetVehicle {
             id, lane, position: pos, speed, driver, route, route_idx: 0, dest: None,
-            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None,
+            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
         });
         true
     }
@@ -1508,7 +1515,7 @@ impl NetWorld {
         self.link_entries[entry_link.idx()] += 1;
         self.fleet.push(NetVehicle {
             id, lane, position: 0.0, speed, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
-            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None,
+            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
         });
         true
     }
@@ -1584,7 +1591,7 @@ impl NetWorld {
         self.link_entries[self.network.lane(lane).link.idx()] += 1;
         self.fleet.push(NetVehicle {
             id, lane, position, speed, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
-            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None,
+            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
         });
     }
 
@@ -2046,10 +2053,29 @@ impl NetWorld {
         // bit-for-bit: `map_collect` is order-preserving, so the flattened decisions match the
         // serial order exactly. The apply below stays serial — a slot-clear check reads state the
         // earlier applies mutate, so two cars can't be cleared into the same gap.
-        let (backend, threshold, n) = (self.active_backend(), self.par_threshold, self.fleet.rows.len());
+        // The MOBIL scan's per-car work is far lighter than the accel gather, so its
+        // parallel crossover sits much later — measured on the loaded real map the
+        // parallel arm *loses* below ~8k cars (dispatch + collect overhead beats the
+        // work split). It gets its own floor rather than riding `par_threshold`.
+        let threshold = self.par_threshold.max(LIGHT_PAR_THRESHOLD);
+        let (backend, n) = (self.active_backend(), self.fleet.rows.len());
         let decided: Vec<Option<(usize, LaneId)>> = map_collect(backend, threshold, n, |i| {
             if self.fleet.rows[i].wreck.is_some() {
                 return None; // wrecks don't change lanes
+            }
+            // A sleeping queued car re-evaluates its queue-jump on a slow cadence
+            // (staggered by id so wakes spread over ticks): a parked car's lane
+            // decision can't change tick-to-tick, and at gridlock a third of the
+            // fleet is parked — this is the scheduler composing with the
+            // lane-change pass, not just the accel gather.
+            {
+                let v = &self.fleet.rows[i];
+                if v.slept
+                    && v.speed < SLEEP_SPEED_EPS
+                    && (self.tick.wrapping_add(v.id as u64)) % SLEEPER_LC_PERIOD != 0
+                {
+                    return None;
+                }
             }
             // Cars on a congested (queue-mode) link skip lane-change evaluation — negligible
             // movement in a jam for a costly scan.
@@ -2146,12 +2172,18 @@ impl NetWorld {
                 Some(d) => d != 0 && d.signum() == delta.signum(),
                 None => self.mandatory_change(v, v.lane, target),
             };
-            // Never drift *voluntarily* into a lane that doesn't carry the route onward —
-            // e.g. keep-right nudging a through car into an exit-only lane, which then
-            // forces it to scramble back at the gore. Only a mandatory move (out of a lane
-            // that already fails to serve the route) may land on a non-serving lane.
-            if !mandatory && to_node < position_dist && self.lane_serves_route(v, target) == Some(false) {
-                continue; // near the gore, don't drift into a lane that won't carry the route
+            // Never drift *voluntarily* into a lane that serves the route worse —
+            // measured by the same landing-chain depth `lanes_to_serving`
+            // positions by, so keep-right can't nudge a car out of the lane it
+            // just pre-positioned into (they'd oscillate), nor a through car
+            // into an exit-only lane it must scramble back out of at the gore.
+            if !mandatory && to_node < position_dist * MAX_POSITION_WINDOWS {
+                if let Some(next) = self.next_link_on_path(v) {
+                    let hops = self.path_hops(v, next);
+                    if self.lane_chain_depth(target, &hops) < self.lane_chain_depth(v.lane, &hops) {
+                        continue;
+                    }
+                }
             }
             let params = {
                 let mut p = MobilParams::new(v.driver.politeness);
@@ -2210,43 +2242,70 @@ impl NetWorld {
         let next = self.next_link_on_path(veh)?;
         let link = self.network.link(self.network.lane(veh.lane).link);
         let cur = self.network.lane(veh.lane).index_in_link as i64;
-        // One junction deeper than "reaches the next link": a lane serves the
-        // route *cleanly* when its landing lane on `next` continues toward the
-        // hop after that — otherwise the car lands owing another forced weave
-        // on the next block (the last-second turn-lane miss, one hop earlier).
-        // Falls back to plain next-link service when no lane offers the clean
-        // chain (the weave on `next` is then genuinely unavoidable). The first
-        // step of lane-level routing; the full lane graph remains open.
-        let next2 = self.second_link_on_path(veh, next);
-        let serves_via = |k: i64, deep: bool| {
+        // Lane-level route preference, `LANE_ROUTE_DEPTH` junctions deep: score
+        // each lane by how far its *landing-lane chain* follows the upcoming
+        // hops without a forced weave, and position for the deepest chain any
+        // lane offers. A lane that merely reaches the next link but strands the
+        // car in the wrong lane there owes a weave on a possibly short block —
+        // the last-second turn-lane miss, pushed one block upstream per depth
+        // level. Graceful per-depth fallback: when no lane reaches depth d, the
+        // depth-(d−1) set serves (the later weave is then unavoidable). This is
+        // lane-level routing evaluated on demand along the path; the standing
+        // lane-graph route search remains open.
+        let hops = self.path_hops(veh, next);
+        let depth_of = |k: i64| {
             let l = LaneId(link.lane_start.0 + k as u32);
-            self.network.movements_of(l).iter().any(|m| {
-                self.network.lane(m.to_lane).link == next
-                    && (!deep
-                        || next2.is_none_or(|n2| {
-                            self.network.movements_of(m.to_lane).iter().any(|m2| self.network.lane(m2.to_lane).link == n2)
-                        }))
-            })
+            self.lane_chain_depth(l, &hops)
         };
-        let deep = (0..link.lane_count as i64).any(|k| serves_via(k, true));
-        let serves = |k: i64| serves_via(k, deep);
-        if serves(cur) {
+        let best = (0..link.lane_count as i64).map(depth_of).max().unwrap_or(0);
+        if best == 0 {
+            return None; // nothing reaches the next link from this carriageway
+        }
+        if depth_of(cur) == best {
             return Some(0);
         }
         (0..link.lane_count as i64)
-            .filter(|&k| serves(k))
+            .filter(|&k| depth_of(k) == best)
             .min_by_key(|&k| (k - cur).abs())
             .map(|k| k - cur)
     }
 
-    /// The link after `next` on this vehicle's path — the second hop, for lane
-    /// preference one junction deeper than the immediate movement.
-    fn second_link_on_path(&self, veh: &NetVehicle, next: LinkId) -> Option<LinkId> {
+    /// The next up-to-[`LANE_ROUTE_DEPTH`] links on this vehicle's path,
+    /// starting with `next` — from its explicit route, or by chaining the
+    /// flow-field's next hops.
+    fn path_hops(&self, veh: &NetVehicle, next: LinkId) -> Vec<LinkId> {
+        let mut hops = vec![next];
         if !veh.route.is_empty() {
-            return (veh.route_idx + 2 < veh.route.len()).then(|| veh.route[veh.route_idx + 2]);
+            for d in 2..=LANE_ROUTE_DEPTH {
+                match veh.route.get(veh.route_idx + d) {
+                    Some(&l) => hops.push(l),
+                    None => break,
+                }
+            }
+            return hops;
         }
-        let (dest, router) = (veh.dest?, self.router.as_ref()?);
-        router.next_hop(dest, next)
+        if let (Some(dest), Some(router)) = (veh.dest, self.router.as_ref()) {
+            while hops.len() < LANE_ROUTE_DEPTH {
+                match router.next_hop(dest, *hops.last().unwrap()) {
+                    Some(l) => hops.push(l),
+                    None => break,
+                }
+            }
+        }
+        hops
+    }
+
+    /// How many of `hops` a car in `lane` can follow by pure movement landings
+    /// (no lane change): the depth its committed chain serves.
+    fn lane_chain_depth(&self, lane: LaneId, hops: &[LinkId]) -> usize {
+        let Some(&hop) = hops.first() else { return 0 };
+        self.network
+            .movements_of(lane)
+            .iter()
+            .filter(|m| self.network.lane(m.to_lane).link == hop)
+            .map(|m| 1 + self.lane_chain_depth(m.to_lane, &hops[1..]))
+            .max()
+            .unwrap_or(0)
     }
 
     fn lane_serves_route(&self, veh: &NetVehicle, lane: LaneId) -> Option<bool> {
@@ -2317,11 +2376,14 @@ impl NetWorld {
     /// Detect stop-line demand (vehicles within the detector zone) and advance
     /// the actuated signals.
     fn advance_signals(&mut self, dt: f64) {
+        // Per-lane detection, like a real stop-line loop: a car calls only the
+        // groups its *lane* feeds, so a through queue can't call the adjacent
+        // bay's protected-left phase.
         let mut demand: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for v in &self.fleet.rows {
             let lane = self.network.lane(v.lane);
             if lane.length - v.position < junction::DETECT {
-                demand.insert(lane.link.0);
+                demand.insert(v.lane.0);
             }
         }
         // Rail preemption: while a crossing is closed, adjacent signals force
@@ -2730,14 +2792,16 @@ impl NetWorld {
         let backend = self.active_backend();
         let par_threshold = self.par_threshold;
 
-        // Active-set scheduler engages only when it will actually pay: a serial or GPU
-        // step is compute-bound, so skipping the gather for queued sleepers is a clear
-        // win; a *parallel* threads step is memory-bandwidth-bound (all cores already
-        // sweep the fleet), where the extra classification costs more bandwidth than the
-        // compute it saves. So gate it off exactly when this step will parallelize.
+        // The active-set scheduler composes with every backend: classification is
+        // a cheap neighbour/gap check, while the full gather it skips (signals,
+        // node walks, conflict and pressure scans) is the heavy half of the
+        // per-car pass — so sleeping queued cars pays whether the sweep is serial
+        // or parallel, and keeping it backend-independent means a threads step
+        // computes the same physics a serial step would. (An earlier gate stood the scheduler down under Threads at load;
+        // measured on the loaded real map, composing them is faster than
+        // either alone.)
         let n = self.fleet.rows.len();
-        let sleep_on = self.cfg.sleep_scheduler
-            && !(matches!(backend, AccelBackend::Threads) && n >= self.scheduler_thread_limit);
+        let sleep_on = self.cfg.sleep_scheduler;
 
         // Phase 4 — one fused per-car pass does what were four separate parallel sweeps of the
         // fleet: intended movement, sleep classification, the box-entry gate, and the accel
@@ -2805,6 +2869,9 @@ impl NetWorld {
         }
 
         let mut taken = std::mem::take(&mut self.fleet.rows);
+        for (v, s) in taken.iter_mut().zip(&sleeping) {
+            v.slept = !matches!(s, Sleep::Awake);
+        }
         let taken_h = std::mem::take(&mut self.fleet.hist);
         let taken_hl = std::mem::take(&mut self.fleet.hist_len);
         let n = taken.len();
@@ -2825,7 +2892,7 @@ impl NetWorld {
                 veh.crossing.is_some() || this.integrate_in_lane(veh, a, dt, intended)
             };
             #[cfg(feature = "parallel")]
-            let out: Vec<bool> = if matches!(backend, AccelBackend::Threads) && n >= par_threshold {
+            let out: Vec<bool> = if matches!(backend, AccelBackend::Threads) && n >= par_threshold.max(LIGHT_PAR_THRESHOLD) {
                 use rayon::prelude::*;
                 taken
                     .par_iter_mut()
@@ -3536,7 +3603,12 @@ impl NetWorld {
         // theirs) does not gap-accept against approaching traffic — arrivals must
         // serve their own sign. With HCM-sized gaps, yielding to every mover
         // within ~7 s parked the armed car for good under a steady cross stream.
-        let armed_all_way = matches!(control, NodeControl::Stop) && veh.stopped_at == Some(node);
+        // Only at a genuine all-way: a two-way stop's minor street has no such
+        // protocol — the major road never arms, so a served stop must still
+        // gap-accept against it.
+        let armed_all_way = matches!(control, NodeControl::Stop)
+            && self.network.all_way_stop(node)
+            && veh.stopped_at == Some(node);
         let prio_yield = !free_flow
             && !armed_all_way
             && matches!(control, NodeControl::Uncontrolled | NodeControl::Stop | NodeControl::Yield)
@@ -4127,13 +4199,14 @@ impl NetWorld {
             && self.movement_state(mid) == SignalState::Red
     }
 
-    /// Whether this approach faces a stop line at a stop-controlled node. Drivers
-    /// act on the posted signs: every `Stop` node in the scraped maps carries
-    /// OSM's `stop=all` — a surveyed all-way stop — so every approach serves the
-    /// line. Per-approach sign data (direction-tagged OSM stop nodes) plugs in
-    /// here once the scraper carries it.
-    fn approach_must_stop(&self, _link: LinkId, _node: NodeId) -> bool {
-        true
+    /// Whether this approach faces a stop line at a stop-controlled node.
+    /// Drivers act on the posted signs: a node-level stop (surveyed on the
+    /// junction node) lines every approach, while a per-approach sign (OSM
+    /// stop/give_way surveyed on the way — the scraper's `sign` field) lines
+    /// only its own street, so the cross traffic of a two-way stop rolls
+    /// through on its right of way.
+    fn approach_must_stop(&self, link: LinkId, _node: NodeId) -> bool {
+        self.network.approach_stops(link)
     }
 
     /// The speed below which this driver treats a stop sign as served. Observed
@@ -6138,7 +6211,7 @@ mod tests {
         for t in 0..900 {
             // A continuous sub-critical stream while the (actuated, unchallenged)
             // green holds — then it ends, and the waiter's gap arrives.
-            if t % 15 == 0 && t < 450 {
+            if t % 12 == 0 && t < 500 {
                 w.spawn_routed(next, vec![LinkId(6), LinkId(5)], 8.0, d.clone());
                 next += 1;
             }
@@ -7954,6 +8027,81 @@ mod tests {
     }
 
     #[test]
+    fn two_way_stop_halts_the_minor_street_and_not_the_major() {
+        use crate::sim::network::LinkSign;
+        // The same crossing as the uncontrolled test, but the minor approach
+        // carries a per-approach stop sign (OSM's way-mapped survey). Serving a
+        // stop line is exactly what arms `stopped_at`, so it is the clean
+        // discriminator: at a two-way stop only minors ever arm; the old
+        // all-way reading (node-level control) armed the major street too.
+        let cross = |minor_sign: LinkSign, center: NodeSpec| {
+            OsmMap {
+                nodes: vec![
+                    center,
+                    NodeSpec::uncontrolled(1, -250.0, 0.0),
+                    NodeSpec::uncontrolled(2, 250.0, 0.0),
+                    NodeSpec::uncontrolled(3, 0.0, -250.0),
+                    NodeSpec::uncontrolled(4, 0.0, 250.0),
+                ],
+                links: vec![
+                    LinkSpec::oneway(1, 0, 1, 22.0), // 0: major W→C
+                    LinkSpec::oneway(0, 2, 1, 22.0), // 1: major C→E
+                    LinkSpec { sign: minor_sign, ..LinkSpec::oneway(3, 0, 1, 10.0) }, // 2: minor S→C
+                    LinkSpec::oneway(0, 4, 1, 10.0), // 3: minor C→N
+                ],
+            }
+            .build()
+        };
+        let majors_armed = |net: Network| {
+            let mut w = NetWorld::new(net, cfg());
+            let (mut next, mut armed) = (0u32, 0u32);
+            for t in 0..600u32 {
+                if t % 12 == 0 && w.spawn_routed(next, vec![LinkId(0), LinkId(1)], 20.0, DriverConfig::car()) {
+                    next += 1;
+                }
+                w.step();
+                armed += w.fleet.rows.iter().filter(|v| v.lane == LaneId(0) && v.stopped_at == Some(NodeId(0))).count() as u32;
+            }
+            armed
+        };
+
+        let net = cross(LinkSign::Stop, NodeSpec::uncontrolled(0, 0.0, 0.0));
+        assert!(matches!(net.node(NodeId(0)).control, NodeControl::Stop));
+        assert!(net.approach_stops(LinkId(2)) && !net.approach_stops(LinkId(0)));
+        assert!(!net.all_way_stop(NodeId(0)));
+        assert_eq!(majors_armed(net.clone()), 0, "the major street never serves a line at a two-way stop");
+        assert!(
+            majors_armed(cross(LinkSign::None, NodeSpec::stop(0, 0.0, 0.0))) > 0,
+            "control: node-level stop (a surveyed all-way) still lines the major street"
+        );
+
+        // Both streams: minors serve their line and gap-accept; flow stays safe.
+        let mut w = NetWorld::new(net, cfg());
+        let mut next = 0u32;
+        let mut minor_served_stop = false;
+        for t in 0..1200u32 {
+            if t % 12 == 0 {
+                let d = DriverConfig::car();
+                if w.spawn_routed(next, vec![LinkId(0), LinkId(1)], 20.0, d.clone()) {
+                    next += 1;
+                }
+                if w.spawn_routed(next, vec![LinkId(2), LinkId(3)], 9.0, d) {
+                    next += 1;
+                }
+            }
+            w.step();
+            minor_served_stop |= w
+                .fleet
+                .rows
+                .iter()
+                .any(|v| v.lane == w.network.link(LinkId(2)).lane_start && v.stopped_at == Some(NodeId(0)));
+        }
+        assert!(w.exited() > 20, "traffic should be flowing: {} exited", w.exited());
+        assert!(w.crashed() <= 2, "two-way stop should stay safe, got {}", w.crashed());
+        assert!(minor_served_stop, "minor-street drivers serve their sign");
+    }
+
+    #[test]
     fn reaction_delay_causes_start_up_lag() {
         // A follower behind a leader that accelerates away travels less over the
         // same window when it has a reaction delay (it's slow to notice the gap
@@ -8063,7 +8211,7 @@ mod tests {
                     let probe = NetVehicle {
                         id, lane: LaneId(0), position: 0.0, speed: 0.0, driver: d,
                         route: Vec::new(), route_idx: 0, dest: None, stopped_at: None,
-                        wait_ticks: 0, crossing: None, lane_change: None, wreck: None,
+                        wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
                     };
                     w.runs_red(&probe, node)
                 })
@@ -8163,6 +8311,7 @@ mod tests {
                 aadt: 0.0,
                 res_weight: 0.0,
                 attr_weight: 0.0,
+                sign: crate::sim::network::LinkSign::None,
             }],
         }
         .build();
@@ -8461,6 +8610,90 @@ mod tests {
     }
 
     #[test]
+    fn queue_discharge_hits_real_saturation_flow() {
+        // HCM ground truth at a signalized stop line: after start-up lost time
+        // (~2 s), a standing queue discharges at a saturation headway of roughly
+        // 1.9 s/veh (~1900 veh/h/lane). This is the supply-side number every
+        // capacity comparison rests on — if discharge is far off, observed
+        // counts can never be matched no matter what demand does.
+        // Single-lane approach so the whole queue discharges through one stop
+        // line — a multi-lane fixture splits the queue across channelized lanes
+        // and measures lane-change noise instead of saturation.
+        let plan = SignalPlan { green_secs: 25.0, yellow_secs: 3.0, offset: 0.0 };
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, 0.0, 0.0),
+                NodeSpec::signalized(2, 300.0, 0.0, plan),
+                NodeSpec::uncontrolled(4, 600.0, 0.0),
+                NodeSpec::uncontrolled(3, 300.0, -200.0),
+                NodeSpec::uncontrolled(5, 300.0, 200.0),
+            ],
+            links: vec![
+                LinkSpec::oneway(1, 2, 1, 15.0),
+                LinkSpec::oneway(2, 4, 1, 15.0),
+                LinkSpec::oneway(3, 2, 1, 15.0),
+                LinkSpec::oneway(2, 5, 1, 15.0),
+            ],
+        }
+        .build();
+        let mut world = NetWorld::new(net, cfg());
+        world.install_router(&[LinkId(1), LinkId(3)]);
+        let d = || DriverConfig { accel_noise: 0.0, ..DriverConfig::car() };
+        // A standing queue at the stop line, launched by the (undisputed, hence
+        // resting-green) signal: the discharge wave itself is the saturation
+        // process, no red-green cycling needed.
+        let lane0 = world.network.link(LinkId(0)).lane_start;
+        let lane_len = world.network.lane(lane0).length;
+        let n_q = 12u32;
+        for k in 0..n_q {
+            let pos = lane_len - 2.0 - k as f64 * 7.0;
+            assert!(
+                world.spawn_routed_in_lane(k, vec![LinkId(0), LinkId(1)], lane0, pos, 0.0, d()),
+                "queue car {k} placed"
+            );
+        }
+        let mut cross: Vec<Option<(u32, f64)>> = vec![None; n_q as usize];
+        let mut last_speed: Vec<f64> = vec![0.0; n_q as usize];
+        for t in 0..1200u32 {
+            world.step();
+            for k in 0..n_q {
+                let ku = k as usize;
+                if cross[ku].is_some() {
+                    continue;
+                }
+                match world.vehicle(k) {
+                    Some(v) if v.is_crossing() || world.network.lane(v.lane).link != LinkId(0) => {
+                        cross[ku] = Some((t, last_speed[ku]));
+                    }
+                    Some(v) => last_speed[ku] = v.speed,
+                    None => cross[ku] = Some((t, last_speed[ku])),
+                }
+            }
+        }
+        let times: Vec<(f64, f64)> = cross.iter().flatten().map(|&(t, sp)| (t as f64 * 0.2, sp)).collect();
+        assert!(times.len() >= 10, "the queue discharged ({} of {n_q})", times.len());
+        for &(t, sp) in &times {
+            eprintln!("  crossed t={t:.1} at {sp:.1} m/s");
+        }
+        // Saturation headways: consecutive stop-line crossings, skipping the
+        // first two cars (start-up lost time by definition).
+        let heads: Vec<f64> = times.windows(2).map(|w| w[1].0 - w[0].0).skip(2).collect();
+        assert!(heads.len() >= 6, "enough saturation headways to measure ({})", heads.len());
+        let sat = heads.iter().sum::<f64>() / heads.len() as f64;
+        eprintln!("saturation headway {sat:.2}s ({:.0} veh/h/lane)", 3600.0 / sat);
+        // Regression floor at the calibrated point (~3.05 s, ≈1180 veh/h/lane at
+        // max_accel 2.0). The real-world target is ~1.9 s (~1900): the residual
+        // sits in the time-gap stack (IDM headway + perception-reaction applying
+        // in full during discharge) — the honest open item, not a tolerance to
+        // widen. Tightening this band is the goal of any future launch-model work.
+        assert!(
+            sat <= 3.3,
+            "saturation headway regressed to {sat:.2}s — stop-line discharge got slower"
+        );
+        assert!(sat >= 1.6, "faster than physical saturation ({sat:.2}s) — check the measurement");
+    }
+
+    #[test]
     fn a_multi_lane_fix_starts_one_window_per_lane_early() {
         // Two lanes from the turn pocket, the positioning window doubles: the car
         // must already be in its serving lane well before the last single window
@@ -8540,6 +8773,53 @@ mod tests {
         }
         assert_eq!(world.exited(), 1, "the car completes the route");
         assert_eq!(lane_at_a_end, Some(0), "it pre-positioned on A for the turn off B");
+    }
+
+    #[test]
+    fn lane_choice_prepositions_across_two_short_blocks() {
+        // The turn is off link C, two *short* blocks ahead; only A offers room
+        // to change. Depth-2 preference sees both A lanes reaching C and does
+        // nothing; depth-3 sees that only A lane 0's landing chain feeds C's
+        // turn lane and moves over while there is still road to do it.
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, 0.0, 0.0),
+                NodeSpec::uncontrolled(2, 400.0, 0.0),
+                NodeSpec::uncontrolled(3, 440.0, 0.0),
+                NodeSpec::uncontrolled(4, 480.0, 0.0),
+                NodeSpec::uncontrolled(5, 480.0, 300.0),  // left exit off C
+                NodeSpec::uncontrolled(6, 780.0, 0.0),    // straight exit off C
+            ],
+            links: vec![
+                LinkSpec::oneway(1, 2, 2, 15.0), // A
+                LinkSpec::oneway(2, 3, 2, 15.0), // B: short block
+                LinkSpec::oneway(3, 4, 2, 15.0), // C: short block
+                LinkSpec::oneway(4, 5, 1, 15.0), // D: left, fed by C lane 0
+                LinkSpec::oneway(4, 6, 1, 15.0), // E: straight, fed by C lane 1
+            ],
+        }
+        .build();
+        let mut world = NetWorld::new(net, cfg());
+        let curb = LaneId(world.network.link(LinkId(0)).lane_start.0 + 1);
+        world.spawn_routed_in_lane(
+            1,
+            vec![LinkId(0), LinkId(1), LinkId(2), LinkId(3)],
+            curb,
+            50.0,
+            12.0,
+            DriverConfig { accel_noise: 0.0, ..DriverConfig::car() },
+        );
+        let mut lane_at_a_end = None;
+        for _ in 0..700 {
+            world.step();
+            if let Some(v) = world.vehicle(1) {
+                if !v.is_crossing() && world.network.lane(v.lane).link == LinkId(0) {
+                    lane_at_a_end = Some(world.network.lane(v.lane).index_in_link);
+                }
+            }
+        }
+        assert_eq!(world.exited(), 1, "the car completes the route");
+        assert_eq!(lane_at_a_end, Some(0), "it pre-positioned on A for the turn two blocks out");
     }
 
     #[test]

@@ -7,7 +7,8 @@ The output schema is the contract between this tool and the Rust engine:
     {
       "meta":  {"place", "bbox", "origin"},
       "nodes": [{"osm_id", "x", "y", "control", "signal"?}],
-      "links": [{"from_osm", "to_osm", "lanes", "speed_limit", "road_class", "turn_lanes"?}]
+      "links": [{"from_osm", "to_osm", "lanes", "speed_limit", "road_class", "turn_lanes"?}],
+      "restrictions": [{"from": [a, via], "to": [via, b], "kind"}]
     }
 
 `x`/`y` are metres in a local equirectangular projection about the bbox centre
@@ -246,7 +247,7 @@ class LandUseGrid:
         return round(0.3 + 1.4 * res, 2), round(0.3 + 1.2 * attr, 2)
 
 
-def build(raw, bbox, place, drivable=DRIVABLE, landuse=None):
+def build(raw, bbox, place, drivable=DRIVABLE, landuse=None, turn_rels=None):
     nodes = {e["id"]: e for e in raw["elements"] if e["type"] == "node"}
     ways = [
         e for e in raw["elements"]
@@ -261,11 +262,18 @@ def build(raw, bbox, place, drivable=DRIVABLE, landuse=None):
         for nid in (way["nodes"][0], way["nodes"][-1]):
             usage[nid] += 1
 
+    def is_road_signal(tags):
+        # A mid-block pedestrian signal is not a junction controller: promoting
+        # it to one drags a phantom signal onto the nearest crossing (the engine
+        # relocates stop-line signals junction-ward). With no pedestrians
+        # modelled, it is free-flow road.
+        return tags.get("highway") == "traffic_signals" and tags.get("traffic_signals") != "pedestrian_crossing"
+
     def is_junction(nid):
         tags = nodes[nid].get("tags", {})
         # A level crossing must survive as a first-class node (like a signal):
         # the engine gates traffic there on the train timetable.
-        return usage[nid] >= 2 or tags.get("highway") == "traffic_signals" or tags.get("railway") == "level_crossing"
+        return usage[nid] >= 2 or is_road_signal(tags) or tags.get("railway") == "level_crossing"
 
     lat0 = (bbox[0] + bbox[2]) / 2
     lon0 = (bbox[1] + bbox[3]) / 2
@@ -279,7 +287,7 @@ def build(raw, bbox, place, drivable=DRIVABLE, landuse=None):
         tags = n.get("tags", {})
         control = "uncontrolled"
         signal = None
-        if tags.get("highway") == "traffic_signals":
+        if is_road_signal(tags):
             control, signal = "signal", {"green_secs": 25.0, "yellow_secs": 4.0, "offset": 0.0}
         elif tags.get("highway") == "stop":
             control = "stop"
@@ -331,7 +339,36 @@ def build(raw, bbox, place, drivable=DRIVABLE, landuse=None):
                 stack.append((imax, hi))
         return [p for p, k in zip(pts, keep) if k]
 
-    def emit_link(a, b, lanes, speed, geometry, name, ref, layer, road_class, turn_lanes, hov_lanes=None):
+    SIGN_KIND = {"stop": "stop", "give_way": "yield"}
+    SIGN_RANK = {None: 0, "yield": 1, "stop": 2}
+
+    def block_signs(seq, lo, hi):
+        # Stop/give_way nodes interior to a block: OSM surveys the sign on the
+        # way at its stop line, not on the junction node — per travel direction.
+        # `direction` names the controlled direction; absent, the sign binds
+        # toward the nearer block end (signs stand by the junction they
+        # protect). Returns the strongest (forward, backward) sign, each the
+        # engine's per-approach `sign` on the corresponding directed link.
+        fwd = bwd = None
+        for k in range(lo + 1, hi):
+            tags = nodes[seq[k]].get("tags", {})
+            kind = SIGN_KIND.get(tags.get("highway"))
+            if not kind:
+                continue
+            d = tags.get("direction")
+            if d not in ("forward", "backward", "both"):
+                sx, sy = project(nodes[seq[k]]["lat"], nodes[seq[k]]["lon"], lat0, lon0)
+                ends = [project(nodes[seq[j]]["lat"], nodes[seq[j]]["lon"], lat0, lon0) for j in (lo, hi)]
+                to_lo = math.hypot(sx - ends[0][0], sy - ends[0][1])
+                to_hi = math.hypot(sx - ends[1][0], sy - ends[1][1])
+                d = "forward" if to_hi <= to_lo else "backward"
+            if d in ("forward", "both") and SIGN_RANK[kind] > SIGN_RANK[fwd]:
+                fwd = kind
+            if d in ("backward", "both") and SIGN_RANK[kind] > SIGN_RANK[bwd]:
+                bwd = kind
+        return fwd, bwd
+
+    def emit_link(a, b, lanes, speed, geometry, name, ref, layer, road_class, turn_lanes, hov_lanes=None, sign=None):
         if (a, b) in emitted:
             return
         emitted.add((a, b))
@@ -360,6 +397,10 @@ def build(raw, bbox, place, drivable=DRIVABLE, landuse=None):
             # outward — the engine restricts those lanes to eligible vehicles
             # (the US-101 express/HOV lanes).
             link["hov_lanes"] = hov_lanes
+        if sign:
+            # Per-approach stop/yield ("stop"|"yield"): this directed link
+            # serves a line at its downstream junction; the cross street rolls.
+            link["sign"] = sign
         if landuse:
             # Trip production/attraction weights from the land-use grid at the
             # link's midpoint — the engine tilts demand origins toward homes and
@@ -400,16 +441,137 @@ def build(raw, bbox, place, drivable=DRIVABLE, landuse=None):
                 emit_node(a)
                 emit_node(b)
                 mid = geom_of(seq[block_start + 1 : i])  # intermediate bend points
-                emit_link(a, b, lanes, speed, mid, name, ref, layer, highway, tl_forward, hov_forward)
+                fwd_sign, bwd_sign = block_signs(seq, block_start, i)
+                emit_link(a, b, lanes, speed, mid, name, ref, layer, highway, tl_forward, hov_forward, fwd_sign)
                 if not oneway:
-                    emit_link(b, a, lanes, speed, list(reversed(mid)), name, ref, layer, highway, tl_backward, hov_backward)
+                    emit_link(b, a, lanes, speed, list(reversed(mid)), name, ref, layer, highway, tl_backward, hov_backward, bwd_sign)
             block_start = i
 
-    return {
+    graph = {
         "meta": {"place": place, "bbox": bbox, "origin": [lat0, lon0]},
         "nodes": list(out_nodes.values()),
         "links": out_links,
     }
+    if turn_rels:
+        graph["restrictions"] = resolve_restrictions(turn_rels, ways, is_junction)
+    return graph
+
+
+# A turn restriction relation names a `from` way, a `via` node (or way), and a
+# `to` way; the engine's movement model wants it as a pair of *emitted links*
+# — (approach-block, exit-block) node pairs — so resolution walks each way from
+# the via point to the adjacent block boundary (the same is_junction split the
+# link emitter uses). Best-effort: conditional/exempted relations, multi-way
+# vias, and ambiguous unsplit two-way ways are skipped and counted.
+EXEMPT_ALL_CARS = {"motorcar", "motor_vehicle"}
+
+
+def resolve_restrictions(rels, ways, is_junction):
+    by_id = {w["id"]: w for w in ways}
+
+    def boundary_from(seq, k, step):
+        # The block boundary adjacent to seq[k], walking by `step`: the first
+        # split node (or the way's end — the emitter always splits there).
+        i = k + step
+        while 0 < i < len(seq) - 1 and not is_junction(seq[i]):
+            i += step
+        return seq[i] if 0 <= i < len(seq) else None
+
+    def walk(way, via, toward_via):
+        # The neighbouring block-boundary node of `via` along `way`, on the
+        # approach side (`toward_via`, against travel) or the exit side (with
+        # travel). None when the geometry can't be resolved: via absent, a loop,
+        # a oneway entered/left against its grain, or via interior to an unsplit
+        # two-way way (the travel arm is then ambiguous).
+        seq = way["nodes"]
+        if seq.count(via) != 1:
+            return None
+        tags = way.get("tags", {})
+        oneway = tags.get("oneway") in ("yes", "true", "1") or tags.get("highway") == "motorway"
+        k = seq.index(via)
+        interior = 0 < k < len(seq) - 1
+        if interior and not oneway:
+            return None
+        if toward_via:
+            # Approach travel ends at via. At the way's first node the approach
+            # ran against node order (impossible on a oneway); anywhere else it
+            # followed node order, so the boundary lies at lower indices.
+            if k == 0:
+                if oneway:
+                    return None
+                step = 1
+            else:
+                step = -1
+        else:
+            # Exit travel starts at via. At the way's last node it runs against
+            # node order (impossible on a oneway); anywhere else it follows it.
+            if k == len(seq) - 1:
+                if oneway:
+                    return None
+                step = -1
+            else:
+                step = 1
+        return boundary_from(seq, k, step)
+
+    out, seen, skipped = [], set(), defaultdict(int)
+    for rel in rels:
+        tags = rel.get("tags", {})
+        kind = tags.get("restriction") or tags.get("restriction:motorcar")
+        if not kind:
+            skipped["conditional/other-class"] += 1
+            continue
+        if not (kind.startswith("no_") or kind.startswith("only_")):
+            skipped["unknown-kind"] += 1
+            continue
+        if EXEMPT_ALL_CARS & set(tags.get("except", "").split(";")):
+            skipped["cars-exempt"] += 1
+            continue
+        members = rel.get("members", [])
+        from_ways = [m["ref"] for m in members if m.get("role") == "from" and m["type"] == "way"]
+        to_ways = [m["ref"] for m in members if m.get("role") == "to" and m["type"] == "way"]
+        via_nodes = [m["ref"] for m in members if m.get("role") == "via" and m["type"] == "node"]
+        via_ways = [m["ref"] for m in members if m.get("role") == "via" and m["type"] == "way"]
+        if len(from_ways) != 1 or len(to_ways) != 1:
+            skipped["multi-from/to"] += 1
+            continue
+        fw, tw = by_id.get(from_ways[0]), by_id.get(to_ways[0])
+        if fw is None or tw is None:
+            skipped["way-outside-graph"] += 1
+            continue
+        if len(via_nodes) == 1 and not via_ways:
+            n1 = n2 = via_nodes[0]
+        elif len(via_ways) == 1 and not via_nodes:
+            vw = by_id.get(via_ways[0])
+            if vw is None:
+                skipped["way-outside-graph"] += 1
+                continue
+            ends = (vw["nodes"][0], vw["nodes"][-1])
+            n1 = next((e for e in ends if e in fw["nodes"]), None)
+            n2 = next((e for e in ends if e != n1 and e in tw["nodes"]), None)
+            if n1 is None or n2 is None:
+                skipped["via-way-detached"] += 1
+                continue
+        else:
+            skipped["complex-via"] += 1
+            continue
+        a = walk(fw, n1, toward_via=True)
+        b = walk(tw, n2, toward_via=False)
+        if a is None or b is None or a == n1 or b == n2:
+            skipped["unresolvable-geometry"] += 1
+            continue
+        if (a, n1) == (b, n2) or (n1 == n2 and a == b):
+            continue  # a u-turn back onto the same block; the engine never wires those
+        entry = (a, n1, n2, b, kind)
+        if entry in seen:
+            continue
+        seen.add(entry)
+        out.append({"from": [a, n1], "to": [n2, b], "kind": kind})
+    if skipped:
+        detail = ", ".join(f"{k}: {v}" for k, v in sorted(skipped.items()))
+        print(f"turn restrictions: {len(out)} resolved; skipped {detail}")
+    else:
+        print(f"turn restrictions: {len(out)} resolved")
+    return out
 
 
 def resolve_bbox(args):
@@ -455,7 +617,14 @@ def main():
         raw = fetch_query(landuse_query(bbox))
         landuse = LandUseGrid(raw, lat0, lon0)
         print(f"land use: {len(landuse.res)} residential cells, {len(landuse.attr)} attraction cells")
-    graph = build(fetch(bbox, classes), bbox, args.place, classes or DRIVABLE, landuse)
+    s, w, n, e = bbox
+    turn_rels = [
+        el for el in fetch_query(
+            f'[out:json][timeout:90]; rel["type"="restriction"]({s},{w},{n},{e}); out body;'
+        ).get("elements", [])
+        if el["type"] == "relation"
+    ]
+    graph = build(fetch(bbox, classes), bbox, args.place, classes or DRIVABLE, landuse, turn_rels)
     if not args.highways_only:
         # Curbside bus stops: the engine dwells buses at these service positions.
         lat0, lon0 = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2

@@ -8,7 +8,7 @@
 
 use std::collections::HashSet;
 
-use super::network::{LinkId, MovementId, Network, NodeControl, NodeId, ProgramId};
+use super::network::{LaneId, MovementId, Network, NodeControl, NodeId, ProgramId};
 use super::signal::{SignalProgram, SignalState, DEFAULT_ALL_RED};
 
 /// Actuation timing: green is held at least `MIN_GREEN`, extended while vehicles
@@ -61,8 +61,10 @@ impl SignalRuntime {
 /// vehicle world only has to supply which links currently have waiting demand.
 pub struct SignalController {
     signals: Vec<SignalRuntime>,
-    /// Approach links per program, per group bit — the links feeding each group.
-    approaches: Vec<Vec<Vec<LinkId>>>,
+    /// Approach *lanes* per program, per group bit — the from-lanes of each
+    /// group's movements. Lane-grained like a real stop-line detector, so a
+    /// through queue never calls the adjacent bay's protected-left phase.
+    approaches: Vec<Vec<Vec<LaneId>>>,
     time: f64,
 }
 
@@ -89,7 +91,7 @@ impl SignalController {
                 rt
             })
             .collect();
-        let mut approaches: Vec<Vec<Vec<LinkId>>> = vec![Vec::new(); net.programs.len()];
+        let mut approaches: Vec<Vec<Vec<LaneId>>> = vec![Vec::new(); net.programs.len()];
         for g in &net.groups {
             let bits = &mut approaches[g.program.idx()];
             if bits.len() <= g.bit as usize {
@@ -99,10 +101,9 @@ impl SignalController {
         for mv in &net.movements {
             if let Some(gid) = mv.signal_group {
                 let g = net.groups[gid.idx()];
-                let link = net.lane(mv.from_lane).link;
                 let feeders = &mut approaches[g.program.idx()][g.bit as usize];
-                if !feeders.contains(&link) {
-                    feeders.push(link);
+                if !feeders.contains(&mv.from_lane) {
+                    feeders.push(mv.from_lane);
                 }
             }
         }
@@ -149,7 +150,7 @@ impl SignalController {
 
     /// Advance actuated signals: hold green while its approaches keep demand,
     /// terminate on max-green or a gap-out with a conflicting approach waiting.
-    /// `demand` is the set of link ids with a vehicle within [`DETECT`] of a line.
+    /// `demand` is the set of *lane* ids with a vehicle within [`DETECT`] of a line.
     /// `forced` preempts a program to a specific phase (rail preemption): the
     /// current phase terminates after a short grace, clearance runs as normal,
     /// and the controller jumps to — and holds — the forced phase.
@@ -368,7 +369,7 @@ mod tests {
         // sit on one phase — it cycles, so more than one green pattern appears.
         let net = arterial_intersection();
         let mut ctrl = SignalController::build(&net);
-        let demand: HashSet<u32> = (0..net.links.len() as u32).collect();
+        let demand: HashSet<u32> = (0..net.lanes.len() as u32).collect();
         let mut patterns: HashSet<Vec<bool>> = HashSet::new();
         for _ in 0..2000 {
             ctrl.advance(&net, &demand, 0.2, &Default::default());

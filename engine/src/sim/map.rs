@@ -102,6 +102,10 @@ pub struct LinkSpec {
     /// the link, ~0.3–4 with 1.0 neutral; `0.0` = no data (treated as neutral).
     /// Multiplies gravity destination choice.
     pub attr_weight: f64,
+    /// Per-approach sign (OSM `highway=stop`/`give_way` surveyed on the way,
+    /// this travel direction): the approach stops/yields at its downstream
+    /// node while the cross street keeps rolling — a two-way stop.
+    pub sign: LinkSign,
 }
 
 impl LinkSpec {
@@ -114,10 +118,37 @@ impl LinkSpec {
     }
 }
 
+/// One OSM turn restriction, resolved by the scraper to emitted-link node-id
+/// pairs meeting at the via node: `from` enters it, `to` leaves it (`from.1 ==
+/// to.0` for a via-node relation; a via-way relation's two ends differ until
+/// the junction merge unifies them, and the restriction is inert if it never
+/// does). `only` inverts the sense: the from-link may use *only* the to-link.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RestrictionSpec {
+    pub from: (i64, i64),
+    pub to: (i64, i64),
+    pub only: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct OsmMap {
     pub nodes: Vec<NodeSpec>,
     pub links: Vec<LinkSpec>,
+}
+
+/// A parsed scraper extract: the topology-transformed map plus the turn
+/// restrictions rewritten alongside it (their node pairs track every collapse
+/// and merge, so they always reference the transformed map's link identities).
+#[derive(Clone, Debug, Default)]
+pub struct ImportedMap {
+    pub map: OsmMap,
+    pub restrictions: Vec<RestrictionSpec>,
+}
+
+impl ImportedMap {
+    pub fn build(&self) -> Network {
+        self.map.build_with_restrictions(&self.restrictions)
+    }
 }
 
 impl OsmMap {
@@ -127,12 +158,25 @@ impl OsmMap {
     /// spurious junction boxes. Only merges segments sharing lanes, speed and
     /// layer; controlled nodes and attribute changes are left intact.
     pub fn collapse_pass_through_nodes(&self) -> OsmMap {
+        self.collapse_pass_through_nodes_with(&mut Vec::new())
+    }
+
+    /// [`collapse_pass_through_nodes`], also rewriting `restrictions` so each
+    /// node pair keeps naming its (possibly merged) link: a pair absorbed into
+    /// a longer chain takes the chain's endpoints, and a restriction whose via
+    /// node dissolved (it gated a single continuation — nothing to restrict)
+    /// is dropped.
+    pub fn collapse_pass_through_nodes_with(&self, restrictions: &mut Vec<RestrictionSpec>) -> OsmMap {
         use std::collections::VecDeque;
         let pos: HashMap<i64, [f64; 2]> = self.nodes.iter().map(|n| (n.osm_id, [n.x, n.y])).collect();
         // Tombstoned link table with a node→incident-link index, so each candidate is
         // examined in O(degree) and collapses drive off a work-queue — near-linear,
         // instead of re-scanning every link for every node on every pass.
         let mut links: Vec<Option<LinkSpec>> = self.links.iter().cloned().map(Some).collect();
+        // Where each tombstoned link's traffic went: the merged link that absorbed
+        // it. Chased transitively, this resolves any original link to its final
+        // merged identity — how the restriction pairs are kept current.
+        let mut redirect: Vec<Option<usize>> = vec![None; links.len()];
         let mut inc: HashMap<i64, Vec<usize>> = HashMap::new();
         for (i, l) in links.iter().enumerate() {
             let l = l.as_ref().unwrap();
@@ -169,31 +213,33 @@ impl OsmMap {
                 })
             };
             let (a_in, a_out, b_in, b_out) = (seg(a, n), seg(n, a), seg(b, n), seg(n, b));
-            let merge = match (incident.len(), a_in, a_out, b_in, b_out) {
+            let merge: Option<Vec<(Vec<usize>, LinkSpec)>> = match (incident.len(), a_in, a_out, b_in, b_out) {
                 (4, Some(ai), Some(ao), Some(bi), Some(bo)) => match (
                     join_pass_through(&links, ai, bo, a, b, n, &pos),
                     join_pass_through(&links, bi, ao, b, a, n, &pos),
                 ) {
-                    (Some(fwd), Some(rev)) => Some((vec![ai, ao, bi, bo], vec![fwd, rev])),
+                    (Some(fwd), Some(rev)) => Some(vec![(vec![ai, bo], fwd), (vec![bi, ao], rev)]),
                     _ => None,
                 },
                 (2, Some(ai), None, None, Some(bo)) => {
-                    join_pass_through(&links, ai, bo, a, b, n, &pos).map(|fwd| (vec![ai, bo], vec![fwd]))
+                    join_pass_through(&links, ai, bo, a, b, n, &pos).map(|fwd| vec![(vec![ai, bo], fwd)])
                 }
                 (2, None, Some(ao), Some(bi), None) => {
-                    join_pass_through(&links, bi, ao, b, a, n, &pos).map(|rev| (vec![bi, ao], vec![rev]))
+                    join_pass_through(&links, bi, ao, b, a, n, &pos).map(|rev| vec![(vec![bi, ao], rev)])
                 }
                 _ => None,
             };
-            if let Some((old, new)) = merge {
-                for i in old {
-                    links[i] = None;
-                }
-                for l in new {
+            if let Some(groups) = merge {
+                for (old, l) in groups {
                     let id = links.len();
+                    for i in old {
+                        links[i] = None;
+                        redirect[i] = Some(id);
+                    }
                     inc.entry(l.from_osm).or_default().push(id);
                     inc.entry(l.to_osm).or_default().push(id);
                     links.push(Some(l));
+                    redirect.push(None);
                 }
                 removed.insert(n);
                 // Re-examine the neighbours: the merge may have changed the joined link's
@@ -203,6 +249,30 @@ impl OsmMap {
                 queue.push_back(a);
                 queue.push_back(b);
             }
+        }
+        if !restrictions.is_empty() {
+            let orig: HashMap<(i64, i64), usize> =
+                self.links.iter().enumerate().map(|(i, l)| ((l.from_osm, l.to_osm), i)).collect();
+            let live = |mut i: usize| {
+                while let Some(n) = redirect[i] {
+                    i = n;
+                }
+                i
+            };
+            restrictions.retain_mut(|r| {
+                if removed.contains(&r.from.1) || removed.contains(&r.to.0) {
+                    return false;
+                }
+                let (Some(&f), Some(&t)) = (orig.get(&r.from), orig.get(&r.to)) else {
+                    return false;
+                };
+                let (Some(fl), Some(tl)) = (&links[live(f)], &links[live(t)]) else {
+                    return false;
+                };
+                r.from = (fl.from_osm, fl.to_osm);
+                r.to = (tl.from_osm, tl.to_osm);
+                true
+            });
         }
         let nodes = self.nodes.iter().filter(|n| !removed.contains(&n.osm_id)).cloned().collect();
         OsmMap { nodes, links: links.into_iter().flatten().collect() }
@@ -214,6 +284,18 @@ impl OsmMap {
     /// drop the now-internal stubs, and re-point the external approaches. `build`
     /// then forms a single box with one coordinated signal instead of two.
     pub fn merge_split_intersections(&self, cap_extent: bool) -> OsmMap {
+        self.merge_split_intersections_with(cap_extent, &mut Vec::new())
+    }
+
+    /// [`merge_split_intersections`], also remapping `restrictions` through the
+    /// cluster collapse. A restriction whose approach or exit link became
+    /// cluster interior (both endpoints merged away) is dropped; a via-way
+    /// restriction whose two via ends merged into one node becomes applicable.
+    pub fn merge_split_intersections_with(
+        &self,
+        cap_extent: bool,
+        restrictions: &mut Vec<RestrictionSpec>,
+    ) -> OsmMap {
         const STUB_MAX: f64 = 25.0;
         // A link this short is junction interior (a turn slot, median crossing or
         // lane-change fragment), so merge it into the junction whatever its
@@ -358,10 +440,31 @@ impl OsmMap {
             }
             links.push(LinkSpec { from_osm, to_osm, geometry, ..l.clone() });
         }
+        restrictions.retain_mut(|r| {
+            let rep = |id: i64| rep_of.get(&id).copied();
+            let (Some(f0), Some(f1), Some(t0), Some(t1)) =
+                (rep(r.from.0), rep(r.from.1), rep(r.to.0), rep(r.to.1))
+            else {
+                return false;
+            };
+            r.from = (f0, f1);
+            r.to = (t0, t1);
+            f0 != f1 && t0 != t1
+        });
         OsmMap { nodes, links }
     }
 
     pub fn build(&self) -> Network {
+        self.build_with_restrictions(&[])
+    }
+
+    /// [`build`] honoring OSM turn restrictions: each restriction filters the
+    /// movement wiring at its via node — `no_*` removes the named exit from the
+    /// approach link, `only_*` removes every other exit. Fail-open: a
+    /// restriction that would leave an approach with no exit at all (a mapping
+    /// error, or exits lost to bbox clipping) is ignored, because stranding
+    /// every driver on the link models nothing real.
+    pub fn build_with_restrictions(&self, restrictions: &[RestrictionSpec]) -> Network {
         let mut net = Network::default();
         let mut id_of: HashMap<i64, NodeId> = HashMap::new();
 
@@ -560,6 +663,31 @@ impl OsmMap {
         for (li, l) in net.links.iter().enumerate() {
             links_from[l.from.idx()].push(li);
         }
+        // Turn restrictions as (approach link → exit link) filters at their via
+        // node, keyed by link index. Node-pair matching covers parallel links —
+        // duplicates of one carriageway are the same street, so the sign binds
+        // them all.
+        let mut link_at: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+        for (i, l) in self.links.iter().enumerate() {
+            link_at.entry((l.from_osm, l.to_osm)).or_default().push(i);
+        }
+        let mut only_of: HashMap<usize, HashSet<usize>> = HashMap::new();
+        let mut banned: HashSet<(usize, usize)> = HashSet::new();
+        for r in restrictions {
+            if r.from.1 != r.to.0 {
+                continue; // a via-way restriction whose interior never merged: spans two junctions
+            }
+            let (Some(ins), Some(outs)) = (link_at.get(&r.from), link_at.get(&r.to)) else { continue };
+            for &i in ins {
+                for &o in outs {
+                    if r.only {
+                        only_of.entry(i).or_default().insert(o);
+                    } else {
+                        banned.insert((i, o));
+                    }
+                }
+            }
+        }
         let mut movements: Vec<Movement> = Vec::new();
         for in_li in 0..net.links.len() {
             let link = net.links[in_li];
@@ -579,6 +707,23 @@ impl OsmMap {
                     continue; // ~>148°: a near-reversal onto the opposing carriageway
                 }
                 onward.push((out_li, (arr[0] * dep[1] - arr[1] * dep[0]).atan2(dot)));
+            }
+            // Apply this approach's turn restrictions (`only_*` first — it is the
+            // stronger claim — then `no_*`), each fail-open so no filter may
+            // strand the approach with zero exits.
+            if let Some(allowed) = only_of.get(&in_li) {
+                let kept: Vec<(usize, f64)> =
+                    onward.iter().copied().filter(|&(o, _)| allowed.contains(&o)).collect();
+                if !kept.is_empty() {
+                    onward = kept;
+                }
+            }
+            if !banned.is_empty() {
+                let kept: Vec<(usize, f64)> =
+                    onward.iter().copied().filter(|&(o, _)| !banned.contains(&(in_li, o))).collect();
+                if !kept.is_empty() {
+                    onward = kept;
+                }
             }
             onward.sort_by(|a, b| b.1.total_cmp(&a.1)); // leftmost turn first → lane 0
 
@@ -758,6 +903,46 @@ impl OsmMap {
                 }
             }
         }
+        // Nodes whose stop control came from the node level (a sign surveyed on
+        // the junction node, or the all-way cluster promote above): every
+        // approach there serves a line. Snapshotted before the per-approach
+        // signs upgrade any further nodes, because a link-signed node lines
+        // *only* its signed approaches — that is what makes a two-way stop.
+        let node_stop_all: Vec<bool> =
+            net.nodes.iter().map(|n| matches!(n.control, NodeControl::Stop)).collect();
+        net.link_signs = self.links.iter().map(|l| l.sign).collect();
+        for li in 0..net.links.len() {
+            let n = net.links[li].to.idx();
+            if touches_freeway[n] {
+                continue;
+            }
+            match (net.link_signs[li], net.nodes[n].control) {
+                (LinkSign::Stop, NodeControl::Uncontrolled | NodeControl::Yield) => {
+                    net.nodes[n].control = NodeControl::Stop;
+                }
+                (LinkSign::Yield, NodeControl::Uncontrolled) => {
+                    net.nodes[n].control = NodeControl::Yield;
+                }
+                _ => {}
+            }
+        }
+        net.link_stop_line = (0..net.links.len())
+            .map(|li| {
+                let to = net.links[li].to.idx();
+                matches!(net.nodes[to].control, NodeControl::Stop)
+                    && (node_stop_all[to] || net.link_signs[li] == LinkSign::Stop)
+            })
+            .collect();
+        net.node_all_way = {
+            let mut aw: Vec<bool> =
+                net.nodes.iter().map(|n| matches!(n.control, NodeControl::Stop)).collect();
+            for (li, l) in net.links.iter().enumerate() {
+                if !net.link_stop_line[li] {
+                    aw[l.to.idx()] = false;
+                }
+            }
+            aw
+        };
         net.build_cross_junction_conflicts();
         net.build_conflict_index();
         coordinate_junction_signals(&mut net, &plans);
@@ -1516,7 +1701,11 @@ fn join_pass_through(
         nonzero(l1.res_weight, l2.res_weight),
         nonzero(l1.attr_weight, l2.attr_weight),
     );
-    Some(LinkSpec { from_osm: from, to_osm: to, lanes, speed_limit, geometry, layer, name, road_class, highway_ref, turn_lanes, hov_lanes, aadt, res_weight, attr_weight })
+    // A sign on the upstream segment referred to the dissolved node — which had a
+    // single continuation, so it really protects the junction downstream: taking
+    // the stronger sign relocates it there, however many pass-throughs dissolve.
+    let sign = l1.sign.max(l2.sign);
+    Some(LinkSpec { from_osm: from, to_osm: to, lanes, speed_limit, geometry, layer, name, road_class, highway_ref, turn_lanes, hov_lanes, aadt, res_weight, attr_weight, sign })
 }
 
 /// Pull every lane back from its end nodes to the junction boundary so vehicles
@@ -2397,15 +2586,27 @@ mod json {
         res_weight: f64,
         #[serde(default)]
         attr_weight: f64,
+        /// `"stop"` / `"yield"`: a per-approach sign on this directed link.
+        #[serde(default)]
+        sign: String,
+    }
+
+    #[derive(Deserialize)]
+    struct JsonRestriction {
+        from: [i64; 2],
+        to: [i64; 2],
+        kind: String,
     }
 
     #[derive(Deserialize)]
     struct JsonMap {
         nodes: Vec<JsonNode>,
         links: Vec<JsonLink>,
+        #[serde(default)]
+        restrictions: Vec<JsonRestriction>,
     }
 
-    pub fn parse(s: &str) -> Result<OsmMap, String> {
+    pub fn parse(s: &str) -> Result<(OsmMap, Vec<RestrictionSpec>), String> {
         let raw: JsonMap = serde_json::from_str(s).map_err(|e| e.to_string())?;
         let nodes = raw
             .nodes
@@ -2449,9 +2650,23 @@ mod json {
                 aadt: l.aadt,
                 res_weight: l.res_weight,
                 attr_weight: l.attr_weight,
+                sign: match l.sign.as_str() {
+                    "stop" => LinkSign::Stop,
+                    "yield" => LinkSign::Yield,
+                    _ => LinkSign::None,
+                },
             })
             .collect();
-        Ok(OsmMap { nodes, links })
+        let restrictions = raw
+            .restrictions
+            .into_iter()
+            .map(|r| RestrictionSpec {
+                from: (r.from[0], r.from[1]),
+                to: (r.to[0], r.to[1]),
+                only: r.kind.starts_with("only_"),
+            })
+            .collect();
+        Ok((OsmMap { nodes, links }, restrictions))
     }
 }
 
@@ -2490,18 +2705,59 @@ pub fn bus_routes_from_json(s: &str) -> Vec<(String, Vec<[f64; 2]>)> {
 }
 
 impl OsmMap {
-    /// Parse the OSM scraper's JSON (`tools/osm-scraper`) into an `OsmMap`,
-    /// simplifying spurious pass-through nodes. Requires the `import` feature.
+    /// Parse the OSM scraper's JSON (`tools/osm-scraper`) into an [`ImportedMap`]
+    /// (the map plus its turn restrictions, which `.build()` honors), simplifying
+    /// spurious pass-through nodes. Requires the `import` feature.
     #[cfg(feature = "import")]
-    pub fn from_json(s: &str) -> Result<OsmMap, String> {
+    pub fn from_json(s: &str) -> Result<ImportedMap, String> {
         Self::from_json_opts(s, true)
     }
 
     /// [`from_json`] with the experimental extent-capped junction merge (`split_junctions`):
     /// large surface junctions stay split into aligned sub-nodes (see `merge_split_intersections`).
     #[cfg(feature = "import")]
-    pub fn from_json_opts(s: &str, split_junctions: bool) -> Result<OsmMap, String> {
-        Ok(json::parse(s)?.collapse_pass_through_nodes().merge_split_intersections(split_junctions))
+    pub fn from_json_opts(s: &str, split_junctions: bool) -> Result<ImportedMap, String> {
+        let (map, mut restrictions) = json::parse(s)?;
+        let map = map
+            .relocate_sign_nodes()
+            .collapse_pass_through_nodes_with(&mut restrictions)
+            .merge_split_intersections_with(split_junctions, &mut restrictions);
+        Ok(ImportedMap { map, restrictions })
+    }
+
+    /// OSM surveys stop/give_way where the sign stands — often a stand-alone
+    /// node on the way rather than on the junction it protects (the same
+    /// convention as stop-line signals). A controlled 1-in/1-out node is such a
+    /// stop line: demote it to a per-approach sign on its incoming link and
+    /// free the node, so the collapse dissolves it and the sign rides the
+    /// merged link to the real junction (`join_pass_through` keeps the
+    /// stronger sign). Two-way pass-throughs (2-in/2-out) stay: with both
+    /// directions controlled the protected junction is ambiguous.
+    fn relocate_sign_nodes(&self) -> OsmMap {
+        let (mut indeg, mut outdeg): (HashMap<i64, u32>, HashMap<i64, u32>) = (HashMap::new(), HashMap::new());
+        for l in &self.links {
+            *outdeg.entry(l.from_osm).or_default() += 1;
+            *indeg.entry(l.to_osm).or_default() += 1;
+        }
+        let mut map = self.clone();
+        let mut demoted: HashMap<i64, LinkSign> = HashMap::new();
+        for n in &mut map.nodes {
+            let kind = match n.control {
+                MapControl::Stop => LinkSign::Stop,
+                MapControl::Yield => LinkSign::Yield,
+                _ => continue,
+            };
+            if indeg.get(&n.osm_id) == Some(&1) && outdeg.get(&n.osm_id) == Some(&1) {
+                demoted.insert(n.osm_id, kind);
+                n.control = MapControl::Uncontrolled;
+            }
+        }
+        for l in &mut map.links {
+            if let Some(&k) = demoted.get(&l.to_osm) {
+                l.sign = l.sign.max(k);
+            }
+        }
+        map
     }
 }
 
@@ -2544,6 +2800,227 @@ mod import_tests {
         assert_eq!(net.link_attr_weight(counted), 2.1);
         let plain = (0..net.links.len() as u32).map(LinkId).find(|&l| l != counted).unwrap();
         assert_eq!(net.link_res_weight(plain), 1.0, "no data → neutral weight");
+    }
+
+    /// A four-way at node 5 whose west approach runs through pass-through node 1
+    /// (dissolved by the collapse, so any restriction naming the `[1, 5]` block
+    /// must be rewritten onto the merged `[10, 5]` link to survive).
+    fn cross_doc(restrictions: &str) -> String {
+        let node = |id: i64, x: f64, y: f64| {
+            format!(r#"{{ "osm_id": {id}, "x": {x:.1}, "y": {y:.1}, "control": "uncontrolled" }}"#)
+        };
+        let arm = |a: i64, b: i64| {
+            format!(
+                r#"{{ "from_osm": {a}, "to_osm": {b}, "lanes": 1, "speed_limit": 13.4 }},
+                   {{ "from_osm": {b}, "to_osm": {a}, "lanes": 1, "speed_limit": 13.4 }}"#
+            )
+        };
+        format!(
+            r#"{{
+                "nodes": [{}, {}, {}, {}, {}, {}],
+                "links": [{}, {}, {}, {}, {}],
+                "restrictions": [{restrictions}]
+            }}"#,
+            node(10, -400.0, 0.0),
+            node(1, -200.0, 0.0),
+            node(2, 0.0, 200.0),
+            node(3, 200.0, 0.0),
+            node(4, 0.0, -200.0),
+            node(5, 0.0, 0.0),
+            arm(10, 1),
+            arm(1, 5),
+            arm(2, 5),
+            arm(3, 5),
+            arm(4, 5),
+        )
+    }
+
+    /// The link running `from`→`to`, located by node positions.
+    fn link_between(net: &Network, from: [f64; 2], to: [f64; 2]) -> LinkId {
+        LinkId(
+            (0..net.links.len())
+                .find(|&i| {
+                    let l = &net.links[i];
+                    net.node(l.from).position == from && net.node(l.to).position == to
+                })
+                .expect("link present") as u32,
+        )
+    }
+
+    /// The exit-node positions (rounded to metres) reachable from the link
+    /// `from`→`via`, straight off the movement wiring.
+    fn exit_targets(net: &Network, from: [f64; 2], via: [f64; 2]) -> BTreeSet<(i64, i64)> {
+        let li = link_between(net, from, via).0 as usize;
+        net.outgoing_links(LinkId(li as u32))
+            .into_iter()
+            .map(|ol| {
+                let p = net.node(net.link(ol).to).position;
+                (p[0].round() as i64, p[1].round() as i64)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn turn_restrictions_prune_movements_across_the_collapse() {
+        let west = [-400.0, 0.0];
+        let center = [0.0, 0.0];
+        let all = exit_targets(&OsmMap::from_json(&cross_doc("")).unwrap().build(), west, center);
+        assert_eq!(all, BTreeSet::from([(0, 200), (200, 0), (0, -200)]), "unrestricted baseline");
+
+        let banned = r#"{ "from": [1, 5], "to": [5, 2], "kind": "no_left_turn" }"#;
+        let net = OsmMap::from_json(&cross_doc(banned)).unwrap().build();
+        assert_eq!(
+            exit_targets(&net, west, center),
+            BTreeSet::from([(200, 0), (0, -200)]),
+            "the left exit is gone; the restriction survived node 1's dissolution"
+        );
+
+        let only = r#"{ "from": [2, 5], "to": [5, 4], "kind": "only_straight_on" }"#;
+        let net = OsmMap::from_json(&cross_doc(only)).unwrap().build();
+        assert_eq!(
+            exit_targets(&net, [0.0, 200.0], center),
+            BTreeSet::from([(0, -200)]),
+            "only_ keeps just the named exit"
+        );
+    }
+
+    #[test]
+    fn stranding_restrictions_fail_open() {
+        let all_banned = r#"
+            { "from": [1, 5], "to": [5, 2], "kind": "no_left_turn" },
+            { "from": [1, 5], "to": [5, 3], "kind": "no_straight_on" },
+            { "from": [1, 5], "to": [5, 4], "kind": "no_right_turn" }"#;
+        let net = OsmMap::from_json(&cross_doc(all_banned)).unwrap().build();
+        assert_eq!(
+            exit_targets(&net, [-400.0, 0.0], [0.0, 0.0]),
+            BTreeSet::from([(0, 200), (200, 0), (0, -200)]),
+            "a restriction set that would strand the approach is ignored wholesale"
+        );
+    }
+
+    /// A plain four-way at node 5 whose north/south (minor) approach links can
+    /// carry per-approach signs; every node uncontrolled unless overridden.
+    fn signed_cross_doc(center_control: &str, minor_sign: &str) -> String {
+        let sign = |s: &str| if s.is_empty() { String::new() } else { format!(r#", "sign": "{s}""#) };
+        format!(
+            r#"{{
+                "nodes": [
+                    {{ "osm_id": 1, "x": -200.0, "y": 0.0, "control": "uncontrolled" }},
+                    {{ "osm_id": 2, "x": 0.0, "y": 200.0, "control": "uncontrolled" }},
+                    {{ "osm_id": 3, "x": 200.0, "y": 0.0, "control": "uncontrolled" }},
+                    {{ "osm_id": 4, "x": 0.0, "y": -200.0, "control": "uncontrolled" }},
+                    {{ "osm_id": 5, "x": 0.0, "y": 0.0, "control": "{center_control}" }}
+                ],
+                "links": [
+                    {{ "from_osm": 1, "to_osm": 5, "lanes": 1, "speed_limit": 13.4 }},
+                    {{ "from_osm": 5, "to_osm": 1, "lanes": 1, "speed_limit": 13.4 }},
+                    {{ "from_osm": 2, "to_osm": 5, "lanes": 1, "speed_limit": 13.4{s} }},
+                    {{ "from_osm": 5, "to_osm": 2, "lanes": 1, "speed_limit": 13.4 }},
+                    {{ "from_osm": 3, "to_osm": 5, "lanes": 1, "speed_limit": 13.4 }},
+                    {{ "from_osm": 5, "to_osm": 3, "lanes": 1, "speed_limit": 13.4 }},
+                    {{ "from_osm": 4, "to_osm": 5, "lanes": 1, "speed_limit": 13.4{s} }},
+                    {{ "from_osm": 5, "to_osm": 4, "lanes": 1, "speed_limit": 13.4 }}
+                ]
+            }}"#,
+            s = sign(minor_sign),
+        )
+    }
+
+    #[test]
+    fn way_mapped_stop_signs_make_a_two_way_stop() {
+        let net = OsmMap::from_json(&signed_cross_doc("uncontrolled", "stop")).unwrap().build();
+        let center = [0.0, 0.0];
+        let c = net.nodes.iter().position(|n| n.position == center).unwrap();
+        assert!(matches!(net.nodes[c].control, NodeControl::Stop), "signed approaches make the node stop-controlled");
+        assert!(net.approach_stops(link_between(&net, [0.0, 200.0], center)), "north minor stops");
+        assert!(net.approach_stops(link_between(&net, [0.0, -200.0], center)), "south minor stops");
+        assert!(!net.approach_stops(link_between(&net, [-200.0, 0.0], center)), "west major rolls");
+        assert!(!net.approach_stops(link_between(&net, [200.0, 0.0], center)), "east major rolls");
+        assert!(!net.all_way_stop(NodeId(c as u32)), "a two-way stop must not run the all-way FIFO");
+    }
+
+    #[test]
+    fn junction_node_stops_stay_all_way() {
+        let net = OsmMap::from_json(&signed_cross_doc("stop", "")).unwrap().build();
+        let center = [0.0, 0.0];
+        let c = net.nodes.iter().position(|n| n.position == center).unwrap();
+        assert!(matches!(net.nodes[c].control, NodeControl::Stop));
+        for arm in [[-200.0, 0.0], [0.0, 200.0], [200.0, 0.0], [0.0, -200.0]] {
+            assert!(net.approach_stops(link_between(&net, arm, center)), "node-level stop lines every approach");
+        }
+        assert!(net.all_way_stop(NodeId(c as u32)), "node-level stop keeps the all-way protocol");
+    }
+
+    #[test]
+    fn stop_line_nodes_relocate_to_their_junction() {
+        // The minor street enters one-way through a stand-alone stop node 9 (the
+        // OSM stop-line convention). It must dissolve, its sign riding the merged
+        // approach to the junction: a two-way stop there, not a mid-block halt.
+        let doc = r#"{
+            "nodes": [
+                { "osm_id": 1, "x": -200.0, "y": 0.0, "control": "uncontrolled" },
+                { "osm_id": 2, "x": 0.0, "y": 300.0, "control": "uncontrolled" },
+                { "osm_id": 9, "x": 0.0, "y": 220.0, "control": "stop" },
+                { "osm_id": 3, "x": 200.0, "y": 0.0, "control": "uncontrolled" },
+                { "osm_id": 5, "x": 0.0, "y": 0.0, "control": "uncontrolled" }
+            ],
+            "links": [
+                { "from_osm": 1, "to_osm": 5, "lanes": 1, "speed_limit": 13.4 },
+                { "from_osm": 5, "to_osm": 1, "lanes": 1, "speed_limit": 13.4 },
+                { "from_osm": 2, "to_osm": 9, "lanes": 1, "speed_limit": 13.4 },
+                { "from_osm": 9, "to_osm": 5, "lanes": 1, "speed_limit": 13.4 },
+                { "from_osm": 3, "to_osm": 5, "lanes": 1, "speed_limit": 13.4 },
+                { "from_osm": 5, "to_osm": 3, "lanes": 1, "speed_limit": 13.4 }
+            ]
+        }"#;
+        let net = OsmMap::from_json(doc).unwrap().build();
+        let center = [0.0, 0.0];
+        assert!(
+            !net.nodes.iter().any(|n| n.position == [0.0, 220.0]),
+            "the stand-alone stop node dissolves"
+        );
+        let c = net.nodes.iter().position(|n| n.position == center).unwrap();
+        assert!(matches!(net.nodes[c].control, NodeControl::Stop));
+        assert!(net.approach_stops(link_between(&net, [0.0, 300.0], center)), "the sign rode down to the junction");
+        assert!(!net.approach_stops(link_between(&net, [-200.0, 0.0], center)), "the cross street keeps rolling");
+        assert!(!net.all_way_stop(NodeId(c as u32)));
+    }
+
+    #[test]
+    fn via_way_restrictions_bind_once_the_junction_merges() {
+        // A divided crossing: median stub 5–6 (8 m, merged as cluster interior),
+        // west approach at 5, east/south arms at 6, north arm at 5. The via-way
+        // restriction's ends land on the merged cluster's one node, where it bans
+        // the through movement.
+        let doc = r#"{
+            "nodes": [
+                { "osm_id": 1, "x": -200.0, "y": 0.0, "control": "uncontrolled" },
+                { "osm_id": 2, "x": 0.0, "y": 200.0, "control": "uncontrolled" },
+                { "osm_id": 3, "x": 208.0, "y": 0.0, "control": "uncontrolled" },
+                { "osm_id": 4, "x": 8.0, "y": -200.0, "control": "uncontrolled" },
+                { "osm_id": 5, "x": 0.0, "y": 0.0, "control": "uncontrolled" },
+                { "osm_id": 6, "x": 8.0, "y": 0.0, "control": "uncontrolled" }
+            ],
+            "links": [
+                { "from_osm": 1, "to_osm": 5, "lanes": 1, "speed_limit": 13.4 },
+                { "from_osm": 5, "to_osm": 1, "lanes": 1, "speed_limit": 13.4 },
+                { "from_osm": 5, "to_osm": 6, "lanes": 1, "speed_limit": 13.4 },
+                { "from_osm": 6, "to_osm": 5, "lanes": 1, "speed_limit": 13.4 },
+                { "from_osm": 2, "to_osm": 5, "lanes": 1, "speed_limit": 13.4 },
+                { "from_osm": 5, "to_osm": 2, "lanes": 1, "speed_limit": 13.4 },
+                { "from_osm": 3, "to_osm": 6, "lanes": 1, "speed_limit": 13.4 },
+                { "from_osm": 6, "to_osm": 3, "lanes": 1, "speed_limit": 13.4 },
+                { "from_osm": 4, "to_osm": 6, "lanes": 1, "speed_limit": 13.4 },
+                { "from_osm": 6, "to_osm": 4, "lanes": 1, "speed_limit": 13.4 }
+            ],
+            "restrictions": [
+                { "from": [1, 5], "to": [6, 3], "kind": "no_straight_on" }
+            ]
+        }"#;
+        let net = OsmMap::from_json(doc).unwrap().build();
+        let exits = exit_targets(&net, [-200.0, 0.0], [4.0, 0.0]);
+        assert!(!exits.contains(&(208, 0)), "the through exit across the median is banned: {exits:?}");
+        assert!(exits.contains(&(0, 200)) && exits.contains(&(8, -200)), "the turns survive: {exits:?}");
     }
 
     /// The junction-end setback of every approach into and exit out of `j`, in
@@ -2592,7 +3069,7 @@ mod import_tests {
     fn extract_complex_junction_fixtures() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
         let Ok(text) = std::fs::read_to_string(&path) else { return };
-        let raw = json::parse(&text).expect("map json");
+        let (raw, _) = json::parse(&text).expect("map json");
         let pos: std::collections::HashMap<i64, [f64; 2]> = raw.nodes.iter().map(|n| (n.osm_id, [n.x, n.y])).collect();
         let mut neigh: std::collections::HashMap<i64, std::collections::BTreeSet<i64>> = Default::default();
         for l in &raw.links {
@@ -3287,7 +3764,7 @@ mod tests {
         let cycle = net.programs[up.2].cycle_length();
         let steps = 2 * (cycle / 0.1).ceil() as usize + 4;
         let mut ctrl = SignalController::build(&net);
-        let demand: HashSet<u32> = (0..net.links.len() as u32).collect();
+        let demand: HashSet<u32> = (0..net.lanes.len() as u32).collect();
         let mut clock = 0.0;
         // One warm-up cycle so the seeded runtime settles onto the schedule.
         while clock < cycle {
@@ -3320,6 +3797,49 @@ mod tests {
     }
 
     #[test]
+    fn a_protected_left_is_called_by_the_bay_not_the_through_queue() {
+        // Per-lane detection: cars in the through lanes of the same approach
+        // must not call the protected-left window; a car in the left's own lane
+        // must. (With per-link detectors, any through queue rang the left bell.)
+        use super::super::junction::SignalController;
+        use super::super::signal::SignalState;
+        use std::collections::HashSet;
+        let net = coordinated_corridor_net();
+        let left = (0..net.movements.len() as u32)
+            .find_map(|m| {
+                let mv = net.movement(MovementId(m));
+                (mv.node == NodeId(1)
+                    && net.movement_turn(MovementId(m)) == TurnType::Left
+                    && net.link_names[net.lane(mv.from_lane).link.idx()] == "Main Street")
+                    .then_some(MovementId(m))
+            })
+            .expect("a Main-Street protected left at the upstream signal");
+        let left_lane = net.movement(left).from_lane;
+        let (pid, _bit, through_mid) = corridor_through(&net);
+        let cycle = net.programs[pid].cycle_length();
+        let steps = 3 * (cycle / 0.1).ceil() as usize;
+
+        // Every through lane of the same link occupied — but not the left's lane.
+        let link = net.lane(left_lane).link;
+        let through_lanes: HashSet<u32> =
+            net.lanes_of(link).filter(|&l| l != left_lane).map(|l| l.0).collect();
+        let run = |demand: &HashSet<u32>| -> bool {
+            let mut ctrl = SignalController::build(&net);
+            let mut left_green = false;
+            for _ in 0..steps {
+                ctrl.advance(&net, demand, 0.1, &Default::default());
+                left_green |= ctrl.movement_state(&net, left) == SignalState::Green
+                    && ctrl.movement_state(&net, through_mid) != SignalState::Green;
+            }
+            left_green
+        };
+        assert!(!run(&through_lanes), "a through queue alone never opens the protected-left window");
+        let mut with_bay = through_lanes.clone();
+        with_bay.insert(left_lane.0);
+        assert!(run(&with_bay), "a car in the bay calls and receives its protected window");
+    }
+
+    #[test]
     fn a_coordinated_signal_rests_in_green_without_side_demand() {
         // The actuated half of semi-actuated coordination: with nobody on the
         // side street, the corridor keeps its green (the side phase is skipped)
@@ -3332,10 +3852,9 @@ mod tests {
         let (pid, _bit, mid) = corridor_through(&net);
         let cycle = net.programs[pid].cycle_length();
         let mut ctrl = SignalController::build(&net);
-        // Demand only on the through movement's own approach: detectors are
-        // per-link, and the opposite Main approach also feeds a protected-left
-        // phase — a genuine (if coarse) left call this test must not place.
-        let main: HashSet<u32> = HashSet::from([net.lane(net.movement(mid).from_lane).link.0]);
+        // Demand only in the through movement's own lane: detection is per-lane,
+        // so this places no call for any protected-left phase.
+        let main: HashSet<u32> = HashSet::from([net.movement(mid).from_lane.0]);
         let mut clock = 0.0;
         // Warm-up cycle, then measure green share over two cycles.
         while clock < cycle {
@@ -3537,7 +4056,7 @@ mod tests {
             ],
             links: vec![
                 LinkSpec::oneway(1, 2, 1, 20.0), // surface road, crosses origin
-                LinkSpec { from_osm: 3, to_osm: 4, lanes: 1, speed_limit: 25.0, geometry: Vec::new(), layer: 1, name: String::new(), road_class: String::new(), highway_ref: String::new(), turn_lanes: String::new(), hov_lanes: String::new(), aadt: 0.0, res_weight: 0.0, attr_weight: 0.0 }, // bridge over it
+                LinkSpec { from_osm: 3, to_osm: 4, lanes: 1, speed_limit: 25.0, geometry: Vec::new(), layer: 1, name: String::new(), road_class: String::new(), highway_ref: String::new(), turn_lanes: String::new(), hov_lanes: String::new(), aadt: 0.0, res_weight: 0.0, attr_weight: 0.0, sign: LinkSign::None }, // bridge over it
             ],
         }
         .build();
