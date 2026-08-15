@@ -106,11 +106,10 @@ pub fn junction_mesh(net: &Network) -> StaticMesh {
     let rings = junction_rings(net);
     let mut mesh = StaticMesh::default();
     for r in &rings.rings {
-        if r.ring.len() >= 3 {
-            fill_fan(&mut mesh, r.apex, &r.ring, ROAD_COLOR);
-        }
-        if r.core.len() >= 3 {
-            fill_fan(&mut mesh, r.apex, &r.core, ROAD_COLOR);
+        for b in &r.boxes {
+            if b.ring.len() >= 3 {
+                fill_fan(&mut mesh, b.apex, &b.ring, ROAD_COLOR);
+            }
         }
     }
     // An interior link's own pavement, unclipped: the setbacks trim its drawn
@@ -134,19 +133,43 @@ pub fn junction_mesh(net: &Network) -> StaticMesh {
     mesh
 }
 
-/// One junction cluster's paved region: the rounded boundary `ring` (fanned from
-/// `apex`), plus — for a multi-node cluster — the solid `core` box where the
-/// streets' width bands cross. The fan alone dips back through the apex between
-/// distant arms, which can leave the far carriageway of a divided crossing
-/// unpaved; the core box fills the crossing solid, median gap included.
-struct ClusterRing {
+/// One member node's local crossing box. A *real* crossing — ≥ 3 arms forming
+/// ≥ 2 distinct streets — gets the junction marker outline; a chain node (a
+/// widened stop-line stub, an attribute change, a collinear pass-through with a
+/// driveway) still paves its box (it bridges the flare) but is never outlined.
+struct NodeBox {
+    node: u32,
     apex: [f64; 2],
+    arms: usize,
+    streets: usize,
     ring: Vec<[f64; 2]>,
-    core: Vec<[f64; 2]>,
 }
 
-/// Every cluster's boundary ring plus the node→cluster map, so both the fill and
-/// the marking/signal-head placement work from one shared boundary.
+/// One junction cluster's paved region. A *compact* cluster (every member node
+/// within [`SPRAWL_RADIUS`] of the centre — a lone crossing, a tightly split
+/// divided crossing) is one box over its external mouths: it genuinely reads
+/// as a single intersection. A *sprawling* cluster — El Camino Real × Millbrae
+/// Avenue splits over four crossing nodes plus widened stop-line stubs, 70 m
+/// across — decomposes into per-member-node local boxes (external arms via
+/// their real mouths, cluster-interior links via their boundary-chart end
+/// cross-sections): four small crossings joined by the interior links' own
+/// pavement, with the real median islands left unpaved, instead of one hull
+/// paved edge to edge.
+struct ClusterRing {
+    boxes: Vec<NodeBox>,
+}
+
+/// Cluster half-extent (m) above which the single-hull box model breaks and the
+/// cluster renders as per-node crossings: past this, member crossings have real
+/// medians and roadway between them that a hull would falsely pave.
+const SPRAWL_RADIUS: f64 = 18.0;
+
+/// Sentinel for a compact cluster's single box, which serves every member node
+/// (see [`stop_positions`]'s fallback).
+const WHOLE_CLUSTER: u32 = u32::MAX;
+
+/// Every cluster's local boxes plus the node→cluster map, so the fill and the
+/// marking/signal-head placement work from one shared boundary.
 struct JunctionRings {
     cluster: Vec<Option<usize>>,
     rings: Vec<ClusterRing>,
@@ -154,30 +177,89 @@ struct JunctionRings {
 
 fn junction_rings(net: &Network) -> JunctionRings {
     let (cluster, ncl) = intersection_clusters(net);
+    // Incident at-grade links per node, once — the per-node box loop is then
+    // O(cluster members · node degree) instead of O(members · links).
+    let mut at: Vec<Vec<(u32, bool)>> = vec![Vec::new(); net.nodes.len()];
+    for (i, l) in net.links.iter().enumerate() {
+        if l.layer == 0 {
+            at[l.to.idx()].push((i as u32, true));
+            at[l.from.idx()].push((i as u32, false));
+        }
+    }
     let mut rings = Vec::with_capacity(ncl);
     for ci in 0..ncl {
         let j = net.junction(crate::sim::network::JunctionId(ci as u32));
-        // The junction owns its arm mouths; the region is built straight from
-        // them. Fan apex = the junction's centre (its busiest node — the actual
-        // crossing point, not an average that sits off to one side).
-        let arms: Vec<([f64; 2], [f64; 2])> = j.mouths.iter().map(|m| (m.anchor, m.outer)).collect();
-        let c = j.center;
-        // A lone crossing gets the street-band box (the crossing streets' width
-        // bands clipped against each other — a parallelogram when they meet
-        // obliquely). A multi-node cluster — a divided arterial or a
-        // sprawling interchange whose arms stagger — can't be one convex box
-        // without leaving arms or the core unpaved, so it uses the arm-mouth fan.
-        let (ring, core) = if arms.len() < 2 {
-            (Vec::new(), Vec::new())
-        } else if j.nodes.len() == 1 {
-            (round_corners(&junction_box(&arms, c), CURB_RADIUS), Vec::new())
+        let sprawling =
+            j.nodes.iter().any(|&nd| norm(sub(net.node(nd).position, j.center)) > SPRAWL_RADIUS);
+        let boxes = if !sprawling && j.mouths.len() >= 2 {
+            // One region for the whole compact cluster. A lone crossing takes
+            // the street-band box; a tightly split crossing (nodes a few metres
+            // apart) takes the hull of its external mouths — a band box is
+            // star-shaped about one node, and the second node's arms slice it.
+            let streets = {
+                let axes: Vec<[f64; 2]> = j.mouths.iter().map(|m| m.dir).collect();
+                street_groups(&axes).iter().max().map_or(0, |&g| g + 1)
+            };
+            let poly = if j.nodes.len() == 1 {
+                let arms: Vec<BoxArm> =
+                    j.mouths.iter().map(|m| BoxArm { m: m.anchor, o: m.outer, axis: m.dir }).collect();
+                junction_box(&arms, j.center).0
+            } else {
+                let corners: Vec<[f64; 2]> =
+                    j.mouths.iter().flat_map(|m| [m.anchor, m.outer]).collect();
+                convex_hull(&corners)
+            };
+            vec![NodeBox {
+                node: WHOLE_CLUSTER,
+                apex: j.center,
+                arms: j.mouths.len(),
+                streets,
+                ring: round_corners(&poly, CURB_RADIUS),
+            }]
+        } else if !sprawling {
+            Vec::new()
         } else {
-            (
-                round_corners(&junction_fan_ring(&arms, c), CURB_RADIUS),
-                round_corners(&junction_box(&arms, c), CURB_RADIUS),
-            )
+            j.nodes
+                .iter()
+                .filter_map(|&nd| {
+                    let c = net.node(nd).position;
+                    let arms: Vec<BoxArm> = at[nd.idx()]
+                        .iter()
+                        .map(|&(li, to)| {
+                            let (m, o) = net.arm_mouth(LinkId(li), to);
+                            let axis =
+                                if to { net.arrival_dir(LinkId(li)) } else { net.departure_dir(LinkId(li)) };
+                            BoxArm { m, o, axis }
+                        })
+                        .collect();
+                    if arms.len() < 2 {
+                        return None;
+                    }
+                    let (mut poly, streets) = junction_box(&arms, c);
+                    // Tile neighbouring member crossings at their perpendicular
+                    // bisectors: an arm's cross-section can sit most of the way
+                    // to the next node, and the band it bounds otherwise grows
+                    // a lobe interpenetrating the neighbour's box.
+                    for &(li, to) in &at[nd.idx()] {
+                        let l = net.link(LinkId(li));
+                        let other = if to { l.from } else { l.to };
+                        if other != nd && cluster[other.idx()] == Some(ci) {
+                            let p = net.node(other).position;
+                            let mid = [(c[0] + p[0]) * 0.5, (c[1] + p[1]) * 0.5];
+                            poly = clip_halfplane(&poly, mid, norm2(sub(c, p)));
+                        }
+                    }
+                    Some(NodeBox {
+                        node: nd.0,
+                        apex: c,
+                        arms: arms.len(),
+                        streets,
+                        ring: round_corners(&poly, CURB_RADIUS),
+                    })
+                })
+                .collect()
         };
-        rings.push(ClusterRing { apex: c, ring, core });
+        rings.push(ClusterRing { boxes });
     }
     JunctionRings { cluster, rings }
 }
@@ -186,20 +268,25 @@ fn junction_rings(net: &Network) -> JunctionRings {
 /// sim's `set_junction_setbacks` so markings sit just behind the crossing.
 const STOP_MARGIN: f64 = 2.5;
 
-/// The lane-arc position of each link's stop line, snapped to its junction
-/// cluster's outer boundary. For a lone crossing this is the node's own stop line
-/// (`lane.length`); for a multi-node cluster it's pulled out to where the approach
-/// crosses the cluster boundary — so markings and heads land at the real mouth of
-/// the junction, not inside it at some interior node's box edge.
+/// The lane-arc position of each link's stop line, snapped to its downstream
+/// node's *local* box — where the sim actually halts the approach. On a
+/// multi-node cluster each approach thus marks at its own crossing's edge (a
+/// divided arterial's stop bars sit at each carriageway crossing), not at the
+/// sprawling cluster's hull.
 fn stop_positions(net: &Network, rings: &JunctionRings) -> Vec<f64> {
     (0..net.links.len())
         .map(|i| {
             let link = LinkId(i as u32);
+            let to = net.link(link).to;
             let lane0 = net.link(link).lane_start;
             let default = net.lane(lane0).length;
-            let Some(ci) = rings.cluster[net.link(link).to.idx()] else { return default };
-            let ring = &rings.rings[ci].ring;
-            match boundary_crossing(net, link, ring) {
+            let Some(ci) = rings.cluster[to.idx()] else { return default };
+            let boxes = &rings.rings[ci].boxes;
+            let whole = || boxes.iter().find(|b| b.node == WHOLE_CLUSTER);
+            let Some(b) = boxes.iter().find(|b| b.node == to.0).or_else(whole) else {
+                return default;
+            };
+            match boundary_crossing(net, link, &b.ring) {
                 // `default` (the lane length) can be sub-metre on tiny links, so the
                 // lower bound must be 0, never a fixed 1.0 (which would be > default).
                 Some(s) => (s - net.lane(lane0).start_offset - STOP_MARGIN).clamp(0.0, default),
@@ -259,34 +346,83 @@ fn point_in_ring(ring: &[[f64; 2]], p: [f64; 2]) -> bool {
     inside
 }
 
-/// The box of a lone crossing: the intersection of the crossing *streets'* bands,
+/// One arm feeding a crossing box: the mouth's two corners plus the street's
+/// travel direction at that end. The direction is the link's own end direction
+/// — never the mouth-midpoint bearing, which a short arm with a wide,
+/// laterally-offset cross-section (a stop-line flare 6 m out) skews by tens of
+/// degrees, splitting one street into two bogus axis groups.
+pub struct BoxArm {
+    pub m: [f64; 2],
+    pub o: [f64; 2],
+    pub axis: [f64; 2],
+}
+
+/// Group arm axes into streets, sign-insensitively (within ~25° = one street:
+/// a road's two directions and its continuations). Returns a group id per axis.
+fn street_groups(axes: &[[f64; 2]]) -> Vec<usize> {
+    let mut reps: Vec<[f64; 2]> = Vec::new();
+    axes.iter()
+        .map(|a| {
+            reps.iter().position(|g| (a[0] * g[0] + a[1] * g[1]).abs() > 0.9).unwrap_or_else(|| {
+                reps.push(*a);
+                reps.len() - 1
+            })
+        })
+        .collect()
+}
+
+/// Convex hull (Andrew's monotone chain, CCW) — the crossing region of a
+/// compact multi-node cluster: the hull of its external mouth corners spans
+/// member fans that no single node's half-plane box can (arms at the second
+/// node slice a star-shaped box away).
+fn convex_hull(pts: &[[f64; 2]]) -> Vec<[f64; 2]> {
+    let mut p: Vec<[f64; 2]> = pts.to_vec();
+    p.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+    p.dedup();
+    if p.len() < 3 {
+        return p;
+    }
+    let cross = |o: [f64; 2], a: [f64; 2], b: [f64; 2]| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    let mut hull: Vec<[f64; 2]> = Vec::with_capacity(p.len() * 2);
+    for pass in 0..2 {
+        let start = hull.len();
+        let it: Box<dyn Iterator<Item = &[f64; 2]>> =
+            if pass == 0 { Box::new(p.iter()) } else { Box::new(p.iter().rev()) };
+        for &q in it {
+            while hull.len() >= start + 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], q) <= 0.0 {
+                hull.pop();
+            }
+            hull.push(q);
+        }
+        hull.pop();
+    }
+    hull
+}
+
+/// The box of a crossing: the intersection of the crossing *streets'* bands,
 /// each bounded by its arms' stop lines. Arms whose axes run within ~25° of each
 /// other (a street's opposite carriageways and continuations) merge into one band
 /// spanning their combined width; clipping the bands against each other yields the
 /// street-aligned region — a rectangle for a right-angle crossing, a parallelogram
-/// when the streets meet obliquely.
-fn junction_box(arms: &[([f64; 2], [f64; 2])], c: [f64; 2]) -> Vec<[f64; 2]> {
-    let r = arms.iter().map(|&(m, o)| norm(sub(m, c)).max(norm(sub(o, c)))).fold(0.0, f64::max) + 20.0;
+/// when the streets meet obliquely. Also returns the number of distinct streets
+/// (axis groups): one means the node is a widening or a collinear pass-through,
+/// not a visual crossing.
+pub use BoxArm as DiagBoxArm;
+
+#[cfg(test)]
+pub fn diag_junction_box(arms: &[BoxArm], c: [f64; 2]) -> (Vec<[f64; 2]>, usize) {
+    junction_box(arms, c)
+}
+
+fn junction_box(arms: &[BoxArm], c: [f64; 2]) -> (Vec<[f64; 2]>, usize) {
+    let r = arms.iter().map(|a| norm(sub(a.m, c)).max(norm(sub(a.o, c)))).fold(0.0, f64::max) + 20.0;
     let mut poly = vec![[c[0] - r, c[1] - r], [c[0] + r, c[1] - r], [c[0] + r, c[1] + r], [c[0] - r, c[1] + r]];
 
     // Group arms by axis (sign-insensitive): each group is one street through the node.
-    let axis_of = |&(m, o): &([f64; 2], [f64; 2])| {
-        let e = [(m[0] + o[0]) * 0.5, (m[1] + o[1]) * 0.5];
-        norm2(sub(e, c))
-    };
-    let mut groups: Vec<(usize, [f64; 2])> = Vec::new(); // (group id per arm order, axis)
-    let mut arm_group = Vec::with_capacity(arms.len());
-    for arm in arms {
-        let a = axis_of(arm);
-        let gid = groups
-            .iter()
-            .position(|&(_, g)| (a[0] * g[0] + a[1] * g[1]).abs() > 0.9)
-            .unwrap_or_else(|| {
-                groups.push((groups.len(), a));
-                groups.len() - 1
-            });
-        arm_group.push(gid);
-    }
+    let arm_group = street_groups(&arms.iter().map(|a| a.axis).collect::<Vec<_>>());
+    let ngroups = arm_group.iter().max().map_or(0, |&g| g + 1);
+    let groups: Vec<(usize, [f64; 2])> =
+        (0..ngroups).map(|g| (g, arms[arm_group.iter().position(|&x| x == g).unwrap()].axis)).collect();
 
     // Each street's band: the extreme edge lines parallel to its axis, spanning
     // every member arm's corners; plus its stop lines across each member mouth.
@@ -294,60 +430,29 @@ fn junction_box(arms: &[([f64; 2], [f64; 2])], c: [f64; 2]) -> Vec<[f64; 2]> {
         let perp = [axis[1], -axis[0]];
         let lat = |p: [f64; 2]| (p[0] - c[0]) * perp[0] + (p[1] - c[1]) * perp[1];
         let (mut lo, mut hi) = (f64::MAX, f64::MIN);
-        for (k, &(m, o)) in arms.iter().enumerate() {
+        for (k, arm) in arms.iter().enumerate() {
             if arm_group[k] != gid {
                 continue;
             }
-            for p in [m, o] {
+            for p in [arm.m, arm.o] {
                 lo = lo.min(lat(p));
                 hi = hi.max(lat(p));
             }
         }
+        // The band always spans the node itself: at a tight multi-arm fork a
+        // street's end cross-sections can land wholly to one side of it (bent
+        // end segments, stitched bounds), and a band that excludes the node
+        // clips the box to an off-node sliver.
+        lo = lo.min(0.0);
+        hi = hi.max(0.0);
         poly = clip_halfplane(&poly, [c[0] + perp[0] * lo, c[1] + perp[1] * lo], perp);
         poly = clip_halfplane(&poly, [c[0] + perp[0] * hi, c[1] + perp[1] * hi], [-perp[0], -perp[1]]);
     }
-    for &(m, o) in arms {
-        let mc = [(m[0] + o[0]) * 0.5, (m[1] + o[1]) * 0.5];
+    for arm in arms {
+        let mc = [(arm.m[0] + arm.o[0]) * 0.5, (arm.m[1] + arm.o[1]) * 0.5];
         poly = clip_halfplane(&poly, mc, norm2(sub(c, mc))); // stop line across the mouth
     }
-    poly
-}
-
-/// The crossing region of a multi-node cluster: each external arm's two mouth
-/// corners, ordered around the centre, with a curb return between neighbours that
-/// are close and a dip back through the centre where they're far apart (so open
-/// spans between arms aren't paved as one giant wedge). Reaches every arm, which a
-/// single convex box can't when the arms stagger.
-fn junction_fan_ring(arms: &[([f64; 2], [f64; 2])], c: [f64; 2]) -> Vec<[f64; 2]> {
-    let ang = |p: &[f64; 2]| (p[1] - c[1]).atan2(p[0] - c[0]);
-    // Orient each mouth's corner pair counter-clockwise about the centre by the
-    // cross product, not by comparing raw angles — a mouth straddling atan2's
-    // ±π cut (an arm due west) compares reversed, which crossed the ring over
-    // itself there and measured the curb gap to the next arm from the wrong
-    // corner.
-    let mut ordered: Vec<([f64; 2], [f64; 2])> = arms
-        .iter()
-        .map(|&(m, o)| {
-            let cross = (m[0] - c[0]) * (o[1] - c[1]) - (m[1] - c[1]) * (o[0] - c[0]);
-            if cross >= 0.0 { (m, o) } else { (o, m) }
-        })
-        .collect();
-    ordered.sort_by(|a, b| {
-        let ca = ang(&[(a.0[0] + a.1[0]) * 0.5, (a.0[1] + a.1[1]) * 0.5]);
-        let cb = ang(&[(b.0[0] + b.1[0]) * 0.5, (b.0[1] + b.1[1]) * 0.5]);
-        ca.total_cmp(&cb)
-    });
-    let n = ordered.len();
-    let mut ring: Vec<[f64; 2]> = Vec::with_capacity(n * 3);
-    for k in 0..n {
-        let (m, o) = ordered[k];
-        ring.push(m);
-        ring.push(o);
-        if norm(sub(o, ordered[(k + 1) % n].0)) > CURB_MAX {
-            ring.push(c);
-        }
-    }
-    ring
+    (poly, groups.len())
 }
 
 /// Clip a convex polygon to the half-plane `{p : (p − a)·n ≥ 0}`
@@ -390,11 +495,6 @@ fn fill_fan(mesh: &mut StaticMesh, center: [f64; 2], ring: &[[f64; 2]], color: [
 /// Curb-return radius (m): California curb returns run ~5–10 m; 5 keeps corners
 /// crisp without eating into small junctions.
 const CURB_RADIUS: f64 = 5.0;
-
-/// Max gap (m) between neighbouring arms of a multi-node cluster that still reads
-/// as one curb-return corner; beyond it the fan boundary dips back through the
-/// centre instead of paving the open span between the arms.
-const CURB_MAX: f64 = 26.0;
 
 /// Round each convex-polygon corner with a quadratic fillet, so the junction
 /// pavement reads with curb returns instead of sharp points. The fillet radius is
@@ -456,13 +556,31 @@ pub fn marking_mesh(net: &Network) -> StaticMesh {
     // junction-cluster boundary (`stop`) so on a multi-node crossing they sit at
     // its real mouth, not inside it. Interior links are inside the box and skipped.
     let interior = interior_links(net);
-    let stop = stop_positions(net, &junction_rings(net));
+    let rings = junction_rings(net);
+    let stop = stop_positions(net, &rings);
     lane_use_arrows(net, &interior, &stop, &mut mesh);
     crosswalks(net, &interior, &stop, &mut mesh);
     stop_yield_markings(net, &interior, &stop, &mut mesh);
-    for j in &net.junctions {
-        for k in 0..4 {
-            mesh.push_ribbon(j.footprint[k], j.footprint[(k + 1) % 4], JUNCTION_MARKER_HALF_W, JUNCTION_MARKER_COLOR, 0.0);
+    // The junction marker hugs each *real* crossing's local box (≥ 3 arms
+    // forming ≥ 2 distinct streets) — on a sprawling divided-road cluster that
+    // is one outline per carriageway crossing, not a hull quad slicing across
+    // mid-block pavement, and never an outline around a stop-line stub or a
+    // collinear chain node. Where two crossings sit so close their boxes
+    // overlap (a tight divided crossing just past the sprawl threshold), only
+    // the stronger keeps its outline — intertwined rings read as scribble.
+    for r in &rings.rings {
+        let mut marked: Vec<&NodeBox> =
+            r.boxes.iter().filter(|b| b.arms >= 3 && b.streets >= 2).collect();
+        marked.sort_by_key(|b| (std::cmp::Reverse(b.arms), b.node));
+        let mut kept: Vec<&NodeBox> = Vec::new();
+        for b in marked {
+            if kept.iter().any(|k| point_in_ring(&k.ring, b.apex)) {
+                continue;
+            }
+            for k in 0..b.ring.len() {
+                mesh.push_ribbon(b.ring[k], b.ring[(k + 1) % b.ring.len()], JUNCTION_MARKER_HALF_W, JUNCTION_MARKER_COLOR, 0.0);
+            }
+            kept.push(b);
         }
     }
     mesh
@@ -717,28 +835,15 @@ pub fn signal_head_placements(net: &Network) -> Vec<(usize, [f32; 2], f32, bool)
         let dir = net.arrival_dir(link);
         let right = [dir[1], -dir[0]]; // right-hand normal of travel
         let off = LANE_WIDTH * 0.5 + POLE_MARGIN + ord * HEAD_SPACING;
-        let mut world = [p[0] + right[0] * off, p[1] + right[1] * off];
-        if let Some(jid) = net.node_junction(net.link(link).to) {
-            world = snap_to_footprint(world, &net.junction(jid).footprint);
-        }
+        // The stop line is snapped to the approach's local crossing box, so the
+        // curbside offset already stands the head at the junction's edge beside
+        // the front stopped car — no further snapping (projecting onto the old
+        // cluster-wide footprint dragged every head of a sprawling divided
+        // crossing onto one hull edge, stacking them mid-block).
+        let world = [p[0] + right[0] * off, p[1] + right[1] * off];
         out.push((gi, [world[0] as f32, world[1] as f32], dir[1].atan2(dir[0]) as f32, is_left[gi]));
     }
     out
-}
-
-fn snap_to_footprint(p: [f64; 2], fp: &[[f64; 2]; 4]) -> [f64; 2] {
-    let mut best = (p, f64::INFINITY);
-    for k in 0..4 {
-        let a = fp[k];
-        let e = norm2(sub(fp[(k + 1) % 4], a));
-        let along = (p[0] - a[0]) * e[0] + (p[1] - a[1]) * e[1];
-        let proj = [a[0] + e[0] * along, a[1] + e[1] * along];
-        let dist = norm(sub(p, proj));
-        if dist < best.1 {
-            best = (proj, dist);
-        }
-    }
-    best.0
 }
 
 /// Bright overlay colour for the user-selected link.
@@ -822,47 +927,6 @@ mod tests {
     use super::*;
     use crate::sim::map::{self, LinkSpec, NodeSpec, OsmMap};
     use crate::sim::network::LinkSign;
-
-    #[test]
-    fn fan_ring_keeps_every_mouth_inside_even_across_the_angle_cut() {
-        // Four cardinal arms, each mouth 6 m wide at 10 m out, corner pairs
-        // deliberately scrambled. The west arm's corners straddle atan2's ±π
-        // branch cut: ordering them by raw angle reverses their sweep and
-        // pinches the ring into a bowtie across that mouth — every mouth
-        // interior must instead sit inside the ring.
-        let c = [0.0, 0.0];
-        let arms: Vec<([f64; 2], [f64; 2])> = vec![
-            ([3.0, 10.0], [-3.0, 10.0]),   // N
-            ([10.0, -3.0], [10.0, 3.0]),   // E
-            ([-3.0, -10.0], [3.0, -10.0]), // S
-            ([-10.0, 3.0], [-10.0, -3.0]), // W — the branch-cut straddler
-        ];
-        let ring = junction_fan_ring(&arms, c);
-        for (p, arm) in [([0.0, 9.0], "north"), ([9.0, 0.0], "east"), ([0.0, -9.0], "south"), ([-9.0, 0.0], "west")]
-        {
-            assert!(point_in_ring(&ring, p), "{arm} mouth interior fell outside the fan ring: {ring:?}");
-        }
-        // The ring must walk the eight corners in one angular sweep — each
-        // arm's pair in counter-clockwise order, the west pair included. The
-        // raw-angle ordering reversed exactly that pair (its corners straddle
-        // ±π), crossing the ring over itself and mismeasuring the curb gap to
-        // the next arm.
-        let expect = [
-            [-3.0, -10.0],
-            [3.0, -10.0],
-            [10.0, -3.0],
-            [10.0, 3.0],
-            [3.0, 10.0],
-            [-3.0, 10.0],
-            [-10.0, 3.0],
-            [-10.0, -3.0],
-        ];
-        assert_eq!(ring.len(), expect.len(), "no spurious centre dips: {ring:?}");
-        let start = ring.iter().position(|p| *p == expect[0]).expect("corner present");
-        for (k, e) in expect.iter().enumerate() {
-            assert_eq!(ring[(start + k) % ring.len()], *e, "ring order breaks at {k}: {ring:?}");
-        }
-    }
 
     #[test]
     fn road_mesh_has_a_quad_per_link() {

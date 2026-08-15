@@ -1036,7 +1036,7 @@ impl Network {
         }
     }
 
-    fn arm_mouth(&self, link: LinkId, end_is_to: bool) -> ([f64; 2], [f64; 2]) {
+    pub(crate) fn arm_mouth(&self, link: LinkId, end_is_to: bool) -> ([f64; 2], [f64; 2]) {
         let l = self.link(link);
         if let Some(lb) = self.link_bounds(link) {
             // The mouth *is* the boundary chart's end cross-section: median and

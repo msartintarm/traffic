@@ -316,6 +316,104 @@ mod golden {
     }
 
     #[test]
+    #[ignore] // diagnostic: junction cluster composition + zoomed crops for a fixture
+    fn diag_junction_structure() {
+        let n: usize = std::env::var("FIXTURE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let net = millbrae_junction(n);
+        for (ji, j) in net.junctions.iter().enumerate() {
+            println!("junction {ji}: center=({:.1},{:.1})", j.center[0], j.center[1]);
+            for &nd in &j.nodes {
+                let p = net.node(nd).position;
+                println!("  node {} ({:.1},{:.1}) {:?}", nd.0, p[0], p[1], net.node(nd).control);
+            }
+            println!("  footprint {:?}", j.footprint.map(|p| [(p[0] * 10.0).round() / 10.0, (p[1] * 10.0).round() / 10.0]));
+            for m in &j.mouths {
+                println!(
+                    "  mouth link {} {} anchor=({:.1},{:.1}) outer=({:.1},{:.1})",
+                    m.link.0,
+                    if m.inbound { "in " } else { "out" },
+                    m.anchor[0], m.anchor[1], m.outer[0], m.outer[1]
+                );
+            }
+        }
+        for i in 0..net.links.len() {
+            let l = net.link(crate::sim::network::LinkId(i as u32));
+            let (f, t) = (net.node(l.from).position, net.node(l.to).position);
+            let lane = net.lane(l.lane_start);
+            println!(
+                "link {i}: {}({:.0},{:.0})→{}({:.0},{:.0}) lanes={} span=[{:.1},{:.1}]",
+                l.from.0, f[0], f[1], l.to.0, t[0], t[1], l.lane_count,
+                lane.start_offset, lane.start_offset + lane.length
+            );
+        }
+        let out = std::env::var("CROP_DIR").unwrap_or_else(|_| ".".into());
+        for (name, c, half) in [("full", [0.0, 0.0], 90.0), ("core", [0.0, 0.0], 45.0), ("west", [-40.0, 5.0], 30.0), ("east", [28.0, 10.0], 30.0)] {
+            let mut r = Raster::centered(c, half, 768, BG);
+            draw_world(&net, &[], &mut r);
+            std::fs::write(format!("{out}/junction{n}_{name}.png"), encode(768, 768, &r.rgb())).unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore] // diagnostic: wide real-map renders for visual review
+    fn diag_real_map_views() {
+        let Some(net) = real_map() else { return };
+        let out = std::env::var("CROP_DIR").unwrap_or_else(|_| ".".into());
+        // The busiest junctions: most cluster members, then most approaches.
+        let mut busy: Vec<(usize, usize)> = net
+            .junctions
+            .iter()
+            .enumerate()
+            .map(|(i, j)| (i, j.nodes.len() * 100 + j.approaches.len()))
+            .collect();
+        busy.sort_by_key(|&(_, k)| std::cmp::Reverse(k));
+        for (rank, &(ji, _)) in busy.iter().take(4).enumerate() {
+            let c = net.junctions[ji].center;
+            let mut r = Raster::centered(c, 80.0, 768, BG);
+            draw_world(&net, &[], &mut r);
+            std::fs::write(format!("{out}/realmap_{rank}.png"), encode(768, 768, &r.rgb())).unwrap();
+            println!("realmap_{rank}: junction {ji} at ({:.0},{:.0}) nodes={} arms={}", c[0], c[1],
+                net.junctions[ji].nodes.len(), net.junctions[ji].mouths.len());
+        }
+    }
+
+    #[test]
+    #[ignore] // diagnostic: per-node arm mouths feeding the local boxes
+    fn diag_node_arms() {
+        use crate::sim::network::LinkId;
+        let net = millbrae_junction(0);
+        for j in &net.junctions {
+            for &nd in &j.nodes {
+                let c = net.node(nd).position;
+                println!("node {} at ({:.1},{:.1}):", nd.0, c[0], c[1]);
+                for (i, l) in net.links.iter().enumerate() {
+                    let (li, to) = if l.to == nd { (i, true) } else if l.from == nd { (i, false) } else { continue };
+                    if l.layer != 0 { continue; }
+                    let (m, o) = net.arm_mouth(LinkId(li as u32), to);
+                    println!("  link {li} {} mouth ({:.1},{:.1})-({:.1},{:.1}) [{}l]",
+                        if to { "in " } else { "out" }, m[0], m[1], o[0], o[1], l.lane_count);
+                }
+                let arms: Vec<crate::render::geometry::DiagBoxArm> = net
+                    .links
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| l.layer == 0)
+                    .filter_map(|(i, l)| {
+                        let to = if l.to == nd { true } else if l.from == nd { false } else { return None };
+                        let (m, o) = net.arm_mouth(LinkId(i as u32), to);
+                        let axis = if to { net.arrival_dir(LinkId(i as u32)) } else { net.departure_dir(LinkId(i as u32)) };
+                        Some(crate::render::geometry::DiagBoxArm { m, o, axis })
+                    })
+                    .collect();
+                if arms.len() >= 2 {
+                    let (poly, streets) = crate::render::geometry::diag_junction_box(&arms, c);
+                    println!("  box streets={streets} poly={:?}", poly.iter().map(|p| [(p[0]*10.0).round()/10.0, (p[1]*10.0).round()/10.0]).collect::<Vec<_>>());
+                }
+            }
+        }
+    }
+
+    #[test]
     #[ignore] // diagnostic: same-approach movement pairs whose interiors converge
     fn dump_converging_turns() {
         use crate::sim::network::MovementId;
