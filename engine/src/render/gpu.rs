@@ -55,6 +55,12 @@ pub struct Renderer {
     density_icap: u64,
     world: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
     markings: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
+    /// Painter's-order draw ranges `[world_idx_start, world_idx_count,
+    /// mark_idx_start, mark_idx_count]` per render band (grade layer, then road
+    /// class) — each band's fill then its markings, so overpasses layer over the
+    /// roads they cross. Empty until `set_world_mesh`; then the whole buffers are
+    /// one band.
+    bands: Vec<[u32; 4]>,
 }
 
 #[wasm_bindgen]
@@ -256,6 +262,7 @@ async fn from_surface(
             density_icap,
             world: None,
             markings: None,
+            bands: Vec::new(),
         })
 }
 
@@ -264,9 +271,16 @@ impl Renderer {
     /// Upload the baked static geometry once. Roads+junctions (`world_*`) draw at
     /// every zoom; markings (`mark_*`) only when zoomed in. Both are flat
     /// `StaticVertex` arrays (center.xy, offset.xy, color.rgb, light).
-    pub fn set_world_mesh(&mut self, world_v: Vec<f32>, world_i: Vec<u32>, mark_v: Vec<f32>, mark_i: Vec<u32>) {
+    pub fn set_world_mesh(&mut self, world_v: Vec<f32>, world_i: Vec<u32>, mark_v: Vec<f32>, mark_i: Vec<u32>, bands: Vec<u32>) {
         self.world = Some(self.upload_mesh("world", &world_v, &world_i));
         self.markings = Some(self.upload_mesh("markings", &mark_v, &mark_i));
+        // Four u32 per band: [world_idx_start, world_idx_count, mark_idx_start,
+        // mark_idx_count]. Fall back to a single band spanning both buffers if
+        // the caller supplied none (keeps a valid draw).
+        self.bands = bands.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
+        if self.bands.is_empty() {
+            self.bands = vec![[0, world_i.len() as u32, 0, mark_i.len() as u32]];
+        }
     }
 
     fn upload_mesh(&self, label: &str, vertices: &[f32], indices: &[u32]) -> (wgpu::Buffer, wgpu::Buffer, u32) {
@@ -368,24 +382,32 @@ impl Renderer {
             pass.set_bind_group(0, &self.cam_bind_group, &[]);
 
             pass.set_pipeline(&self.static_pipeline);
-            if let Some((vbuf, ibuf, icount)) = &self.world {
-                pass.set_vertex_buffer(0, vbuf.slice(..));
-                pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..*icount, 0, 0..1);
+            // Painter's-order render bands (grade layer, then road class), bottom
+            // to top: each band's fill then its markings, so a higher grade
+            // layer's opaque fill covers the road and lane lines it crosses over.
+            // Markings are still zoom-gated (skipped when zoomed out).
+            let zoomed_in = mpp < MARKING_MAX_MPP;
+            if let (Some((wv, wi, _)), Some((mv, mi, _))) = (&self.world, &self.markings) {
+                for &[ws, wc, ms, mc] in &self.bands {
+                    if wc > 0 {
+                        pass.set_vertex_buffer(0, wv.slice(..));
+                        pass.set_index_buffer(wi.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(ws..ws + wc, 0, 0..1);
+                    }
+                    if zoomed_in && mc > 0 {
+                        pass.set_vertex_buffer(0, mv.slice(..));
+                        pass.set_index_buffer(mi.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(ms..ms + mc, 0, 0..1);
+                    }
+                }
             }
 
+            // The occupancy tint is a translucent overlay on top of the layered
+            // world (it and the opaque markings blend, both readable).
             if density_count > 0 {
                 pass.set_vertex_buffer(0, self.density_vbuf.slice(..));
                 pass.set_index_buffer(self.density_ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..density_count, 0, 0..1);
-            }
-
-            if mpp < MARKING_MAX_MPP {
-                if let Some((vbuf, ibuf, icount)) = &self.markings {
-                    pass.set_vertex_buffer(0, vbuf.slice(..));
-                    pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..*icount, 0, 0..1);
-                }
             }
 
             if count > 0 {

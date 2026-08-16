@@ -12,7 +12,7 @@ use std::rc::Rc;
 use super::boundary;
 use super::config::VehicleClass;
 use super::hash::IntMap;
-use super::net_world::NetWorld;
+use super::net_world::{NetWorld, ScheduledStop};
 use super::network::{LinkId, Network};
 use super::rng::{self, Stream};
 use super::rush_hour::{self, SurfaceClass};
@@ -389,20 +389,62 @@ struct RushRate {
     scale: f64,
 }
 
-/// A named bus line: a resolved link chain served on a day-clock headway.
+/// One real (GTFS-compiled) bus departure on a line: when it leaves and the
+/// per-stop schedule the world holds it to at timepoints.
+#[derive(Clone, Debug)]
+pub struct BusTrip {
+    pub weekend: bool,
+    /// First-stop departure, day-seconds (normalized into `[0, 86400)`).
+    pub departure: f64,
+    pub stops: Vec<ScheduledStop>,
+}
+
+/// A named bus line: a resolved link chain, served on real GTFS trips when the
+/// transit artifact provides them, else on a synthetic day-clock headway.
 #[derive(Clone, Debug)]
 pub struct TransitLine {
     pub name: String,
     pub route: Vec<LinkId>,
-    /// Day-seconds of the next departure; `due` holds an undelivered departure
-    /// (entrance blocked) for retry.
+    /// Real trips sorted by departure; empty → synthetic headway service.
+    pub trips: Vec<BusTrip>,
+    /// Day-seconds of the next synthetic departure; `due` holds an undelivered
+    /// departure (entrance blocked) for retry.
     next_departure: f64,
     due: bool,
+    /// Cursor into `trips` for the current service day; `due_trip` retries a
+    /// fired-but-blocked real departure. `last_scan` detects the midnight wrap
+    /// (negative-infinity sentinel = fast-forward past history on first scan,
+    /// so a rebuild mid-day never re-fires the morning's departures).
+    next_trip: usize,
+    due_trip: Option<usize>,
+    last_scan: f64,
 }
 
 impl TransitLine {
     pub fn new(name: String, route: Vec<LinkId>) -> Self {
-        Self { name, route, next_departure: 0.0, due: false }
+        Self {
+            name,
+            route,
+            trips: Vec::new(),
+            next_departure: 0.0,
+            due: false,
+            next_trip: 0,
+            due_trip: None,
+            last_scan: f64::NEG_INFINITY,
+        }
+    }
+
+    /// Install real trips (replacing the synthetic headway): departures are
+    /// normalized into one day and sorted so the firing cursor can sweep them.
+    pub fn set_trips(&mut self, mut trips: Vec<BusTrip>) {
+        for t in &mut trips {
+            t.departure = t.departure.rem_euclid(86_400.0);
+        }
+        trips.sort_by(|a, b| a.departure.total_cmp(&b.departure));
+        self.trips = trips;
+        self.next_trip = 0;
+        self.due_trip = None;
+        self.last_scan = f64::NEG_INFINITY;
     }
 }
 
@@ -607,26 +649,57 @@ impl DemandGenerator {
 
     /// Fire due transit departures: each line spawns a bus on its route when the
     /// day clock passes the next departure; a blocked entrance retries until
-    /// admitted (schedules slip, they don't skip).
+    /// admitted (schedules slip, they don't skip). Lines with real GTFS trips
+    /// fire those exact departures (on the right service day) and hand the
+    /// spawned bus its per-stop schedule; lines without run the synthetic
+    /// headway.
     fn step_transit(&mut self, world: &mut NetWorld, day_secs: f64) {
         let n_lines = self.transit.len();
+        let weekend = self.weekend();
         for k in 0..n_lines {
-            let line = &mut self.transit[k];
-            if line.next_departure == 0.0 && !line.due {
-                // First call: phase departures across lines so they don't bunch.
-                line.next_departure =
-                    day_secs + transit_headway(day_secs) * (k as f64 + 1.0) / (n_lines as f64 + 1.0);
+            let real = !self.transit[k].trips.is_empty();
+            if real {
+                let line = &mut self.transit[k];
+                if line.last_scan == f64::NEG_INFINITY {
+                    // First scan (fresh build or mid-day rebuild): skip history.
+                    line.next_trip = line.trips.partition_point(|t| t.departure <= day_secs);
+                } else if day_secs + 1800.0 < line.last_scan {
+                    line.next_trip = 0; // midnight wrap: sweep from the top
+                }
+                line.last_scan = day_secs;
+                if line.due_trip.is_none() {
+                    while line.next_trip < line.trips.len() {
+                        let t = &line.trips[line.next_trip];
+                        if t.departure > day_secs {
+                            break;
+                        }
+                        line.next_trip += 1;
+                        // Only fresh departures on the right service day; a
+                        // stale one (a clock jump) is skipped, not bunch-fired.
+                        if t.weekend == weekend && day_secs - t.departure < 600.0 {
+                            line.due_trip = Some(line.next_trip - 1);
+                            break;
+                        }
+                    }
+                }
+            } else {
+                let line = &mut self.transit[k];
+                if line.next_departure == 0.0 && !line.due {
+                    // First call: phase departures across lines so they don't bunch.
+                    line.next_departure =
+                        day_secs + transit_headway(day_secs) * (k as f64 + 1.0) / (n_lines as f64 + 1.0);
+                }
+                // Midnight wrap: pull a departure scheduled "yesterday" back into
+                // range rather than waiting a whole day for the clock to catch it.
+                if line.next_departure > day_secs + 43_200.0 {
+                    line.next_departure -= 86_400.0;
+                }
+                if !line.due && day_secs >= line.next_departure {
+                    line.due = true;
+                    line.next_departure += transit_headway(day_secs);
+                }
             }
-            // Midnight wrap: pull a departure scheduled "yesterday" back into
-            // range rather than waiting a whole day for the clock to catch it.
-            if line.next_departure > day_secs + 43_200.0 {
-                line.next_departure -= 86_400.0;
-            }
-            if !line.due && day_secs >= line.next_departure {
-                line.due = true;
-                line.next_departure += transit_headway(day_secs);
-            }
-            if !line.due {
+            if if real { self.transit[k].due_trip.is_none() } else { !self.transit[k].due } {
                 continue;
             }
             let route = self.transit[k].route.clone();
@@ -636,7 +709,11 @@ impl DemandGenerator {
             if world.spawn_routed(id, route, speed, driver) {
                 self.next_id += 1;
                 self.spawned += 1;
-                self.transit[k].due = false;
+                let line = &mut self.transit[k];
+                if let Some(ti) = line.due_trip.take() {
+                    world.set_bus_schedule(id, line.trips[ti].stops.clone());
+                }
+                line.due = false;
             }
         }
     }
@@ -935,6 +1012,11 @@ impl DemandGenerator {
         }
 
         let day_now = self.day_secs(world.time());
+        // Per-tick day clock for day-scheduled infrastructure (crossings,
+        // trains, bus holding) — finer than the bridge's per-frame feed, and
+        // the only feed in headless runs.
+        let day_rate = if self.rush_clock.is_some() { self.day_compression } else { 1.0 };
+        world.set_day_clock(day_now, day_rate, weekend);
         self.step_transit(world, day_now);
 
         if let Some(t) = &mut self.rush_clock {

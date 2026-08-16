@@ -8,7 +8,10 @@ The output schema is the contract between this tool and the Rust engine:
       "meta":  {"place", "bbox", "origin"},
       "nodes": [{"osm_id", "x", "y", "control", "signal"?}],
       "links": [{"from_osm", "to_osm", "lanes", "speed_limit", "road_class", "turn_lanes"?}],
-      "restrictions": [{"from": [a, via], "to": [via, b], "kind"}]
+      "restrictions": [{"from": [a, via], "to": [via, b], "kind"}],
+      "rail_lines": [{"kind", "pts", "speeds": [[seg_idx, mps]], "layers": [[seg_idx, layer]], "name"?}],
+      "rail_stations": [{"x", "y", "kind", "name"?}],
+      "rail_platforms": [[[x, y], ...]]
     }
 
 `x`/`y` are metres in a local equirectangular projection about the bbox centre
@@ -247,6 +250,42 @@ class LandUseGrid:
         return round(0.3 + 1.4 * res, 2), round(0.3 + 1.2 * attr, 2)
 
 
+# Douglas–Peucker on a projected metre-space polyline: drop bend points that lie within
+# SIMPLIFY_TOL_M of the chord they'd otherwise interrupt. Below half a lane width the
+# thinned curve is indistinguishable when driven or drawn, so this shrinks the file (and
+# the engine's per-link geometry work) with no perceptible loss of resolution. Iterative
+# so a long straight way can't blow the recursion limit.
+def simplify(pts, tol=SIMPLIFY_TOL_M):
+    if len(pts) < 3:
+        return pts
+    keep = [False] * len(pts)
+    keep[0] = keep[-1] = True
+    stack = [(0, len(pts) - 1)]
+    while stack:
+        lo, hi = stack.pop()
+        if hi <= lo + 1:
+            continue
+        x1, y1 = pts[lo]
+        x2, y2 = pts[hi]
+        dx, dy = x2 - x1, y2 - y1
+        dd = dx * dx + dy * dy
+        imax, dmax = lo, -1.0
+        for i in range(lo + 1, hi):
+            px, py = pts[i]
+            if dd == 0.0:
+                d = math.hypot(px - x1, py - y1)
+            else:
+                t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / dd))
+                d = math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
+            if d > dmax:
+                imax, dmax = i, d
+        if dmax > tol:
+            keep[imax] = True
+            stack.append((lo, imax))
+            stack.append((imax, hi))
+    return [p for p, k in zip(pts, keep) if k]
+
+
 def build(raw, bbox, place, drivable=DRIVABLE, landuse=None, turn_rels=None):
     nodes = {e["id"]: e for e in raw["elements"] if e["type"] == "node"}
     ways = [
@@ -303,41 +342,6 @@ def build(raw, bbox, place, drivable=DRIVABLE, landuse=None, turn_rels=None):
 
     def geom_of(node_ids):
         return [list(project(nodes[nid]["lat"], nodes[nid]["lon"], lat0, lon0)) for nid in node_ids]
-
-    # Douglas–Peucker on a projected metre-space polyline: drop bend points that lie within
-    # SIMPLIFY_TOL_M of the chord they'd otherwise interrupt. Below half a lane width the
-    # thinned curve is indistinguishable when driven or drawn, so this shrinks the file (and
-    # the engine's per-link geometry work) with no perceptible loss of resolution. Iterative
-    # so a long straight way can't blow the recursion limit.
-    def simplify(pts, tol=SIMPLIFY_TOL_M):
-        if len(pts) < 3:
-            return pts
-        keep = [False] * len(pts)
-        keep[0] = keep[-1] = True
-        stack = [(0, len(pts) - 1)]
-        while stack:
-            lo, hi = stack.pop()
-            if hi <= lo + 1:
-                continue
-            x1, y1 = pts[lo]
-            x2, y2 = pts[hi]
-            dx, dy = x2 - x1, y2 - y1
-            dd = dx * dx + dy * dy
-            imax, dmax = lo, -1.0
-            for i in range(lo + 1, hi):
-                px, py = pts[i]
-                if dd == 0.0:
-                    d = math.hypot(px - x1, py - y1)
-                else:
-                    t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / dd))
-                    d = math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
-                if d > dmax:
-                    imax, dmax = i, d
-            if dmax > tol:
-                keep[imax] = True
-                stack.append((lo, imax))
-                stack.append((imax, hi))
-        return [p for p, k in zip(pts, keep) if k]
 
     SIGN_KIND = {"stop": "stop", "give_way": "yield"}
     SIGN_RANK = {None: 0, "yield": 1, "stop": 2}
@@ -574,6 +578,199 @@ def resolve_restrictions(rels, ways, is_junction):
     return out
 
 
+# --- rail (`rail_lines` / `rail_stations` / `rail_platforms`) ---------------
+# Trains are schedule-driven and live outside the road graph: the engine needs
+# continuous track polylines (its chainage source), station anchors to snap
+# GTFS stops onto, and platform outlines to draw. Ways are stitched through
+# plain track joints and split at switches (>= 3 incident tracks), so one
+# physical track becomes one polyline; speed/layer changes along it are carried
+# as segment breakpoints rather than splitting the line, keeping chainage
+# continuous across bridges. Sidings/yards/spurs are excluded — timetable
+# service never runs on them.
+
+RAIL_KINDS = {"rail", "light_rail", "tram", "subway", "narrow_gauge"}
+RAIL_SERVICE_EXCLUDE = {"siding", "yard", "spur", "crossover"}
+RAIL_DEFAULT_MPH = {"rail": 60, "light_rail": 35, "tram": 25, "subway": 50, "narrow_gauge": 25}
+# One physical system retags across tunnel portals (Muni: surface light_rail →
+# subway underground; street-running tram sections) — stitch across the family
+# so a through service keeps one continuous chainage. Heavy rail stays its own.
+URBAN_RAIL_FAMILY = {"light_rail", "tram", "subway"}
+
+
+def rail_kind_joins(a, b):
+    return a == b or (a in URBAN_RAIL_FAMILY and b in URBAN_RAIL_FAMILY)
+
+
+def rail_query(bbox):
+    s, w, n, e = bbox
+    kinds = "|".join(sorted(RAIL_KINDS))
+    return f"""
+    [out:json][timeout:90];
+    (
+      way["railway"~"^({kinds})$"]({s},{w},{n},{e});
+      node["railway"~"^(station|halt|tram_stop)$"]({s},{w},{n},{e});
+      way["railway"~"^(station|halt|platform)$"]({s},{w},{n},{e});
+      way["public_transport"="platform"]({s},{w},{n},{e});
+    );
+    (._;>;);
+    out body;
+    """
+
+
+def parse_rail_speed_mps(tags, kind):
+    raw = tags.get("maxspeed")
+    mph = RAIL_DEFAULT_MPH.get(kind, 45)
+    if raw:
+        token = raw.split()[0]
+        try:
+            v = float(token)
+            mph = v if "mph" in raw else v / 1.60934
+        except ValueError:
+            pass
+    return round(mph * 0.44704, 2)
+
+
+def scrape_rail(bbox, lat0, lon0):
+    els = fetch_query(rail_query(bbox)).get("elements", [])
+    node_ll = {e["id"]: (e["lat"], e["lon"]) for e in els if e["type"] == "node"}
+    tracks = [
+        e for e in els
+        if e["type"] == "way"
+        and e.get("tags", {}).get("railway") in RAIL_KINDS
+        and e.get("tags", {}).get("service") not in RAIL_SERVICE_EXCLUDE
+        and len(e.get("nodes", [])) >= 2
+    ]
+
+    by_id = {w["id"]: w for w in tracks}
+    incident = defaultdict(list)
+    for w in tracks:
+        incident[w["nodes"][0]].append(w["id"])
+        incident[w["nodes"][-1]].append(w["id"])
+
+    def end_dir(way, nid):
+        # Unit direction leaving `nid` along `way` (nid is one of its endpoints).
+        seq = way["nodes"]
+        a, b = (seq[0], seq[1]) if seq[0] == nid else (seq[-1], seq[-2])
+        if a not in node_ll or b not in node_ll:
+            return None
+        pa = project(*node_ll[a], lat0, lon0)
+        pb = project(*node_ll[b], lat0, lon0)
+        dx, dy = pb[0] - pa[0], pb[1] - pa[1]
+        h = math.hypot(dx, dy)
+        return (dx / h, dy / h) if h > 1e-9 else None
+
+    def continuation(nid, d_away, kind, used):
+        # The straightest unvisited same-kind track leaving `nid`. A plain joint
+        # continues at dot ≈ 1; at a switch the main track (straight) beats the
+        # diverging turnout leg (~10° off); below the collinearity floor the
+        # line ends — a wye or sharp junction is a genuine break.
+        best, best_dot = None, 0.86
+        for wid in incident[nid]:
+            if wid in used:
+                continue
+            cand = by_id[wid]
+            if not rail_kind_joins(cand["tags"]["railway"], kind):
+                continue
+            d_out = end_dir(cand, nid)
+            if d_out is None:
+                continue
+            dot = d_away[0] * d_out[0] + d_away[1] * d_out[1]
+            if dot > best_dot:
+                best, best_dot = wid, dot
+        return best
+
+    used, lines = set(), []
+    for w0 in tracks:
+        if w0["id"] in used:
+            continue
+        kind = w0["tags"]["railway"]
+        used.add(w0["id"])
+        chain = [(w0, False)]
+        while True:
+            way, rev = chain[-1]
+            nid = way["nodes"][0 if rev else -1]
+            d = end_dir(way, nid)
+            nxt = continuation(nid, (-d[0], -d[1]), kind, used) if d else None
+            if nxt is None:
+                break
+            used.add(nxt)
+            chain.append((by_id[nxt], by_id[nxt]["nodes"][-1] == nid))
+        while True:
+            way, rev = chain[0]
+            nid = way["nodes"][-1 if rev else 0]
+            d = end_dir(way, nid)
+            prv = continuation(nid, (-d[0], -d[1]), kind, used) if d else None
+            if prv is None:
+                break
+            used.add(prv)
+            chain.insert(0, (by_id[prv], by_id[prv]["nodes"][0] == nid))
+
+        pts, speeds, layers, names = [], [], [], defaultdict(int)
+        for way, rev in chain:
+            seq = way["nodes"][::-1] if rev else way["nodes"]
+            seg = [list(project(node_ll[n][0], node_ll[n][1], lat0, lon0)) for n in seq if n in node_ll]
+            if len(seg) < 2:
+                continue
+            seg = simplify(seg)
+            # Segment i spans pts[i]..pts[i+1]; a continuing way's first segment
+            # starts at the join point already stored, hence the -1.
+            start = len(pts) - 1 if pts else 0
+            spd = parse_rail_speed_mps(way["tags"], kind)
+            lay = parse_layer(way["tags"])
+            if not speeds or speeds[-1][1] != spd:
+                speeds.append([start, spd])
+            if not layers or layers[-1][1] != lay:
+                layers.append([start, lay])
+            if way["tags"].get("name"):
+                names[way["tags"]["name"]] += 1
+            pts.extend(seg[1:] if pts else seg)
+        if len(pts) < 2:
+            continue
+        line = {"kind": kind, "pts": pts, "speeds": speeds, "layers": layers}
+        if names:
+            line["name"] = max(names, key=names.get)
+        lines.append(line)
+
+    stations = []
+    for e in els:
+        tags = e.get("tags", {})
+        r = tags.get("railway")
+        if r not in ("station", "halt", "tram_stop"):
+            continue
+        if e["type"] == "node":
+            x, y = project(e["lat"], e["lon"], lat0, lon0)
+        elif e["type"] == "way":
+            lls = [node_ll[n] for n in e["nodes"] if n in node_ll]
+            if not lls:
+                continue
+            x, y = project(
+                sum(p[0] for p in lls) / len(lls), sum(p[1] for p in lls) / len(lls), lat0, lon0
+            )
+        else:
+            continue
+        st = {"x": x, "y": y, "kind": r}
+        if tags.get("name"):
+            st["name"] = tags["name"]
+        stations.append(st)
+
+    platforms = []
+    for e in els:
+        if e["type"] != "way":
+            continue
+        tags = e.get("tags", {})
+        is_rail_platform = tags.get("railway") == "platform" or (
+            tags.get("public_transport") == "platform"
+            and any(tags.get(m) == "yes" for m in ("train", "tram", "subway", "light_rail"))
+        )
+        if not is_rail_platform:
+            continue
+        seg = [list(project(node_ll[n][0], node_ll[n][1], lat0, lon0)) for n in e["nodes"] if n in node_ll]
+        if len(seg) >= 2:
+            platforms.append(simplify(seg))
+
+    return lines, stations, platforms
+
+
 def resolve_bbox(args):
     if args.bbox:
         return tuple(args.bbox)
@@ -680,6 +877,15 @@ def main():
                 routes.append({"name": name, "pts": sampled})
         graph["bus_routes"] = routes
         print(f"bus routes: {len(routes)}")
+    # Rail: continuous track polylines + station anchors + platform outlines.
+    # Always scraped (even highways-only — the corridor renders and the GTFS
+    # compiler snaps timetable trips onto these lines).
+    lat0, lon0 = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+    rail_lines, rail_stations, rail_platforms = scrape_rail(bbox, lat0, lon0)
+    graph["rail_lines"] = rail_lines
+    graph["rail_stations"] = rail_stations
+    graph["rail_platforms"] = rail_platforms
+    print(f"rail: {len(rail_lines)} lines, {len(rail_stations)} stations, {len(rail_platforms)} platforms")
     with open(args.out, "w") as f:
         json.dump(graph, f, separators=(",", ":"))
     print(f"wrote {args.out}: {len(graph['nodes'])} nodes, {len(graph['links'])} links")

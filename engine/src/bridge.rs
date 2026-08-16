@@ -12,7 +12,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::render::camera::Camera;
 use crate::render::interp;
-use crate::render::scene::{brake_intensity, class_color, class_dims, crash_instance, edge_ribbon, signal_color, signal_head_instances};
+use crate::render::scene::{brake_intensity, class_color, class_dims, crash_instance, edge_ribbon, signal_color, signal_head_instances, train_color};
 use crate::render::gpu::Renderer;
 use crate::render::{geometry, Instance, StaticMesh, StaticVertex};
 use crate::sim::clock::SimClock;
@@ -23,7 +23,7 @@ use crate::sim::demand::{self, DemandGenerator, DemandSources};
 use crate::sim::congestion::CongestionConfig;
 use crate::sim::map;
 use crate::sim::net_world::{AccelBackend, NetWorld};
-use crate::sim::network::{LinkId, Network, LANE_WIDTH};
+use crate::sim::network::{LinkId, Network, RoadKind, LANE_WIDTH};
 
 /// Soft wall-clock budget (ms) for one frame's catch-up stepping. Past this, the
 /// frame stops advancing the sim and renders, dropping the backlog so a heavy step
@@ -89,6 +89,10 @@ pub struct Simulation {
     metering_enabled: bool,
     /// Named bus lines resolved from the map, carried across demand rebuilds.
     transit_lines: Vec<demand::TransitLine>,
+    /// The compiled transit artifact as loaded, so the transit toggle can
+    /// re-apply it after a disable; `transit_enabled` gates trains + real trips.
+    transit_json: Option<String>,
+    transit_enabled: bool,
     /// A wreck-clearance duration the user expressed in day-clock minutes, so a
     /// compression change re-derives the sim-seconds value it maps to.
     wreck_clear_day_minutes: Option<f64>,
@@ -149,6 +153,11 @@ pub struct Simulation {
     show_crashes: bool,
     /// The junction the user selected (stats panel + footprint highlight).
     selected_junction: Option<usize>,
+    /// The static world surface as one fill mesh, built lazily the first time the ASCII
+    /// view is requested and reused every frame after — the network geometry never changes
+    /// once assembled, so this avoids rebuilding the whole city's triangles per frame (and
+    /// costs no memory for sessions that never open the ASCII view).
+    ascii_fill: Option<StaticMesh>,
 }
 
 #[wasm_bindgen]
@@ -177,6 +186,7 @@ impl Simulation {
     pub fn from_map_json(json: &str, seed: u32, split_junctions: bool) -> Result<Simulation, JsValue> {
         let map = map::OsmMap::from_json_opts(json, split_junctions).map_err(|e| JsValue::from_str(&e))?;
         let mut net = map.build();
+        net.rail = crate::sim::rail::RailNetwork::from_map_json(json);
         net.attach_bus_stops(&map::bus_stops_from_json(json));
         let lines: Vec<demand::TransitLine> = map::bus_routes_from_json(json)
             .into_iter()
@@ -205,7 +215,7 @@ impl Simulation {
         Simulation {
             world, clock, seed: cfg.seed, demand, demand_sources, commute: None, demand_rate, entry_speed_cap,
             day_compression: demand::DEFAULT_DAY_COMPRESSION, wreck_clear_day_minutes: None,
-            metering_enabled: true, transit_lines: Vec::new(), camera,
+            metering_enabled: true, transit_lines: Vec::new(), transit_json: None, transit_enabled: true, camera,
             prev: PoseMap::default(), prev_lane: IntMap::default(), prev_crossing: IntMap::default(), selected: None, signal_heads,
             gpu: None, gpu_pending: None, gpu_relax: None, gpu_generation: 0, gpu_cost: Vec::new(), gpu_last: 0.0, gpu_fingerprint: 0,
             effective_speed: 0.0, throttled: false, last_advance_ms: 0.0, last_camera_ms: 0.0,
@@ -213,6 +223,7 @@ impl Simulation {
             frame_budget: true,
             show_crashes: false,
             selected_junction: None,
+            ascii_fill: None,
         }
     }
 
@@ -261,6 +272,118 @@ impl Simulation {
             }
             Err(_) => false,
         }
+    }
+
+    /// Install a compiled transit artifact (`tools/gtfs` output): the rail
+    /// timetable snaps onto the map's rail lines (crossing closures switch from
+    /// the synthetic cadence to real trains), and bus trips attach to their
+    /// named transit lines (real departures + timepoint holding replace the
+    /// synthetic headway). Returns `[rail_kept, rail_dropped, bus_kept,
+    /// bus_dropped]`; soft-fails per trip, never breaking the sim.
+    #[cfg(feature = "import")]
+    pub fn set_transit_json(&mut self, json: &str) -> Vec<u32> {
+        self.transit_json = Some(json.to_string());
+        self.transit_enabled = true;
+        self.apply_transit_json(json)
+    }
+
+    /// Master transit switch: off clears the timetable (crossings fall back to
+    /// the synthetic cadence) and reverts every line to headway service; on
+    /// re-applies the stored artifact. Live and non-destructive.
+    pub fn set_transit_enabled(&mut self, on: bool) {
+        if on == self.transit_enabled {
+            return;
+        }
+        self.transit_enabled = on;
+        #[cfg(feature = "import")]
+        if on {
+            if let Some(json) = self.transit_json.clone() {
+                self.apply_transit_json(&json);
+            }
+            return;
+        }
+        self.world.set_timetable(Default::default());
+        for line in &mut self.transit_lines {
+            line.set_trips(Vec::new());
+        }
+        self.demand.set_transit_lines(self.transit_lines.clone());
+    }
+
+    pub fn transit_enabled(&self) -> bool {
+        self.transit_enabled
+    }
+
+    #[cfg(feature = "import")]
+    fn apply_transit_json(&mut self, json: &str) -> Vec<u32> {
+        use crate::sim::net_world::ScheduledStop;
+        use crate::sim::rail;
+        let Ok((rail_specs, bus_specs)) = rail::transit_from_json(json) else {
+            return vec![0, 0, 0, 0];
+        };
+        let (tt, rail_dropped) = rail::build_timetable(&self.world.network.rail, &rail_specs);
+        let rail_kept = tt.trips.len() as u32;
+        self.world.set_timetable(tt);
+
+        // Buses: resolve each trip's stops onto the road network, group by line
+        // name, attach to the matching scraped line (or build a new line from
+        // the stop trace when no OSM relation matched it). Trips of one line
+        // share physical stops, so resolution is memoized by position — the
+        // difference between a sub-second load and a frozen progress bar on a
+        // city-sized artifact (nearest_surface_link scans every road segment).
+        let (mut bus_kept, mut bus_dropped) = (0u32, 0u32);
+        let mut by_line: std::collections::BTreeMap<String, (Vec<demand::BusTrip>, Vec<[f64; 2]>)> =
+            std::collections::BTreeMap::new();
+        let mut stop_cache: std::collections::HashMap<(i64, i64), Option<(u32, f64)>> = std::collections::HashMap::new();
+        for spec in bus_specs {
+            let mut stops = Vec::new();
+            for st in &spec.stops {
+                let key = ((st.pos[0] * 4.0).round() as i64, (st.pos[1] * 4.0).round() as i64);
+                let net = &self.world.network;
+                let hit = *stop_cache.entry(key).or_insert_with(|| {
+                    net.nearest_surface_link(st.pos)
+                        .filter(|&(_, _, d)| d <= 30.0)
+                        .map(|(link, arc, _)| (link.0, arc))
+                });
+                if let Some((link, arc)) = hit {
+                    stops.push(ScheduledStop {
+                        link,
+                        arc,
+                        departure: st.departure.rem_euclid(86_400.0),
+                        timepoint: st.timepoint,
+                    });
+                }
+            }
+            if stops.len() < 2 {
+                bus_dropped += 1;
+                continue;
+            }
+            let departure = spec.stops.first().map_or(0.0, |s| s.departure);
+            let entry = by_line.entry(spec.line.clone()).or_default();
+            if spec.stops.len() > entry.1.len() {
+                entry.1 = spec.stops.iter().map(|s| s.pos).collect();
+            }
+            entry.0.push(demand::BusTrip { weekend: spec.weekend, departure, stops });
+            bus_kept += 1;
+        }
+        let names_match = |a: &str, b: &str| {
+            let (a, b) = (a.to_lowercase(), b.to_lowercase());
+            a == b || a.contains(&b) || b.contains(&a)
+        };
+        for (name, (trips, rep_pts)) in by_line {
+            let n = trips.len() as u32;
+            if let Some(line) = self.transit_lines.iter_mut().find(|l| names_match(&l.name, &name)) {
+                line.set_trips(trips);
+            } else if let Some(route) = self.world.network.resolve_route_chain(&rep_pts) {
+                let mut line = demand::TransitLine::new(name, route);
+                line.set_trips(trips);
+                self.transit_lines.push(line);
+            } else {
+                bus_dropped += n;
+                bus_kept -= n;
+            }
+        }
+        self.demand.set_transit_lines(self.transit_lines.clone());
+        vec![rail_kept, rail_dropped as u32, bus_kept, bus_dropped]
     }
 
     /// Rebuild the demand generator for a new source mix and reinstall the router over
@@ -878,15 +1001,17 @@ impl Simulation {
         vec![count as f32, mean as f32, self.world.link_flows()[i] as f32, occ as f32]
     }
 
-    /// `[x, y, heading, brake, blinker]` per vehicle: pose interpolated between the
-    /// last two ticks by the clock's sub-tick `alpha`, a brake-light intensity in
-    /// `[0,1]` from deceleration, and a turn-signal side (`-1` left, `+1` right, `0`
-    /// none) already gated by the blink phase.
+    /// `[x, y, heading, brake, blinker, length, width, class]` per vehicle:
+    /// pose interpolated between the last two ticks by the clock's sub-tick
+    /// `alpha`, a brake-light intensity in `[0,1]` from deceleration, a
+    /// turn-signal side (`-1` left, `+1` right, `0` none) already gated by the
+    /// blink phase, and the class dimensions/id (0 car, 1 truck, 2 bus) so the
+    /// 2D fallback draws a bus as a bus, not a car-sized quad.
     pub fn vehicle_instances(&self) -> Vec<f32> {
         let alpha = self.clock.alpha() as f32;
         let dt = self.clock.dt() as f32;
         let lit = blink_on();
-        let mut out = Vec::with_capacity(self.world.vehicles().len() * 5);
+        let mut out = Vec::with_capacity(self.world.vehicles().len() * 8);
         for v in self.world.vehicles() {
             let c = self.world.vehicle_world_pose(v);
             let (cx, cy, ch, cs) = (c[0] as f32, c[1] as f32, c[2] as f32, v.speed as f32);
@@ -907,7 +1032,14 @@ impl Simulation {
                 None => (cx, cy, ch, 0.0),
             };
             let blinker = if lit { self.world.vehicle_blinker(v) as f32 } else { 0.0 };
-            out.extend_from_slice(&[x, y, h, brake, blinker]);
+            let class = VehicleClass::from_length(v.driver.vehicle_length);
+            let dims = class_dims(class);
+            let class_id = match class {
+                VehicleClass::Car => 0.0,
+                VehicleClass::Truck => 1.0,
+                VehicleClass::Bus => 2.0,
+            };
+            out.extend_from_slice(&[x, y, h, brake, blinker, dims[0], dims[1], class_id]);
         }
         out
     }
@@ -997,6 +1129,25 @@ impl Simulation {
         geometry::marking_mesh(&self.world.network).indices
     }
 
+    /// Painter's-order draw ranges into the world/marking index buffers, four
+    /// `u32`s per render band: `[world_index_start, world_index_count,
+    /// marking_index_start, marking_index_count]`. The renderer draws each band's
+    /// fill then its markings in order, so a higher grade layer's fill covers the
+    /// road and lane lines it crosses over (see [`geometry::world_bands`]). The
+    /// ranges line up with `world_mesh_*`/`marking_mesh_*`, which concatenate the
+    /// same bands in the same order.
+    pub fn render_band_ranges(&self) -> Vec<u32> {
+        let mut out = Vec::new();
+        let (mut wi, mut mi) = (0u32, 0u32);
+        for band in geometry::world_bands(&self.world.network) {
+            let (wc, mc) = (band.fill.indices.len() as u32, band.marking.indices.len() as u32);
+            out.extend_from_slice(&[wi, wc, mi, mc]);
+            wi += wc;
+            mi += mc;
+        }
+        out
+    }
+
     fn world_mesh(&self) -> StaticMesh {
         geometry::world_mesh(&self.world.network)
     }
@@ -1037,11 +1188,72 @@ impl Simulation {
                 }
             })
             .collect();
+        let mut instances = instances;
+        instances.extend(self.train_instance_vec());
         bytemuck::cast_slice(&instances).to_vec()
     }
 
     pub fn render_instance_count(&self) -> u32 {
-        self.world.vehicles().len() as u32
+        (self.world.vehicles().len() + self.train_instance_vec().len()) as u32
+    }
+
+    /// Active trains as carriage-chain instances riding the same instanced draw
+    /// as the vehicles: each train is a run of carriage quads placed along its
+    /// line's chainage. Positions are pure functions of the day clock, so both
+    /// the previous and current poses come from direct evaluation — trains
+    /// never touch the per-id `prev` pose map (and need no ids at all).
+    fn train_instance_vec(&self) -> Vec<Instance> {
+        let tt = self.world.timetable();
+        if tt.is_empty() {
+            return Vec::new();
+        }
+        let (day, rate, weekend) = self.world.day_view();
+        let dt = self.clock.dt();
+        let rail = &self.world.network.rail;
+        let now = tt.active_trains(day, weekend);
+        let prev: crate::sim::hash::IntMap<f64> = tt
+            .active_trains(day - dt * rate, weekend)
+            .into_iter()
+            .map(|t| (t.trip as u32, t.route_pos))
+            .collect();
+        let mut out = Vec::new();
+        for tr in now {
+            let trip = &tt.trips[tr.trip];
+            let car = tr.class.car_length();
+            let color = train_color(tr.class);
+            let prev_front = prev.get(&(tr.trip as u32)).copied().unwrap_or(tr.route_pos);
+            for k in 0..tr.carriages {
+                let off = k as f64 * car + car * 0.5;
+                let c = trip.pose(rail, tr.route_pos - off);
+                let p = trip.pose(rail, prev_front - off);
+                out.push(Instance {
+                    pos: [c[0] as f32, c[1] as f32],
+                    prev_pos: [p[0] as f32, p[1] as f32],
+                    control: [((c[0] + p[0]) * 0.5) as f32, ((c[1] + p[1]) * 0.5) as f32],
+                    scale: [(car * 0.94) as f32, tr.class.width() as f32],
+                    color,
+                    heading: c[2] as f32,
+                    prev_heading: p[2] as f32,
+                    brake: 0.0,
+                    blinker: 0.0,
+                });
+            }
+        }
+        out
+    }
+
+    /// Train carriages for the 2D fallback: `[x, y, heading, length, width]`
+    /// per carriage, pose already interpolated by the clock's sub-tick alpha.
+    pub fn train_poses(&self) -> Vec<f32> {
+        let alpha = self.clock.alpha() as f32;
+        let mut out = Vec::new();
+        for i in self.train_instance_vec() {
+            let x = i.prev_pos[0] + (i.pos[0] - i.prev_pos[0]) * alpha;
+            let y = i.prev_pos[1] + (i.pos[1] - i.prev_pos[1]) * alpha;
+            let h = i.prev_heading + shortest_angle(i.prev_heading, i.heading) * alpha;
+            out.extend_from_slice(&[x, y, h, i.scale[0], i.scale[1]]);
+        }
+        out
     }
 
     /// Signal heads — plus the selected junction's footprint highlight — as raw
@@ -1203,6 +1415,39 @@ impl Simulation {
         flatten(self.world.network.lane_dividers())
     }
 
+    /// The current view rendered to a colourised ASCII grid (HTML for a `<pre>`) — the same
+    /// [`ascii::Ascii`] rasteriser the native tests use, fed the exact geometry the GPU
+    /// renderer draws. Roads (`#`) are shaded by class, vehicles (`@`) by speed (green
+    /// free-flow → red stopped), and signal heads (`O`) by state (red/amber/green). `rows`
+    /// sets the vertical resolution; the column count is derived from the camera aspect so
+    /// cells read roughly square (monospace cells are ~2:1). Powers the browser's terminal view.
+    pub fn ascii_view(&mut self, rows: u32) -> String {
+        let rows = rows.max(1) as usize;
+        let ([cx, cy], mpp, [vw, vh]) = (self.camera.center, self.camera.meters_per_pixel, self.camera.viewport);
+        let (hx, hy) = (vw * mpp * 0.5, vh * mpp * 0.5);
+        let cols = (2.0 * rows as f64 * (vw / vh).max(1e-6)).round().max(1.0) as usize;
+        let mut a = crate::render::ascii::Ascii::new([cx - hx, cy - hy], [cx + hx, cy + hy], cols, rows);
+        if self.ascii_fill.is_none() {
+            self.ascii_fill = Some(geometry::world_fill_colored(&self.world.network, ascii_road_color, ASCII_JUNCTION_COLOR));
+        }
+        a.fill_mesh_colored(self.ascii_fill.as_ref().unwrap(), '#'); // roads, tinted by class
+        for v in self.world.vehicles() {
+            let p = self.world.vehicle_world_pose(v);
+            // Buses get their own glyph so transit reads at a glance; the
+            // colour still carries speed for everyone.
+            let glyph = if VehicleClass::from_length(v.driver.vehicle_length) == VehicleClass::Bus { 'B' } else { '@' };
+            a.plot_colored([p[0], p[1]], glyph, speed_color(v.speed));
+        }
+        for i in self.train_instance_vec() {
+            a.plot_colored([i.pos[0] as f64, i.pos[1] as f64], 'T', i.color);
+        }
+        // Signal heads last, so a lit lens is never hidden behind a queued car.
+        for (pos, _heading, state, _is_left) in self.signal_head_slots() {
+            a.plot_colored([pos[0] as f64, pos[1] as f64], 'O', signal_color(state));
+        }
+        a.render_html()
+    }
+
     /// `[min_x, min_y, max_x, max_y]` world bounds for the camera fit.
     pub fn world_bounds(&self) -> Vec<f32> {
         self.world.network.bounds().iter().map(|&v| v as f32).collect()
@@ -1324,6 +1569,29 @@ fn build_demand(
     gen.set_entry_speed_cap(entry_cap);
     gen.set_rush_hour(&world.network, sources.rush_hour);
     gen
+}
+
+/// Road-class palette for the ASCII view: the freeway system warm, surface streets cooler
+/// and dimmer down the hierarchy, so the network structure reads at a glance.
+fn ascii_road_color(kind: RoadKind) -> [f32; 3] {
+    match kind {
+        RoadKind::Freeway => [0.98, 0.74, 0.26],
+        RoadKind::Ramp => [0.82, 0.56, 0.30],
+        RoadKind::Arterial => [0.36, 0.76, 0.86],
+        RoadKind::Collector => [0.44, 0.72, 0.48],
+        RoadKind::Local => [0.42, 0.48, 0.60],
+    }
+}
+
+/// Intersection-box fill colour in the ASCII view — a neutral light grey the coloured
+/// approaches plug into.
+const ASCII_JUNCTION_COLOR: [f32; 3] = [0.58, 0.60, 0.66];
+
+/// Vehicle colour in the ASCII view: a red→yellow→green ramp by speed, so congestion
+/// (slow/stopped) reads red against free-flowing green. ~13 m/s (≈29 mph) is full green.
+fn speed_color(mps: f64) -> [f32; 3] {
+    let t = (mps / 13.0).clamp(0.0, 1.0) as f32;
+    [((1.0 - t) * 2.0).min(1.0), (t * 2.0).min(1.0), 0.18]
 }
 
 /// Shortest signed angular difference `a → b`, so heading interpolation takes

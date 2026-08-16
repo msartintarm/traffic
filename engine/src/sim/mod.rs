@@ -29,6 +29,7 @@ pub mod meso_gpu;
 pub mod accel_gpu;
 pub mod net_world;
 pub mod network;
+pub mod rail;
 pub mod rng;
 pub mod router;
 pub mod rush_hour;

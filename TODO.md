@@ -12,6 +12,32 @@ code, not this file, if in doubt.
 
 ## Landed (audited 2026-08-12)
 
+- [x] **[H] Real transit: timetable trains + GTFS buses.** *(2026-08-21)* See
+  `PLAN_TRANSIT.md` (status section) for the full map. Trains are schedule-driven
+  outside the road graph (`sim/rail.rs`: run profiles fitted to the timetable,
+  power-limited acceleration, hold-at-station, lateness carry; position a pure
+  function of the day clock), rendered as carriage chains on the existing
+  instanced draw; level crossings close on precomputed real-passage intervals
+  (`NetWorld::set_timetable` → `rail_closed`, synthetic cadence as the
+  no-artifact fallback, preemption unchanged). Buses fire real GTFS departures
+  with per-stop timepoint holding (`TransitLine::set_trips`,
+  `advance_bus_stops`). Data: scraper rail pass (through-switch stitching) +
+  `tools/gtfs/compile_gtfs.py`; Millbrae/San Carlos/peninsula extracts carry
+  rail + `*.transit.json.gz`. Tests:
+  `a_slack_schedule_arrives_exactly_on_time_and_never_departs_early`,
+  `an_infeasible_schedule_runs_flat_out_and_carries_lateness`,
+  `crossing_closures_bracket_the_passage_with_lead_time`,
+  `a_real_timetable_replaces_the_synthetic_crossing_cadence`,
+  `an_early_bus_holds_at_a_timepoint_until_its_scheduled_departure`,
+  `real_trips_fire_at_their_scheduled_departures_with_their_schedules`,
+  `rail_draws_above_the_at_grade_roads_it_crosses`,
+  `a_multi_fragment_route_stitches_its_own_path`. Diagnostics:
+  `diag_transit_artifact`, `diag_rail_views` (both env-driven, ignored).
+  *(2026-08-22)* SF shipped (Muni/BART/Caltrain, ~150 concurrent trains
+  midday); multi-fragment trips stitch their own path (SF snap 51% → 100%);
+  buses render distinctly in all backends (2D fallback per-class dims/colour,
+  ASCII `B` glyph).
+
 - [x] **[H] OSM-data accuracy: turn restrictions, two-way stops, pedestrian-signal
   filter.** *(2026-08-14)* The scraper resolves `type=restriction` relations to
   emitted-link node pairs (`resolve_restrictions`; conditional/exempt/complex-via
@@ -225,6 +251,24 @@ code, not this file, if in doubt.
   not inflow scaling, is the GEH lever (the calibrator A/B proved inflow just
   queues at junctions).
 
+- [x] **[M] Grade-separation z-ordering for fills + markings (Option A — landed 2026-08-16).**
+  `render::geometry::world_bands` groups fills+markings into painter's-order **render bands**
+  keyed by (grade layer, then road-class `at_grade_rank`); `draw_world` (raster/ascii) and the
+  GPU (`render_band_ranges` → `gpu.rs` per-band draw) both draw each band's fill then its
+  markings bottom-to-top, so an overpass band's opaque fill covers the road AND lane lines it
+  crosses (verified: SF interchange `diag_overpass_views` — the marking bleed is gone), and
+  same-grade overlaps resolve by road class (the user's "express ordering at equal grade" ask).
+  Per-link divider/strip bodies factored (`Network::{link_dividers,link_strips}`) so markings
+  bucket by band. Guards: `overpass_band_draws_after_the_surface_it_crosses`,
+  `same_grade_bands_order_by_road_class`, `band_ranges_partition_the_concatenated_meshes`
+  (pins the GPU range/mesh alignment, since that path is wasm-only). Goldens reblessed (junction
+  fill now cleanly covers approach markings at the box). Minor accepted change: the translucent
+  occupancy tint now draws on top of markings (was under) — markings stay readable through it.
+  Remaining (separate): (2) **vehicles ignore layer** — an under-bridge car still draws over the
+  bridge (layer is derivable `v.lane`→link→layer, just not plumbed to the instance buffer);
+  (3) density/mass overlay not banded (see the tint note); (4) no elevation cue (overpass same
+  colour, occlusion only).
+
 ---
 
 ## Do NOT destabilize (already solid)
@@ -262,6 +306,36 @@ signal heads snap to each approach's *local* box. Golden screenshots reblessed; 
 `a_divided_crossing_decomposes_into_multiple_local_boxes`, `street_groups_*`, `junction_box_*`,
 `convex_hull_*`, and the realism metrics (`the_crossing_core_is_solid_pavement`,
 `no_stray_nub_islands`). Diagnostics: `diag_junction_structure`, `diag_real_map_views` (ignored).
+
+Stage 4b (2026-08-16 — cross-city hardening; assessed SF / San Carlos / Columbus / peninsula):
+divided arterials render excellently everywhere (columbus_0's 4-box diamond, sf_0/sf_4). Two
+issues found + fixed. (1) **Complex tangles** (offset/multi-way crossings, e.g. sancarlos_5)
+decomposed into all-sub-threshold boxes → no outline + notchy fill. Fix: the sprawl path now
+*tries* per-node decomposition and keeps it only when `marked_boxes` finds ≥ 2 clean
+non-overlapping crossings; otherwise falls back to one unifying `whole_cluster_box` hull. The
+`SPRAWL_RADIUS` is now just a gate to try decomposition, not the final decision. (2)
+**Interior-link marking scribble** bled across boxes: `Network::{road_strips,lane_dividers}`
+now skip `link_is_junction_interior` links (both ends one cluster), as arrows already did —
+benefits the browser feed too (parity). Golden fixtures reblessed (cleaner box interiors).
+Guards: `marked_boxes_counts_clean_nonoverlapping_crossings`,
+`every_cluster_is_decomposed_or_unified_never_a_sliver_scatter` (invariant over SF/San Carlos/
+Millbrae real maps), `interior_link_markings_do_not_scribble_across_the_box`. Diagnostic:
+`diag_city_views` (env `MAP=<name>`, ignored — also prints per-junction conflict count + an
+interchange-node safety scan).
+
+- [x] **[L] Freeway free-flow merges no longer get a spurious crossing marker.** *(2026-08-16)*
+  A merge/diverge (the ugly leaf outline on the peninsula gores) is not an at-grade crossing.
+  `render::geometry::outlined_boxes` now drops the blue marker for a cluster whose every member
+  node is `Network::is_interchange_node` (all incident links grade-separated); the ribbons +
+  junction fill still pave the gore, only the outline is suppressed. Verified safe against the
+  at-grade cases — columbus_0 etc. are `primary`/`secondary` Arterial (columbus.json is a FULL
+  network despite the README's highways-only recipe), so `is_interchange_node=false` → they
+  keep markers. Guards: `a_freeway_merge_carries_no_crossing_outline`,
+  `a_divided_crossing_decomposes_into_multiple_local_boxes` (now also asserts the at-grade
+  crossing *keeps* its outline). Residual (accepted): the rare genuine trunk×trunk at-grade
+  signalized crossing would also lose its outline — but only the outline; fill/markings/signal
+  heads stay. A finer gate is noisy (ramp meters read as "signalized", freeway weaves as
+  "conflict"), so the blunt all-grade-separated test is the right call.
 
 ---
 

@@ -20,6 +20,17 @@ pub fn class_color(c: VehicleClass) -> [f32; 3] {
     }
 }
 
+pub fn train_color(c: crate::sim::rail::TrainClass) -> [f32; 3] {
+    use crate::sim::rail::TrainClass;
+    match c {
+        TrainClass::Emu => [0.82, 0.24, 0.25],
+        TrainClass::Metro => [0.78, 0.80, 0.84],
+        TrainClass::LightRail => [0.35, 0.72, 0.45],
+        TrainClass::DieselCommuter => [0.62, 0.30, 0.20],
+        TrainClass::Freight => [0.45, 0.38, 0.30],
+    }
+}
+
 /// A unit car mesh (extent ±0.5, scaled to metres per-instance): a matte body, a
 /// red rear-lamp strip flagged `light = 1` (emissive under braking), and two
 /// front-corner turn-signal lamps flagged `light = 4` (left, +y) / `light = 5`

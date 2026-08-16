@@ -35,11 +35,17 @@ pub trait RenderTarget {
     fn markings(&mut self, _mesh: &StaticMesh) {}
 }
 
-/// Drive a [`RenderTarget`] with the current world and vehicle poses. The single
-/// path both backends go through, so they can't diverge.
+/// Drive a [`RenderTarget`] with the current world and vehicle poses. Draws in
+/// painter's-order render bands (grade layer, then road-class priority): each
+/// band's fill then its markings, bottom to top, so an overpass band's fill
+/// covers the road and lane lines it crosses over, and same-grade overlaps
+/// resolve by road class. The single path the raster/ascii backends go through;
+/// the GPU backend consumes the same [`geometry::world_bands`].
 pub fn draw_world<R: RenderTarget>(net: &Network, vehicle_poses: &[[f64; 3]], target: &mut R) {
-    target.world(&geometry::world_mesh(net));
-    target.markings(&geometry::marking_mesh(net));
+    for band in geometry::world_bands(net) {
+        target.world(&band.fill);
+        target.markings(&band.marking);
+    }
     for &pose in vehicle_poses {
         target.vehicle(pose);
     }

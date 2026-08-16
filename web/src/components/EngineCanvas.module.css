@@ -55,6 +55,36 @@
   touch-action: none;
 }
 
+/* ASCII "terminal" overlay: a container that fills the canvas box and centres the grid,
+   hidden until the toggle turns it on (onFrame flips display to flex). pointer-events:none
+   lets pan / zoom / hover pass through to the canvas beneath, so navigation still drives
+   the view. The inner .asciiGrid holds the colourised markup (per-char <span> colours). */
+.ascii {
+  position: absolute;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border-radius: 8px;
+  background: #0b0e13;
+  pointer-events: none;
+  user-select: none;
+}
+
+.asciiGrid {
+  margin: 0;
+  white-space: pre;
+  font-family: ui-monospace, monospace;
+  color: #7dd3fc; /* fallback for any uncoloured text; roads/cars/signals carry their own */
+}
+
+.wrapper:fullscreen .ascii,
+.wrapper:-webkit-full-screen .ascii,
+.wrapper.pseudoFullscreen .ascii {
+  border-radius: 0;
+}
+
 /* Top-left control bar: play/pause, speed, zoom, fit. */
 /* Top-left stack: the button row plus the collapsible settings panel below it.
    Transparent + click-through so only its child boxes capture pointer input. */
@@ -120,6 +150,20 @@
 
 .button:hover:not(:disabled) {
   background: rgba(56, 189, 248, 0.3);
+}
+
+/* The map-selection dropdown. The closed control keeps the `.button` look, but
+   its open option list would otherwise carry the translucent light-blue button
+   tint, leaving the light option text low-contrast. Force a solid dark menu
+   (matching the canvas background) with near-white text. `color-scheme: dark`
+   also asks the browser to theme the native popup dark. */
+.mapSelect {
+  color-scheme: dark;
+}
+
+.mapSelect option {
+  background-color: #0b0e13;
+  color: #e0f2fe;
 }
 
 .button:disabled {

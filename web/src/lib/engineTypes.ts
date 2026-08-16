@@ -16,6 +16,7 @@ export type Sim = {
   world_mesh_indices(): Uint32Array;
   marking_mesh_vertices(): Float32Array;
   marking_mesh_indices(): Uint32Array;
+  render_band_ranges(): Uint32Array;
   view_proj(): Float32Array;
   alpha(): number;
   render_instances(): Uint8Array;
@@ -35,6 +36,9 @@ export type Sim = {
   clear_crashes(): void;
   density_vertices(): Float32Array;
   density_indices(): Uint32Array;
+  // ASCII "terminal" view of the current camera; optional so a stale wasm build degrades
+  // (the toggle then simply keeps the normal render). `rows` sets the vertical resolution.
+  ascii_view?(rows: number): string;
   set_viewport(w: number, h: number): void;
   fit(): void;
   pan_pixels(dx: number, dy: number): void;
@@ -68,6 +72,14 @@ export type Sim = {
   demand_surface(): boolean;
   // Real LODES commute flows (tools/lodes output); only on import-enabled builds.
   set_commute_od?(json: string): boolean;
+  // Compiled transit artifact (tools/gtfs output): real train timetable + bus trips.
+  // Returns [rail_kept, rail_dropped, bus_kept, bus_dropped]; import-enabled builds only.
+  set_transit_json?(json: string): Uint32Array;
+  // Transit master switch: off reverts to synthetic crossings/headways.
+  set_transit_enabled?(on: boolean): void;
+  transit_enabled?(): boolean;
+  // Train carriages for the 2D fallback: [x, y, heading, length, width] per carriage.
+  train_poses?(): Float32Array;
   set_rush_hour(enabled: boolean): void;
   // Day-clock speed (day-seconds per sim second); optional so a stale wasm build degrades.
   set_day_compression?(x: number): void;
@@ -92,7 +104,7 @@ export type Sim = {
 };
 
 export type Renderer = {
-  set_world_mesh(wv: Float32Array, wi: Uint32Array, mv: Float32Array, mi: Uint32Array): void;
+  set_world_mesh(wv: Float32Array, wi: Uint32Array, mv: Float32Array, mi: Uint32Array, bands: Uint32Array): void;
   render(
     vp: Float32Array,
     alpha: number,

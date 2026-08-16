@@ -59,6 +59,33 @@ const ZOOM_RANGE = 60; // fit-out … max-in ratio driving the slider
 // Day-clock speeds the slider snaps to (day-seconds per sim second); 1 = real time.
 const DAY_COMPRESSION_STEPS = [1, 5, 15, 30, 60, 120, 240];
 
+/** Scale the ASCII overlay's font so its `cols × rows` grid fills the canvas box without
+ * distortion. The engine already sized the grid to the view aspect (columns ≈ 2·rows·vw/vh,
+ * since monospace cells are ~2:1), so a single font size fits both axes; we take the smaller
+ * of the width- and height-limited sizes. `html` is the colourised markup: `cols` is the
+ * first row's visible-character count (tags stripped), `rows` the line count. The `data-fit`
+ * key skips re-styling on frames where nothing that affects the fit changed. */
+function fitAscii(pre: HTMLPreElement, html: string) {
+  const box = pre.parentElement;
+  if (!box) return;
+  const nl = html.indexOf("\n");
+  const firstLine = nl < 0 ? html : html.slice(0, nl);
+  const cols = firstLine.replace(/<[^>]*>/g, "").length; // visible chars, minus <span> tags
+  if (cols === 0) return;
+  let rows = 0;
+  for (let i = 0; i < html.length; i++) if (html.charCodeAt(i) === 10) rows++;
+  if (rows === 0) return;
+  const w = box.clientWidth;
+  const h = box.clientHeight;
+  const key = `${cols}:${rows}:${w}:${h}`;
+  if (pre.dataset.fit === key) return;
+  pre.dataset.fit = key;
+  const CHAR_ADVANCE = 0.62; // monospace glyph advance as a fraction of font size (slight over-estimate avoids edge clipping)
+  const fontPx = Math.max(2, Math.min(w / (cols * CHAR_ADVANCE), h / rows));
+  pre.style.fontSize = `${fontPx}px`;
+  pre.style.lineHeight = `${fontPx}px`;
+}
+
 export default function EngineCanvas() {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -72,6 +99,7 @@ export default function EngineCanvas() {
   const perfStatusRef = useRef<HTMLSpanElement>(null); // live "what's running" line in the Performance panel
   const tipRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+  const asciiRef = useRef<HTMLPreElement>(null); // the ASCII "terminal" overlay (shown when asciiMode is on)
   const fitMppRef = useRef(1);
   const [ready, setReady] = useState(false);
   const [loadingFraction, setLoadingFraction] = useState(0); // boot progress 0→1 for the loading bar
@@ -89,6 +117,7 @@ export default function EngineCanvas() {
   const [rushHour, setRushHour] = useState(false);
   const [dayCompression, setDayCompression] = useState(60); // engine DEFAULT_DAY_COMPRESSION
   const [rampMetering, setRampMetering] = useState(true); // engine default: on (D4 peak windows)
+  const [transit, setTransit] = useState(true); // engine default: on (real timetables when the artifact loads)
   const rushClockRef = useRef<HTMLSpanElement>(null);
   const [accelBackend, setAccelBackend] = useState("serial");
   const [parThreshold, setParThreshold] = useState(500); // matches engine DEFAULT_PAR_THRESHOLD
@@ -103,6 +132,7 @@ export default function EngineCanvas() {
   const [startSpeedMps, setStartSpeedMps] = useState(36); // ≥ every road limit ⇒ "enter at limit"
   const [units, setUnits] = useState<"mi" | "km">("mi");
   const unitsRef = useRef<"mi" | "km">("mi"); // read inside the per-frame HUD update (avoids stale closure)
+  const [asciiMode, setAsciiMode] = useState(false); // render the sim as an ASCII grid instead of pixels
   const [isFullscreen, setIsFullscreen] = useState(false);
   // iPhone Safari has no element Fullscreen API at all, so we fall back to a CSS overlay
   // (`position: fixed` filling the viewport) tracked by this flag.
@@ -321,6 +351,17 @@ export default function EngineCanvas() {
           onFrame: (f) => {
             fitMppRef.current = f.fitMpp;
             cameraRef.current = cameraFromParams(f.snapshot.camera);
+            const pre = asciiRef.current;
+            const box = pre?.parentElement;
+            if (pre && box) {
+              if (f.ascii != null) {
+                pre.innerHTML = f.ascii; // engine-generated <span> runs; colours + safe chars only
+                box.style.display = "flex";
+                fitAscii(pre, f.ascii);
+              } else if (box.style.display !== "none") {
+                box.style.display = "none";
+              }
+            }
             const o = overlayFromSnapshot(f.snapshot, { fitMpp: f.fitMpp, zoomRange: ZOOM_RANGE }, smootherRef.current);
             if (statsRef.current) statsRef.current.textContent = o.stats;
             if (perfStatusRef.current) perfStatusRef.current.textContent = o.perf;
@@ -427,6 +468,12 @@ export default function EngineCanvas() {
   return (
     <div ref={wrapperRef} className={`${styles.wrapper}${pseudoFs ? ` ${styles.pseudoFullscreen}` : ""}`}>
       <canvas ref={canvasRef} width={900} height={600} className={styles.canvas} />
+      {/* ASCII "terminal" overlay: the container centres the grid and is shown by onFrame
+          when the mode is on; the inner <pre> holds the per-frame colourised HTML.
+          pointer-events:none so pan/zoom/hover still reach the canvas underneath. */}
+      <div className={styles.ascii} aria-hidden="true">
+        <pre ref={asciiRef} className={styles.asciiGrid} />
+      </div>
 
       {!ready && !error && (
         <div className={styles.loading} role="status" aria-live="polite">
@@ -499,7 +546,7 @@ export default function EngineCanvas() {
               Fit
             </button>
             <select
-              className={styles.button}
+              className={`${styles.button} ${styles.mapSelect}`}
               value={scenario}
               onChange={(e) => {
                 const url = new URL(window.location.href);
@@ -568,6 +615,18 @@ export default function EngineCanvas() {
               />
               Ramp meters
             </label>
+            <label className={styles.zoomLabel} title="Real transit from GTFS timetables: trains run their scheduled trips on the rail corridor (level crossings close for actual passages), and buses follow their published departures with timepoint holding. Off reverts to synthetic crossing cadences and headway buses.">
+              <input
+                type="checkbox"
+                checked={transit}
+                disabled={!ready}
+                onChange={(e) => {
+                  sessionRef.current?.applyControl({ type: "transit", value: e.target.checked });
+                  setTransit(e.target.checked);
+                }}
+              />
+              Transit
+            </label>
             {rushHour && (
               <label className={styles.zoomLabel} title="How fast the simulated day plays: 1× is real time (accuracy mode), 60× plays the 24 h in ~24 min. Only the day clock scales — traffic dynamics always run in real time.">
                 Day {dayCompression}×
@@ -632,6 +691,21 @@ export default function EngineCanvas() {
               <option value="mi">Units: mph</option>
               <option value="km">Units: km/h</option>
             </select>
+            <label
+              className={styles.zoomLabel}
+              title="Render the current view as an ASCII grid — the exact road geometry (#) and vehicle placement (@) the engine draws, as text. Pan, zoom, and hover still work through it."
+            >
+              <input
+                type="checkbox"
+                checked={asciiMode}
+                disabled={!ready}
+                onChange={(e) => {
+                  sessionRef.current?.applyControl({ type: "ascii", value: e.target.checked });
+                  setAsciiMode(e.target.checked);
+                }}
+              />
+              ASCII render
+            </label>
         </Collapsible>
         <Collapsible
           className={styles.settings}

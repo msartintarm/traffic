@@ -12,11 +12,23 @@ pub struct Ascii {
     min: [f64; 2],
     max: [f64; 2],
     buf: Vec<char>,
+    /// Per-cell colour, parallel to `buf`. Ignored by the plain [`Ascii::render`] (and thus
+    /// every test, which asserts on characters), consumed only by [`Ascii::render_html`] for
+    /// the browser's colourised view. The char-only writers leave it at the default.
+    colors: Vec<[u8; 3]>,
+}
+
+/// Colour a char-only write leaves behind — irrelevant to `render`, and the browser view
+/// only ever uses the colour-carrying writers, so this is a harmless placeholder.
+const DEFAULT_COLOR: [u8; 3] = [0xff, 0xff, 0xff];
+
+fn to_u8(c: [f32; 3]) -> [u8; 3] {
+    [((c[0] * 255.0).clamp(0.0, 255.0)) as u8, ((c[1] * 255.0).clamp(0.0, 255.0)) as u8, ((c[2] * 255.0).clamp(0.0, 255.0)) as u8]
 }
 
 impl Ascii {
     pub fn new(min: [f64; 2], max: [f64; 2], cols: usize, rows: usize) -> Self {
-        Self { cols, rows, min, max, buf: vec![' '; cols * rows] }
+        Self { cols, rows, min, max, buf: vec![' '; cols * rows], colors: vec![DEFAULT_COLOR; cols * rows] }
     }
 
     /// A square world view of half-extent `r` metres centred on `c`. `cols` is
@@ -50,9 +62,23 @@ impl Ascii {
         self.cell_of(p).map(|(c, r)| self.at(c, r))
     }
 
+    fn set(&mut self, col: usize, row: usize, ch: char, color: [u8; 3]) {
+        let i = row * self.cols + col;
+        self.buf[i] = ch;
+        self.colors[i] = color;
+    }
+
     pub fn plot(&mut self, p: [f64; 2], ch: char) {
         if let Some((c, r)) = self.cell_of(p) {
-            self.buf[r * self.cols + c] = ch;
+            self.set(c, r, ch, DEFAULT_COLOR);
+        }
+    }
+
+    /// Plot a single cell in `color` (RGB `0..1`) — the colour-carrying counterpart of
+    /// [`Ascii::plot`], for vehicles and signal heads in the browser view.
+    pub fn plot_colored(&mut self, p: [f64; 2], ch: char, color: [f32; 3]) {
+        if let Some((c, r)) = self.cell_of(p) {
+            self.set(c, r, ch, to_u8(color));
         }
     }
 
@@ -70,15 +96,45 @@ impl Ascii {
                 let sv = mesh.vertices[i as usize];
                 [(sv.center[0] + sv.offset[0]) as f64, (sv.center[1] + sv.offset[1]) as f64]
             };
-            self.fill_tri([v(tri[0]), v(tri[1]), v(tri[2])], ch);
+            self.fill_tri([v(tri[0]), v(tri[1]), v(tri[2])], ch, DEFAULT_COLOR);
         }
     }
 
-    fn fill_tri(&mut self, t: [[f64; 2]; 3], ch: char) {
-        for row in 0..self.rows {
-            for col in 0..self.cols {
+    /// Like [`Ascii::fill_mesh`], but each triangle is filled in its own vertex colour
+    /// (from the mesh) — the browser view shades roads by their class this way.
+    pub fn fill_mesh_colored(&mut self, mesh: &StaticMesh, ch: char) {
+        for tri in mesh.indices.chunks_exact(3) {
+            let v = |i: u32| {
+                let sv = mesh.vertices[i as usize];
+                [(sv.center[0] + sv.offset[0]) as f64, (sv.center[1] + sv.offset[1]) as f64]
+            };
+            let color = to_u8(mesh.vertices[tri[0] as usize].color);
+            self.fill_tri([v(tri[0]), v(tri[1]), v(tri[2])], ch, color);
+        }
+    }
+
+    fn fill_tri(&mut self, t: [[f64; 2]; 3], ch: char, color: [u8; 3]) {
+        // Only test cells inside the triangle's bounding box: a triangle lies within its
+        // own bbox, so cells outside it can't contain a vertex — `point_in_tri` still
+        // decides membership for every cell tested, so the fill is identical to a
+        // full-grid scan but costs O(bbox) not O(grid), making a whole-city ASCII view
+        // (thousands of small triangles) tractable rather than quadratic.
+        let (min_x, max_x) = (t[0][0].min(t[1][0]).min(t[2][0]), t[0][0].max(t[1][0]).max(t[2][0]));
+        let (min_y, max_y) = (t[0][1].min(t[1][1]).min(t[2][1]), t[0][1].max(t[1][1]).max(t[2][1]));
+        if max_x < self.min[0] || min_x > self.max[0] || max_y < self.min[1] || min_y > self.max[1] {
+            return; // wholly outside the view
+        }
+        let col_of = |x: f64| ((x - self.min[0]) / (self.max[0] - self.min[0]) * self.cols as f64).floor();
+        let row_of = |y: f64| ((self.max[1] - y) / (self.max[1] - self.min[1]) * self.rows as f64).floor();
+        // Pad by one cell each way so a boundary cell whose centre sits just inside is never missed.
+        let c0 = (col_of(min_x) as isize - 1).clamp(0, self.cols as isize - 1) as usize;
+        let c1 = (col_of(max_x) as isize + 1).clamp(0, self.cols as isize - 1) as usize;
+        let r0 = (row_of(max_y) as isize - 1).clamp(0, self.rows as isize - 1) as usize; // max y → top row
+        let r1 = (row_of(min_y) as isize + 1).clamp(0, self.rows as isize - 1) as usize;
+        for row in r0..=r1 {
+            for col in c0..=c1 {
                 if point_in_tri(t, self.cell_center(col, row)) {
-                    self.buf[row * self.cols + col] = ch;
+                    self.set(col, row, ch, color);
                 }
             }
         }
@@ -88,6 +144,47 @@ impl Ascii {
         let mut s = String::with_capacity((self.cols + 1) * self.rows);
         for row in 0..self.rows {
             s.extend(&self.buf[row * self.cols..(row + 1) * self.cols]);
+            s.push('\n');
+        }
+        s
+    }
+
+    /// The grid as HTML for a `<pre>`: each run of same-coloured, non-blank cells becomes
+    /// one `<span style="color:#rrggbb">…</span>`; blanks are literal spaces; rows end in
+    /// `\n`. Runs are coalesced so the markup stays small even for a full city. The engine
+    /// ships this to the browser's colourised ASCII overlay.
+    pub fn render_html(&self) -> String {
+        let mut s = String::with_capacity(self.cols * self.rows * 2);
+        for row in 0..self.rows {
+            let mut open: Option<[u8; 3]> = None;
+            for col in 0..self.cols {
+                let i = row * self.cols + col;
+                let ch = self.buf[i];
+                if ch == ' ' {
+                    if open.take().is_some() {
+                        s.push_str("</span>");
+                    }
+                    s.push(' ');
+                    continue;
+                }
+                let color = self.colors[i];
+                if open != Some(color) {
+                    if open.is_some() {
+                        s.push_str("</span>");
+                    }
+                    s.push_str(&format!("<span style=\"color:#{:02x}{:02x}{:02x}\">", color[0], color[1], color[2]));
+                    open = Some(color);
+                }
+                match ch {
+                    '&' => s.push_str("&amp;"),
+                    '<' => s.push_str("&lt;"),
+                    '>' => s.push_str("&gt;"),
+                    c => s.push(c),
+                }
+            }
+            if open.is_some() {
+                s.push_str("</span>");
+            }
             s.push('\n');
         }
         s
@@ -279,6 +376,24 @@ mod tests {
         let mut a = Ascii::centered(center, r, 30);
         draw_world(net, &[], &mut a);
         a
+    }
+
+    #[test]
+    fn render_html_coalesces_colour_runs_and_leaves_blanks_bare() {
+        // The browser's colourised view: adjacent same-colour cells share one <span>; a
+        // blank breaks the run and is emitted as a literal space (no span). Guards the
+        // markup the `<pre>` overlay consumes without needing a browser.
+        let mut a = Ascii::new([0.0, 0.0], [10.0, 1.0], 5, 1); // 5 cells, each 2 world-units wide
+        a.plot_colored([1.0, 0.5], '#', [1.0, 0.0, 0.0]); // col 0, red
+        a.plot_colored([3.0, 0.5], '#', [1.0, 0.0, 0.0]); // col 1, red — coalesces with col 0
+        a.plot_colored([9.0, 0.5], '@', [0.0, 1.0, 0.0]); // col 4, green (cols 2–3 blank)
+        let html = a.render_html();
+        assert_eq!(html.matches("<span").count(), 2, "one span for the red run, one for green: {html}");
+        assert!(html.contains("#ff0000") && html.contains("#00ff00"), "colours are hex-encoded: {html}");
+        assert!(html.starts_with("<span") && html.trim_end().ends_with("</span>"), "well-formed span nesting: {html}");
+        // The two middle cells are blank: literal spaces between the closing red span and
+        // the opening green one, not wrapped in any span.
+        assert!(html.contains("</span>  <span"), "blank cells stay bare between runs: {html}");
     }
 
     #[test]

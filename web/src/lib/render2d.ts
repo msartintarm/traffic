@@ -38,16 +38,19 @@ export function render2d(canvas: AnyCanvas, sim: Sim, scene: Scene | null) {
     ctx.fill();
   }
 
+  // Body colour per class (car / truck / bus) — mirrors the GPU path's
+  // `class_color`, so a bus reads as a bus in the fallback too.
+  const CLASS_FILL = ["#cdd3da", "#dc8d3d", "#4d85db"];
   const inst = sim.vehicle_instances();
-  const len = 4.6 * scale;
-  const wid = 2.0 * scale;
-  for (let i = 0; i < inst.length; i += 5) {
+  for (let i = 0; i < inst.length; i += 8) {
     const brake = inst[i + 3];
     const blink = inst[i + 4]; // -1 left, +1 right, 0 none (already blink-gated)
+    const len = inst[i + 5] * scale;
+    const wid = inst[i + 6] * scale;
     ctx.save();
     ctx.translate(sx(inst[i]), sy(inst[i + 1]));
     ctx.rotate(-inst[i + 2]);
-    ctx.fillStyle = "#cdd3da";
+    ctx.fillStyle = CLASS_FILL[inst[i + 7]] ?? CLASS_FILL[0];
     ctx.fillRect(-len / 2, -wid / 2, len, wid);
     if (brake > 0.01) {
       ctx.fillStyle = `rgba(255,40,30,${(0.3 + 0.7 * brake).toFixed(3)})`;
@@ -62,6 +65,21 @@ export function render2d(canvas: AnyCanvas, sim: Sim, scene: Scene | null) {
       ctx.fillRect(len / 2 - bw, by, bw, bh);
     }
     ctx.restore();
+  }
+
+  // Train carriages: engine-interpolated poses with real per-class dimensions.
+  const trains = sim.train_poses?.();
+  if (trains) {
+    ctx.fillStyle = "#c94a4c";
+    for (let i = 0; i < trains.length; i += 5) {
+      const tl = trains[i + 3] * scale;
+      const tw = trains[i + 4] * scale;
+      ctx.save();
+      ctx.translate(sx(trains[i]), sy(trains[i + 1]));
+      ctx.rotate(-trains[i + 2]);
+      ctx.fillRect(-tl / 2, -tw / 2, tl, tw);
+      ctx.restore();
+    }
   }
 
   const heads = sim.signal_heads();

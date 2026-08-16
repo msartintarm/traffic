@@ -54,7 +54,13 @@ local.
   ],
   "restrictions": [
     { "from": [123, 456], "to": [456, 789], "kind": "no_left_turn" }
-  ]
+  ],
+  "rail_lines": [
+    { "kind": "rail", "name": "Caltrain Peninsula Subdivision",
+      "pts": [[x, y]], "speeds": [[seg_idx, mps]], "layers": [[seg_idx, layer]] }
+  ],
+  "rail_stations": [ { "x": 1.0, "y": 2.0, "kind": "station", "name": "Millbrae" } ],
+  "rail_platforms": [ [[x, y]] ]
 }
 ```
 

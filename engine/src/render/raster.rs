@@ -360,6 +360,69 @@ mod golden {
     }
 
     #[test]
+    #[ignore] // diagnostic: rail corridor renders (env MAP_JSON=path [TRANSIT_JSON=path] [CROP_DIR=out])
+    fn diag_rail_views() {
+        let Ok(path) = std::env::var("MAP_JSON") else {
+            println!("set MAP_JSON");
+            return;
+        };
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut net = crate::sim::map::OsmMap::from_json(&text).expect("map json").build();
+        net.rail = crate::sim::rail::RailNetwork::from_map_json(&text);
+        if net.rail.is_empty() {
+            println!("no rail in {path}");
+            return;
+        }
+        // Live carriages at 08:00 weekday when a transit artifact is given,
+        // drawn as body quads (the raster's `vehicle` hook is deliberately a
+        // no-op for car-free regression shots).
+        let mut poses: Vec<[f64; 3]> = Vec::new();
+        let mut bodies = crate::render::StaticMesh::default();
+        if let Ok(tpath) = std::env::var("TRANSIT_JSON") {
+            let (rt, _) = crate::sim::rail::transit_from_json(&std::fs::read_to_string(tpath).unwrap()).unwrap();
+            let (tt, _) = crate::sim::rail::build_timetable(&net.rail, &rt);
+            for tr in tt.active_trains(8.0 * 3600.0, false) {
+                let trip = &tt.trips[tr.trip];
+                let car = tr.class.car_length();
+                let color = crate::render::scene::train_color(tr.class);
+                for k in 0..tr.carriages {
+                    let p = trip.pose(&net.rail, tr.route_pos - (k as f64 * car + car * 0.5));
+                    poses.push(p);
+                    let (dx, dy) = (p[2].cos(), p[2].sin());
+                    let h = car * 0.47;
+                    bodies.push_ribbon(
+                        [p[0] - dx * h, p[1] - dy * h],
+                        [p[0] + dx * h, p[1] + dy * h],
+                        tr.class.width() / 2.0,
+                        color,
+                        0.0,
+                    );
+                }
+            }
+            println!("{} carriages posed at 08:00", poses.len());
+        }
+        let out = std::env::var("CROP_DIR").unwrap_or_else(|_| ".".into());
+        let mut crops: Vec<(String, [f64; 2], f64)> = Vec::new();
+        if let Some(st) = net.rail.stations.first() {
+            crops.push(("station".into(), st.pos, 160.0));
+        }
+        if let Some(line) = net.rail.lines.iter().max_by(|a, b| a.length().total_cmp(&b.length())) {
+            let p = line.pose_at(line.length() * 0.5);
+            crops.push(("midline".into(), [p[0], p[1]], 120.0));
+        }
+        if let Some(p) = poses.first() {
+            crops.push(("train".into(), [p[0], p[1]], 200.0));
+        }
+        for (name, c, half) in crops {
+            let mut r = Raster::centered(c, half, 768, BG);
+            draw_world(&net, &poses, &mut r);
+            r.world(&bodies);
+            std::fs::write(format!("{out}/rail_{name}.png"), encode(768, 768, &r.rgb())).unwrap();
+            println!("rail_{name}.png at ({:.0},{:.0})", c[0], c[1]);
+        }
+    }
+
+    #[test]
     #[ignore] // diagnostic: wide real-map renders for visual review
     fn diag_real_map_views() {
         let Some(net) = real_map() else { return };
@@ -379,6 +442,131 @@ mod golden {
             std::fs::write(format!("{out}/realmap_{rank}.png"), encode(768, 768, &r.rgb())).unwrap();
             println!("realmap_{rank}: junction {ji} at ({:.0},{:.0}) nodes={} arms={}", c[0], c[1],
                 net.junctions[ji].nodes.len(), net.junctions[ji].mouths.len());
+        }
+    }
+
+    #[test]
+    #[ignore] // diagnostic: renders over-under (grade-separated) crossings (env MAP=name)
+    fn diag_overpass_views() {
+        use crate::sim::network::LinkId;
+        let name = std::env::var("MAP").unwrap_or_else(|_| "sf".into());
+        let path = format!("{}/../web/public/{name}.json", env!("CARGO_MANIFEST_DIR"));
+        let Ok(text) = std::fs::read_to_string(&path) else { return };
+        let net = crate::sim::map::OsmMap::from_json(&text).expect("city json").build();
+        let out = std::env::var("CROP_DIR").unwrap_or_else(|_| ".".into());
+        let mid = |i: usize| {
+            let p = &net.polylines[i];
+            p[p.len() / 2]
+        };
+        let seg_min_dist = |a: usize, b: usize| {
+            let (pa, pb) = (&net.polylines[a], &net.polylines[b]);
+            let mut m = f64::MAX;
+            for wa in pa.windows(2) {
+                for wb in pb.windows(2) {
+                    let d = ((wa[0][0] + wa[1][0]) * 0.5 - (wb[0][0] + wb[1][0]) * 0.5)
+                        .hypot((wa[0][1] + wa[1][1]) * 0.5 - (wb[0][1] + wb[1][1]) * 0.5);
+                    m = m.min(d);
+                }
+            }
+            m
+        };
+        // Over-under crossings: a layer>0 link whose midpoint is close to a
+        // layer-0 link it doesn't share a node with (a bridge over a road).
+        let mut rendered = 0;
+        for i in 0..net.links.len() {
+            if net.link(LinkId(i as u32)).layer <= 0 {
+                continue;
+            }
+            let over = net.link(LinkId(i as u32));
+            let crosser = (0..net.links.len()).find(|&j| {
+                let u = net.link(LinkId(j as u32));
+                u.layer == 0
+                    && u.from != over.from && u.from != over.to && u.to != over.from && u.to != over.to
+                    && seg_min_dist(i, j) < 4.0
+            });
+            if crosser.is_none() {
+                continue;
+            }
+            let c = mid(i);
+            let mut r = Raster::centered(c, 45.0, 768, BG);
+            draw_world(&net, &[], &mut r);
+            std::fs::write(format!("{out}/{name}_overpass_{rendered}.png"), encode(768, 768, &r.rgb())).unwrap();
+            println!("{name}_overpass_{rendered}: layer-{} link {i} over link {} at ({:.0},{:.0})",
+                over.layer, crosser.unwrap(), c[0], c[1]);
+            rendered += 1;
+            if rendered >= 4 {
+                break;
+            }
+        }
+        if rendered == 0 {
+            println!("{name}: no over-under crossing found");
+        }
+    }
+
+    #[test]
+    #[ignore] // diagnostic: junction renders for an arbitrary city map (env MAP=name)
+    fn diag_city_views() {
+        let name = std::env::var("MAP").unwrap_or_else(|_| "map".into());
+        let path = format!("{}/../web/public/{name}.json", env!("CARGO_MANIFEST_DIR"));
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            println!("no map at {path}");
+            return;
+        };
+        let net = crate::sim::map::OsmMap::from_json(&text).expect("city json").build();
+        let out = std::env::var("CROP_DIR").unwrap_or_else(|_| ".".into());
+        let extent = |ji: usize| {
+            let j = &net.junctions[ji];
+            j.nodes.iter().map(|&nd| {
+                let p = net.node(nd).position;
+                ((p[0] - j.center[0]).hypot(p[1] - j.center[1]) * 10.0) as u64
+            }).max().unwrap_or(0)
+        };
+        // Rank by "hardest to render": most member nodes, then widest extent,
+        // then most arms — the sprawling multi-node crossings the decomposition
+        // handles, which is what could regress off Millbrae.
+        let mut rank: Vec<usize> = (0..net.junctions.len()).collect();
+        rank.sort_by_key(|&ji| {
+            let j = &net.junctions[ji];
+            std::cmp::Reverse((j.nodes.len(), extent(ji), j.mouths.len()))
+        });
+        println!("== {name}: {} junctions ==", net.junctions.len());
+        // Safety scan for suppressing markers on interchange nodes: how many
+        // all-grade-separated junctions ALSO carry a signal/stop or crossing
+        // conflicts — those would be genuine at-grade crossings wrongly flagged.
+        let (mut interchange_total, mut ix_signalled, mut ix_conflict_only) = (0usize, 0usize, 0usize);
+        for j in &net.junctions {
+            if !j.nodes.iter().all(|&nd| net.is_interchange_node(nd)) {
+                continue;
+            }
+            interchange_total += 1;
+            let signalled = j.nodes.iter().any(|&nd| {
+                matches!(net.node(nd).control, crate::sim::network::NodeControl::Signalized(_) | crate::sim::network::NodeControl::Stop)
+            });
+            let conflicts = net.conflicts.iter().any(|cp| j.nodes.contains(&cp.node));
+            if signalled {
+                ix_signalled += 1;
+            } else if conflicts {
+                ix_conflict_only += 1;
+            }
+        }
+        println!("  interchange-node junctions: {interchange_total}; signalized/stop: {ix_signalled} (real crossings), conflict-only: {ix_conflict_only} (freeway weaves)");
+        let all_boxes = crate::render::geometry::debug_junction_boxes(&net);
+        for (r, &ji) in rank.iter().take(6).enumerate() {
+            let j = &net.junctions[ji];
+            let c = j.center;
+            let half = (extent(ji) as f64 / 10.0 + 35.0).max(45.0);
+            let mut raster = Raster::centered(c, half, 768, BG);
+            draw_world(&net, &[], &mut raster);
+            std::fs::write(format!("{out}/{name}_{r}.png"), encode(768, 768, &raster.rgb())).unwrap();
+            let conflicts = net.conflicts.iter().filter(|cp| j.nodes.contains(&cp.node)).count();
+            let interchange = j.nodes.iter().all(|&nd| net.is_interchange_node(nd));
+            println!("{name}_{r}: junction {ji} at ({:.0},{:.0}) nodes={} arms={} extent={:.0}m conflicts={conflicts} interchange={interchange} view={half:.0}m",
+                c[0], c[1], j.nodes.len(), j.mouths.len(), extent(ji) as f64 / 10.0);
+            for &(node, arms, streets, area, comp) in &all_boxes[ji] {
+                let marked = arms >= 3 && streets >= 2 && area >= 40.0 && comp >= 0.55;
+                println!("    box node {node}: arms={arms} streets={streets} area={area:.0} comp={comp:.2} {}",
+                    if marked { "MARKED" } else { "" });
+            }
         }
     }
 

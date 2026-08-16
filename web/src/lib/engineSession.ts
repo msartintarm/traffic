@@ -33,7 +33,7 @@ export type SessionCallbacks = {
     fitMpp: number;
     congestionEnabled: boolean;
   }) => void;
-  onFrame: (f: { snapshot: StatsSnapshot; selected: SelectedInfo | null; fitMpp: number }) => void;
+  onFrame: (f: { snapshot: StatsSnapshot; selected: SelectedInfo | null; fitMpp: number; ascii?: string | null }) => void;
   onHover: (name: string | null, x: number, y: number) => void;
   // Boot progress for the loading bar: `fraction` 0→1, `stage` a short human label.
   onProgress: (fraction: number, stage: string) => void;
@@ -48,6 +48,11 @@ const hasRaf = typeof requestAnimationFrame === "function";
 const schedule = (cb: (t: number) => void): number =>
   hasRaf ? requestAnimationFrame(cb) : (setTimeout(() => cb(performance.now()), 16) as unknown as number);
 const unschedule = (id: number): void => (hasRaf ? cancelAnimationFrame(id) : clearTimeout(id));
+
+// Vertical resolution of the ASCII "terminal" view. The engine derives the column count
+// from the camera aspect (monospace cells are ~2:1), and the main thread scales the font
+// to fit — so this is purely the detail/cost knob, not tied to the display size.
+const ASCII_ROWS = 54;
 
 function assertNever(x: never): never {
   throw new Error(`unhandled control: ${JSON.stringify(x)}`);
@@ -121,6 +126,7 @@ export async function startEngineSession(
   let width = config.width;
   let height = config.height;
   let fitMpp = 1;
+  let asciiMode = false; // when on, ship an ASCII grid each frame and skip the GPU/2D draw
   let roads: { name: string; pts: number[][] }[] = [];
 
   cb.onProgress(0.04, "Loading engine…");
@@ -155,6 +161,21 @@ export async function startEngineSession(
           if (!ok) console.warn(`commute OD rejected by engine: ${lodesFile}`);
         } catch (e) {
           console.warn(`commute OD missing for ${realMap.name} (${lodesFile}): ${e}`);
+        }
+      }
+      // Compiled transit artifact (tools/gtfs): real train timetable + bus
+      // trips. Optional sibling like the LODES file — a map without one keeps
+      // the synthetic crossings/headways.
+      if (sim.set_transit_json) {
+        cb.onProgress(0.72, "Loading transit schedules…");
+        const transitFile = realMap.file.replace(/\.json$/, ".transit.json");
+        try {
+          const counts = sim.set_transit_json(await fetchMapText(`${config.basePath}/${transitFile}`));
+          console.info(
+            `transit: ${counts[0]} rail trips (+${counts[1]} dropped), ${counts[2]} bus trips (+${counts[3]} dropped)`,
+          );
+        } catch (e) {
+          console.info(`no transit artifact for ${realMap.name} (${transitFile}): ${e}`);
         }
       }
     } catch {
@@ -196,6 +217,7 @@ export async function startEngineSession(
       sim.world_mesh_indices(),
       sim.marking_mesh_vertices(),
       sim.marking_mesh_indices(),
+      sim.render_band_ranges(),
     );
     if (config.gpu) {
       try {
@@ -266,24 +288,30 @@ export async function startEngineSession(
     const dt = Math.min((now - last) / 1000, 0.1);
     last = now;
     sim.advance(dt);
-    if (renderer) {
-      renderer.render(
-        sim.view_proj(),
-        sim.alpha(),
-        sim.meters_per_pixel(),
-        sim.render_instances(),
-        sim.render_instance_count(),
-        sim.signal_instances(),
-        sim.signal_instance_count(),
-        sim.crash_instances(),
-        sim.crash_instance_count(),
-        sim.density_vertices(),
-        sim.density_indices(),
-      );
-    } else {
-      render2d(canvas, sim, scene);
+    // ASCII view: the engine rasterises the same geometry to text; the pixel render is
+    // skipped (the overlay covers the canvas) so it costs nothing while the toggle is on.
+    // A stale wasm build lacking `ascii_view` just falls through to the normal render.
+    const ascii = asciiMode && sim.ascii_view ? sim.ascii_view(ASCII_ROWS) : null;
+    if (ascii === null) {
+      if (renderer) {
+        renderer.render(
+          sim.view_proj(),
+          sim.alpha(),
+          sim.meters_per_pixel(),
+          sim.render_instances(),
+          sim.render_instance_count(),
+          sim.signal_instances(),
+          sim.signal_instance_count(),
+          sim.crash_instances(),
+          sim.crash_instance_count(),
+          sim.density_vertices(),
+          sim.density_indices(),
+        );
+      } else {
+        render2d(canvas, sim, scene);
+      }
     }
-    cb.onFrame({ snapshot: snapshot(), selected: selectedInfo(), fitMpp });
+    cb.onFrame({ snapshot: snapshot(), selected: selectedInfo(), fitMpp, ascii });
     rafId = schedule(draw);
   };
   rafId = schedule(draw);
@@ -328,6 +356,8 @@ export async function startEngineSession(
       case "play": sim.play(); break;
       case "pause": sim.pause(); break;
       case "frameBudget": sim.set_frame_budget(c.value); break;
+      case "ascii": asciiMode = c.value; break;
+      case "transit": sim.set_transit_enabled?.(c.value); break;
       case "select": {
         // A click inside a junction footprint selects the intersection; anywhere
         // else selects the nearest road segment.

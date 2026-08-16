@@ -14,6 +14,7 @@ use super::idm;
 use super::mobil::{self, MobilParams};
 use super::junction::{self, Junctions, SignalController};
 use super::network::{Lane, LaneId, LinkId, MovementId, Network, NodeControl, NodeId, RoadKind, TurnType};
+use super::rail;
 use super::router::FieldRouter;
 use super::signal::SignalState;
 
@@ -192,6 +193,18 @@ pub struct CrashRecord {
     pub closing_speed: f32,
 }
 
+/// One scheduled bus-service stop, resolved onto the network: where it is and
+/// when the timetable says the bus should leave it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScheduledStop {
+    pub link: u32,
+    pub arc: f64,
+    /// Scheduled departure, day-seconds (may exceed 86400 past midnight).
+    pub departure: f64,
+    /// GTFS timepoint: an early bus holds here until the scheduled departure.
+    pub timepoint: bool,
+}
+
 /// One metered on-ramp: the ramp link, the freeway mainline its merge feeds
 /// (whose occupancy drives the ALINEA rate), and the live cycle state.
 struct RampMeter {
@@ -228,6 +241,20 @@ pub struct NetWorld {
     pm_plan: bool,
     /// Rail preemption table: `(program, track-clearing phase, crossing node)`.
     rail_preempts: Vec<(u32, usize, NodeId)>,
+    /// Real train timetable (empty until a transit artifact is installed);
+    /// train positions are pure functions of `day_secs` over `network.rail`.
+    timetable: rail::Timetable,
+    /// Per-crossing closure intervals precomputed from the timetable, keyed by
+    /// node id. A crossing absent here falls back to the synthetic cadence.
+    crossing_sets: HashMap<u32, rail::ClosureSet>,
+    /// Service-day flag fed with the day clock (`day % 7 ≥ 5` upstream).
+    weekend: bool,
+    /// Day-seconds per sim second the day clock advances at (the demand
+    /// compression), so a day-clock hold converts to sim-time dwell.
+    day_rate: f64,
+    /// Scheduled service per live bus id: resolved stops with day-second
+    /// departures; a timepoint stop holds an early bus to its schedule.
+    bus_schedules: HashMap<u32, Vec<ScheduledStop>>,
     /// Bus stops per link `(stop index, link arc)` — from `Network::bus_stops`.
     stops_by_link: IntMap<Vec<(u32, f64)>>,
     /// Per movement: does it carry any registered conflict point? An
@@ -772,6 +799,9 @@ const METER_GREEN_SECS: f64 = 2.5;
 const RAIL_CLOSURE_SECS: f64 = 45.0;
 /// Curbside service time a bus spends at each stop.
 const BUS_DWELL_SECS: f64 = 25.0;
+/// Ceiling on schedule holding at a timepoint (sim seconds) — a wildly early
+/// bus (or a schedule glitch) can't park at a curb stop indefinitely.
+const MAX_BUS_HOLD_SECS: f64 = 600.0;
 /// Speed at which a receiving-lane occupant counts as *departing* — a leader to
 /// car-follow rather than a blockage the box gates must hold for. Walking pace:
 /// a tail genuinely rolling off, not a stop-and-go twitch. This must sit *below*
@@ -1057,6 +1087,8 @@ impl NetWorld {
             network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0, crashed_by: [0; 2], crash_log: Vec::new(),
             merges, link_straight, turn_caps, merge_feeder_lane, through_next, corridor_of, corridor_offset, seam_primary, signals, link_entries, router: None, external_reroute: false,
             meters: Vec::new(), metering_on: false, day_secs: 0.0, pm_plan: false, rail_preempts,
+            timetable: rail::Timetable::default(), crossing_sets: HashMap::new(), weekend: false, day_rate: 1.0,
+            bus_schedules: HashMap::new(),
             stops_by_link, bus_dwell: HashMap::new(), movement_conflicted,
             route_fingerprint: 0, route_cycle_tick: 0, parallel_routing: true, cache_sort: true, junctions,
             accel_backend: AccelBackend::Serial,
@@ -2535,13 +2567,69 @@ impl NetWorld {
         }
     }
 
+    /// Install the real train timetable and precompute each crossing's closure
+    /// intervals from it: a crossing snaps onto every rail line within reach
+    /// (parallel tracks at one crossing union their closures). Crossings the
+    /// timetable never touches keep the synthetic cadence.
+    pub fn set_timetable(&mut self, tt: rail::Timetable) {
+        self.crossing_sets.clear();
+        for n in 0..self.network.nodes.len() {
+            if !self.network.nodes[n].rail_crossing {
+                continue;
+            }
+            // Projection is per trip (parallel tracks and stitched paths all
+            // register), so one call covers the whole crossing.
+            let set = rail::crossing_closures(&tt, &self.network.rail, self.network.nodes[n].position);
+            if !set.weekday.is_empty() || !set.weekend.is_empty() {
+                self.crossing_sets.insert(n as u32, set);
+            }
+        }
+        self.timetable = tt;
+    }
+
+    pub fn timetable(&self) -> &rail::Timetable {
+        &self.timetable
+    }
+
+    /// The day clock as the renderer needs it: `(day_secs, day_rate, weekend)`.
+    pub fn day_view(&self) -> (f64, f64, bool) {
+        (self.day_secs, self.day_rate, self.weekend)
+    }
+
+    /// Trains active right now (empty without a timetable); positions are pure
+    /// functions of the day clock, evaluated over `network.rail`.
+    pub fn trains(&self) -> Vec<rail::TrainState> {
+        self.timetable.active_trains(self.day_secs, self.weekend)
+    }
+
+    /// Feed the full day clock: seconds-into-day, its advance rate
+    /// (day-seconds per sim second), and the service-day flag. Supersets
+    /// [`set_day_secs`](Self::set_day_secs) for callers that have all three.
+    pub fn set_day_clock(&mut self, secs: f64, rate: f64, weekend: bool) {
+        self.set_day_secs(secs);
+        self.day_rate = rate.max(1e-9);
+        self.weekend = weekend;
+    }
+
+    /// Attach a scheduled service to a live bus: its resolved stops with
+    /// day-second departures (see [`ScheduledStop`]). State is dropped with the
+    /// bus's dwell state when it leaves the network.
+    pub fn set_bus_schedule(&mut self, id: u32, stops: Vec<ScheduledStop>) {
+        self.bus_schedules.insert(id, stops);
+    }
+
     /// Whether a rail crossing at `node` is currently closed to road traffic.
-    /// The timetable is a pure function of the day clock: Caltrain-like cadence
-    /// (≈10 closures/h across both directions at the commute peaks, 4/h midday,
-    /// 1/h overnight), each closure [`RAIL_CLOSURE_SECS`] of day time.
+    /// With a real timetable installed the precomputed closure intervals rule
+    /// (lights lead the train, gates lift after the tail clears — see
+    /// [`rail::crossing_closures`]). Without one, the synthetic Caltrain-like
+    /// cadence stands in: ≈10 closures/h at the commute peaks, 4/h midday,
+    /// 1/h overnight, each [`RAIL_CLOSURE_SECS`] of day time.
     fn rail_closed(&self, node: NodeId) -> bool {
         if !self.network.node(node).rail_crossing {
             return false;
+        }
+        if let Some(set) = self.crossing_sets.get(&node.0) {
+            return set.closed_at(self.day_secs, self.weekend);
         }
         let h = self.day_secs / 3600.0;
         let per_hour = if (6.0..9.0).contains(&h) || (16.0..19.0).contains(&h) {
@@ -2604,13 +2692,34 @@ impl NetWorld {
                     (pos - arc).abs() < 3.5 && !(last_link == lane.link.0 && pos <= last_arc + 4.0)
                 })
             {
-                self.bus_dwell.insert(v.id, (self.tick + (BUS_DWELL_SECS / dt) as u64, lane.link.0, pos));
+                // Base curbside service, extended by schedule holding: an early
+                // bus at a timepoint stop waits out the day-clock gap to its
+                // scheduled departure (converted to sim seconds by the day
+                // rate); a late one just serves the doors and goes. The
+                // schedule can only lengthen a dwell, never cut it short.
+                let mut dwell = BUS_DWELL_SECS;
+                if let Some(sched) = self.bus_schedules.get(&v.id) {
+                    if let Some(st) = sched
+                        .iter()
+                        .find(|s| s.link == lane.link.0 && (s.arc - pos).abs() < 30.0 && s.timepoint)
+                    {
+                        let mut wait = st.departure - self.day_secs;
+                        if wait < -43_200.0 {
+                            wait += 86_400.0; // scheduled just past a midnight wrap
+                        }
+                        if (0.0..1800.0).contains(&wait) {
+                            dwell = dwell.max((wait / self.day_rate).min(MAX_BUS_HOLD_SECS));
+                        }
+                    }
+                }
+                self.bus_dwell.insert(v.id, (self.tick + (dwell / dt) as u64, lane.link.0, pos));
             }
         }
         // Drop state for buses that have left the network.
         if self.tick % 1024 == 0 {
             let live: std::collections::HashSet<u32> = self.fleet.rows.iter().map(|v| v.id).collect();
             self.bus_dwell.retain(|id, _| live.contains(id));
+            self.bus_schedules.retain(|id, _| live.contains(id));
         }
     }
 
@@ -6612,6 +6721,52 @@ mod tests {
     }
 
     #[test]
+    fn real_trips_fire_at_their_scheduled_departures_with_their_schedules() {
+        use super::super::demand::{BusTrip, DemandGenerator, TransitLine};
+        // A line with compiled GTFS trips: departures fire at their day-clock
+        // times (weekday service only), each spawned bus carries its per-stop
+        // schedule, and the synthetic headway never runs.
+        let mut net = OsmMap {
+            nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 500.0, 0.0)],
+            links: vec![LinkSpec::oneway(1, 2, 2, 13.0)],
+        }
+        .build();
+        net.attach_bus_stops(&[[240.0, 2.0]]);
+        let arc = net.bus_stops[0].1;
+        let mut w = NetWorld::new(net, cfg());
+        let mut gen = DemandGenerator::new(&w, &[], 5);
+        // The fallback day clock starts at 05:30 (19 800): departures 30 s and
+        // 150 s in, plus a weekend trip that must not run today.
+        let stop = |dep: f64| ScheduledStop { link: 0, arc, departure: dep, timepoint: true };
+        let mut line = TransitLine::new("ECR".into(), vec![LinkId(0)]);
+        line.set_trips(vec![
+            BusTrip { weekend: false, departure: 19_830.0, stops: vec![stop(19_860.0)] },
+            BusTrip { weekend: true, departure: 19_860.0, stops: vec![stop(19_890.0)] },
+            BusTrip { weekend: false, departure: 19_950.0, stops: vec![stop(19_980.0)] },
+        ]);
+        gen.set_transit_lines(vec![line]);
+        let mut first_seen: HashMap<u32, f64> = HashMap::new();
+        let mut schedules_attached = false;
+        for t in 0..3000u32 {
+            gen.step(&mut w, cfg().dt);
+            w.step();
+            for v in w.vehicles() {
+                if v.driver.vehicle_length >= 11.0 {
+                    first_seen.entry(v.id).or_insert(t as f64 * 0.2);
+                }
+            }
+            schedules_attached |= !w.bus_schedules.is_empty();
+        }
+        let mut starts: Vec<f64> = first_seen.values().copied().collect();
+        starts.sort_by(f64::total_cmp);
+        assert_eq!(starts.len(), 2, "two weekday departures, no weekend trip, no headway service");
+        assert!((starts[0] - 30.0).abs() < 3.0, "first departure at +30 s: {:.1}", starts[0]);
+        assert!((starts[1] - 150.0).abs() < 3.0, "second at +150 s: {:.1}", starts[1]);
+        assert!(schedules_attached, "spawned buses carry their stop schedules");
+        assert_eq!(w.exited(), 2, "both buses complete the route");
+    }
+
+    #[test]
     fn buses_dwell_at_stops_and_cars_pass_through() {
         // One street with a mid-block bus stop: a bus brakes to it, serves ~25 s,
         // then continues; a car sails past without stopping.
@@ -6733,6 +6888,112 @@ mod tests {
         assert_eq!(closed_entries, 0, "no vehicle enters a closed crossing");
         assert!(open_flow > 100, "traffic flows between trains: {open_flow}");
         assert_eq!(w.crashed(), 0);
+    }
+
+    #[test]
+    fn a_real_timetable_replaces_the_synthetic_crossing_cadence() {
+        use super::super::rail;
+        // The same street-across-a-crossing, but with real rail geometry and a
+        // real timetable installed: the crossing closes exactly around the
+        // scheduled train's passage (lead time before, clear time after) and at
+        // no other time — the synthetic cadence no longer applies.
+        let mut nodes = vec![
+            NodeSpec::uncontrolled(1, -200.0, 0.0),
+            NodeSpec::uncontrolled(2, 0.0, 0.0),
+            NodeSpec::uncontrolled(3, 200.0, 0.0),
+        ];
+        nodes[1].rail_crossing = true;
+        let mut net = OsmMap {
+            nodes,
+            links: vec![LinkSpec::oneway(1, 2, 1, 13.0), LinkSpec::oneway(2, 3, 1, 13.0)],
+        }
+        .build();
+        net.rail.lines.push(rail::RailLine::new(
+            "rail".into(),
+            "test sub".into(),
+            vec![[0.0, -500.0], [0.0, 500.0]],
+            vec![(0, 35.0)],
+            vec![(0, 0)],
+        ));
+        let mut w = NetWorld::new(net, cfg());
+        let trip = rail::TrainTrip::build(
+            0,
+            rail::TrainClass::Emu,
+            false,
+            7,
+            0.0,
+            1.0,
+            vec![
+                rail::TripStop { s: 0.0, arrival: 43_200.0, departure: 43_200.0 },
+                rail::TripStop { s: 1000.0, arrival: 43_270.0, departure: 43_280.0 },
+            ],
+            |_| 35.0,
+        );
+        // The crossing sits at chainage 500 on the line (node 2 at y = 0).
+        let t_pass = trip.time_at_pos(500.0).unwrap();
+        w.set_timetable(rail::Timetable { trips: vec![trip] });
+        let crossing = NodeId(1);
+        w.set_day_clock(t_pass, 1.0, false);
+        assert!(w.rail_closed(crossing), "closed while the train passes");
+        w.set_day_clock(t_pass - rail::CROSSING_LEAD_SECS + 1.0, 1.0, false);
+        assert!(w.rail_closed(crossing), "lights lead the train");
+        w.set_day_clock(t_pass - rail::CROSSING_LEAD_SECS - 10.0, 1.0, false);
+        assert!(!w.rail_closed(crossing), "open before the lead window");
+        w.set_day_clock(t_pass + 120.0, 1.0, false);
+        assert!(!w.rail_closed(crossing), "open after the tail clears");
+        // The synthetic midday cadence (closed at every 900 s boundary) is
+        // superseded: a boundary far from the scheduled train is open.
+        w.set_day_clock(12.0 * 3600.0 + 905.0, 1.0, false);
+        assert!(!w.rail_closed(crossing), "no synthetic closures with a timetable installed");
+        // Weekday trip: the weekend service day sees no closure.
+        w.set_day_clock(t_pass, 1.0, true);
+        assert!(!w.rail_closed(crossing));
+        // The active train renders where the schedule says it is (route
+        // distance == chainage here: start 0, dir +1).
+        w.set_day_clock(t_pass, 1.0, false);
+        let trains = w.trains();
+        assert_eq!(trains.len(), 1);
+        let front = trains[0].route_pos;
+        assert!((front - 500.0).abs() < 30.0, "front near the crossing at passage time: {front}");
+    }
+
+    #[test]
+    fn an_early_bus_holds_at_a_timepoint_until_its_scheduled_departure() {
+        // A scheduled bus reaching its timepoint stop early waits out the day
+        // clock to the scheduled departure (not just the door dwell); a late
+        // one serves the doors and goes.
+        let mk = || {
+            let mut net = OsmMap {
+                nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 400.0, 0.0)],
+                links: vec![LinkSpec::oneway(1, 2, 2, 13.0)],
+            }
+            .build();
+            net.attach_bus_stops(&[[180.0, 2.0]]);
+            let arc = net.bus_stops[0].1;
+            (NetWorld::new(net, cfg()), arc)
+        };
+        let quiet = DriverConfig { accel_noise: 0.0, ..VehicleClass::Bus.driver() };
+        let run = |dep_offset: f64| {
+            let (mut w, arc) = mk();
+            assert!(w.spawn_routed(1, vec![LinkId(0)], 10.0, quiet));
+            w.set_bus_schedule(
+                1,
+                vec![ScheduledStop { link: 0, arc, departure: 1000.0 + dep_offset, timepoint: true }],
+            );
+            let mut stopped = 0u32;
+            for t in 0..1800 {
+                w.set_day_clock(1000.0 + t as f64 * 0.2, 1.0, false);
+                w.step();
+                if w.vehicles().first().is_some_and(|v| v.speed < 0.3) {
+                    stopped += 1;
+                }
+            }
+            stopped as f64 * 0.2
+        };
+        let held = run(150.0);
+        assert!((100.0..170.0).contains(&held), "an early bus holds to its departure: {held:.0}s");
+        let late = run(5.0);
+        assert!((20.0..40.0).contains(&late), "a late bus only serves the doors: {late:.0}s");
     }
 
     #[test]

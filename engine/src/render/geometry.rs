@@ -3,7 +3,7 @@
 //! [`StaticMesh`] (`center + offset` vertices) so the shader can hold every
 //! road/line to a minimum on-screen width at any zoom.
 
-use crate::sim::network::{LaneId, LinkId, MovementId, Network, NodeControl, NodeId, TurnType, LANE_WIDTH};
+use crate::sim::network::{Junction, LaneId, LinkId, MovementId, Network, NodeControl, NodeId, RoadKind, TurnType, LANE_WIDTH};
 
 use super::{mass, StaticMesh, StaticVertex};
 
@@ -15,15 +15,186 @@ pub const LANE_LINE_COLOR: [f32; 3] = [0.50, 0.50, 0.46]; // same-direction dash
 pub const EDGE_LINE_COLOR: [f32; 3] = [0.55, 0.55, 0.50]; // outer road edge
 pub const CENTER_LINE_COLOR: [f32; 3] = [0.55, 0.46, 0.13]; // dimmed yellow, luminance like the white lines
 
-/// The complete static world surface — at-grade carriageways, junction fills,
-/// then overpasses on top — as one mesh. The single source of truth every
-/// render backend draws (the browser GPU feed and the ASCII rasteriser both use
-/// this), so what the tests rasterise is exactly what the browser shows.
+/// One painter's-order render band: the opaque surfaces (`fill`) and the lane
+/// lines/arrows (`marking`) at one render rank. Bands are drawn bottom-to-top,
+/// each band's fill then its markings, so a higher band's opaque fill covers a
+/// lower band's markings.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RenderBand {
+    pub fill: StaticMesh,
+    pub marking: StaticMesh,
+}
+
+/// The world as painter's-order bands, grouped by **render rank** = (grade
+/// layer, then road-class priority). This is what makes grade separation and
+/// same-grade precedence render correctly: an overpass band's fill draws after
+/// — and so covers — the road and lane lines it crosses over; and where two
+/// same-grade roads overlap, the higher-class one's surface wins, instead of
+/// every lane line drawing on top of every surface. The junction band sits just
+/// above the at-grade road bands (its box paves over the approach ends) and
+/// below any overpass. Both render backends consume these bands, so the tested
+/// raster order is exactly the browser's.
+pub fn world_bands(net: &Network) -> Vec<RenderBand> {
+    use std::collections::BTreeMap;
+    let interior = interior_links(net);
+    let mut bands: BTreeMap<(i32, u64), RenderBand> = BTreeMap::new();
+    for i in 0..net.links.len() {
+        let l = net.link(LinkId(i as u32));
+        let band = bands.entry((l.layer, l.kind.at_grade_rank())).or_default();
+        link_fill(net, i, &mut band.fill);
+        if !interior[i] {
+            link_markings(net, LinkId(i as u32), &mut band.marking);
+        }
+    }
+    let jband = bands.entry((0, JUNCTION_PRIORITY)).or_default();
+    jband.fill.extend(&junction_mesh(net));
+    jband.marking.extend(&junction_markings(net));
+    for (key, rail) in rail_band_geometry(net) {
+        let band = bands.entry(key).or_default();
+        band.fill.extend(&rail.fill);
+        band.marking.extend(&rail.marking);
+    }
+    bands.into_values().collect()
+}
+
+/// Junction band priority: above every road class, so the box covers its
+/// at-grade approaches; still below a higher grade layer's roads (and below
+/// the rail band — rails stay visible across a level crossing's box).
+const JUNCTION_PRIORITY: u64 = u64::MAX - 1;
+/// Rail band priority: the top of its grade layer. Track ballast + rails draw
+/// over the road surface they cross at grade, the way real embedded crossing
+/// rails read; an overpass road on `layer 1` still covers a `layer 0` track.
+const RAIL_PRIORITY: u64 = u64::MAX;
+
+pub const RAIL_BED_COLOR: [f32; 3] = [0.13, 0.12, 0.11];
+pub const RAIL_STEEL_COLOR: [f32; 3] = [0.52, 0.53, 0.55];
+pub const PLATFORM_COLOR: [f32; 3] = [0.33, 0.32, 0.28];
+const RAIL_BED_HALF_WIDTH: f64 = 2.0;
+/// Standard gauge 1.435 m: each rail sits this far off the track centreline.
+const RAIL_GAUGE_HALF: f64 = 0.7175;
+
+/// Rail geometry as render-band entries keyed like [`world_bands`]'s map:
+/// per grade-layer run of each track, a ballast-bed fill and the two steel
+/// rails as markings; platforms and station discs land in the layer-0 band.
+fn rail_band_geometry(net: &Network) -> Vec<((i32, u64), RenderBand)> {
+    use std::collections::BTreeMap;
+    if net.rail.is_empty() && net.rail.platforms.is_empty() {
+        return Vec::new();
+    }
+    let mut bands: BTreeMap<(i32, u64), RenderBand> = BTreeMap::new();
+    for line in &net.rail.lines {
+        for (layer, run) in line.layer_runs() {
+            let band = bands.entry((layer, RAIL_PRIORITY)).or_default();
+            for i in *run.start()..*run.end() {
+                let (a, b) = (line.pts[i], line.pts[i + 1]);
+                band.fill.push_ribbon(a, b, RAIL_BED_HALF_WIDTH, RAIL_BED_COLOR, 0.0);
+                let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+                let len = dx.hypot(dy).max(1e-9);
+                let n = [dy / len, -dx / len];
+                for side in [-1.0, 1.0] {
+                    let off = [n[0] * RAIL_GAUGE_HALF * side, n[1] * RAIL_GAUGE_HALF * side];
+                    band.marking.push_ribbon(
+                        [a[0] + off[0], a[1] + off[1]],
+                        [b[0] + off[0], b[1] + off[1]],
+                        0.06,
+                        RAIL_STEEL_COLOR,
+                        0.0,
+                    );
+                }
+            }
+        }
+    }
+    let band = bands.entry((0, RAIL_PRIORITY)).or_default();
+    for p in &net.rail.platforms {
+        let closed = p.len() >= 4 && p.first() == p.last();
+        if closed {
+            band.fill.push_polygon(&p[..p.len() - 1], PLATFORM_COLOR);
+        } else {
+            for w in p.windows(2) {
+                band.fill.push_ribbon(w[0], w[1], 1.5, PLATFORM_COLOR, 0.0);
+            }
+        }
+    }
+    for st in &net.rail.stations {
+        band.fill.push_disc(st.pos, 6.0, PLATFORM_COLOR);
+    }
+    bands.into_iter().collect()
+}
+
+/// The complete static world surface (all bands' fills concatenated in
+/// painter's order), for callers that want the flat mesh. The banded
+/// [`world_bands`] is what the renderers draw so overpasses layer correctly.
 pub fn world_mesh(net: &Network) -> StaticMesh {
-    let mut mesh = road_mesh(net);
-    mesh.extend(&junction_mesh(net));
-    mesh.extend(&overpass_mesh(net));
+    let mut mesh = StaticMesh::default();
+    for b in world_bands(net) {
+        mesh.extend(&b.fill);
+    }
     mesh
+}
+
+/// Like [`world_mesh`], but each link's fill is tinted by `color_of(kind)` and the
+/// junction band by `junction`, instead of the uniform asphalt [`ROAD_COLOR`]. Same
+/// triangles, same painter's order — only the vertex colours differ. The ASCII "terminal"
+/// view uses this to shade the road hierarchy (the pixel renderers keep the flat asphalt).
+pub fn world_fill_colored(net: &Network, color_of: impl Fn(RoadKind) -> [f32; 3], junction: [f32; 3]) -> StaticMesh {
+    use std::collections::BTreeMap;
+    let mut bands: BTreeMap<(i32, u64), StaticMesh> = BTreeMap::new();
+    for (key, rail) in rail_band_geometry(net) {
+        bands.entry(key).or_default().extend(&rail.fill);
+    }
+    for i in 0..net.links.len() {
+        let l = net.link(LinkId(i as u32));
+        let band = bands.entry((l.layer, l.kind.at_grade_rank())).or_default();
+        let start = band.vertices.len();
+        link_fill(net, i, band);
+        let color = color_of(l.kind);
+        for v in &mut band.vertices[start..] {
+            v.color = color;
+        }
+    }
+    let mut jm = junction_mesh(net);
+    for v in &mut jm.vertices {
+        v.color = junction;
+    }
+    bands.entry((0, JUNCTION_PRIORITY)).or_default().extend(&jm);
+    let mut out = StaticMesh::default();
+    for (_, m) in bands {
+        out.extend(&m);
+    }
+    out
+}
+
+/// One link's carriageway fill ribbons, appended to `mesh`.
+fn link_fill(net: &Network, i: usize, mesh: &mut StaticMesh) {
+    let half = net.links[i].lane_count as f64 * LANE_WIDTH / 2.0;
+    for seg in net.polylines[i].windows(2) {
+        let (a, b) = offset_right(seg[0], seg[1], half);
+        mesh.push_ribbon(a, b, half, ROAD_COLOR, 0.0);
+    }
+}
+
+/// One link's lane markings (dashed dividers + solid edge/centre lines),
+/// appended to `mesh` — the per-link half of [`marking_mesh`], bucketed by band.
+fn link_markings(net: &Network, id: LinkId, mesh: &mut StaticMesh) {
+    let mut dividers = Vec::new();
+    net.link_dividers(id, &mut dividers);
+    for d in dividers {
+        dashed_line(mesh, [d[0], d[1]], [d[2], d[3]], 3.0, 3.0, 0.15, LANE_LINE_COLOR);
+    }
+    let mut strips = Vec::new();
+    net.link_strips(id, &mut strips);
+    for s in strips {
+        let (a, b, half) = ([s[0], s[1]], [s[2], s[3]], s[4] / 2.0);
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let len = dx.hypot(dy).max(1e-9);
+        let n = [dy / len, -dx / len];
+        // Inner edge (side -1) borders opposing traffic → yellow centre line;
+        // outer edge (side +1) is the road edge.
+        for (side, color) in [(-1.0, CENTER_LINE_COLOR), (1.0, EDGE_LINE_COLOR)] {
+            let off = [n[0] * half * side, n[1] * half * side];
+            mesh.push_ribbon([a[0] + off[0], a[1] + off[1]], [b[0] + off[0], b[1] + off[1]], 0.1, color, 0.0);
+        }
+    }
 }
 
 /// Filled carriageway ribbons for at-grade and tunnel links (`layer <= 0`),
@@ -176,13 +347,131 @@ pub fn debug_junction_boxes(net: &Network) -> Vec<Vec<(u32, usize, usize, f64, f
 }
 
 /// Cluster half-extent (m) above which the single-hull box model breaks and the
-/// cluster renders as per-node crossings: past this, member crossings have real
-/// medians and roadway between them that a hull would falsely pave.
+/// cluster renders as per-node crossings: past this, member crossings *may* have
+/// real medians and roadway between them that a hull would falsely pave. Only a
+/// gate to *try* decomposition — [`marked_boxes`] then confirms the split found
+/// genuine separate crossings, else the hull is kept.
 const SPRAWL_RADIUS: f64 = 18.0;
 
-/// Sentinel for a compact cluster's single box, which serves every member node
+/// Sentinel for a whole-cluster single box (compact cluster, or a sprawling
+/// tangle whose decomposition found no clean split), serving every member node
 /// (see [`stop_positions`]'s fallback).
 const WHOLE_CLUSTER: u32 = u32::MAX;
+
+/// A marked box must read as a fat crossing outline, not a clipped sliver: a
+/// floor on area (a real box is ~200+ m²) and on compactness (a thin wedge
+/// fails even at large area). Below either it still paves but is not outlined.
+const MIN_MARKER_AREA: f64 = 40.0;
+/// A full crossing box is a quad (compactness ≥ ~0.7 square, ~0.55 at a 45°
+/// skew — steeper than real arterials cross); a box clipped to a near-triangle
+/// by a close cluster neighbour falls below and is a wedge, not a legible outline.
+const MIN_MARKER_COMPACTNESS: f64 = 0.55;
+
+/// Indices of the boxes that read as real crossing outlines: ≥ 3 arms forming
+/// ≥ 2 distinct streets, fat enough (area + compactness), and not nested inside
+/// a stronger sibling already kept. Both the junction marker outline and the
+/// fill-topology choice (decompose vs unify) read this one "is this a genuine
+/// crossing" signal, so they can never disagree.
+fn marked_boxes(boxes: &[NodeBox]) -> Vec<usize> {
+    let mut cand: Vec<usize> = (0..boxes.len())
+        .filter(|&i| {
+            let b = &boxes[i];
+            b.arms >= 3
+                && b.streets >= 2
+                && polygon_area(&b.ring) >= MIN_MARKER_AREA
+                && compactness(&b.ring) >= MIN_MARKER_COMPACTNESS
+        })
+        .collect();
+    cand.sort_by_key(|&i| (std::cmp::Reverse(boxes[i].arms), boxes[i].node));
+    let mut kept: Vec<usize> = Vec::new();
+    for i in cand {
+        if kept.iter().all(|&k| !point_in_ring(&boxes[k].ring, boxes[i].apex)) {
+            kept.push(i);
+        }
+    }
+    kept
+}
+
+/// The boxes of cluster `ci` that get a blue crossing outline: [`marked_boxes`],
+/// minus any in a free-flow grade-separated interchange cluster (every member
+/// node is an interchange node — a merge/diverge/connector with no at-grade
+/// cross street). A merge is not an at-grade crossing: its ribbons + fill still
+/// pave the gore, but it carries no crossing box. An at-grade ramp *terminal*
+/// (a ramp meeting a surface street) keeps its outline — that node touches a
+/// non-grade-separated link, so the cluster is not all-interchange.
+fn outlined_boxes(net: &Network, ci: usize, boxes: &[NodeBox]) -> Vec<usize> {
+    let j = net.junction(crate::sim::network::JunctionId(ci as u32));
+    if !j.nodes.is_empty() && j.nodes.iter().all(|&nd| net.is_interchange_node(nd)) {
+        return Vec::new();
+    }
+    marked_boxes(boxes)
+}
+
+/// One unifying box over a whole cluster's external mouths: the street-band box
+/// for a lone node, else the convex hull of the mouth corners. Used for a
+/// compact cluster, and as the fallback when a sprawling cluster's per-node
+/// decomposition finds no clean multi-crossing structure (a complex tangle, not
+/// a divided arterial — decomposing it leaves sub-threshold boxes and no
+/// unifying outline).
+fn whole_cluster_box(j: &Junction) -> NodeBox {
+    let streets = {
+        let axes: Vec<[f64; 2]> = j.mouths.iter().map(|m| m.dir).collect();
+        street_groups(&axes).iter().max().map_or(0, |&g| g + 1)
+    };
+    let poly = if j.nodes.len() == 1 {
+        let arms: Vec<BoxArm> =
+            j.mouths.iter().map(|m| BoxArm { m: m.anchor, o: m.outer, axis: m.dir }).collect();
+        junction_box(&arms, j.center).0
+    } else {
+        let corners: Vec<[f64; 2]> = j.mouths.iter().flat_map(|m| [m.anchor, m.outer]).collect();
+        convex_hull(&corners)
+    };
+    NodeBox {
+        node: WHOLE_CLUSTER,
+        apex: j.center,
+        arms: j.mouths.len(),
+        streets,
+        ring: round_corners(&poly, CURB_RADIUS),
+    }
+}
+
+/// Per-member-node local crossing boxes for a sprawling cluster: each node's
+/// `junction_box` from its own arm mouths, tiled at the perpendicular bisectors
+/// to adjacent members so neighbouring boxes abut instead of interpenetrating.
+fn decompose_cluster(net: &Network, ci: usize, j: &Junction, cluster: &[Option<usize>], at: &[Vec<(u32, bool)>]) -> Vec<NodeBox> {
+    j.nodes
+        .iter()
+        .filter_map(|&nd| {
+            let c = net.node(nd).position;
+            let arms: Vec<BoxArm> = at[nd.idx()]
+                .iter()
+                .map(|&(li, to)| {
+                    let (m, o) = net.arm_mouth(LinkId(li), to);
+                    let axis = if to { net.arrival_dir(LinkId(li)) } else { net.departure_dir(LinkId(li)) };
+                    BoxArm { m, o, axis }
+                })
+                .collect();
+            if arms.len() < 2 {
+                return None;
+            }
+            let (mut poly, streets) = junction_box(&arms, c);
+            // Tile neighbouring member crossings at their perpendicular
+            // bisectors: an arm's cross-section can sit most of the way to the
+            // next node, and the band it bounds otherwise grows a lobe
+            // interpenetrating the neighbour's box.
+            for &(li, to) in &at[nd.idx()] {
+                let l = net.link(LinkId(li));
+                let other = if to { l.from } else { l.to };
+                if other != nd && cluster[other.idx()] == Some(ci) {
+                    let p = net.node(other).position;
+                    let mid = [(c[0] + p[0]) * 0.5, (c[1] + p[1]) * 0.5];
+                    poly = clip_halfplane(&poly, mid, norm2(sub(c, p)));
+                }
+            }
+            Some(NodeBox { node: nd.0, apex: c, arms: arms.len(), streets, ring: round_corners(&poly, CURB_RADIUS) })
+        })
+        .collect()
+}
 
 /// Every cluster's local boxes plus the node→cluster map, so the fill and the
 /// marking/signal-head placement work from one shared boundary.
@@ -207,73 +496,23 @@ fn junction_rings(net: &Network) -> JunctionRings {
         let j = net.junction(crate::sim::network::JunctionId(ci as u32));
         let sprawling =
             j.nodes.iter().any(|&nd| norm(sub(net.node(nd).position, j.center)) > SPRAWL_RADIUS);
-        let boxes = if !sprawling && j.mouths.len() >= 2 {
-            // One region for the whole compact cluster. A lone crossing takes
-            // the street-band box; a tightly split crossing (nodes a few metres
-            // apart) takes the hull of its external mouths — a band box is
-            // star-shaped about one node, and the second node's arms slice it.
-            let streets = {
-                let axes: Vec<[f64; 2]> = j.mouths.iter().map(|m| m.dir).collect();
-                street_groups(&axes).iter().max().map_or(0, |&g| g + 1)
-            };
-            let poly = if j.nodes.len() == 1 {
-                let arms: Vec<BoxArm> =
-                    j.mouths.iter().map(|m| BoxArm { m: m.anchor, o: m.outer, axis: m.dir }).collect();
-                junction_box(&arms, j.center).0
-            } else {
-                let corners: Vec<[f64; 2]> =
-                    j.mouths.iter().flat_map(|m| [m.anchor, m.outer]).collect();
-                convex_hull(&corners)
-            };
-            vec![NodeBox {
-                node: WHOLE_CLUSTER,
-                apex: j.center,
-                arms: j.mouths.len(),
-                streets,
-                ring: round_corners(&poly, CURB_RADIUS),
-            }]
-        } else if !sprawling {
+        let boxes = if j.mouths.len() < 2 {
             Vec::new()
+        } else if !sprawling {
+            // A compact cluster reads as one intersection: one unifying box.
+            vec![whole_cluster_box(j)]
         } else {
-            j.nodes
-                .iter()
-                .filter_map(|&nd| {
-                    let c = net.node(nd).position;
-                    let arms: Vec<BoxArm> = at[nd.idx()]
-                        .iter()
-                        .map(|&(li, to)| {
-                            let (m, o) = net.arm_mouth(LinkId(li), to);
-                            let axis =
-                                if to { net.arrival_dir(LinkId(li)) } else { net.departure_dir(LinkId(li)) };
-                            BoxArm { m, o, axis }
-                        })
-                        .collect();
-                    if arms.len() < 2 {
-                        return None;
-                    }
-                    let (mut poly, streets) = junction_box(&arms, c);
-                    // Tile neighbouring member crossings at their perpendicular
-                    // bisectors: an arm's cross-section can sit most of the way
-                    // to the next node, and the band it bounds otherwise grows
-                    // a lobe interpenetrating the neighbour's box.
-                    for &(li, to) in &at[nd.idx()] {
-                        let l = net.link(LinkId(li));
-                        let other = if to { l.from } else { l.to };
-                        if other != nd && cluster[other.idx()] == Some(ci) {
-                            let p = net.node(other).position;
-                            let mid = [(c[0] + p[0]) * 0.5, (c[1] + p[1]) * 0.5];
-                            poly = clip_halfplane(&poly, mid, norm2(sub(c, p)));
-                        }
-                    }
-                    Some(NodeBox {
-                        node: nd.0,
-                        apex: c,
-                        arms: arms.len(),
-                        streets,
-                        ring: round_corners(&poly, CURB_RADIUS),
-                    })
-                })
-                .collect()
+            // A sprawling cluster *may* be several separate crossings (a divided
+            // arterial with a median) — try the per-node decomposition. Keep it
+            // only if it actually found ≥ 2 clean crossings; otherwise the
+            // cluster is one complex tangle whose split leaves sub-threshold
+            // boxes, so unify it under one hull instead.
+            let per_node = decompose_cluster(net, ci, j, &cluster, &at);
+            if marked_boxes(&per_node).len() >= 2 {
+                per_node
+            } else {
+                vec![whole_cluster_box(j)]
+            }
         };
         rings.push(ClusterRing { boxes });
     }
@@ -573,25 +812,24 @@ fn norm2(v: [f64; 2]) -> [f64; 2] {
     [v[0] / n, v[1] / n]
 }
 
-/// Lane dividers (dashed) plus solid carriageway edge lines. Drawn only when
-/// zoomed in (the renderer skips this mesh past a zoom threshold).
+/// Lane dividers (dashed) plus solid carriageway edge lines and the junction
+/// markings, all bands concatenated. Drawn only when zoomed in (the renderer
+/// skips this mesh past a zoom threshold). The banded [`world_bands`] is what
+/// the renderers actually draw so markings layer under overpasses.
 pub fn marking_mesh(net: &Network) -> StaticMesh {
     let mut mesh = StaticMesh::default();
-    for d in net.lane_dividers() {
-        dashed_line(&mut mesh, [d[0], d[1]], [d[2], d[3]], 3.0, 3.0, 0.15, LANE_LINE_COLOR);
+    for b in world_bands(net) {
+        mesh.extend(&b.marking);
     }
-    for s in net.road_strips() {
-        let (a, b, half) = ([s[0], s[1]], [s[2], s[3]], s[4] / 2.0);
-        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-        let len = dx.hypot(dy).max(1e-9);
-        let n = [dy / len, -dx / len];
-        // Inner edge (side -1) borders opposing traffic → yellow centre line;
-        // outer edge (side +1) is the road edge.
-        for (side, color) in [(-1.0, CENTER_LINE_COLOR), (1.0, EDGE_LINE_COLOR)] {
-            let off = [n[0] * half * side, n[1] * half * side];
-            mesh.push_ribbon([a[0] + off[0], a[1] + off[1]], [b[0] + off[0], b[1] + off[1]], 0.1, color, 0.0);
-        }
-    }
+    mesh
+}
+
+/// The junction-owned markings — lane-use arrows, crosswalks, stop/yield lines,
+/// and the blue crossing outlines — the at-grade-junction half of the marking
+/// layer (the per-link lane lines are [`link_markings`]). Drawn in the junction
+/// band, above the at-grade road markings and below any overpass.
+fn junction_markings(net: &Network) -> StaticMesh {
+    let mut mesh = StaticMesh::default();
     // Arrows/crosswalks/stop-lines go at each approach's stop line, snapped to the
     // junction-cluster boundary (`stop`) so on a multi-node crossing they sit at
     // its real mouth, not inside it. Interior links are inside the box and skipped.
@@ -602,42 +840,18 @@ pub fn marking_mesh(net: &Network) -> StaticMesh {
     crosswalks(net, &interior, &stop, &mut mesh);
     stop_yield_markings(net, &interior, &stop, &mut mesh);
     // The junction marker hugs each *real* crossing's local box (≥ 3 arms
-    // forming ≥ 2 distinct streets) — on a sprawling divided-road cluster that
-    // is one outline per carriageway crossing, not a hull quad slicing across
-    // mid-block pavement, and never an outline around a stop-line stub or a
-    // collinear chain node. Where two crossings sit so close their boxes
-    // overlap (a tight divided crossing just past the sprawl threshold), only
-    // the stronger keeps its outline — intertwined rings read as scribble.
-    // A marked box must read as a fat crossing outline, not a clipped sliver: a
-    // floor on area (a real box is ~200+ m²) and on compactness (a thin wedge
-    // fails even at large area). Below either it still paves but is not outlined.
-    const MIN_MARKER_AREA: f64 = 40.0;
-    // A full crossing box is a quad (compactness ≥ ~0.7 square, ~0.55 at a 45°
-    // skew — steeper than real arterials cross); a box clipped to a near-
-    // triangle by a close cluster neighbour falls below and is a wedge, not a
-    // legible outline.
-    const MIN_MARKER_COMPACTNESS: f64 = 0.55;
-    for r in &rings.rings {
-        let mut marked: Vec<&NodeBox> = r
-            .boxes
-            .iter()
-            .filter(|b| {
-                b.arms >= 3
-                    && b.streets >= 2
-                    && polygon_area(&b.ring) >= MIN_MARKER_AREA
-                    && compactness(&b.ring) >= MIN_MARKER_COMPACTNESS
-            })
-            .collect();
-        marked.sort_by_key(|b| (std::cmp::Reverse(b.arms), b.node));
-        let mut kept: Vec<&NodeBox> = Vec::new();
-        for b in marked {
-            if kept.iter().any(|k| point_in_ring(&k.ring, b.apex)) {
-                continue;
+    // forming ≥ 2 distinct streets, fat enough) — on a sprawling divided-road
+    // cluster that is one outline per carriageway crossing; on a compact or
+    // tangled cluster the one unifying box; a free-flow freeway merge/diverge
+    // gets none (`outlined_boxes` drops it — a merge is not an at-grade
+    // crossing). The outline exactly traces the boxes the fill topology chose,
+    // never a stop-line stub, collinear chain node, or clipped wedge.
+    for (ci, r) in rings.rings.iter().enumerate() {
+        for &i in &outlined_boxes(net, ci, &r.boxes) {
+            let ring = &r.boxes[i].ring;
+            for k in 0..ring.len() {
+                mesh.push_ribbon(ring[k], ring[(k + 1) % ring.len()], JUNCTION_MARKER_HALF_W, JUNCTION_MARKER_COLOR, 0.0);
             }
-            for k in 0..b.ring.len() {
-                mesh.push_ribbon(b.ring[k], b.ring[(k + 1) % b.ring.len()], JUNCTION_MARKER_HALF_W, JUNCTION_MARKER_COLOR, 0.0);
-            }
-            kept.push(b);
         }
     }
     mesh
@@ -1033,6 +1247,28 @@ mod tests {
         }
     }
 
+    fn box_at(node: u32, cx: f64, cy: f64, r: f64) -> NodeBox {
+        let ring = round_corners(&[[cx - r, cy - r], [cx + r, cy - r], [cx + r, cy + r], [cx - r, cy + r]], CURB_RADIUS);
+        NodeBox { node, apex: [cx, cy], arms: 4, streets: 2, ring }
+    }
+
+    #[test]
+    fn marked_boxes_counts_clean_nonoverlapping_crossings() {
+        // Two fat quads far apart → both count (the divided-arterial signal
+        // that keeps decomposition). A third fat quad overlapping the first is
+        // deduped; a tiny quad fails the area floor.
+        let mut boxes = vec![box_at(0, 0.0, 0.0, 8.0), box_at(1, 40.0, 0.0, 8.0)];
+        assert_eq!(marked_boxes(&boxes).len(), 2, "two separate fat crossings both mark");
+        boxes.push(box_at(2, 1.5, 1.5, 8.0)); // overlaps box 0
+        boxes.push(box_at(3, 80.0, 0.0, 2.0)); // area ~16 < floor
+        assert_eq!(marked_boxes(&boxes), vec![0, 1], "overlap deduped, sliver dropped");
+
+        // A lone fat crossing amid slivers → 1 marked, so a sprawling cluster
+        // here would fall back to one unifying hull instead of decomposing.
+        let tangle = vec![box_at(0, 0.0, 0.0, 8.0), box_at(1, 40.0, 0.0, 2.0), box_at(2, -40.0, 0.0, 2.0)];
+        assert_eq!(marked_boxes(&tangle).len(), 1, "one clean crossing → decomposition would not hold");
+    }
+
     /// The El Camino Real × Millbrae Avenue divided crossing (fixture 0): its one
     /// sprawling junction cluster must render as *several* real crossing boxes,
     /// not a single hull — one carriageway crossing plus the cross-street
@@ -1043,19 +1279,105 @@ mod tests {
         let net = map::millbrae_junction(0);
         let rings = junction_rings(&net);
         assert_eq!(rings.rings.len(), 1, "fixture 0 is one junction cluster");
-        let marked: Vec<&NodeBox> =
-            rings.rings[0].boxes.iter().filter(|b| b.arms >= 3 && b.streets >= 2).collect();
+        // The real marker/fill signal: ≥ 2 non-overlapping clean crossings, so
+        // the cluster decomposes (not the tangle-fallback hull).
+        let marked = marked_boxes(&rings.rings[0].boxes);
         assert!(
             marked.len() >= 2,
             "a divided arterial crossing reads as multiple local boxes, got {}",
             marked.len()
         );
-        // No marked box's centre sits inside another's ring — the outlines are
-        // distinct crossings, not intertwined scribble.
-        for (i, a) in marked.iter().enumerate() {
-            for (j, b) in marked.iter().enumerate() {
-                if i != j {
-                    assert!(!point_in_ring(&a.ring, b.apex), "marked boxes {i},{j} overlap at a node");
+        assert!(
+            rings.rings[0].boxes.iter().all(|b| b.node != WHOLE_CLUSTER),
+            "a genuine divided crossing decomposes, never the unifying hull"
+        );
+        // An at-grade crossing keeps its crossing outline — the interchange
+        // suppression must not touch it (surface arterials, not grade-separated).
+        assert!(
+            !outlined_boxes(&net, 0, &rings.rings[0].boxes).is_empty(),
+            "an at-grade divided crossing keeps its blue crossing outline"
+        );
+    }
+
+    /// A freeway free-flow merge (every incident link grade-separated) is not an
+    /// at-grade crossing: its ribbons + fill still pave the gore, but it carries
+    /// no blue crossing outline. Was the ugly leaf marker on the peninsula gores.
+    #[cfg(feature = "import")]
+    #[test]
+    fn a_freeway_merge_carries_no_crossing_outline() {
+        // Motorway mainline W→C→E with a ramp merging at C. Node C has degree 3
+        // (an intersection to `build_junctions`) but every arm is grade-separated.
+        let mw = |a, b| LinkSpec { road_class: "motorway".into(), ..LinkSpec::oneway(a, b, 3, 29.0) };
+        let ramp = |a, b| LinkSpec { road_class: "motorway_link".into(), ..LinkSpec::oneway(a, b, 1, 20.0) };
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, -200.0, 0.0),
+                NodeSpec::uncontrolled(2, 0.0, 0.0),
+                NodeSpec::uncontrolled(3, 200.0, 0.0),
+                NodeSpec::uncontrolled(4, -140.0, -140.0),
+            ],
+            links: vec![mw(1, 2), mw(2, 3), ramp(4, 2)],
+        }
+        .build();
+        let c = net.nodes.iter().position(|n| n.position == [0.0, 0.0]).unwrap();
+        assert!(net.is_interchange_node(NodeId(c as u32)), "the merge is a grade-separated interchange node");
+        let rings = junction_rings(&net);
+        assert!(!rings.rings.is_empty(), "the merge forms a junction cluster");
+        for (ci, r) in rings.rings.iter().enumerate() {
+            assert!(
+                outlined_boxes(&net, ci, &r.boxes).is_empty(),
+                "a free-flow freeway merge carries no crossing outline"
+            );
+        }
+        // The gore is still paved — suppression drops only the outline, not the
+        // fill: the junction mesh has geometry.
+        assert!(!junction_mesh(&net).is_empty(), "the merge gore is still paved");
+    }
+
+    /// A complex tangle whose decomposition finds < 2 clean crossings falls back
+    /// to one unifying box — fixture 0's tighter siblings and every San Carlos /
+    /// SF tangle rely on this. Verified structurally via `marked_boxes` above and
+    /// visually via the `diag_city_views` diagnostic; here we assert the
+    /// invariant that a cluster is *either* decomposed into ≥ 2 clean crossings
+    /// *or* a single whole-cluster box — never a scatter of unmarked slivers.
+    #[cfg(feature = "import")]
+    #[test]
+    fn every_cluster_is_decomposed_or_unified_never_a_sliver_scatter() {
+        for name in ["sancarlos", "sf", "map"] {
+            let path = format!("{}/../web/public/{name}.json", env!("CARGO_MANIFEST_DIR"));
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let net = map::OsmMap::from_json(&text).expect("city json").build();
+            let rings = junction_rings(&net);
+            for r in &rings.rings {
+                if r.boxes.iter().any(|b| b.node == WHOLE_CLUSTER) {
+                    assert_eq!(r.boxes.len(), 1, "{name}: a unified cluster is exactly one box");
+                } else if !r.boxes.is_empty() {
+                    assert!(
+                        marked_boxes(&r.boxes).len() >= 2,
+                        "{name}: a decomposed cluster must have ≥ 2 clean crossings, not a sliver scatter"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Interior links (both ends in one junction) are paved over by the box, so
+    /// their lane markings must not render — otherwise dividers/edge-lines
+    /// scribble across the drawn intersection (the San Carlos / SF tangle
+    /// artifact). No divider segment of fixture 0 may lie inside a junction box.
+    #[cfg(feature = "import")]
+    #[test]
+    fn interior_link_markings_do_not_scribble_across_the_box() {
+        let net = map::millbrae_junction(0);
+        let rings = junction_rings(&net);
+        for d in net.lane_dividers() {
+            let mid = [(d[0] + d[2]) * 0.5, (d[1] + d[3]) * 0.5];
+            for r in &rings.rings {
+                for b in &r.boxes {
+                    assert!(
+                        !point_in_ring(&b.ring, mid),
+                        "a lane divider at {mid:?} falls inside a junction box — interior markings not suppressed"
+                    );
                 }
             }
         }
@@ -1103,6 +1425,112 @@ mod tests {
         .build();
         assert_eq!(road_mesh(&net).vertices.len(), 4, "only the surface link is at grade");
         assert_eq!(overpass_mesh(&net).vertices.len(), 4, "the bridge draws on top");
+    }
+
+    #[test]
+    fn overpass_band_draws_after_the_surface_it_crosses() {
+        // A layer-1 bridge over a surface road with markings. The band model
+        // must place the bridge's fill in a LATER band than the surface road's
+        // markings, so the bridge's opaque ribbon covers the lane lines below
+        // instead of them bleeding over it.
+        let surface = |a, b| LinkSpec { road_class: "secondary".into(), ..LinkSpec::oneway(a, b, 2, 20.0) };
+        let bridge = |a, b| LinkSpec { road_class: "secondary".into(), layer: 1, ..LinkSpec::oneway(a, b, 2, 20.0) };
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, -100.0, 0.0),
+                NodeSpec::uncontrolled(2, 100.0, 0.0),
+                NodeSpec::uncontrolled(3, 0.0, -100.0),
+                NodeSpec::uncontrolled(4, 0.0, 100.0),
+            ],
+            links: vec![surface(1, 2), bridge(3, 4)],
+        }
+        .build();
+        let bands = world_bands(&net);
+        // The surface road (layer 0) has lane markings; the bridge (layer 1) has
+        // fill in a strictly later band.
+        let surface_band = bands.iter().position(|b| !b.marking.is_empty()).expect("surface markings exist");
+        let bridge_band = bands
+            .iter()
+            .rposition(|b| !b.fill.is_empty())
+            .expect("bridge fill exists");
+        assert!(
+            bridge_band > surface_band,
+            "the overpass fill (band {bridge_band}) draws after the surface markings (band {surface_band}), covering them"
+        );
+    }
+
+    /// The GPU draws per band range into the concatenated world/marking buffers,
+    /// so `world_mesh`/`marking_mesh` MUST equal the bands concatenated in order —
+    /// otherwise the browser's band ranges index the wrong triangles. This can't
+    /// be checked visually here (the GPU path is wasm-only), so pin it exactly.
+    #[cfg(feature = "import")]
+    #[test]
+    fn band_ranges_partition_the_concatenated_meshes() {
+        for net in [map::millbrae_junction(0), map::arterial_intersection()] {
+            let bands = world_bands(&net);
+            let (mut wcat, mut mcat) = (StaticMesh::default(), StaticMesh::default());
+            for b in &bands {
+                wcat.extend(&b.fill);
+                mcat.extend(&b.marking);
+            }
+            assert_eq!(wcat, world_mesh(&net), "world_mesh is the bands' fills concatenated in order");
+            assert_eq!(mcat, marking_mesh(&net), "marking_mesh is the bands' markings concatenated in order");
+            // The bridge's per-band index ranges (cumulative counts) therefore
+            // cover the whole index arrays exactly, in order.
+            let (wsum, msum): (usize, usize) =
+                bands.iter().fold((0, 0), |(w, m), b| (w + b.fill.indices.len(), m + b.marking.indices.len()));
+            assert_eq!(wsum, world_mesh(&net).indices.len());
+            assert_eq!(msum, marking_mesh(&net).indices.len());
+        }
+    }
+
+    #[test]
+    fn same_grade_bands_order_by_road_class() {
+        // Two crossing roads at grade, different class: the band model orders
+        // them by class so a consistent surface wins where they overlap, rather
+        // than every lane line drawing over every surface. A major road's band
+        // comes after a minor road's.
+        let major = |a, b| LinkSpec { road_class: "primary".into(), ..LinkSpec::oneway(a, b, 2, 25.0) };
+        let minor = |a, b| LinkSpec { road_class: "residential".into(), ..LinkSpec::oneway(a, b, 1, 13.0) };
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, -300.0, 0.0),
+                NodeSpec::uncontrolled(2, 300.0, 0.0),
+                NodeSpec::uncontrolled(3, 0.0, -300.0),
+                NodeSpec::uncontrolled(4, 0.0, 300.0),
+            ],
+            links: vec![major(1, 2), minor(3, 4)],
+        }
+        .build();
+        // With distinct classes, the at-grade roads split into ≥ 2 bands ordered
+        // minor→major (before the junction band). Confirm a strict ordering
+        // exists rather than one undifferentiated at-grade band.
+        let road_bands = world_bands(&net).into_iter().filter(|b| !b.fill.is_empty()).count();
+        assert!(road_bands >= 2, "distinct-class at-grade roads occupy separate render bands, got {road_bands}");
+    }
+
+    #[test]
+    fn rail_draws_above_the_at_grade_roads_it_crosses() {
+        // A track crossing a surface road: the rail band (bed fill + steel-rail
+        // markings) draws after every road band and the junction band at the
+        // same grade layer, so crossing rails stay visible over the pavement —
+        // and a rail-less map gains no band at all.
+        let mut net = map::arterial_intersection();
+        let before = world_bands(&net).len();
+        net.rail.lines.push(crate::sim::rail::RailLine::new(
+            "rail".into(),
+            "test".into(),
+            vec![[-200.0, 10.0], [200.0, 10.0]],
+            vec![(0, 35.0)],
+            vec![(0, 0)],
+        ));
+        let bands = world_bands(&net);
+        assert_eq!(bands.len(), before + 1, "one new rail band at grade 0");
+        let rail_band = bands.last().expect("bands exist");
+        assert!(!rail_band.fill.is_empty() && !rail_band.marking.is_empty(), "ballast + rails in the top band");
+        // Bands are keyed (layer, rank): at one grade layer the rail band is last.
+        let junction_band = bands.iter().rposition(|b| b.fill != rail_band.fill).expect("junction band below");
+        assert!(junction_band < bands.len() - 1);
     }
 
     #[test]

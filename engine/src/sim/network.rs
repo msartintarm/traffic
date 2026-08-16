@@ -362,6 +362,10 @@ pub struct Network {
     /// runs; vehicle placement, dividers, strips, and mouths fall back to the
     /// centreline-offset model until then.
     pub lane_bounds: Vec<LaneBounds>,
+    /// Rail geometry (tracks / stations / platforms), riding on the road network
+    /// so every render backend sees it through the one `&Network`. Empty on
+    /// hand-built maps; trains themselves live in the world's timetable.
+    pub rail: super::rail::RailNetwork,
 }
 
 fn movement_pair_key(a: MovementId, b: MovementId) -> u64 {
@@ -973,6 +977,19 @@ impl Network {
 
     pub fn node_junction(&self, node: NodeId) -> Option<JunctionId> {
         self.node_junction.get(node.idx()).copied().flatten()
+    }
+
+    /// Whether a link lies wholly inside one junction cluster (both endpoints in
+    /// the same junction) — a short interior stub the junction fill paves over.
+    /// Its lane markings must not render, or they scribble across the drawn
+    /// intersection box; `road_strips`/`lane_dividers` skip it, as the arrow and
+    /// crosswalk placement already do (`render::geometry::interior_links`).
+    pub fn link_is_junction_interior(&self, link: LinkId) -> bool {
+        let l = &self.links[link.idx()];
+        matches!(
+            (self.node_junction(l.from), self.node_junction(l.to)),
+            (Some(a), Some(b)) if a == b
+        )
     }
 
     /// The external approach link a path entered a junction through, tracing back
@@ -1656,30 +1673,41 @@ impl Network {
     pub fn road_strips(&self) -> Vec<[f64; 5]> {
         let mut out = Vec::new();
         for i in 0..self.links.len() {
-            if let Some(lb) = self.link_bounds(LinkId(i as u32)) {
-                let n = self.links[i].lane_count as usize;
-                for si in 1..lb.stations.len() {
-                    let (m0, c0) = (lb.bounds[0][si - 1], lb.bounds[n][si - 1]);
-                    let (m1, c1) = (lb.bounds[0][si], lb.bounds[n][si]);
-                    let w = (norm(sub(c0, m0)) + norm(sub(c1, m1))) * 0.5;
-                    if w < 1e-6 {
-                        continue;
-                    }
-                    let mid = |a: [f64; 2], b: [f64; 2]| [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
-                    let (a, b) = (mid(m0, c0), mid(m1, c1));
-                    out.push([a[0], a[1], b[0], b[1], w]);
-                }
-                continue;
+            if self.link_is_junction_interior(LinkId(i as u32)) {
+                continue; // paved over by the junction box — its edge lines would scribble across it
             }
-            let w = self.links[i].lane_count as f64 * LANE_WIDTH;
-            let c = w / 2.0;
-            for seg in self.drivable_polyline(LinkId(i as u32)).windows(2) {
-                let dir = unit(sub(seg[1], seg[0]));
-                let n = [dir[1] * c, -dir[0] * c];
-                out.push([seg[0][0] + n[0], seg[0][1] + n[1], seg[1][0] + n[0], seg[1][1] + n[1], w]);
-            }
+            self.link_strips(LinkId(i as u32), &mut out);
         }
         out
+    }
+
+    /// One link's carriageway strip segments `[x0, y0, x1, y1, width]`, appended
+    /// to `out`. Factored from [`road_strips`] so the render's per-layer bands can
+    /// bucket a link's edge/centre lines by its grade/priority.
+    pub fn link_strips(&self, id: LinkId, out: &mut Vec<[f64; 5]>) {
+        let i = id.idx();
+        if let Some(lb) = self.link_bounds(id) {
+            let n = self.links[i].lane_count as usize;
+            for si in 1..lb.stations.len() {
+                let (m0, c0) = (lb.bounds[0][si - 1], lb.bounds[n][si - 1]);
+                let (m1, c1) = (lb.bounds[0][si], lb.bounds[n][si]);
+                let w = (norm(sub(c0, m0)) + norm(sub(c1, m1))) * 0.5;
+                if w < 1e-6 {
+                    continue;
+                }
+                let mid = |a: [f64; 2], b: [f64; 2]| [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
+                let (a, b) = (mid(m0, c0), mid(m1, c1));
+                out.push([a[0], a[1], b[0], b[1], w]);
+            }
+            return;
+        }
+        let w = self.links[i].lane_count as f64 * LANE_WIDTH;
+        let c = w / 2.0;
+        for seg in self.drivable_polyline(id).windows(2) {
+            let dir = unit(sub(seg[1], seg[0]));
+            let n = [dir[1] * c, -dir[0] * c];
+            out.push([seg[0][0] + n[0], seg[0][1] + n[1], seg[1][0] + n[0], seg[1][1] + n[1], w]);
+        }
     }
 
     /// Interior lane-divider segments `[x0, y0, x1, y1]`. With lane bounds built
@@ -1689,76 +1717,87 @@ impl Network {
     pub fn lane_dividers(&self) -> Vec<[f64; 4]> {
         let mut out = Vec::new();
         for i in 0..self.links.len() {
-            let link = self.links[i];
-            let lanes = link.lane_count;
-            if let Some(lb) = self.link_bounds(LinkId(i as u32)) {
-                let n = lanes as usize;
-                for k in 1..n {
-                    for si in 1..lb.stations.len() {
-                        let (a, b) = (lb.bounds[k][si - 1], lb.bounds[k][si]);
-                        let on_edge = |p: [f64; 2], q: [f64; 2]| norm(sub(p, q)) < 0.3;
-                        if on_edge(a, lb.bounds[0][si - 1]) && on_edge(b, lb.bounds[0][si]) {
-                            continue;
-                        }
-                        if on_edge(a, lb.bounds[n][si - 1]) && on_edge(b, lb.bounds[n][si]) {
-                            continue;
-                        }
-                        if norm(sub(a, b)) > 1e-6 {
-                            out.push([a[0], a[1], b[0], b[1]]);
-                        }
-                    }
-                }
-                continue;
+            if self.link_is_junction_interior(LinkId(i as u32)) {
+                continue; // paved over by the junction box — its dividers would scribble across it
             }
-            let taper = |k: u32| self.lane(LaneId(link.lane_start.0 + k)).pocket_taper;
-            let has_pocket = (0..lanes).any(|k| taper(k) > 0.0);
-            let poly = self.drivable_polyline(LinkId(i as u32));
-            if !has_pocket {
-                for seg in poly.windows(2) {
-                    let dir = unit(sub(seg[1], seg[0]));
-                    let (nx, ny) = (dir[1], -dir[0]);
-                    for k in 1..lanes {
-                        let off = k as f64 * LANE_WIDTH;
-                        out.push([seg[0][0] + nx * off, seg[0][1] + ny * off, seg[1][0] + nx * off, seg[1][1] + ny * off]);
-                    }
-                }
-                continue;
-            }
-            // Pocket approach: subdivide so a divider follows the tapering boundary.
-            // `to_line` (distance to the stop line) drives the pocket offset, so
-            // track cumulative distance from the upstream end and subtract from the
-            // total to get each sample's distance to the stop line.
-            let total: f64 = poly.windows(2).map(|w| norm(sub(w[1], w[0]))).sum();
-            let boundary = |k: u32, to_line: f64| -> f64 {
-                let a = self.lane_offset_at(self.lane(LaneId(link.lane_start.0 + k - 1)), to_line);
-                let b = self.lane_offset_at(self.lane(LaneId(link.lane_start.0 + k)), to_line);
-                0.5 * (a + b)
-            };
-            let lat = |p: [f64; 2], dir: [f64; 2], o: f64| [p[0] + dir[1] * o, p[1] - dir[0] * o];
-            const STEP: f64 = 2.0;
-            let mut s0 = 0.0f64; // distance from the upstream end to the segment start
-            for seg in poly.windows(2) {
-                let seg_len = norm(sub(seg[1], seg[0]));
-                if seg_len < 1e-6 {
-                    continue;
-                }
-                let dir = unit(sub(seg[1], seg[0]));
-                let steps = (seg_len / STEP).ceil().max(1.0) as usize;
-                for k in 1..lanes {
-                    for t in 0..steps {
-                        let (f0, f1) = (t as f64 / steps as f64, (t + 1) as f64 / steps as f64);
-                        let a = [seg[0][0] + (seg[1][0] - seg[0][0]) * f0, seg[0][1] + (seg[1][1] - seg[0][1]) * f0];
-                        let b = [seg[0][0] + (seg[1][0] - seg[0][0]) * f1, seg[0][1] + (seg[1][1] - seg[0][1]) * f1];
-                        let oa = boundary(k, total - (s0 + seg_len * f0));
-                        let ob = boundary(k, total - (s0 + seg_len * f1));
-                        let (pa, pb) = (lat(a, dir, oa), lat(b, dir, ob));
-                        out.push([pa[0], pa[1], pb[0], pb[1]]);
-                    }
-                }
-                s0 += seg_len;
-            }
+            self.link_dividers(LinkId(i as u32), &mut out);
         }
         out
+    }
+
+    /// One link's lane-divider segments, appended to `out`. Factored from
+    /// [`lane_dividers`] so the render's per-layer bands can bucket a link's
+    /// dividers by its grade/priority; the flat accessor loops non-interior links.
+    pub fn link_dividers(&self, id: LinkId, out: &mut Vec<[f64; 4]>) {
+        let i = id.idx();
+        let link = self.links[i];
+        let lanes = link.lane_count;
+        if let Some(lb) = self.link_bounds(id) {
+            let n = lanes as usize;
+            for k in 1..n {
+                for si in 1..lb.stations.len() {
+                    let (a, b) = (lb.bounds[k][si - 1], lb.bounds[k][si]);
+                    let on_edge = |p: [f64; 2], q: [f64; 2]| norm(sub(p, q)) < 0.3;
+                    if on_edge(a, lb.bounds[0][si - 1]) && on_edge(b, lb.bounds[0][si]) {
+                        continue;
+                    }
+                    if on_edge(a, lb.bounds[n][si - 1]) && on_edge(b, lb.bounds[n][si]) {
+                        continue;
+                    }
+                    if norm(sub(a, b)) > 1e-6 {
+                        out.push([a[0], a[1], b[0], b[1]]);
+                    }
+                }
+            }
+            return;
+        }
+        let taper = |k: u32| self.lane(LaneId(link.lane_start.0 + k)).pocket_taper;
+        let has_pocket = (0..lanes).any(|k| taper(k) > 0.0);
+        let poly = self.drivable_polyline(id);
+        if !has_pocket {
+            for seg in poly.windows(2) {
+                let dir = unit(sub(seg[1], seg[0]));
+                let (nx, ny) = (dir[1], -dir[0]);
+                for k in 1..lanes {
+                    let off = k as f64 * LANE_WIDTH;
+                    out.push([seg[0][0] + nx * off, seg[0][1] + ny * off, seg[1][0] + nx * off, seg[1][1] + ny * off]);
+                }
+            }
+            return;
+        }
+        // Pocket approach: subdivide so a divider follows the tapering boundary.
+        // `to_line` (distance to the stop line) drives the pocket offset, so
+        // track cumulative distance from the upstream end and subtract from the
+        // total to get each sample's distance to the stop line.
+        let total: f64 = poly.windows(2).map(|w| norm(sub(w[1], w[0]))).sum();
+        let boundary = |k: u32, to_line: f64| -> f64 {
+            let a = self.lane_offset_at(self.lane(LaneId(link.lane_start.0 + k - 1)), to_line);
+            let b = self.lane_offset_at(self.lane(LaneId(link.lane_start.0 + k)), to_line);
+            0.5 * (a + b)
+        };
+        let lat = |p: [f64; 2], dir: [f64; 2], o: f64| [p[0] + dir[1] * o, p[1] - dir[0] * o];
+        const STEP: f64 = 2.0;
+        let mut s0 = 0.0f64; // distance from the upstream end to the segment start
+        for seg in poly.windows(2) {
+            let seg_len = norm(sub(seg[1], seg[0]));
+            if seg_len < 1e-6 {
+                continue;
+            }
+            let dir = unit(sub(seg[1], seg[0]));
+            let steps = (seg_len / STEP).ceil().max(1.0) as usize;
+            for k in 1..lanes {
+                for t in 0..steps {
+                    let (f0, f1) = (t as f64 / steps as f64, (t + 1) as f64 / steps as f64);
+                    let a = [seg[0][0] + (seg[1][0] - seg[0][0]) * f0, seg[0][1] + (seg[1][1] - seg[0][1]) * f0];
+                    let b = [seg[0][0] + (seg[1][0] - seg[0][0]) * f1, seg[0][1] + (seg[1][1] - seg[0][1]) * f1];
+                    let oa = boundary(k, total - (s0 + seg_len * f0));
+                    let ob = boundary(k, total - (s0 + seg_len * f1));
+                    let (pa, pb) = (lat(a, dir, oa), lat(b, dir, ob));
+                    out.push([pa[0], pa[1], pb[0], pb[1]]);
+                }
+            }
+            s0 += seg_len;
+        }
     }
 
     /// Axis-aligned world bounds `[min_x, min_y, max_x, max_y]` over all nodes.

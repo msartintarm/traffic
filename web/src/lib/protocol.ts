@@ -50,7 +50,9 @@ export type Control =
   | { type: "hover"; wx: number; wy: number; x: number; y: number }
   | { type: "play" }
   | { type: "pause" }
-  | { type: "frameBudget"; value: boolean };
+  | { type: "frameBudget"; value: boolean }
+  | { type: "ascii"; value: boolean }
+  | { type: "transit"; value: boolean };
 
 export type ControlType = Control["type"];
 
@@ -58,7 +60,7 @@ export const CONTROL_TYPES: ReadonlySet<ControlType> = new Set([
   "speed", "demandRate", "rushHour", "dayCompression", "rampMetering", "sleepScheduler",
   "parThreshold", "parallelRouting", "cacheSort", "showCrashes", "clearCrashes", "entrySpeedCap", "congestionEngage", "congestionEnabled",
   "demandSources", "fit", "metersPerPixel", "zoomAt", "panBy", "resize", "select",
-  "hover", "play", "pause", "frameBudget",
+  "hover", "play", "pause", "frameBudget", "ascii", "transit",
 ] satisfies ControlType[]);
 
 export function isControl(msg: unknown): msg is Control {
@@ -167,7 +169,7 @@ export type InitMsg = { type: "init"; canvas: OffscreenCanvas; config: InitConfi
 // surfaces a boot/parse failure as the on-screen error.
 export type FromWorker =
   | { type: "ready"; backend: string; mapLabel: string; gpuRouting: boolean; fitMpp: number; congestionEnabled: boolean }
-  | { type: "frame"; snapshot: StatsSnapshot; selected: SelectedInfo | null; fitMpp: number }
+  | { type: "frame"; snapshot: StatsSnapshot; selected: SelectedInfo | null; fitMpp: number; ascii?: string | null }
   | { type: "hover"; name: string | null; x: number; y: number }
   | { type: "progress"; fraction: number; stage: string }
   | { type: "fatal"; message: string };
