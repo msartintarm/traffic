@@ -2733,6 +2733,7 @@ impl OsmMap {
     /// merged link to the real junction (`join_pass_through` keeps the
     /// stronger sign). Two-way pass-throughs (2-in/2-out) stay: with both
     /// directions controlled the protected junction is ambiguous.
+    #[cfg(feature = "import")]
     fn relocate_sign_nodes(&self) -> OsmMap {
         let (mut indeg, mut outdeg): (HashMap<i64, u32>, HashMap<i64, u32>) = (HashMap::new(), HashMap::new());
         for l in &self.links {

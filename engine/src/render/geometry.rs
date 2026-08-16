@@ -159,6 +159,22 @@ struct ClusterRing {
     boxes: Vec<NodeBox>,
 }
 
+/// Diagnostic accessor: per-cluster marked-box metrics (node, arms, streets,
+/// area, compactness), for the ignored render-review tests.
+#[cfg(test)]
+pub fn debug_junction_boxes(net: &Network) -> Vec<Vec<(u32, usize, usize, f64, f64)>> {
+    junction_rings(net)
+        .rings
+        .iter()
+        .map(|r| {
+            r.boxes
+                .iter()
+                .map(|b| (b.node, b.arms, b.streets, polygon_area(&b.ring), compactness(&b.ring)))
+                .collect()
+        })
+        .collect()
+}
+
 /// Cluster half-extent (m) above which the single-hull box model breaks and the
 /// cluster renders as per-node crossings: past this, member crossings have real
 /// medians and roadway between them that a hull would falsely pave.
@@ -351,10 +367,10 @@ fn point_in_ring(ring: &[[f64; 2]], p: [f64; 2]) -> bool {
 /// — never the mouth-midpoint bearing, which a short arm with a wide,
 /// laterally-offset cross-section (a stop-line flare 6 m out) skews by tens of
 /// degrees, splitting one street into two bogus axis groups.
-pub struct BoxArm {
-    pub m: [f64; 2],
-    pub o: [f64; 2],
-    pub axis: [f64; 2],
+struct BoxArm {
+    m: [f64; 2],
+    o: [f64; 2],
+    axis: [f64; 2],
 }
 
 /// Group arm axes into streets, sign-insensitively (within ~25° = one street:
@@ -407,13 +423,6 @@ fn convex_hull(pts: &[[f64; 2]]) -> Vec<[f64; 2]> {
 /// when the streets meet obliquely. Also returns the number of distinct streets
 /// (axis groups): one means the node is a widening or a collinear pass-through,
 /// not a visual crossing.
-pub use BoxArm as DiagBoxArm;
-
-#[cfg(test)]
-pub fn diag_junction_box(arms: &[BoxArm], c: [f64; 2]) -> (Vec<[f64; 2]>, usize) {
-    junction_box(arms, c)
-}
-
 fn junction_box(arms: &[BoxArm], c: [f64; 2]) -> (Vec<[f64; 2]>, usize) {
     let r = arms.iter().map(|a| norm(sub(a.m, c)).max(norm(sub(a.o, c)))).fold(0.0, f64::max) + 20.0;
     let mut poly = vec![[c[0] - r, c[1] - r], [c[0] + r, c[1] - r], [c[0] + r, c[1] + r], [c[0] - r, c[1] + r]];
@@ -520,6 +529,37 @@ fn round_corners(poly: &[[f64; 2]], radius: f64) -> Vec<[f64; 2]> {
     out
 }
 
+/// Signed polygon area (shoelace); the marker filter reads its magnitude to
+/// drop degenerate slivers left when a member node's box is over-clipped.
+fn polygon_area(poly: &[[f64; 2]]) -> f64 {
+    let n = poly.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mut a = 0.0;
+    for i in 0..n {
+        let (p, q) = (poly[i], poly[(i + 1) % n]);
+        a += p[0] * q[1] - q[0] * p[1];
+    }
+    (a * 0.5).abs()
+}
+
+/// Isoperimetric compactness `4π·area / perimeter²` ∈ (0, 1]: ~0.8 for a
+/// rounded box, →0 for a thin sliver. Separates a legible crossing outline (a
+/// fat box) from an over-clipped wedge better than raw area, which a long thin
+/// artifact can still exceed.
+fn compactness(poly: &[[f64; 2]]) -> f64 {
+    let n = poly.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let perim: f64 = (0..n).map(|i| norm(sub(poly[(i + 1) % n], poly[i]))).sum();
+    if perim < 1e-6 {
+        return 0.0;
+    }
+    std::f64::consts::TAU * 2.0 * polygon_area(poly) / (perim * perim)
+}
+
 fn sub(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
     [a[0] - b[0], a[1] - b[1]]
 }
@@ -568,9 +608,26 @@ pub fn marking_mesh(net: &Network) -> StaticMesh {
     // collinear chain node. Where two crossings sit so close their boxes
     // overlap (a tight divided crossing just past the sprawl threshold), only
     // the stronger keeps its outline — intertwined rings read as scribble.
+    // A marked box must read as a fat crossing outline, not a clipped sliver: a
+    // floor on area (a real box is ~200+ m²) and on compactness (a thin wedge
+    // fails even at large area). Below either it still paves but is not outlined.
+    const MIN_MARKER_AREA: f64 = 40.0;
+    // A full crossing box is a quad (compactness ≥ ~0.7 square, ~0.55 at a 45°
+    // skew — steeper than real arterials cross); a box clipped to a near-
+    // triangle by a close cluster neighbour falls below and is a wedge, not a
+    // legible outline.
+    const MIN_MARKER_COMPACTNESS: f64 = 0.55;
     for r in &rings.rings {
-        let mut marked: Vec<&NodeBox> =
-            r.boxes.iter().filter(|b| b.arms >= 3 && b.streets >= 2).collect();
+        let mut marked: Vec<&NodeBox> = r
+            .boxes
+            .iter()
+            .filter(|b| {
+                b.arms >= 3
+                    && b.streets >= 2
+                    && polygon_area(&b.ring) >= MIN_MARKER_AREA
+                    && compactness(&b.ring) >= MIN_MARKER_COMPACTNESS
+            })
+            .collect();
         marked.sort_by_key(|b| (std::cmp::Reverse(b.arms), b.node));
         let mut kept: Vec<&NodeBox> = Vec::new();
         for b in marked {
@@ -934,6 +991,74 @@ mod tests {
         let mesh = road_mesh(&net);
         assert_eq!(mesh.vertices.len(), net.links.len() * 4);
         assert_eq!(mesh.indices.len(), net.links.len() * 6);
+    }
+
+    #[test]
+    fn street_groups_merge_collinear_arms_and_split_the_crossing_axis() {
+        // A right-angle crossing: E and W arms (opposite bearings, one street)
+        // must share a group; N is the second street. Direction sign is ignored.
+        let e = [1.0, 0.0];
+        let w = [-1.0, 0.0];
+        let n = [0.0, 1.0];
+        let g = street_groups(&[e, w, n]);
+        assert_eq!(g[0], g[1], "opposite arms of one street group together");
+        assert_ne!(g[0], g[2], "the crossing street is its own group");
+        assert_eq!(g.iter().max().map_or(0, |&x| x + 1), 2, "two distinct streets");
+    }
+
+    #[test]
+    fn junction_box_of_a_right_angle_crossing_is_a_quad_over_the_node() {
+        // Two 2-lane streets crossing at the origin at 90°, mouths one lane
+        // (~3.65 m) out each way. The box should be a convex quad spanning the
+        // node, reporting two streets.
+        let hw = LANE_WIDTH; // one lane's half-street reach
+        let arms = vec![
+            BoxArm { m: [hw, hw], o: [hw, -hw], axis: [1.0, 0.0] },   // E
+            BoxArm { m: [-hw, -hw], o: [-hw, hw], axis: [-1.0, 0.0] }, // W
+            BoxArm { m: [-hw, hw], o: [hw, hw], axis: [0.0, 1.0] },   // N
+            BoxArm { m: [hw, -hw], o: [-hw, -hw], axis: [0.0, -1.0] }, // S
+        ];
+        let (poly, streets) = junction_box(&arms, [0.0, 0.0]);
+        assert_eq!(streets, 2);
+        assert!(poly.len() >= 4, "a crossing box is at least a quad: {poly:?}");
+        assert!(point_in_ring(&poly, [0.0, 0.0]), "the box covers the crossing node");
+    }
+
+    #[test]
+    fn convex_hull_wraps_a_point_cloud() {
+        let hull = convex_hull(&[[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0], [1.0, 1.0]]);
+        assert_eq!(hull.len(), 4, "the interior point is dropped: {hull:?}");
+        for corner in [[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]] {
+            assert!(hull.contains(&corner), "hull keeps every extreme corner");
+        }
+    }
+
+    /// The El Camino Real × Millbrae Avenue divided crossing (fixture 0): its one
+    /// sprawling junction cluster must render as *several* real crossing boxes,
+    /// not a single hull — one carriageway crossing plus the cross-street
+    /// crossing — with the marker outlines non-overlapping.
+    #[cfg(feature = "import")]
+    #[test]
+    fn a_divided_crossing_decomposes_into_multiple_local_boxes() {
+        let net = map::millbrae_junction(0);
+        let rings = junction_rings(&net);
+        assert_eq!(rings.rings.len(), 1, "fixture 0 is one junction cluster");
+        let marked: Vec<&NodeBox> =
+            rings.rings[0].boxes.iter().filter(|b| b.arms >= 3 && b.streets >= 2).collect();
+        assert!(
+            marked.len() >= 2,
+            "a divided arterial crossing reads as multiple local boxes, got {}",
+            marked.len()
+        );
+        // No marked box's centre sits inside another's ring — the outlines are
+        // distinct crossings, not intertwined scribble.
+        for (i, a) in marked.iter().enumerate() {
+            for (j, b) in marked.iter().enumerate() {
+                if i != j {
+                    assert!(!point_in_ring(&a.ring, b.apex), "marked boxes {i},{j} overlap at a node");
+                }
+            }
+        }
     }
 
     #[test]

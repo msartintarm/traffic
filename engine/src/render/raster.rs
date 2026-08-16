@@ -346,6 +346,11 @@ mod golden {
                 lane.start_offset, lane.start_offset + lane.length
             );
         }
+        for (ci, boxes) in crate::render::geometry::debug_junction_boxes(&net).iter().enumerate() {
+            for &(node, arms, streets, area, comp) in boxes {
+                println!("  box cluster {ci} node {node}: arms={arms} streets={streets} area={area:.1} compact={comp:.3}");
+            }
+        }
         let out = std::env::var("CROP_DIR").unwrap_or_else(|_| ".".into());
         for (name, c, half) in [("full", [0.0, 0.0], 90.0), ("core", [0.0, 0.0], 45.0), ("west", [-40.0, 5.0], 30.0), ("east", [28.0, 10.0], 30.0)] {
             let mut r = Raster::centered(c, half, 768, BG);
@@ -374,42 +379,6 @@ mod golden {
             std::fs::write(format!("{out}/realmap_{rank}.png"), encode(768, 768, &r.rgb())).unwrap();
             println!("realmap_{rank}: junction {ji} at ({:.0},{:.0}) nodes={} arms={}", c[0], c[1],
                 net.junctions[ji].nodes.len(), net.junctions[ji].mouths.len());
-        }
-    }
-
-    #[test]
-    #[ignore] // diagnostic: per-node arm mouths feeding the local boxes
-    fn diag_node_arms() {
-        use crate::sim::network::LinkId;
-        let net = millbrae_junction(0);
-        for j in &net.junctions {
-            for &nd in &j.nodes {
-                let c = net.node(nd).position;
-                println!("node {} at ({:.1},{:.1}):", nd.0, c[0], c[1]);
-                for (i, l) in net.links.iter().enumerate() {
-                    let (li, to) = if l.to == nd { (i, true) } else if l.from == nd { (i, false) } else { continue };
-                    if l.layer != 0 { continue; }
-                    let (m, o) = net.arm_mouth(LinkId(li as u32), to);
-                    println!("  link {li} {} mouth ({:.1},{:.1})-({:.1},{:.1}) [{}l]",
-                        if to { "in " } else { "out" }, m[0], m[1], o[0], o[1], l.lane_count);
-                }
-                let arms: Vec<crate::render::geometry::DiagBoxArm> = net
-                    .links
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, l)| l.layer == 0)
-                    .filter_map(|(i, l)| {
-                        let to = if l.to == nd { true } else if l.from == nd { false } else { return None };
-                        let (m, o) = net.arm_mouth(LinkId(i as u32), to);
-                        let axis = if to { net.arrival_dir(LinkId(i as u32)) } else { net.departure_dir(LinkId(i as u32)) };
-                        Some(crate::render::geometry::DiagBoxArm { m, o, axis })
-                    })
-                    .collect();
-                if arms.len() >= 2 {
-                    let (poly, streets) = crate::render::geometry::diag_junction_box(&arms, c);
-                    println!("  box streets={streets} poly={:?}", poly.iter().map(|p| [(p[0]*10.0).round()/10.0, (p[1]*10.0).round()/10.0]).collect::<Vec<_>>());
-                }
-            }
         }
     }
 

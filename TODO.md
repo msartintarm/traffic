@@ -249,6 +249,20 @@ dividers, strips, edge lines, mouths); pocket bays as real edge geometry;
 `junction_interiors_hug_their_corners_and_never_swap_lanes`,
 `through_seams_are_stitched_shut_across_the_map`, and the golden junction screenshots.
 
+Stage 4 (2026-08-15 — junction *render* decomposition): `render::geometry::junction_rings`
+no longer paves a sprawling divided crossing as one convex hull (the borked El Camino ×
+Millbrae blue box slicing mid-block). A cluster within `SPRAWL_RADIUS` (18 m) stays one box
+(street-band for a lone node, `convex_hull` of mouths for a tight split); a wider cluster
+decomposes into per-member-node `junction_box`es from each node's `arm_mouth` cross-sections,
+tiled at perpendicular bisectors, with the real medians left unpaved. `junction_box` groups
+arms into streets by the link's own end direction (not the skew-prone mouth-midpoint bearing)
+and spans the node. Marker outlines drawn only for real crossings (≥ 3 arms, ≥ 2 streets, area
+≥ 40 m², compactness ≥ 0.55 — a wedge clip-artifact is dropped), non-overlapping. Stop lines /
+signal heads snap to each approach's *local* box. Golden screenshots reblessed; guarded by
+`a_divided_crossing_decomposes_into_multiple_local_boxes`, `street_groups_*`, `junction_box_*`,
+`convex_hull_*`, and the realism metrics (`the_crossing_core_is_solid_pavement`,
+`no_stray_nub_islands`). Diagnostics: `diag_junction_structure`, `diag_real_map_views` (ignored).
+
 ---
 
 ## Suggested order
