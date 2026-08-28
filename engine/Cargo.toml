@@ -65,6 +65,10 @@ wgpu = { version = "26", default-features = false, features = ["webgpu", "webgl"
 name = "scorecard"
 required-features = ["import"]
 
+[[example]]
+name = "spin_audit"
+required-features = ["import"]
+
 [dev-dependencies]
 # Native shader validation: parse + type-check meso.wgsl under `cargo test` so a
 # WGSL typo fails CI instead of silently producing a blank GPU pass in a browser

@@ -27,6 +27,12 @@ pub struct NetVehicle {
     pub lane: LaneId,
     pub position: f64,
     pub speed: f64,
+    /// Kinematic heading (rad): steers toward the path tangent each step but can
+    /// only slew as fast as a real car yaws (see [`NetWorld::settle_headings`]),
+    /// so no geometry defect — a kinked polyline, a degenerate interior — can
+    /// render as a physically impossible rotation. This is the heading the world
+    /// pose, the render, and the collision footprint all see.
+    heading: f64,
     pub driver: DriverConfig,
     pub route: Vec<LinkId>,
     pub route_idx: usize,
@@ -764,6 +770,13 @@ const DECISION_HORIZON: f64 = 180.0;
 /// far ahead a curve is read.
 const A_LAT: f64 = 3.0;
 const CURVE_LOOKAHEAD: f64 = 45.0;
+/// Bounds on how fast the kinematic heading can slew (see `settle_headings`):
+/// the sharpest curvature a car's steering geometry allows (tan 35° over a 2.7 m
+/// wheelbase — a ~3.9 m minimum turning radius) and the tyre-grip lateral limit
+/// (m/s², ~0.7 g) that caps yaw at speed. Together: `ω ≤ min(v·κ, grip/v)` —
+/// zero when stationary, peaking near 77°/s at ~5 m/s.
+const YAW_KAPPA_MAX: f64 = 0.26;
+const YAW_GRIP_LAT: f64 = 7.0;
 /// Maximum physical deceleration (m/s², ~0.9 g of tyre grip). IDM's interaction term is
 /// unbounded as the gap shrinks, so an unclamped car could compute hundreds of m/s² and
 /// teleport from highway speed to a dead stop in one tick. `integrate`/`advance_crossing`
@@ -781,6 +794,19 @@ const MERGE_APPROACH: f64 = 45.0;
 /// Floor on the cross-boundary leader search: even stopped, a car looks this far ahead
 /// (so it notices a queue starting to build just past the next node).
 const LEADER_HORIZON_MIN: f64 = 30.0;
+
+/// Signed shortest rotation `a → b`, in (-π, π] — so the heading slew always
+/// turns the short way round.
+fn shortest_angle(a: f64, b: f64) -> f64 {
+    let mut d = (b - a) % std::f64::consts::TAU;
+    if d > std::f64::consts::PI {
+        d -= std::f64::consts::TAU;
+    }
+    if d <= -std::f64::consts::PI {
+        d += std::f64::consts::TAU;
+    }
+    d
+}
 
 /// How far ahead a car needs to see to brake comfortably: its reaction (headway) distance
 /// plus its stopping distance at comfortable deceleration. The cross-boundary leader walk
@@ -1473,8 +1499,9 @@ impl NetWorld {
 
     pub fn spawn(&mut self, id: u32, lane: LaneId, position: f64, speed: f64, driver: DriverConfig) {
         self.link_entries[self.network.lane(lane).link.idx()] += 1;
+        let heading = self.network.lane_point(lane, position)[2];
         self.fleet.push(NetVehicle {
-            id, lane, position, speed, driver, route: Vec::new(), route_idx: 0, dest: None,
+            id, lane, position, speed, heading, driver, route: Vec::new(), route_idx: 0, dest: None,
             stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
         });
     }
@@ -1503,8 +1530,9 @@ impl NetWorld {
         let Some(lane) = lane else { return false };
         let speed = self.safe_entry_speed(lane, speed, &driver);
         self.link_entries[first.idx()] += 1;
+        let heading = self.network.lane_point(lane, 0.0)[2];
         self.fleet.push(NetVehicle {
-            id, lane, position: 0.0, speed, driver, route, route_idx: 0, dest: None,
+            id, lane, position: 0.0, speed, heading, driver, route, route_idx: 0, dest: None,
             stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
         });
         true
@@ -1526,8 +1554,9 @@ impl NetWorld {
             return false;
         }
         self.link_entries[first.idx()] += 1;
+        let heading = self.network.lane_point(lane, pos)[2];
         self.fleet.push(NetVehicle {
-            id, lane, position: pos, speed, driver, route, route_idx: 0, dest: None,
+            id, lane, position: pos, speed, heading, driver, route, route_idx: 0, dest: None,
             stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
         });
         true
@@ -1545,8 +1574,9 @@ impl NetWorld {
         let Some(lane) = self.entry_lane_toward(entry_link, admit_gap, id, Some(dest)) else { return false };
         let speed = self.safe_entry_speed(lane, speed, &driver);
         self.link_entries[entry_link.idx()] += 1;
+        let heading = self.network.lane_point(lane, 0.0)[2];
         self.fleet.push(NetVehicle {
-            id, lane, position: 0.0, speed, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
+            id, lane, position: 0.0, speed, heading, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
             stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
         });
         true
@@ -1621,8 +1651,9 @@ impl NetWorld {
     #[cfg(test)]
     pub fn spawn_to_in_lane(&mut self, id: u32, lane: LaneId, position: f64, dest: LinkId, speed: f64, driver: DriverConfig) {
         self.link_entries[self.network.lane(lane).link.idx()] += 1;
+        let heading = self.network.lane_point(lane, position)[2];
         self.fleet.push(NetVehicle {
-            id, lane, position, speed, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
+            id, lane, position, speed, heading, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
             stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
         });
     }
@@ -1746,9 +1777,20 @@ impl NetWorld {
     }
 
 
-    /// A vehicle's current world pose `[x, y, heading]` — its interior crossing
-    /// path when inside a node, otherwise its lane position.
+    /// A vehicle's current world pose `[x, y, heading]`: its position from the
+    /// path geometry, its heading from the kinematic state — the tangent-tracking,
+    /// yaw-rate-limited angle [`settle_headings`](Self::settle_headings) advances,
+    /// which is what the render and the collision footprint should see.
     pub fn vehicle_world_pose(&self, v: &NetVehicle) -> [f64; 3] {
+        let p = self.path_pose(v);
+        [p[0], p[1], v.heading]
+    }
+
+    /// The pose pure path geometry dictates — the interior crossing path when
+    /// inside a node, otherwise the lane position. Its heading is the raw path
+    /// tangent (it can step discontinuously at a vertex or a seam); the kinematic
+    /// heading steers toward it but never faster than a car can yaw.
+    fn path_pose(&self, v: &NetVehicle) -> [f64; 3] {
         if let Some(c) = v.crossing {
             let s = self.crossing_arc(v).clamp(0.0, self.network.interior(c.movement).len);
             return self.network.interior_point(c.movement, s);
@@ -1768,6 +1810,31 @@ impl NetWorld {
 
     pub fn vehicle(&self, id: u32) -> Option<&NetVehicle> {
         self.fleet.rows.iter().find(|v| v.id == id)
+    }
+
+    /// Advance every vehicle's kinematic heading toward its path tangent, at no
+    /// more than the yaw rate a real car can produce at its current speed. The
+    /// path tangent can step discontinuously (a polyline vertex, an interior
+    /// seam, a landing); this is the layer that guarantees the *pose* never does —
+    /// whatever the geometry, a rendered car physically cannot spin in place, and
+    /// a stationary car cannot rotate at all.
+    fn settle_headings(&mut self, dt: f64) {
+        for i in 0..self.fleet.rows.len() {
+            let v = &self.fleet.rows[i];
+            if v.speed <= 0.05 {
+                continue;
+            }
+            let target = self.path_pose(v)[2];
+            let omega = (v.speed * YAW_KAPPA_MAX).min(YAW_GRIP_LAT / v.speed);
+            let d = shortest_angle(v.heading, target).clamp(-omega * dt, omega * dt);
+            let h = &mut self.fleet.rows[i].heading;
+            *h += d;
+            if *h > std::f64::consts::PI {
+                *h -= std::f64::consts::TAU;
+            } else if *h <= -std::f64::consts::PI {
+                *h += std::f64::consts::TAU;
+            }
+        }
     }
 
     fn intended_movement(&self, veh: &NetVehicle) -> Option<MovementId> {
@@ -3133,6 +3200,7 @@ impl NetWorld {
         self.fleet.hist = hist;
         self.fleet.hist_len = hist_len;
         self.exited += exited;
+        self.settle_headings(dt);
         prof.lap(6);
         self.time += dt;
         self.tick += 1;
@@ -3341,7 +3409,14 @@ impl NetWorld {
         // like a free-flow seam — also when the discrete landing overrun would put the car
         // *inside* the occupant ahead (a fast crosser can overrun metres in one tick).
         let to_lane = self.network.movement(c.movement).to_lane;
-        let land_pos = (s - it.len).min(self.network.lane(to_lane).length);
+        // Land where the interior's exit *physically* sits on the new lane, not at
+        // arc zero: a straightened seam's exit can end past the lane's start point
+        // (overlapping arm mouths), and rebasing to 0 would slide the pose back
+        // over road already driven. Zero whenever exit and lane start coincide —
+        // every generic corner movement.
+        let start = self.network.lane_point(to_lane, 0.0);
+        let skip = ((it.exit[0] - start[0]) * start[2].cos() + (it.exit[1] - start[1]) * start[2].sin()).max(0.0);
+        let land_pos = (s - it.len + skip).min(self.network.lane(to_lane).length);
         let overrun = front.get(&to_lane.0).is_some_and(|&rear| land_pos > rear - veh.driver.min_gap);
         let blocked = overrun
             || (!self.free_flow_seam(c.movement) && !self.receiving_lane_clear(c.movement, front, veh.driver.min_gap));
@@ -3394,7 +3469,7 @@ impl NetWorld {
     /// target, so the pose is continuous at the seam and eases over at the standard
     /// lane-change rate — a lane remap reads as a normal merge, never a sideways snap.
     fn seam_landing_blend(&self, mid: MovementId, lat_shift: f64) -> Option<LaneChange> {
-        if !self.network.is_continuation_seam(mid) {
+        if !self.network.is_straight_seam(mid) {
             return None;
         }
         let mv = self.network.movement(mid);
@@ -8470,7 +8545,7 @@ mod tests {
                 .filter(|&id| {
                     let d = DriverConfig::car().sample(w.cfg.seed, id);
                     let probe = NetVehicle {
-                        id, lane: LaneId(0), position: 0.0, speed: 0.0, driver: d,
+                        id, lane: LaneId(0), position: 0.0, speed: 0.0, heading: 0.0, driver: d,
                         route: Vec::new(), route_idx: 0, dest: None, stopped_at: None,
                         wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
                     };

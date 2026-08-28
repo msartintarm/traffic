@@ -292,6 +292,9 @@ pub struct Network {
     pub interiors: Vec<Interior>,
     /// Crossing points between conflicting movements, over the whole network.
     pub conflicts: Vec<ConflictPoint>,
+    /// Whether each movement's interior was built as a straight seam (index-aligned
+    /// with `movements`; see [`is_straight_seam`](Self::is_straight_seam)).
+    straight_seams: Vec<bool>,
     /// Per-node render setback (metres): how far short of the node the drawn
     /// carriageway/markings stop — the junction-box edge. Smaller than a lane's
     /// stop-line setback (which adds a crosswalk margin), so lines run up to the
@@ -849,25 +852,31 @@ impl Network {
     /// depart to different links, and their interior paths pass within a lane
     /// width of each other — a genuine crossing, not a merge or a diverge.
     pub fn build_interiors(&mut self) {
-        self.interiors = (0..self.movements.len() as u32)
+        let built: Vec<(Interior, bool)> = (0..self.movements.len() as u32)
             .map(|m| {
                 let mv = self.movement(MovementId(m));
                 let entry = point2(self.lane_point(mv.from_lane, self.lane(mv.from_lane).length));
                 let exit = point2(self.lane_point(mv.to_lane, 0.0));
                 let arr = self.arrival_dir(self.lane(mv.from_lane).link);
                 let dep = self.departure_dir(self.lane(mv.to_lane).link);
+                // A straight run along the arrival direction, as far forward as the
+                // exit sits (a stub when it doesn't); the landing blend eases any
+                // lateral offset on the next link.
+                let straight = || {
+                    let d = sub(exit, entry);
+                    let gap = (d[0] * arr[0] + d[1] * arr[1]).max(0.25);
+                    let exit = [entry[0] + arr[0] * gap, entry[1] + arr[1] * gap];
+                    let c1 = [entry[0] + arr[0] * gap / 3.0, entry[1] + arr[1] * gap / 3.0];
+                    let c2 = [entry[0] + arr[0] * gap * 2.0 / 3.0, entry[1] + arr[1] * gap * 2.0 / 3.0];
+                    (Interior { entry, c1, c2, exit, len: gap }, true)
+                };
                 // A continuation seam is not a place a car steers: it runs straight
                 // through at its own lateral line, however far the target lane sits —
                 // the landing blend eases it over on the next link. A curve here would
                 // pack the whole lateral move into the node's ~1 m gap and double back
                 // on itself whenever the chord is mostly sideways.
                 if self.is_continuation_seam(MovementId(m)) {
-                    let d = sub(exit, entry);
-                    let gap = (d[0] * arr[0] + d[1] * arr[1]).max(0.25);
-                    let exit = [entry[0] + arr[0] * gap, entry[1] + arr[1] * gap];
-                    let c1 = [entry[0] + arr[0] * gap / 3.0, entry[1] + arr[1] * gap / 3.0];
-                    let c2 = [entry[0] + arr[0] * gap * 2.0 / 3.0, entry[1] + arr[1] * gap * 2.0 / 3.0];
-                    return Interior { entry, c1, c2, exit, len: gap };
+                    return straight();
                 }
                 // Control handles lie along the arrival and departure road
                 // directions, a third of the chord out, so the path leaves and
@@ -896,9 +905,33 @@ impl Network {
                 let c2 = [exit[0] - dep[0] * k2, exit[1] - dep[1] * k2];
                 let mut it = Interior { entry, c1, c2, exit, len: 0.0 };
                 it.len = interior_polyline(&it).last().map_or(0.0, |&(_, s)| s);
-                it
+                // Drivability check: a well-formed path never points backward
+                // against *both* its arrival and departure roads. Overlapping or
+                // nearly coincident mouths (a corridor bend whose incoming arm ends
+                // past the outgoing arm's start, a turn whose stop lines nearly
+                // touch) bend the Bézier into a hairpin or loop that does — a car
+                // on it reverses heading within a couple of metres, the physically
+                // impossible "tight spin". Fall back to the straight stub and let
+                // the landing rebase + blend carry the car onto the exit lane. A
+                // genuine U-turn (arrival ≈ −departure) can't trip this: no tangent
+                // opposes both directions at once.
+                // Sampled exactly the way `interior_point` serves tangents to
+                // vehicles (clamped centred difference), so a reversal squeezed
+                // into a cusp the coarse polyline chords step over is still seen.
+                let doubles_back = (0..=64).any(|k| {
+                    let t = k as f64 / 64.0;
+                    let a = bezier3(it.entry, it.c1, it.c2, it.exit, (t - 0.02).max(0.0));
+                    let b = bezier3(it.entry, it.c1, it.c2, it.exit, (t + 0.02).min(1.0));
+                    let d = unit(sub(b, a));
+                    d[0] * arr[0] + d[1] * arr[1] < -0.1 && d[0] * dep[0] + d[1] * dep[1] < -0.1
+                });
+                if doubles_back {
+                    return straight();
+                }
+                (it, false)
             })
             .collect();
+        (self.interiors, self.straight_seams) = built.into_iter().unzip();
 
         let polys: Vec<Vec<([f64; 2], f64)>> = self.interiors.iter().map(interior_polyline).collect();
         let bboxes: Vec<[f64; 4]> = polys.iter().map(|p| poly_bbox(p)).collect();
@@ -1590,6 +1623,16 @@ impl Network {
         self.is_interchange_movement(mid) && a[0] * b[0] + a[1] * b[1] > SEAM_ALIGN_DOT
     }
 
+    /// A movement whose interior was built as a *straight* run along the arrival
+    /// direction rather than the corner Bézier: every continuation seam, plus any
+    /// movement whose mouths make a curved path undrivable (overlapping or nearly
+    /// coincident arm mouths — see [`build_interiors`]). The seam-landing blend
+    /// keys off this: a straightened path lands wherever it lands and eases over
+    /// laterally, instead of assuming the interior delivered it to the target lane.
+    pub fn is_straight_seam(&self, mid: MovementId) -> bool {
+        self.straight_seams.get(mid.idx()).copied().unwrap_or_else(|| self.is_continuation_seam(mid))
+    }
+
     /// Whether every carriageway meeting `node` is grade-separated — a pure highway
     /// interchange point (diverge/merge/connector), with no at-grade cross street.
     pub fn is_interchange_node(&self, node: NodeId) -> bool {
@@ -1646,8 +1689,15 @@ impl Network {
             let dot = (a[0] * b[0] + a[1] * b[1]).clamp(-1.0, 1.0);
             let angle = cross.atan2(dot).abs();
             if angle > 1e-4 {
+                // Cap the segments entering the estimate: a sharp bend between two
+                // *long* straights is still a sharp bend — the turn happens within
+                // a car length or two of the vertex, not spread over the whole
+                // segment — so an uncapped average reads a 30° kink between 50 m
+                // segments as a gentle ~100 m curve and never slows for it. After
+                // import filleting, vertices are dense through curves and the
+                // capped estimate converges on the true arc radius.
                 let seg_out = norm(sub(poly[i + 1], poly[i]));
-                best = best.min(0.5 * (seg_in + seg_out) / angle);
+                best = best.min(0.5 * (seg_in.min(15.0) + seg_out.min(15.0)) / angle);
             }
         }
         best

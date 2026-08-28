@@ -592,7 +592,15 @@ mod tests {
                 let tx = tangent_at(&net, m, net.interior(m).len);
                 let dot = |a: [f64; 2], b: [f64; 2]| a[0] * b[0] + a[1] * b[1];
                 assert!(dot(te, arr) > 0.85, "junction {n} movement {} enters misaligned (dot {:.2})", m.0, dot(te, arr));
-                assert!(dot(tx, dep) > 0.85, "junction {n} movement {} exits misaligned (dot {:.2})", m.0, dot(tx, dep));
+                if net.is_straight_seam(m) {
+                    // A straightened movement (continuation seam, or a degenerate
+                    // corner whose mouths overlap/nearly touch) runs along the
+                    // arrival direction end to end; the turn happens after landing
+                    // via the yaw-limited heading, not inside the stub.
+                    assert!(dot(tx, arr) > 0.85, "junction {n} straight seam {} bends (dot {:.2})", m.0, dot(tx, arr));
+                } else {
+                    assert!(dot(tx, dep) > 0.85, "junction {n} movement {} exits misaligned (dot {:.2})", m.0, dot(tx, dep));
+                }
             }
             let nm = net.movements.len() as u32;
             for a in 0..nm {

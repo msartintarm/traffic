@@ -13,7 +13,7 @@ use engine::sim::config::SimConfig;
 use engine::sim::demand::{self, DemandGenerator, DemandSources};
 use engine::sim::map::OsmMap;
 use engine::sim::net_world::{prof_take, AccelBackend, NetWorld, PHASE_NAMES, STEP_PHASES};
-use engine::sim::network::{LinkId, Network, NodeControl, NodeId};
+use engine::sim::network::{LinkId, MovementId, Network, NodeControl, NodeId};
 
 fn map_from(file: &str) -> Option<Network> {
     let path = format!("{}/../web/public/{}", env!("CARGO_MANIFEST_DIR"), file);
@@ -528,6 +528,122 @@ fn real_map_builds_and_renders_without_panicking() {
     let _ = engine::render::geometry::world_mesh(&net);
     let _ = engine::render::geometry::marking_mesh(&net);
     let _ = engine::render::geometry::signal_head_placements(&net);
+}
+
+/// Signed shortest rotation a → b, in (-π, π].
+fn shortest_angle(a: f64, b: f64) -> f64 {
+    let mut d = (b - a) % std::f64::consts::TAU;
+    if d > std::f64::consts::PI {
+        d -= std::f64::consts::TAU;
+    }
+    if d <= -std::f64::consts::PI {
+        d += std::f64::consts::TAU;
+    }
+    d
+}
+
+/// No movement interior may run *backward*: at no point along the crossing path
+/// may the tangent oppose both the arrival and the departure direction. A car
+/// traversing such a path reverses heading mid-node, drives back down the road it
+/// came in on, and reverses again on landing — rendered as a physically
+/// impossible tight spin (the Millbrae Richmond Drive / Linden Avenue corridor
+/// seams, where an arm's mouth ends downstream of the next arm's start and the
+/// generic corner Bézier connects them through a ~3 m hairpin). The criterion is
+/// U-turn-safe: with arrival ≈ −departure no tangent can oppose both, so a
+/// genuine U-turn's half-circle passes while any hairpin or single-flip fails.
+#[test]
+fn movement_interiors_never_run_backward() {
+    for map in ["map", "sancarlos", "sf", "peninsula"] {
+        let Some(net) = map_from(&format!("{map}.json")) else { continue };
+        let mut bad = Vec::new();
+        for i in 0..net.movements.len() {
+            let mid = MovementId(i as u32);
+            let mv = net.movement(mid);
+            let (fl, tl) = (net.lane(mv.from_lane).link, net.lane(mv.to_lane).link);
+            let arr = net.arrival_dir(fl);
+            let dep = net.departure_dir(tl);
+            let it = net.interior(mid);
+            let n = 32;
+            let backward = (0..=n).any(|k| {
+                let p = net.interior_point(mid, it.len * k as f64 / n as f64);
+                let t = [p[2].cos(), p[2].sin()];
+                t[0] * arr[0] + t[1] * arr[1] < -0.1 && t[0] * dep[0] + t[1] * dep[1] < -0.1
+            });
+            if backward {
+                bad.push(format!(
+                    "mv {i} node n{} len {:.1} m: {} -> {}",
+                    mv.node.0, it.len, net.link_names[fl.0 as usize], net.link_names[tl.0 as usize]
+                ));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "{map}.json: {} movement interior(s) double back on the approach road:\n  {}",
+            bad.len(),
+            bad.join("\n  ")
+        );
+    }
+}
+
+/// Under whole-city demand on the real map, no vehicle's heading may change
+/// faster than a car can physically yaw. Catches the rendered "tight spin" class
+/// end-to-end, whatever geometry or pose-blending path produces it: a one-tick
+/// heading flip (≥ 100° in 0.2 s) while the car is actually moving, or ≥ 300° of
+/// accumulated rotation inside any 2 s window — several times a hard-lock turn at
+/// parking speed, and beyond any real vehicle short of a skid.
+#[test]
+fn no_impossible_yaw_rates_under_city_demand() {
+    let Some(net) = real_map() else { return };
+    let cfg = SimConfig::default_config();
+    let mut world = NetWorld::new(net, cfg);
+    let pairs = demand::od_pairs(&world.network, 0, 600, DemandSources::new(true, true));
+    let mut gen = DemandGenerator::new(&world, &pairs, 0);
+    world.install_router(&gen.destinations());
+    ramp(&mut world, &mut gen, cfg.dt, 400);
+    let window = (2.0 / cfg.dt) as usize;
+    let mut hist: HashMap<u32, ([f64; 3], Vec<f64>)> = HashMap::new();
+    let (mut flips, mut spins) = (0usize, 0usize);
+    let mut example = String::new();
+    for _ in 0..800 {
+        gen.step(&mut world, cfg.dt);
+        world.step();
+        let mut alive = HashMap::with_capacity(hist.len());
+        for v in world.vehicles() {
+            let pose = world.vehicle_world_pose(v);
+            let (dtheta, mut deltas) = match hist.remove(&v.id) {
+                Some((prev, deltas)) => {
+                    let ds = ((pose[0] - prev[0]).powi(2) + (pose[1] - prev[1]).powi(2)).sqrt();
+                    let d = shortest_angle(prev[2], pose[2]);
+                    (if ds > 0.05 { d } else { 0.0 }, deltas)
+                }
+                None => (0.0, Vec::new()),
+            };
+            deltas.push(dtheta);
+            if deltas.len() > window {
+                deltas.remove(0);
+            }
+            let link = world.network.lane(v.lane).link;
+            let at = format!(
+                "car {} at ({:.0}, {:.0}) on {} (link {})",
+                v.id, pose[0], pose[1], world.network.link_names[link.0 as usize], link.0
+            );
+            if dtheta.abs().to_degrees() >= 100.0 {
+                flips += 1;
+                example = at;
+            } else if deltas.iter().map(|d| d.abs()).sum::<f64>().to_degrees() >= 300.0 {
+                spins += 1;
+                example = at;
+                deltas.clear();
+            }
+            alive.insert(v.id, (pose, deltas));
+        }
+        hist = alive;
+    }
+    assert!(
+        flips == 0 && spins == 0,
+        "physically impossible rotation under demand: {flips} one-tick heading flips (≥100°/0.2 s while moving), \
+         {spins} spin windows (≥300°/2 s); e.g. {example}"
+    );
 }
 
 /// The whole-city San Francisco map (~10k nodes, ~66k movements) must build and

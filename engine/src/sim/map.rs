@@ -610,6 +610,7 @@ impl OsmMap {
             let mut polyline = vec![net.nodes[from.idx()].position];
             polyline.extend(spec.geometry.iter().copied());
             polyline.push(net.nodes[to.idx()].position);
+            let polyline = fillet_polyline(polyline, FILLET_RADIUS);
             let length = polyline.windows(2).map(|w| distance(w[0], w[1])).sum();
             let link_id = LinkId(net.links.len() as u32);
             let lane_start = LaneId(net.lanes.len() as u32);
@@ -1627,6 +1628,81 @@ fn coordinate_green_waves(net: &mut Network) {
 
 fn distance(a: [f64; 2], b: [f64; 2]) -> f64 {
     (a[0] - b[0]).hypot(a[1] - b[1])
+}
+
+/// Target corner radius for [`fillet_polyline`] — a comfortable urban curb-return
+/// scale, well above any car's minimum turning radius.
+const FILLET_RADIUS: f64 = 8.0;
+
+/// Round each interior bend of a link centreline into a short curve, so a mapped
+/// corner is something a car steers through (bounded heading change per metre)
+/// rather than a point where the heading jumps instantaneously. The fillet aims
+/// for `radius`, shrunk where the adjacent segments are short — each vertex may
+/// consume at most half of each neighbouring segment, so consecutive fillets
+/// never overlap. Endpoints (the node positions) and every sub-segment direction
+/// outside the curves are preserved, so junction arrival/departure directions
+/// and downstream placement passes see the same road axes.
+fn fillet_polyline(poly: Vec<[f64; 2]>, radius: f64) -> Vec<[f64; 2]> {
+    const MIN_TURN: f64 = 0.10; // ~6°: already smooth enough to steer through
+    // Leave the link's ends untouched: the junction model (end-direction sampling,
+    // carriageway bands, stop-line clearance, arm mouths) owns the geometry there,
+    // and rounding a vertex under a junction box perturbs all of it. The fillet's
+    // job is mid-corridor steering realism; near a node cars are slow and the
+    // interior paths carry them.
+    const END_KEEP: f64 = 15.0;
+    if poly.len() < 3 {
+        return poly;
+    }
+    let mut arc = vec![0.0; poly.len()];
+    for i in 1..poly.len() {
+        arc[i] = arc[i - 1] + distance(poly[i - 1], poly[i]);
+    }
+    let total = arc[poly.len() - 1];
+    let mut out: Vec<[f64; 2]> = Vec::with_capacity(poly.len() * 3);
+    out.push(poly[0]);
+    let push = |out: &mut Vec<[f64; 2]>, p: [f64; 2]| {
+        if distance(*out.last().unwrap(), p) > 1e-9 {
+            out.push(p);
+        }
+    };
+    for i in 1..poly.len() - 1 {
+        if arc[i] < END_KEEP || total - arc[i] < END_KEEP {
+            let v = poly[i];
+            push(&mut out, v);
+            continue;
+        }
+        let (p, v, n) = (poly[i - 1], poly[i], poly[i + 1]);
+        let (la, lb) = (distance(p, v), distance(v, n));
+        if la < 1e-6 || lb < 1e-6 {
+            push(&mut out, v);
+            continue;
+        }
+        let a = [(v[0] - p[0]) / la, (v[1] - p[1]) / la];
+        let b = [(n[0] - v[0]) / lb, (n[1] - v[1]) / lb];
+        let theta = (a[0] * b[0] + a[1] * b[1]).clamp(-1.0, 1.0).acos();
+        // Leave near-reversal spikes alone: a "fillet" across one would cut the
+        // corner into a different road entirely; they don't survive import anyway.
+        if theta < MIN_TURN || theta > 2.8 {
+            push(&mut out, v);
+            continue;
+        }
+        let t = (radius * (theta / 2.0).tan()).min(0.5 * la.min(lb));
+        let p1 = [v[0] - a[0] * t, v[1] - a[1] * t];
+        let p2 = [v[0] + b[0] * t, v[1] + b[1] * t];
+        // Quadratic Bézier with its control at the vertex — tangent to both
+        // segments at p1/p2 and within a few percent of the inscribed arc.
+        let steps = ((theta / 0.26).ceil() as usize).max(2); // a point every ~15°
+        for k in 0..=steps {
+            let s = k as f64 / steps as f64;
+            let u = 1.0 - s;
+            push(&mut out, [
+                u * u * p1[0] + 2.0 * u * s * v[0] + s * s * p2[0],
+                u * u * p1[1] + 2.0 * u * s * v[1] + s * s * p2[1],
+            ]);
+        }
+    }
+    push(&mut out, poly[poly.len() - 1]);
+    out
 }
 
 fn uf_find(parent: &mut HashMap<i64, i64>, x: i64) -> i64 {
