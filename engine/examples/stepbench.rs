@@ -61,11 +61,16 @@ fn main() {
     }
     println!("\nfleet {} after {warm} ticks", world.vehicles().len());
 
-    let configs: &[(&str, AccelBackend, bool)] = &[
-        ("serial sleep-off ", AccelBackend::Serial, false),
-        ("serial sleep-on  ", AccelBackend::Serial, true),
-        ("threads sleep-off", AccelBackend::Threads, false),
-        ("threads sleep-on ", AccelBackend::Threads, true),
+    if !cfg!(feature = "parallel") {
+        println!("WARNING: built without --features parallel — the Threads rows below fall back to SERIAL and measure nothing.");
+    }
+    let configs: &[(&str, AccelBackend, bool, bool)] = &[
+        ("serial sleep-off          ", AccelBackend::Serial, false, false),
+        ("serial sleep-on           ", AccelBackend::Serial, true, false),
+        ("serial sleep-on +locality ", AccelBackend::Serial, true, true),
+        ("threads sleep-off         ", AccelBackend::Threads, false, false),
+        ("threads sleep-on          ", AccelBackend::Threads, true, false),
+        ("threads sleep-on +locality", AccelBackend::Threads, true, true),
     ];
     const ROUNDS: usize = 4;
     const SETTLE: usize = 20;
@@ -75,9 +80,10 @@ fn main() {
     let mut samples = vec![0u32; configs.len()];
     let mut phases = vec![[0.0f64; STEP_PHASES]; configs.len()];
     for _ in 0..ROUNDS {
-        for (ci, &(_, backend, sleep)) in configs.iter().enumerate() {
+        for (ci, &(_, backend, sleep, locality)) in configs.iter().enumerate() {
             world.set_accel_backend(backend);
             world.set_sleep_scheduler(sleep);
+            world.set_locality_sort(locality);
             for _ in 0..SETTLE {
                 gen.step(&mut world, dt);
                 world.step();

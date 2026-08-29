@@ -74,6 +74,8 @@ export type Sim = {
   set_arterial_routing?(on: boolean): void;
   /** Targeted route refresh: dirty gating + early-terminated field solves. */
   set_targeted_routing?(on: boolean): void;
+  /** Periodic fleet memory-locality reorder (cache-friendly neighbor reads). */
+  set_locality_sort?(on: boolean): void;
   cache_sort(): boolean;
   set_demand_sources(highway: boolean, surface: boolean): void;
   demand_highway(): boolean;

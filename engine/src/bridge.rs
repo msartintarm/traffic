@@ -826,6 +826,14 @@ impl Simulation {
         self.world.set_targeted_routing(on);
     }
 
+    /// Toggle the periodic fleet memory-locality reorder: vehicles re-sorted by
+    /// road position every 16 ticks so neighbor reads walk adjacent memory. A
+    /// pure speed option (~6% on the serial engine at city scale); tie-break
+    /// order may differ marginally from the unsorted fleet. Off by default.
+    pub fn set_locality_sort(&mut self, on: bool) {
+        self.world.set_locality_sort(on);
+    }
+
     /// Toggle the cache-friendly per-lane/per-corridor sort (a flat position-key array instead
     /// of reading a vehicle row per comparison). On by default; a display-neutral performance
     /// option — the simulation result is identical either way.

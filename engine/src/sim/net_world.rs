@@ -257,6 +257,12 @@ pub struct NetWorld {
     /// Reroute cycles solve only what will be read: dirty fields, early-stopped
     /// at their querying links (see [`FieldRouter::begin_recompute_targeted`]).
     targeted_routing: bool,
+    /// Periodically permute the fleet into (lane, position) order so the per-car
+    /// passes' neighbor reads walk adjacent memory instead of pointer-chasing a
+    /// shuffled ~250-byte-row array — the memory-bound closures are why the
+    /// threads backend gains nothing. Off by default: any row order is a valid
+    /// sim, but apply-order tie-breaks shift, so goldens/tests stay exact.
+    locality_sort: bool,
     /// Entry links observed spawning traffic toward each destination — the
     /// spawn-gateway targets a field must keep covered for future arrivals.
     dest_entries: HashMap<u32, Vec<u32>>,
@@ -510,7 +516,11 @@ where
         #[cfg(feature = "parallel")]
         AccelBackend::Threads if n >= threshold => {
             use rayon::prelude::*;
-            (0..n).into_par_iter().map(f).collect()
+            // Coarse chunks: the per-car closures are memory-bound (fat rows,
+            // neighbor pointer chases), so fine-grained work-stealing spends its
+            // wins on dispatch. ~hundred-car splits keep every core busy at a
+            // fraction of the stealing traffic.
+            (0..n).into_par_iter().with_min_len(128).map(f).collect()
         }
         _ => (0..n).map(f).collect(),
     }
@@ -1203,7 +1213,7 @@ impl NetWorld {
         Self {
             network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0, divergences: 0,
             control_aware_routing: true, lane_eval_stagger: true, arterial_routing: false,
-            targeted_routing: true, dest_entries: HashMap::new(), crashed_by: [0; 2], crash_log: Vec::new(),
+            targeted_routing: true, dest_entries: HashMap::new(), locality_sort: false, crashed_by: [0; 2], crash_log: Vec::new(),
             merges, link_straight, turn_caps, merge_feeder_lane, through_next, corridor_of, corridor_offset, seam_primary, signals, link_entries, router: None, external_reroute: false,
             meters: Vec::new(), metering_on: false, day_secs: 0.0, pm_plan: false, rail_preempts,
             timetable: rail::Timetable::default(), crossing_sets: HashMap::new(), weekend: false, day_rate: 1.0,
@@ -1397,6 +1407,11 @@ impl NetWorld {
     /// Toggle the free-flow lane-evaluation stagger.
     pub fn set_lane_eval_stagger(&mut self, on: bool) {
         self.lane_eval_stagger = on;
+    }
+
+    /// Toggle the periodic fleet locality reorder (see the field docs).
+    pub fn set_locality_sort(&mut self, on: bool) {
+        self.locality_sort = on;
     }
 
     /// Toggle targeted route refresh (dirty gating + early-terminated solves).
@@ -2028,10 +2043,30 @@ impl NetWorld {
     /// zeroed each tick (visual queue spacing is arc-truth); lateral error is
     /// resolved by steering alone unless it exceeds the divergence guard.
     fn track_path(&mut self, dt: f64) {
-        for i in 0..self.fleet.rows.len() {
+        // Per-car and read-only against shared state, so the compute half fans
+        // across cores; the tiny write-back stays serial. `None` = untouched
+        // (parked) row.
+        let n = self.fleet.rows.len();
+        let (backend, threshold) = (self.active_backend(), self.par_threshold.max(LIGHT_PAR_THRESHOLD));
+        let updates: Vec<Option<([f64; 3], f64, bool)>> = map_collect(backend, threshold, n, |i| self.track_one(i, dt));
+        for (i, u) in updates.into_iter().enumerate() {
+            if let Some((kin, steer, diverged)) = u {
+                self.fleet.rows[i].kin = kin;
+                self.fleet.rows[i].steer = steer;
+                if diverged {
+                    self.divergences += 1;
+                }
+            }
+        }
+    }
+
+    /// One vehicle's tracker step: the new kinematic pose, wheel position, and
+    /// whether the divergence guard fired — or `None` for a parked car.
+    fn track_one(&self, i: usize, dt: f64) -> Option<([f64; 3], f64, bool)> {
+        {
             let v = &self.fleet.rows[i];
             if v.speed <= 0.05 {
-                continue;
+                return None;
             }
             let len = v.driver.vehicle_length;
             let [x, y, th] = v.kin;
@@ -2140,11 +2175,7 @@ impl NetWorld {
                 x2 -= lat_fix * s;
                 y2 += lat_fix * c;
             }
-            self.fleet.rows[i].kin = [x2, y2, th2];
-            self.fleet.rows[i].steer = kappa;
-            if diverged {
-                self.divergences += 1;
-            }
+            Some(([x2, y2, th2], kappa, diverged))
         }
     }
 
@@ -3299,9 +3330,34 @@ impl NetWorld {
         }
     }
 
+    /// Permute the fleet (rows + histories, together) into (lane, arc-position)
+    /// order. Any order is a valid simulation; this one makes every per-car
+    /// pass's neighbor reads mostly-sequential in memory.
+    fn locality_reorder(&mut self) {
+        let n = self.fleet.rows.len();
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        order.sort_by(|&a, &b| {
+            let (va, vb) = (&self.fleet.rows[a as usize], &self.fleet.rows[b as usize]);
+            (va.lane.0, va.position).partial_cmp(&(vb.lane.0, vb.position)).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let rows = std::mem::take(&mut self.fleet.rows);
+        let hist = std::mem::take(&mut self.fleet.hist);
+        let hist_len = std::mem::take(&mut self.fleet.hist_len);
+        let mut rows: Vec<Option<NetVehicle>> = rows.into_iter().map(Some).collect();
+        let mut hist: Vec<Option<History>> = hist.into_iter().map(Some).collect();
+        for &i in &order {
+            self.fleet.rows.push(rows[i as usize].take().unwrap());
+            self.fleet.hist.push(hist[i as usize].take().unwrap());
+            self.fleet.hist_len.push(hist_len[i as usize]);
+        }
+    }
+
     pub fn step(&mut self) {
         let dt = self.cfg.dt;
         let mut prof = Prof::new();
+        if self.locality_sort && self.tick % 16 == 0 {
+            self.locality_reorder();
+        }
         self.refresh_routes();
         prof.lap(0);
         self.advance_signals(dt);
@@ -3428,20 +3484,12 @@ impl NetWorld {
                 }
                 veh.crossing.is_some() || this.integrate_in_lane(veh, a, dt, intended)
             };
-            #[cfg(feature = "parallel")]
-            let out: Vec<bool> = if matches!(backend, AccelBackend::Threads) && n >= par_threshold.max(LIGHT_PAR_THRESHOLD) {
-                use rayon::prelude::*;
-                taken
-                    .par_iter_mut()
-                    .zip(accels.par_iter())
-                    .zip(intended_mv.par_iter())
-                    .map(|((veh, &a), &intended)| integrate_one(veh, a, intended))
-                    .collect()
-            } else {
-                taken.iter_mut().zip(&accels).zip(&intended_mv).map(|((veh, &a), &intended)| integrate_one(veh, a, intended)).collect()
-            };
-            #[cfg(not(feature = "parallel"))]
-            let out: Vec<bool> = taken.iter_mut().zip(&accels).zip(&intended_mv).map(|((veh, &a), &intended)| integrate_one(veh, a, intended)).collect();
+            // Deliberately serial: measured with the parallel feature actually
+            // enabled (SF, ~11k cars), the rayon zip arm ran this at 1.7 ms vs
+            // 0.7 ms serial — the per-car work is a few dozen flops on a fat
+            // row, all dispatch and cache-line traffic, no compute to win back.
+            let out: Vec<bool> =
+                taken.iter_mut().zip(&accels).zip(&intended_mv).map(|((veh, &a), &intended)| integrate_one(veh, a, intended)).collect();
             out
         };
 

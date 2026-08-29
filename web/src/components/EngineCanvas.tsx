@@ -132,6 +132,7 @@ export default function EngineCanvas() {
   const [laneEvalStagger, setLaneEvalStagger] = useState(true); // human-cadence lane decisions, on by default (see net_world default)
   const [arterialRouting, setArterialRouting] = useState(false); // arterial-first fields, off by default (see net_world default)
   const [targetedRouting, setTargetedRouting] = useState(true); // targeted route refresh, on by default (see net_world default)
+  const [localitySort, setLocalitySort] = useState(false); // fleet memory-locality reorder, off by default (see net_world default)
   const [startSpeedMps, setStartSpeedMps] = useState(36); // ≥ every road limit ⇒ "enter at limit"
   const [units, setUnits] = useState<"mi" | "km">("mi");
   const unitsRef = useRef<"mi" | "km">("mi"); // read inside the per-frame HUD update (avoids stale closure)
@@ -847,6 +848,21 @@ export default function EngineCanvas() {
                 }}
               />
               Targeted route refresh
+            </label>
+            <label
+              className={styles.zoomLabel}
+              title="Periodically reorder the vehicle array by road position so each car's neighbor lookups read adjacent memory — measurably faster on big fleets (~6% on the serial engine). Changes nothing visible; simulation tie-breaks may differ marginally from the unsorted order. Off by default."
+            >
+              <input
+                type="checkbox"
+                checked={localitySort}
+                disabled={!ready}
+                onChange={(e) => {
+                  sessionRef.current?.applyControl({ type: "localitySort", value: e.target.checked });
+                  setLocalitySort(e.target.checked);
+                }}
+              />
+              Memory locality sort
             </label>
             <label
               className={styles.zoomLabel}

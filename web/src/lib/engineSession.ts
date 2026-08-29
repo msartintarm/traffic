@@ -346,6 +346,7 @@ export async function startEngineSession(
       case "laneEvalStagger": sim.set_lane_eval_stagger?.(c.value); break;
       case "arterialRouting": sim.set_arterial_routing?.(c.value); break;
       case "targetedRouting": sim.set_targeted_routing?.(c.value); break;
+      case "localitySort": sim.set_locality_sort?.(c.value); break;
       case "showCrashes": sim.set_show_crashes(c.value); break;
       case "clearCrashes": sim.clear_crashes(); break;
       case "entrySpeedCap": sim.set_entry_speed_cap(c.value); break;
