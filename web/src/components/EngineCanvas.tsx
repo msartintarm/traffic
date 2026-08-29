@@ -96,7 +96,6 @@ export default function EngineCanvas() {
   const statsRef = useRef<HTMLSpanElement>(null);
   // Glides the HUD's jittery per-frame counts (EMA + deadband) across frames.
   const smootherRef = useRef(new StatsSmoother());
-  const perfStatusRef = useRef<HTMLSpanElement>(null); // live "what's running" line in the Performance panel
   const tipRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const asciiRef = useRef<HTMLPreElement>(null); // the ASCII "terminal" overlay (shown when asciiMode is on)
@@ -368,7 +367,6 @@ export default function EngineCanvas() {
             }
             const o = overlayFromSnapshot(f.snapshot, { fitMpp: f.fitMpp, zoomRange: ZOOM_RANGE }, smootherRef.current);
             if (statsRef.current) statsRef.current.textContent = o.stats;
-            if (perfStatusRef.current) perfStatusRef.current.textContent = o.perf;
             if (rushClockRef.current) rushClockRef.current.textContent = o.rushClock ?? "";
             if (sliderRef.current) sliderRef.current.value = String(o.sliderValue);
             if (panelRef.current) {
@@ -942,7 +940,6 @@ export default function EngineCanvas() {
                 />
               </label>
             )}
-            <span ref={perfStatusRef} className={styles.perfStatus} />
         </Collapsible>
       </div>
 
@@ -964,6 +961,14 @@ export default function EngineCanvas() {
           <li>Click to select</li>
         </ul>
       </Collapsible>
+      <a
+        className={styles.osmCredit}
+        href="https://www.openstreetmap.org/copyright"
+        target="_blank"
+        rel="noreferrer"
+      >
+        © OpenStreetMap contributors
+      </a>
 
       <div ref={tipRef} className={styles.tooltip} />
     </div>

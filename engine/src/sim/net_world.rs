@@ -35,6 +35,10 @@ pub struct NetVehicle {
     /// render as motion a four-wheeled car cannot produce. This is what the world
     /// pose, the render, and the collision footprint all see.
     kin: [f64; 3],
+    /// Current steered path curvature (1/m, left-positive) — the wheel position.
+    /// [`NetWorld::track_path`] slews it toward its command at [`STEER_RATE`],
+    /// so lock builds and unwinds at a human pace instead of snapping.
+    steer: f64,
     pub driver: DriverConfig,
     pub route: Vec<LinkId>,
     pub route_idx: usize,
@@ -811,26 +815,49 @@ const LIGHT_PAR_THRESHOLD: usize = 8000;
 /// constraint (signal/box/yield/stop) can yet bind — [`NetWorld::gather_context`] LOD-skips
 /// the node stack, and the active-set scheduler's free-car path applies from here out.
 const DECISION_HORIZON: f64 = 180.0;
-/// Comfortable lateral acceleration (m/s²) bounding curve speed (`v = √(A_LAT·r)`), and how
-/// far ahead a curve is read.
-const A_LAT: f64 = 3.0;
+/// Speed-dependent comfortable lateral acceleration (m/s²), AASHTO
+/// side-friction style: drivers accept ~0.35–0.4 g threading an intersection at
+/// walking-to-jogging speed and only ~0.12 g at highway speed, falling roughly
+/// linearly in between (Green Book side-friction factors ≈ 0.38 at 15 km/h down
+/// to ≈ 0.09–0.12 at 110+ km/h). One envelope drives both how fast a car takes
+/// a curve of radius r and how hard the tracker may steer at its current speed.
+fn comfort_lat(v: f64) -> f64 {
+    (3.9 - 0.145 * v).clamp(1.2, 3.9)
+}
+/// The speed a driver chooses for a curve of radius `r` under the envelope:
+/// solve `v² = r · a(v)` with the linear branch of [`comfort_lat`], capped by
+/// the low-speed plateau.
+fn comfort_speed(r: f64) -> f64 {
+    if !r.is_finite() {
+        return f64::INFINITY;
+    }
+    let quad = (-0.145 * r + (0.021025 * r * r + 15.6 * r).sqrt()) * 0.5;
+    quad.min((3.9 * r).sqrt())
+}
+/// How far ahead a curve is read.
 const CURVE_LOOKAHEAD: f64 = 45.0;
 /// Bicycle-model bounds for [`NetWorld::track_path`]. Steering geometry:
-/// maximum front-wheel angle tan 38°; the wheelbase is [`AXLE_WHEELBASE`] of the
+/// maximum front-wheel angle tan 35° (a 10.5–12 m curb-to-curb turning circle —
+/// rear-axle path radius ≈ 3.9 m for a 4.5 m car); the wheelbase is [`AXLE_WHEELBASE`] of the
 /// vehicle length (car ≈ 2.7 m of 4.5 → ~3.9 m minimum turning radius; a bus
 /// proportionally wider), and the rear axle sits [`AXLE_FRONT`] of the length
 /// behind the front bumper (the pose anchor the rest of the sim uses). Grip:
 /// the tyre lateral limit (m/s², ~0.7 g) that caps curvature at speed —
 /// `κ ≤ min(tan δ_max / wheelbase, grip / v²)`.
-const AXLE_STEER_TAN: f64 = 0.78;
+const AXLE_STEER_TAN: f64 = 0.70;
 const AXLE_WHEELBASE: f64 = 0.6;
 const AXLE_FRONT: f64 = 0.8;
 const YAW_GRIP_LAT: f64 = 7.0;
+/// Road-wheel steering rate (rad/s): a driver winds lock on and off through the
+/// steering ratio, reaching full lock from centre in ~1.3 s — the wheel cannot
+/// snap. Divided by the wheelbase this bounds how fast the tracked curvature
+/// may change per second.
+const STEER_RATE: f64 = 0.55;
 /// Pure-pursuit lookahead from the rear axle: `0.8·v` clamped to this range
 /// (m). The floor sits just above the wheelbase — tight enough to hug a city
 /// corner, stable enough not to oscillate; the ceiling keeps highway tracking
 /// calm.
-const LOOKAHEAD_MIN: f64 = 3.5;
+const LOOKAHEAD_MIN: f64 = 2.8;
 const LOOKAHEAD_MAX: f64 = 12.0;
 /// The divergence guard — the knob that trades path-hugging against full
 /// kinematics. Lateral deviation of the kinematic pose from the arc reference
@@ -1105,7 +1132,7 @@ impl NetWorld {
             .map(|i| {
                 let lane_start = network.link(LinkId(i as u32)).lane_start;
                 let r = network.min_radius_ahead(lane_start, 0.0, f64::INFINITY);
-                (A_LAT * r).sqrt() >= network.lane(lane_start).speed_limit
+                comfort_speed(r) >= network.lane(lane_start).speed_limit
             })
             .collect();
 
@@ -1123,7 +1150,7 @@ impl NetWorld {
                 }
                 let r = network.interior_min_radius(mid);
                 if r.is_finite() {
-                    (A_LAT * r).sqrt().clamp(2.5, 10.0)
+                    comfort_speed(r).clamp(2.5, 10.0)
                 } else {
                     f64::INFINITY
                 }
@@ -1622,7 +1649,7 @@ impl NetWorld {
         self.link_entries[self.network.lane(lane).link.idx()] += 1;
         let kin = Self::spawn_kin(&self.network, lane, position, &driver);
         self.fleet.push(NetVehicle {
-            id, lane, position, speed, kin, driver, route: Vec::new(), route_idx: 0, dest: None,
+            id, lane, position, speed, kin, steer: 0.0, driver, route: Vec::new(), route_idx: 0, dest: None,
             stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
         });
     }
@@ -1653,7 +1680,7 @@ impl NetWorld {
         self.link_entries[first.idx()] += 1;
         let kin = Self::spawn_kin(&self.network, lane, 0.0, &driver);
         self.fleet.push(NetVehicle {
-            id, lane, position: 0.0, speed, kin, driver, route, route_idx: 0, dest: None,
+            id, lane, position: 0.0, speed, kin, steer: 0.0, driver, route, route_idx: 0, dest: None,
             stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
         });
         true
@@ -1677,7 +1704,7 @@ impl NetWorld {
         self.link_entries[first.idx()] += 1;
         let kin = Self::spawn_kin(&self.network, lane, pos, &driver);
         self.fleet.push(NetVehicle {
-            id, lane, position: pos, speed, kin, driver, route, route_idx: 0, dest: None,
+            id, lane, position: pos, speed, kin, steer: 0.0, driver, route, route_idx: 0, dest: None,
             stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
         });
         true
@@ -1703,7 +1730,7 @@ impl NetWorld {
         self.link_entries[entry_link.idx()] += 1;
         let kin = Self::spawn_kin(&self.network, lane, 0.0, &driver);
         self.fleet.push(NetVehicle {
-            id, lane, position: 0.0, speed, kin, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
+            id, lane, position: 0.0, speed, kin, steer: 0.0, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
             stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
         });
         true
@@ -1780,7 +1807,7 @@ impl NetWorld {
         self.link_entries[self.network.lane(lane).link.idx()] += 1;
         let kin = Self::spawn_kin(&self.network, lane, position, &driver);
         self.fleet.push(NetVehicle {
-            id, lane, position, speed, kin, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
+            id, lane, position, speed, kin, steer: 0.0, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
             stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
         });
     }
@@ -2018,7 +2045,16 @@ impl NetWorld {
             let (dx, dy) = (r[0] - x, r[1] - y);
             let dist = dx.hypot(dy);
             let alpha = shortest_angle(th, dy.atan2(dx));
-            let kappa_max = (AXLE_STEER_TAN / (AXLE_WHEELBASE * len)).min(YAW_GRIP_LAT / (v.speed * v.speed));
+            // Steering authority, in three nested bounds: what the steering
+            // geometry can do at all (tan 35° over the wheelbase — the 10.5–12 m
+            // curb-to-curb circle of a real car), what a driver is *willing* to
+            // pull laterally at this speed (the AASHTO-style comfort envelope:
+            // ~0.4 g threading an intersection, ~0.12 g at highway speed), and —
+            // only during a recovery crank, where comfort is beside the point —
+            // raw tyre grip.
+            let kappa_geo = AXLE_STEER_TAN / (AXLE_WHEELBASE * len);
+            let v2 = v.speed * v.speed;
+            let kappa_max = kappa_geo.min(comfort_lat(v.speed) / v2);
             // Past the shoulder line pure pursuit's sin(α) goes blind (a
             // displaced car would roll straight on, diverging forever; a held
             // car's arc once drove 874 m away). A real driver cranks the wheel:
@@ -2026,7 +2062,7 @@ impl NetWorld {
             // a bounded, steering-legal loop of a few seconds at worst, confined
             // to the handful of degenerate-mouth handoffs.
             let mut kappa_cmd = if alpha.abs() > std::f64::consts::FRAC_PI_2 {
-                kappa_max * alpha.signum()
+                kappa_geo.min(YAW_GRIP_LAT / v2) * alpha.signum()
             } else if dist > 0.5 {
                 2.0 * alpha.sin() / dist
             } else {
@@ -2038,7 +2074,13 @@ impl NetWorld {
             if let Some(c) = v.crossing {
                 kappa_cmd += self.network.interior_curvature(c.movement, self.crossing_arc(v));
             }
-            let kappa = kappa_cmd.clamp(-kappa_max, kappa_max);
+            let clamp_hi = if alpha.abs() > std::f64::consts::FRAC_PI_2 { kappa_geo.min(YAW_GRIP_LAT / v2) } else { kappa_max };
+            // The wheel winds, it doesn't snap: curvature approaches its command
+            // at the steering rate, so lock builds over ~a second — the visible
+            // ease-in/ease-out of a real turn.
+            let target = kappa_cmd.clamp(-clamp_hi, clamp_hi);
+            let dk = (STEER_RATE / (AXLE_WHEELBASE * len)) * dt;
+            let kappa = v.steer + (target - v.steer).clamp(-dk, dk);
             // The wheels only roll *forward*, and rolling doubles as the
             // longitudinal sync: ground distance this tick is whatever keeps the
             // front bumper level with the arc pose along the car's axis, floored
@@ -2099,6 +2141,7 @@ impl NetWorld {
                 y2 += lat_fix * c;
             }
             self.fleet.rows[i].kin = [x2, y2, th2];
+            self.fleet.rows[i].steer = kappa;
             if diverged {
                 self.divergences += 1;
             }
@@ -3957,7 +4000,7 @@ impl NetWorld {
         // needs these, so compute them before it.
         let geom_curve = {
             let r = self.network.min_radius_ahead(veh.lane, veh.position, CURVE_LOOKAHEAD);
-            r.is_finite().then(|| SpeedTarget { speed: (A_LAT * r).sqrt(), distance: CURVE_LOOKAHEAD })
+            r.is_finite().then(|| SpeedTarget { speed: comfort_speed(r), distance: CURVE_LOOKAHEAD })
         };
         let turn = intended
             .and_then(|mid| {
@@ -8869,7 +8912,7 @@ mod tests {
                 .filter(|&id| {
                     let d = DriverConfig::car().sample(w.cfg.seed, id);
                     let probe = NetVehicle {
-                        id, lane: LaneId(0), position: 0.0, speed: 0.0, kin: [0.0; 3], driver: d,
+                        id, lane: LaneId(0), position: 0.0, speed: 0.0, kin: [0.0; 3], steer: 0.0, driver: d,
                         route: Vec::new(), route_idx: 0, dest: None, stopped_at: None,
                         wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
                     };
@@ -9634,6 +9677,155 @@ mod tests {
         );
     }
 
+    /// The 90°-corner fixture the turning-behavior tests share.
+    fn right_turn_world() -> NetWorld {
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, -200.0, 0.0),
+                NodeSpec::uncontrolled(2, 0.0, 0.0),
+                NodeSpec::uncontrolled(3, 0.0, -200.0),
+            ],
+            links: vec![LinkSpec::oneway(1, 2, 1, 15.0), LinkSpec::oneway(2, 3, 1, 15.0)],
+        }
+        .build();
+        let mut world = NetWorld::new(net, cfg());
+        assert!(world.spawn_routed(1, vec![LinkId(0), LinkId(1)], 10.0, DriverConfig { accel_noise: 0.0, ..DriverConfig::car() }));
+        world
+    }
+
+    #[test]
+    fn the_turning_point_sits_on_the_rear_axle() {
+        // Four-wheel geometry: the instantaneous center of rotation lies on the
+        // rear axle line, so through a steady turn the front bumper sweeps a
+        // wider arc than the rear axle, and the two radii differ by exactly the
+        // axle offset: R_front² = R_rear² + (0.8·len)². Measure both radii from
+        // per-tick displacement/rotation and check the relation.
+        let mut world = right_turn_world();
+        let len = DriverConfig::car().vehicle_length;
+        let mut prev: Option<([f64; 3], [f64; 2])> = None;
+        let (mut sum_r2_diff, mut samples) = (0.0f64, 0u32);
+        for _ in 0..600 {
+            world.step();
+            let Some(v) = world.vehicle(1) else { break };
+            let (pose, rear) = (world.vehicle_world_pose(v), v.rear_axle());
+            if let Some((pp, pr)) = prev {
+                let dth = shortest_angle(pp[2], pose[2]).abs();
+                if dth > 0.04 {
+                    let ds_front = (pose[0] - pp[0]).hypot(pose[1] - pp[1]);
+                    let ds_rear = (rear[0] - pr[0]).hypot(rear[1] - pr[1]);
+                    let (rf, rr) = (ds_front / dth, ds_rear / dth);
+                    sum_r2_diff += rf * rf - rr * rr;
+                    samples += 1;
+                }
+            }
+            prev = Some((pose, rear));
+        }
+        assert!(samples >= 5, "the corner produced a measurable steady turn ({samples} samples)");
+        let measured = sum_r2_diff / samples as f64;
+        let expected = (AXLE_FRONT * len) * (AXLE_FRONT * len);
+        assert!(
+            (measured - expected).abs() < expected * 0.35,
+            "R_front² − R_rear² ≈ (axle offset)²: measured {measured:.1}, expected {expected:.1} m²"
+        );
+    }
+
+    #[test]
+    fn intersection_turns_reach_real_world_sharpness() {
+        // A 90° city corner is taken at real curb-return sharpness: the rear
+        // axle's tightest arc lands between the steering geometry's floor
+        // (~3.9 m for a 10.5–12 m curb-to-curb car, never tighter) and the
+        // AASHTO passenger-car design turn (7.3 m centerline — any wider reads
+        // as the lazy bus-like sweep this heuristic exists to prevent).
+        let mut world = right_turn_world();
+        let mut prev: Option<[f64; 2]> = None;
+        let mut prev_h = None::<f64>;
+        let mut tightest = f64::INFINITY;
+        for _ in 0..600 {
+            world.step();
+            let Some(v) = world.vehicle(1) else { break };
+            let (pose, rear) = (world.vehicle_world_pose(v), v.rear_axle());
+            if let (Some(pr), Some(ph)) = (prev, prev_h) {
+                let dth = shortest_angle(ph, pose[2]).abs();
+                let ds = (rear[0] - pr[0]).hypot(rear[1] - pr[1]);
+                if dth > 0.04 && ds > 0.1 {
+                    tightest = tightest.min(ds / dth);
+                }
+            }
+            prev = Some(rear);
+            prev_h = Some(pose[2]);
+        }
+        assert!(
+            (3.4..=7.5).contains(&tightest),
+            "tightest rear-axle radius through the corner: {tightest:.1} m (real cars: 3.9–7.3)"
+        );
+    }
+
+    #[test]
+    fn highway_steering_stays_within_comfort() {
+        // At speed, drivers tolerate ~0.12 g laterally — a lane change at
+        // 20 m/s must stay inside the comfort envelope, not flick across.
+        let net = OsmMap {
+            nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 3000.0, 0.0)],
+            links: vec![LinkSpec::oneway(1, 2, 2, 25.0)],
+        }
+        .build();
+        let mut world = NetWorld::new(net, cfg());
+        let lanes: Vec<LaneId> = world.network.lanes_of(LinkId(0)).collect();
+        world.spawn(1, lanes[0], 50.0, 20.0, DriverConfig { accel_noise: 0.0, ..DriverConfig::car() });
+        let mut prev_h = None::<f64>;
+        let (mut peak_lat, mut changed) = (0.0f64, false);
+        for _ in 0..150 {
+            world.step();
+            let Some(v) = world.vehicle(1) else { break };
+            let pose = world.vehicle_world_pose(v);
+            changed |= world.network.lane(v.lane).index_in_link == 1;
+            if let Some(ph) = prev_h {
+                let omega = shortest_angle(ph, pose[2]).abs() / cfg().dt;
+                peak_lat = peak_lat.max(omega * v.speed);
+            }
+            prev_h = Some(pose[2]);
+        }
+        assert!(changed, "the car changed lanes");
+        assert!(
+            peak_lat > 0.2 && peak_lat < comfort_lat(20.0) * 1.35,
+            "the maneuver is steered yet stays inside the high-speed comfort envelope: peak {peak_lat:.2} m/s² (envelope {:.2})",
+            comfort_lat(20.0)
+        );
+    }
+
+    #[test]
+    fn lock_builds_at_a_human_rate() {
+        // The wheel winds, it doesn't snap: through the corner, measured path
+        // curvature may change no faster than the road-wheel steering rate over
+        // the wheelbase allows (~full lock in 1.3 s), plus discretization slack.
+        let mut world = right_turn_world();
+        let len = DriverConfig::car().vehicle_length;
+        let rate_lim = STEER_RATE / (AXLE_WHEELBASE * len) * cfg().dt;
+        let mut prev: Option<([f64; 2], f64)> = None;
+        let mut prev_kappa = None::<f64>;
+        let mut worst = 0.0f64;
+        for _ in 0..600 {
+            world.step();
+            let Some(v) = world.vehicle(1) else { break };
+            let (pose, rear) = (world.vehicle_world_pose(v), v.rear_axle());
+            if let Some((pr, ph)) = prev {
+                let ds = (rear[0] - pr[0]).hypot(rear[1] - pr[1]);
+                if ds > 0.3 {
+                    let kappa = shortest_angle(ph, pose[2]) / ds;
+                    if let Some(pk) = prev_kappa {
+                        worst = worst.max((kappa - pk).abs());
+                    }
+                    prev_kappa = Some(kappa);
+                }
+            }
+            prev = Some((rear, pose[2]));
+        }
+        assert!(
+            worst <= rate_lim * 1.5,
+            "curvature never jumps faster than the wheel can wind: worst {worst:.4} per tick (limit {rate_lim:.4})"
+        );
+    }
+
     #[test]
     fn a_lane_change_slides_the_pose_across_gradually() {
         let net = OsmMap {
@@ -9652,10 +9844,11 @@ mod tests {
         let (mut changed_at, mut settled) = (None, false);
         let mut prev_y = world.vehicle_world_pose(world.vehicle(1).unwrap())[1];
         let mut max_jump = 0.0f64;
-        // One extra second past the blend duration: the steered S-curve settles
-        // asymptotically (a real car straightens out over its lookahead), unlike
-        // the old linear pose slide which snapped onto the centerline exactly.
-        let settle_ticks = ((LANE_CHANGE_DURATION + 1.0) / cfg().dt) as u32 + 2;
+        // Extra seconds past the blend duration: at 20 m/s the comfort envelope
+        // allows ~1.2 m/s² laterally, so a real 3.5 m lane change takes ~4 s of
+        // steered S-curve (winding lock on and off at the steering rate) — the
+        // arc-side blend finishes first and the pose settles behind it.
+        let settle_ticks = ((LANE_CHANGE_DURATION + 3.5) / cfg().dt) as u32 + 2;
         for t in 0..80 {
             world.step();
             let v = world.vehicle(1).unwrap();

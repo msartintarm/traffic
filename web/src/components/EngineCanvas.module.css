@@ -247,15 +247,6 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* Live "what's actually running" readout at the foot of the Performance panel. */
-.perfStatus {
-  margin-top: 0.15rem;
-  padding-top: 0.25rem;
-  border-top: 1px solid rgba(255, 255, 255, 0.12);
-  align-self: stretch;
-  color: #93c5fd;
-  font-variant-numeric: tabular-nums;
-}
 .perfStatus:empty {
   display: none;
 }
@@ -279,10 +270,10 @@
   pointer-events: none;
 }
 
-/* Bottom-right usage hint (collapsible). */
+/* Bottom-right usage hint (collapsible), lifted to leave room for the OSM credit. */
 .hint {
   position: absolute;
-  bottom: 0.6rem;
+  bottom: 1.7rem;
   right: 0.6rem;
   display: flex;
   flex-direction: column;
@@ -529,4 +520,23 @@
   .loadingFill::after {
     animation: none;
   }
+}
+
+/* OSM attribution, pinned under the controls guide (ODbL requires crediting
+ * "© OpenStreetMap contributors"; the link is the standard copyright page). */
+.osmCredit {
+  position: absolute;
+  bottom: 0.25rem;
+  right: 0.6rem;
+  font-family: ui-monospace, monospace;
+  font-size: 0.6rem;
+  color: #64748b;
+  text-decoration: none;
+  background: rgba(15, 15, 20, 0.45);
+  padding: 0.05rem 0.4rem;
+  border-radius: 6px;
+}
+.osmCredit:hover {
+  color: #94a3b8;
+  text-decoration: underline;
 }

@@ -1048,12 +1048,17 @@ impl Simulation {
         let mut out = Vec::with_capacity(self.world.vehicles().len() * 8);
         for v in self.world.vehicles() {
             let c = self.world.vehicle_world_pose(v);
-            let (cx, cy, ch, cs) = (c[0] as f32, c[1] as f32, c[2] as f32, v.speed as f32);
+            // Centre-of-body anchor, same shift as `render_instances` — the 2D
+            // fallback draws its rectangle centred on (x, y).
+            let half = 0.5 * v.driver.vehicle_length as f32;
+            let (ch, cs) = (c[2] as f32, v.speed as f32);
+            let (cx, cy) = (c[0] as f32 - half * ch.cos(), c[1] as f32 - half * ch.sin());
             // Quadratic Bézier through the turn control (a straight lerp when it's the
             // midpoint), so a car crossing a node curves through the corner even when
             // high-speed catch-up skipped the per-tick interior samples.
             let (x, y, h, brake) = match self.prev.get(&v.id) {
-                Some(&[px, py, ph, ps]) => {
+                Some(&[rpx, rpy, ph, ps]) => {
+                    let (px, py) = (rpx - half * ph.cos(), rpy - half * ph.sin());
                     let [kx, ky] = self.control_point(v.id, v.lane.0, [px, py], [cx, cy]);
                     let (u, m, a2) = ((1.0 - alpha) * (1.0 - alpha), 2.0 * (1.0 - alpha) * alpha, alpha * alpha);
                     (
@@ -1207,8 +1212,16 @@ impl Simulation {
             .map(|v| {
                 let class = VehicleClass::from_length(v.driver.vehicle_length);
                 let c = self.world.vehicle_world_pose(v);
-                let (cx, cy, ch, cs) = (c[0] as f32, c[1] as f32, c[2] as f32, v.speed as f32);
-                let [px, py, ph, ps] = self.prev.get(&v.id).copied().unwrap_or([cx, cy, ch, cs]);
+                // The pose anchors the *front bumper*; the drawn quad is centred on
+                // its instance position, so shift back half a body — otherwise the
+                // car renders half a length ahead of itself and its turning point
+                // (the rear axle, 0.8·len behind the pose) sits behind the drawn
+                // tail, which reads as pivoting around thin air.
+                let half = 0.5 * v.driver.vehicle_length as f32;
+                let (ch, cs) = (c[2] as f32, v.speed as f32);
+                let (cx, cy) = (c[0] as f32 - half * ch.cos(), c[1] as f32 - half * ch.sin());
+                let [rpx, rpy, ph, ps] = self.prev.get(&v.id).copied().unwrap_or([c[0] as f32, c[1] as f32, ch, cs]);
+                let (px, py) = (rpx - half * ph.cos(), rpy - half * ph.sin());
                 Instance {
                     pos: [cx, cy],
                     prev_pos: [px, py],
