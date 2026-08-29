@@ -81,3 +81,7 @@ png = "0.17"
 [profile.release]
 opt-level = 3
 lto = true
+
+[[example]]
+name = "route_probe"
+required-features = ["import"]

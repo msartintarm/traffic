@@ -858,6 +858,7 @@ impl OsmMap {
         align_through_seams(&mut net);
         net.build_lane_bounds();
         stitch_seam_bounds(&mut net);
+        enforce_mouth_ordering(&mut net);
         net.build_interiors();
 
         let plans = relocate_signals_to_junctions(&net, &self.nodes);
@@ -2407,6 +2408,97 @@ fn offset_ramps_to_curb(net: &mut Network) {
                 net.polylines[li][i][0] += shift[0] * t;
                 net.polylines[li][i][1] += shift[1] * t;
             }
+        }
+    }
+}
+
+/// Guarantee every movement's exit mouth sits *ahead* of its entry mouth along
+/// the arrival direction, by pulling an offending approach's stop line further
+/// upstream. At a handful of shallow-angle or tightly-packed nodes the chart
+/// puts an incoming lane's end past (or nearly on top of) the outgoing lane's
+/// start; the interior connecting them is then physically undrivable — a car
+/// lands behind its own bumper, rotated, and has to drive a full-lock recovery
+/// loop through the box (the Richmond → Laurel pattern: landed 5 m behind-left,
+/// 95° off). Trimming the from-link's lanes moves its mouth back along its own
+/// chart line, so the corner Bézier built afterwards is a forward, steerable
+/// path. Runs on trimmed lane lengths only — the chart, polylines, and end
+/// directions are untouched; must run before [`Network::build_interiors`].
+fn enforce_mouth_ordering(net: &mut Network) {
+    // A turn needs at least this much forward room between mouths to be
+    // steerable; and no stop line moves more than this per pass (a defective
+    // cluster shouldn't relocate a stop line halfway up the block).
+    const MARGIN: f64 = 1.0;
+    const MAX_TRIM: f64 = 18.0;
+    const MIN_LANE: f64 = 3.0;
+    for _ in 0..4 {
+        let mut end_trim = vec![0.0f64; net.links.len()];
+        let mut start_push = vec![0.0f64; net.links.len()];
+        for mv in &net.movements {
+            let (fl, tl) = (net.lane(mv.from_lane).link, net.lane(mv.to_lane).link);
+            let arr = net.arrival_dir(fl);
+            let dep = net.departure_dir(tl);
+            let dot = arr[0] * dep[0] + arr[1] * dep[1];
+            // Only genuine *turns* need forward room between their mouths — an
+            // undrivable turn handoff dumps a car behind itself, rotated.
+            // Reversals legitimately have backward chords, and aligned seams
+            // (freeway continuations, corridor bends) are already served by the
+            // straight-seam interior + landing rebase; trimming those shifted
+            // freeway seam geometry and broke merges.
+            if !(-0.5..0.7).contains(&dot) {
+                continue;
+            }
+            let entry = net.lane_point(mv.from_lane, net.lane(mv.from_lane).length);
+            let exit = net.lane_point(mv.to_lane, 0.0);
+            let fwd = (exit[0] - entry[0]) * arr[0] + (exit[1] - entry[1]) * arr[1];
+            if fwd < MARGIN {
+                end_trim[fl.idx()] = end_trim[fl.idx()].max(MARGIN - fwd);
+                if dot > 0.3 {
+                    start_push[tl.idx()] = start_push[tl.idx()].max((MARGIN - fwd) / dot);
+                }
+            }
+        }
+        let mut changed = false;
+        for li in 0..net.links.len() {
+            let link = net.links[li];
+            for lane in link.lane_start.0..link.lane_start.0 + link.lane_count {
+                let l = &mut net.lanes[lane as usize];
+                let trim = end_trim[li].min(MAX_TRIM).min(l.length - MIN_LANE);
+                if trim > 0.01 {
+                    l.length -= trim;
+                    changed = true;
+                }
+            }
+        }
+        // Second lever, applied only where the approach could not make room.
+        let mut deficit = vec![0.0f64; net.links.len()];
+        for mv in &net.movements {
+            let (fl, tl) = (net.lane(mv.from_lane).link, net.lane(mv.to_lane).link);
+            let arr = net.arrival_dir(fl);
+            let dep = net.departure_dir(tl);
+            if !(0.3..0.7).contains(&(arr[0] * dep[0] + arr[1] * dep[1])) {
+                continue;
+            }
+            let entry = net.lane_point(mv.from_lane, net.lane(mv.from_lane).length);
+            let exit = net.lane_point(mv.to_lane, 0.0);
+            let fwd = (exit[0] - entry[0]) * arr[0] + (exit[1] - entry[1]) * arr[1];
+            if fwd < MARGIN {
+                deficit[tl.idx()] = deficit[tl.idx()].max(start_push[tl.idx()].min(MARGIN - fwd + 2.0));
+            }
+        }
+        for li in 0..net.links.len() {
+            let link = net.links[li];
+            for lane in link.lane_start.0..link.lane_start.0 + link.lane_count {
+                let l = &mut net.lanes[lane as usize];
+                let push = deficit[li].min(MAX_TRIM).min(l.length - MIN_LANE);
+                if push > 0.01 {
+                    l.start_offset += push;
+                    l.length -= push;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
         }
     }
 }

@@ -783,19 +783,21 @@ const DECISION_HORIZON: f64 = 180.0;
 const A_LAT: f64 = 3.0;
 const CURVE_LOOKAHEAD: f64 = 45.0;
 /// Bicycle-model bounds for [`NetWorld::track_path`]. Steering geometry:
-/// maximum front-wheel angle tan 35°; the wheelbase is [`AXLE_WHEELBASE`] of the
+/// maximum front-wheel angle tan 38°; the wheelbase is [`AXLE_WHEELBASE`] of the
 /// vehicle length (car ≈ 2.7 m of 4.5 → ~3.9 m minimum turning radius; a bus
 /// proportionally wider), and the rear axle sits [`AXLE_FRONT`] of the length
 /// behind the front bumper (the pose anchor the rest of the sim uses). Grip:
 /// the tyre lateral limit (m/s², ~0.7 g) that caps curvature at speed —
 /// `κ ≤ min(tan δ_max / wheelbase, grip / v²)`.
-const AXLE_STEER_TAN: f64 = 0.7;
+const AXLE_STEER_TAN: f64 = 0.78;
 const AXLE_WHEELBASE: f64 = 0.6;
 const AXLE_FRONT: f64 = 0.8;
 const YAW_GRIP_LAT: f64 = 7.0;
-/// Pure-pursuit lookahead: `0.8·v` clamped to this range (m). Short enough to
-/// hug residential corners, long enough not to oscillate at highway speed.
-const LOOKAHEAD_MIN: f64 = 2.0;
+/// Pure-pursuit lookahead from the rear axle: `0.8·v` clamped to this range
+/// (m). The floor sits just above the wheelbase — tight enough to hug a city
+/// corner, stable enough not to oscillate; the ceiling keeps highway tracking
+/// calm.
+const LOOKAHEAD_MIN: f64 = 3.5;
 const LOOKAHEAD_MAX: f64 = 12.0;
 /// The divergence guard — the knob that trades path-hugging against full
 /// kinematics. Lateral deviation of the kinematic pose from the arc reference
@@ -1824,6 +1826,13 @@ impl NetWorld {
         [p[0] - f * p[2].cos(), p[1] - f * p[2].sin(), p[2]]
     }
 
+    /// The pose pure path geometry dictates (public for audits/tests): where the
+    /// sim's arc position puts the front bumper, against which the kinematic pose
+    /// is synced. See [`path_pose`](Self::vehicle_arc_pose).
+    pub fn vehicle_arc_pose(&self, v: &NetVehicle) -> [f64; 3] {
+        self.path_pose(v)
+    }
+
     /// The pose pure path geometry dictates — the interior crossing path when
     /// inside a node, otherwise the lane position. Its heading is the raw path
     /// tangent (it can step discontinuously at a vertex or a seam); the kinematic
@@ -1894,12 +1903,36 @@ impl NetWorld {
             }
             let len = v.driver.vehicle_length;
             let [x, y, th] = v.kin;
+            // Lookahead measured from the *rear axle* — the point doing the
+            // chasing. The arc reference is stationed at the front bumper, so the
+            // path offset subtracts the axle offset; at corner speeds the target
+            // sits barely past the bumper and the car tracks the turn tightly
+            // instead of lazily cutting toward a point a car-length beyond it.
             let ld = (0.8 * v.speed).clamp(LOOKAHEAD_MIN, LOOKAHEAD_MAX);
-            let r = self.reference_point(v, ld);
+            let r = self.reference_point(v, ld - AXLE_FRONT * len);
             let (dx, dy) = (r[0] - x, r[1] - y);
             let dist = dx.hypot(dy);
-            let kappa_cmd = if dist > 0.5 { 2.0 * shortest_angle(th, dy.atan2(dx)).sin() / dist } else { 0.0 };
+            let alpha = shortest_angle(th, dy.atan2(dx));
             let kappa_max = (AXLE_STEER_TAN / (AXLE_WHEELBASE * len)).min(YAW_GRIP_LAT / (v.speed * v.speed));
+            // Past the shoulder line pure pursuit's sin(α) goes blind (a
+            // displaced car would roll straight on, diverging forever; a held
+            // car's arc once drove 874 m away). A real driver cranks the wheel:
+            // full lock toward the shorter side until the target is ahead again —
+            // a bounded, steering-legal loop of a few seconds at worst, confined
+            // to the handful of degenerate-mouth handoffs.
+            let mut kappa_cmd = if alpha.abs() > std::f64::consts::FRAC_PI_2 {
+                kappa_max * alpha.signum()
+            } else if dist > 0.5 {
+                2.0 * alpha.sin() / dist
+            } else {
+                0.0
+            };
+            // Feed-forward through the node: steer with the interior's own
+            // curvature and let pursuit correct the residual, instead of
+            // discovering a tight turn only through accumulating error.
+            if let Some(c) = v.crossing {
+                kappa_cmd += self.network.interior_curvature(c.movement, self.crossing_arc(v));
+            }
             let kappa = kappa_cmd.clamp(-kappa_max, kappa_max);
             // The wheels only roll *forward*, and rolling doubles as the
             // longitudinal sync: ground distance this tick is whatever keeps the
@@ -1920,9 +1953,23 @@ impl NetWorld {
             let long = ex0 * c0 + ey0 * s0;
             let lat0 = -ex0 * s0 + ey0 * c0;
             let mut ds = long.clamp(0.0, v.speed * dt * 1.5 + 0.3);
-            if lat0.abs() > 1.0 {
+            // Ahead-ness measured in the *path's* frame: how far the drawn front
+            // sits past the sim's station along the road. The maneuver floor may
+            // only roll while the car is not ahead — without this guard a car
+            // recovering a lateral error against a stalled arc (a queue, a box
+            // admission gate) crept unboundedly into the intersection (32 m ahead
+            // observed), parked there until its arc caught up, and its phantom
+            // body triggered junction crashes the arc-based conflict logic never
+            // scheduled.
+            let ahead = -(ex0 * p[2].cos() + ey0 * p[2].sin());
+            if lat0.abs() > 1.0 && ahead < 0.5 {
                 ds = ds.max(0.5 * v.speed * dt);
             }
+            // Hard cap in the path frame: rolling may never take the drawn front
+            // more than half a metre past the sim's station (mid-turn, the
+            // car-frame projection alone can't see this). A car that got ahead
+            // rolls nothing until the arc catches up.
+            ds = ds.min((v.speed * dt + 0.5 - ahead).max(0.0));
             let mut th2 = th + kappa * ds;
             if th2 > std::f64::consts::PI {
                 th2 -= std::f64::consts::TAU;
@@ -4167,7 +4214,13 @@ impl NetWorld {
                     if !self.network.movements_conflict(idi, idj) {
                         continue;
                     }
-                    let (pi, pj) = (self.vehicle_world_pose(vi), self.vehicle_world_pose(vj));
+                    // Judged in the sim's arc frame, the same frame the conflict
+                    // points and box scheduling live in — two bodies genuinely
+                    // meeting on their paths. The kinematic pose is the *drawn*
+                    // frame; its bounded tracking deviations (corner off-tracking,
+                    // recovery at the few degenerate mouths) would read as
+                    // phantom junction crashes the dynamics never produced.
+                    let (pi, pj) = (self.vehicle_arc_pose(vi), self.vehicle_arc_pose(vj));
                     let width = |v: &NetVehicle| VehicleClass::from_length(v.driver.vehicle_length).width();
                     if body_overlap(pi, vi.driver.vehicle_length, width(vi), pj, vj.driver.vehicle_length, width(vj)) {
                         let closing = (vi.speed.max(vj.speed)) as f32;
@@ -9343,6 +9396,7 @@ mod tests {
         let kappa_lim = AXLE_STEER_TAN / (AXLE_WHEELBASE * DriverConfig::car().vehicle_length);
         let mut prev: Option<([f64; 3], [f64; 2])> = None;
         let (mut total, mut worst_crab, mut wrong_way) = (0.0f64, 0.0f64, 0.0f64);
+        let mut peak_kappa = 0.0f64;
         for _ in 0..600 {
             world.step();
             let Some(v) = world.vehicle(1) else { break };
@@ -9351,6 +9405,9 @@ mod tests {
                 let dth = shortest_angle(pp[2], pose[2]);
                 let (dx, dy) = (rear[0] - pr[0], rear[1] - pr[1]);
                 let ds = dx.hypot(dy);
+                if ds > 0.05 {
+                    peak_kappa = peak_kappa.max(dth.abs() / ds);
+                }
                 total += dth;
                 wrong_way = wrong_way.max(dth); // a right turn only ever yaws negative
                 assert!(
@@ -9371,6 +9428,14 @@ mod tests {
         );
         assert!(wrong_way.to_degrees() < 2.0, "and never yawed the wrong way: {:.1}°", wrong_way.to_degrees());
         assert!(worst_crab.to_degrees() < 15.0, "rear axle tracked, not slid: crab {:.1}°", worst_crab.to_degrees());
+        // Sharpness: a city corner is taken tightly — the rear axle's tightest
+        // arc must dip under ~9 m radius (real curb-return scale), not sweep a
+        // lazy bus-like arc across the box.
+        assert!(
+            peak_kappa > 1.0 / 9.0,
+            "the corner is taken at curb-return sharpness: tightest radius {:.1} m",
+            1.0 / peak_kappa.max(1e-9)
+        );
     }
 
     #[test]

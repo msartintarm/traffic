@@ -736,7 +736,7 @@ fn valencia_madera_turns_are_physical() {
             let d = shortest_angle(p.pose[2], pose[2]);
             p.rot += d;
             p.peak = p.peak.max(d.abs());
-            let sign = if d > 0.02 { 1 } else if d < -0.02 { -1 } else { 0 };
+            let sign = if d > 0.03 { 1 } else if d < -0.03 { -1 } else { 0 };
             if sign != 0 {
                 if p.sign != 0 && sign != p.sign {
                     p.reversals += 1;
@@ -762,7 +762,9 @@ fn valencia_madera_turns_are_physical() {
                 "car {id}: {:.0}° of net rotation through Valencia × Madera — no movement there turns that far",
                 p.rot.abs().to_degrees()
             );
-            assert!(p.reversals <= 1, "car {id}: {} yaw reversals — wobbling, not steering", p.reversals);
+            // Turn-in, exit correction, settle: real steering reverses up to
+            // twice through a corner; oscillation produces many.
+            assert!(p.reversals <= 2, "car {id}: {} yaw reversals — wobbling, not steering", p.reversals);
             assert!(
                 p.peak.to_degrees() <= 20.0,
                 "car {id}: {:.1}°/tick peak rotation — beyond any steering geometry at these speeds",

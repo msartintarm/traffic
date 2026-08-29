@@ -815,6 +815,29 @@ impl Network {
         [p[0], p[1], d[1].atan2(d[0])]
     }
 
+    /// Signed curvature (1/m, left-positive) of a movement's interior Bézier at
+    /// arc position `s` — the feed-forward a path tracker needs so a car steers
+    /// *with* a tight turn instead of discovering it through tracking error.
+    pub fn interior_curvature(&self, mid: MovementId, s: f64) -> f64 {
+        let it = self.interior(mid);
+        let t = (s / it.len.max(1e-9)).clamp(0.0, 1.0);
+        let (p0, p1, p2, p3) = (it.entry, it.c1, it.c2, it.exit);
+        let u = 1.0 - t;
+        let d1 = [
+            3.0 * (u * u * (p1[0] - p0[0]) + 2.0 * u * t * (p2[0] - p1[0]) + t * t * (p3[0] - p2[0])),
+            3.0 * (u * u * (p1[1] - p0[1]) + 2.0 * u * t * (p2[1] - p1[1]) + t * t * (p3[1] - p2[1])),
+        ];
+        let d2 = [
+            6.0 * (u * (p2[0] - 2.0 * p1[0] + p0[0]) + t * (p3[0] - 2.0 * p2[0] + p1[0])),
+            6.0 * (u * (p2[1] - 2.0 * p1[1] + p0[1]) + t * (p3[1] - 2.0 * p2[1] + p1[1])),
+        ];
+        let speed2 = d1[0] * d1[0] + d1[1] * d1[1];
+        if speed2 < 1e-6 {
+            return 0.0;
+        }
+        (d1[0] * d2[1] - d1[1] * d2[0]) / speed2.powf(1.5)
+    }
+
     /// Smallest turn radius (m) along a movement's interior Bézier — analytic
     /// curvature `|B'×B''| / |B'|³` sampled across the curve, `INFINITY` for a
     /// straight path. What a curve-speed limit through the box reads, the way

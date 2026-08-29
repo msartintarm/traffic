@@ -42,6 +42,46 @@ validation). What shipped, including deviations from the design below:
   suspected render-side (bridge prev-pose interpolation / id reuse per the
   render-id invariant); verify in the browser after the next wasm deploy.
 
+## Status (2026-08-28, second pass): throughput + sharpness fixes
+
+Follow-up on two reports against the P1–P3 build (mid-box sticking at
+El Camino × Millbrae Ave; cornering too soft / wrong for a two-axle car):
+
+- **Throughput root cause**: junction crash detection read the *kinematic*
+  poses of conflicting crossers — bounded tracking deviations (corner
+  off-tracking, recovery at degenerate mouths) registered as phantom junction
+  crashes (52 per 8 sim-min, 60 s wrecks parked mid-box). Fixed by judging the
+  junction branch of `detect_crashes` in the **arc frame** (`vehicle_arc_pose`)
+  — the frame the conflict points and box scheduling live in; rear-end
+  detection was already arc-based. Crashes back to 8 per 8 sim-min (ramp 0).
+- **Kin-ahead creep**: the maneuver floor let the drawn car outrun a stalled
+  arc by up to 32 m (parked "mid-box" while its arc queued). Fixed with a
+  path-frame ahead cap (`ds ≤ v·dt + 0.5 − ahead`) and an ahead-gate on the
+  floor.
+- **Recovery at undrivable handoffs** (the Richmond → Laurel pattern: landing
+  5 m behind-left, 95° rotated): tried hold-until-ahead (a held car's arc
+  drove 874 m away — never again), settled on full-lock toward the target when
+  it is behind the shoulder — bounded, steering-legal, and crash-neutral now
+  that crashes are arc-frame.
+- **Root geometry**: `map.rs::enforce_mouth_ordering` (runs before
+  `build_interiors`) pulls a turn approach's stop line upstream until every
+  turn movement's exit mouth is ≥ 1 m ahead of its entry mouth (two levers:
+  end-trim on the approach, start-push on aligned receivers). **Turns only**
+  (`arr·dep ∈ (−0.5, 0.7)`): trimming aligned/interchange seams shifted
+  freeway seam geometry and broke highway-mode merges. 8 of 3161 movements
+  remain geometrically unfixable by trims (the Rollins cluster fan);
+  full-lock recovery + divergence telemetry cover them.
+- **Sharpness**: lookahead re-referenced to the rear axle (was effectively
+  `ld + 3.6 m` — every corner soft), floor 3.5 m ≈ 1.3·wheelbase; curvature
+  feed-forward from the interior Bézier (`Network::interior_curvature`) so
+  tight turns are steered, not discovered by error; steering authority raised
+  to tan 38°. Audit worst curvature now sits exactly at the 0.26 limit;
+  `a_right_turn_sweeps_like_a_car` asserts the tightest arc dips under 9 m
+  (curb-return scale). Valencia passage test allows ≤ 2 significant yaw
+  reversals (turn-in / correction / settle is real steering).
+- Goldens: `junction_0.png` regenerated (stop lines at the fixture's
+  degenerate turn mouths moved upstream — the mouth-ordering pass working).
+
 ## The three reports, diagnosed
 
 1. **"Cars don't turn like 4-wheeled cars."** Correct, structurally: today the
