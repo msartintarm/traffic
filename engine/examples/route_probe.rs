@@ -30,7 +30,13 @@ fn main() {
     println!("destination fields: {}", dests.len());
     let t = Instant::now();
     world.install_router(&dests);
-    println!("install_router (all fields, free-flow): {:.2}s", t.elapsed().as_secs_f64());
+    println!("install_router whole-graph: {:.2}s", t.elapsed().as_secs_f64());
+    world.set_arterial_routing(true);
+    let t = Instant::now();
+    world.install_router(&dests);
+    println!("install_router arterial-mode: {:.2}s", t.elapsed().as_secs_f64());
+    world.set_arterial_routing(false);
+    world.install_router(&dests);
 
     let t = Instant::now();
     let costs = world.live_link_costs();
@@ -58,4 +64,33 @@ fn main() {
         if v.speed > 0.9 * v.driver.desired_speed.min(lane.speed_limit) { free += 1 }
     }
     println!("fleet: {} on residential, {} on arterial; {} approaching a stop node; {} at free-flow speed", res, art, near_stop, free);
+    println!("whole-graph mode: exited {} leaked {} crashed {}", world.exited(), world.leaked(), world.crashed());
+
+    // Same demand under arterial-first routing: watch throughput and leaks.
+    let net2 = OsmMap::from_json(&std::fs::read_to_string(&path).unwrap()).unwrap().build();
+    let mut world2 = NetWorld::new(net2, cfg);
+    world2.set_arterial_routing(true);
+    let mut gen2 = DemandGenerator::new(&world2, &pairs, 0);
+    world2.install_router(&gen2.destinations());
+    let t = Instant::now();
+    for _ in 0..2400 {
+        gen2.step(&mut world2, cfg.dt);
+        world2.step();
+    }
+    println!(
+        "arterial mode 2400 ticks: {:.1} ms/tick, fleet {}, exited {} leaked {} crashed {}",
+        t.elapsed().as_secs_f64() * 1000.0 / 2400.0,
+        world2.vehicles().len(), world2.exited(), world2.leaked(), world2.crashed()
+    );
+    let (mut res2, mut art2) = (0u32, 0u32);
+    for v in world2.vehicles() {
+        use engine::sim::network::RoadKind;
+        if matches!(world2.network.link(world2.network.lane(v.lane).link).kind, RoadKind::Local) { res2 += 1 } else { art2 += 1 }
+    }
+    println!("arterial-mode fleet: {res2} on residential, {art2} on arterial");
+    let (g, e) = (
+        engine::sim::net_world::GATED.load(std::sync::atomic::Ordering::Relaxed),
+        engine::sim::net_world::EVALED.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    println!("lane-eval gate: {g} gated vs {e} evaluated ({:.0}% cut)", 100.0 * g as f64 / (g + e).max(1) as f64);
 }

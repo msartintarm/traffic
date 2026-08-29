@@ -74,19 +74,67 @@ pub fn distances_to_with(pred: &[Vec<u32>], dest: LinkId, cost: &[u64]) -> Vec<u
 pub struct PartialField {
     dist: Vec<u64>,
     heap: std::collections::BinaryHeap<std::cmp::Reverse<(u64, u32)>>,
+    /// Which links this solve has *settled* (popped with a final distance) — the
+    /// region a targeted solve is exact over, and the merge boundary when a
+    /// partial result is published over a previous field.
+    settled: Vec<bool>,
+    /// Early-termination targets: the solve is complete once every target is
+    /// settled (Dijkstra settles in distance order, so everything a querying
+    /// car can read is final by then). `None` = run to exhaustion.
+    targets: Option<Vec<bool>>,
+    targets_left: usize,
 }
 
 impl PartialField {
     pub fn new(n: usize, dest: LinkId) -> Self {
+        Self::new_multi(n, std::iter::once(dest.0))
+    }
+
+    /// A field seeded at several zero-cost sources at once — the "distance to the
+    /// nearest of these" solve the arterial-ascent field uses (every trunk link
+    /// is a source).
+    pub fn new_multi(n: usize, seeds: impl Iterator<Item = u32>) -> Self {
         let mut dist = vec![UNREACHABLE; n];
-        dist[dest.idx()] = 0;
         let mut heap = std::collections::BinaryHeap::new();
-        heap.push(std::cmp::Reverse((0u64, dest.0)));
-        Self { dist, heap }
+        for s in seeds {
+            dist[s as usize] = 0;
+            heap.push(std::cmp::Reverse((0u64, s)));
+        }
+        Self { dist, heap, settled: vec![false; n], targets: None, targets_left: 0 }
+    }
+
+    /// Restrict this solve to early-terminate once every link in `targets` is
+    /// settled — the links that will actually query the field this cycle.
+    pub fn with_targets(mut self, targets: &[u32]) -> Self {
+        let mut set = vec![false; self.dist.len()];
+        let mut left = 0;
+        for &t in targets {
+            if !set[t as usize] {
+                set[t as usize] = true;
+                left += 1;
+            }
+        }
+        self.targets = Some(set);
+        self.targets_left = left;
+        self
+    }
+
+    pub fn settled(&self) -> &[bool] {
+        &self.settled
     }
 
     /// Settle up to `budget` links; returns `true` once the field is complete (heap drained).
     pub fn advance(&mut self, pred: &[Vec<u32>], cost: &[u64], budget: usize) -> bool {
+        self.advance_masked(pred, cost, budget, None)
+    }
+
+    /// [`advance`](Self::advance), restricted: with a mask, relaxation never
+    /// enters a link outside it — the field is solved over a subgraph (arterial
+    /// trunk + a destination's access neighborhood) and every excluded link
+    /// simply stays `UNREACHABLE`, which the router answers with its ascent
+    /// fallback. This is what makes an arterial-mode field ~a third of the work
+    /// of a whole-graph one.
+    pub fn advance_masked(&mut self, pred: &[Vec<u32>], cost: &[u64], budget: usize, allowed: Option<&[bool]>) -> bool {
         let mut settled = 0usize;
         while settled < budget {
             let Some(std::cmp::Reverse((d, b))) = self.heap.pop() else {
@@ -96,8 +144,20 @@ impl PartialField {
                 continue; // a stale, superseded entry — not a settle
             }
             settled += 1;
+            self.settled[b as usize] = true;
+            if let Some(ts) = &self.targets {
+                if ts[b as usize] {
+                    self.targets_left -= 1;
+                    if self.targets_left == 0 {
+                        return true; // every querying link is final — the rest is unread this cycle
+                    }
+                }
+            }
             let step = cost[b as usize].saturating_add(d);
             for &a in &pred[b as usize] {
+                if allowed.is_some_and(|m| !m[a as usize]) {
+                    continue;
+                }
                 if step < self.dist[a as usize] {
                     self.dist[a as usize] = step;
                     self.heap.push(std::cmp::Reverse((step, a)));
@@ -107,6 +167,31 @@ impl PartialField {
         self.heap.is_empty() // budget spent; done iff nothing is left to settle
     }
 
+    /// The links within `cap` cost of `dest` on the *unrestricted* graph — a
+    /// destination's local access neighborhood, merged into the trunk mask so a
+    /// trip can descend from the arterials to its actual endpoint.
+    pub fn neighborhood(pred: &[Vec<u32>], dest: LinkId, cost: &[u64], cap: u64) -> Vec<u32> {
+        let mut f = Self::new(pred.len(), dest);
+        let mut out = Vec::new();
+        while let Some(std::cmp::Reverse((d, b))) = f.heap.pop() {
+            if d > f.dist[b as usize] {
+                continue;
+            }
+            if d > cap {
+                break;
+            }
+            out.push(b);
+            let step = cost[b as usize].saturating_add(d);
+            for &a in &pred[b as usize] {
+                if step < f.dist[a as usize] {
+                    f.dist[a as usize] = step;
+                    f.heap.push(std::cmp::Reverse((step, a)));
+                }
+            }
+        }
+        out
+    }
+
     pub fn dist(&self) -> &[u64] {
         &self.dist
     }
@@ -114,6 +199,11 @@ impl PartialField {
     /// Move the settled distances out (leaving the field empty), to publish into a live buffer.
     pub fn take_dist(&mut self) -> Vec<u64> {
         std::mem::take(&mut self.dist)
+    }
+
+    /// Move both the distances and the settled map out, for a merge-publish.
+    pub fn take_parts(&mut self) -> (Vec<u64>, Vec<bool>) {
+        (std::mem::take(&mut self.dist), std::mem::take(&mut self.settled))
     }
 }
 

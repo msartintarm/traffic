@@ -66,6 +66,14 @@ export type Sim = {
   set_parallel_routing(on: boolean): void;
   parallel_routing(): boolean;
   set_cache_sort(on: boolean): void;
+  /** Stop/yield control delay priced into routing (optional: older wasm builds lack it). */
+  set_control_aware_routing?(on: boolean): void;
+  /** Human-cadence discretionary lane-decision stagger. */
+  set_lane_eval_stagger?(on: boolean): void;
+  /** Arterial-first routing fields with local access neighborhoods. */
+  set_arterial_routing?(on: boolean): void;
+  /** Targeted route refresh: dirty gating + early-terminated field solves. */
+  set_targeted_routing?(on: boolean): void;
   cache_sort(): boolean;
   set_demand_sources(highway: boolean, surface: boolean): void;
   demand_highway(): boolean;

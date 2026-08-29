@@ -35,6 +35,10 @@ export type Control =
   | { type: "parThreshold"; value: number }
   | { type: "parallelRouting"; value: boolean }
   | { type: "cacheSort"; value: boolean }
+  | { type: "stopCostRouting"; value: boolean }
+  | { type: "laneEvalStagger"; value: boolean }
+  | { type: "arterialRouting"; value: boolean }
+  | { type: "targetedRouting"; value: boolean }
   | { type: "showCrashes"; value: boolean }
   | { type: "clearCrashes" }
   | { type: "entrySpeedCap"; value: number }
@@ -58,7 +62,8 @@ export type ControlType = Control["type"];
 
 export const CONTROL_TYPES: ReadonlySet<ControlType> = new Set([
   "speed", "demandRate", "rushHour", "dayCompression", "rampMetering", "sleepScheduler",
-  "parThreshold", "parallelRouting", "cacheSort", "showCrashes", "clearCrashes", "entrySpeedCap", "congestionEngage", "congestionEnabled",
+  "parThreshold", "parallelRouting", "cacheSort", "stopCostRouting", "laneEvalStagger", "arterialRouting", "targetedRouting",
+  "showCrashes", "clearCrashes", "entrySpeedCap", "congestionEngage", "congestionEnabled",
   "demandSources", "fit", "metersPerPixel", "zoomAt", "panBy", "resize", "select",
   "hover", "play", "pause", "frameBudget", "ascii", "transit",
 ] satisfies ControlType[]);

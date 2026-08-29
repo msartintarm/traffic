@@ -342,6 +342,10 @@ export async function startEngineSession(
       case "parThreshold": sim.set_par_threshold(c.value); break;
       case "parallelRouting": sim.set_parallel_routing(c.value); break;
       case "cacheSort": sim.set_cache_sort(c.value); break;
+      case "stopCostRouting": sim.set_control_aware_routing?.(c.value); break;
+      case "laneEvalStagger": sim.set_lane_eval_stagger?.(c.value); break;
+      case "arterialRouting": sim.set_arterial_routing?.(c.value); break;
+      case "targetedRouting": sim.set_targeted_routing?.(c.value); break;
       case "showCrashes": sim.set_show_crashes(c.value); break;
       case "clearCrashes": sim.clear_crashes(); break;
       case "entrySpeedCap": sim.set_entry_speed_cap(c.value); break;

@@ -792,6 +792,40 @@ impl Simulation {
         self.world.parallel_routing()
     }
 
+    /// Toggle stop/yield control delay in routing costs — drivers plan around the
+    /// ~9 s a four-way stop really costs, keeping through-traffic on the arterials
+    /// instead of rat-running the stop-sign grid. On by default; takes effect on
+    /// the next reroute cycle.
+    pub fn set_control_aware_routing(&mut self, on: bool) {
+        self.world.set_control_aware_routing(on);
+    }
+
+    /// Toggle the human-cadence lane-decision stagger: away from a junction (and
+    /// while parked in queue) a driver re-weighs a discretionary lane change about
+    /// once a second, not every tick. On by default; cuts the lane-change scan
+    /// substantially at city scale with no change to mandatory turn positioning.
+    pub fn set_lane_eval_stagger(&mut self, on: bool) {
+        self.world.set_lane_eval_stagger(on);
+    }
+
+    /// Toggle arterial-first routing: through-plans are solved over the arterial
+    /// network plus each destination's local access streets, and a car on outer
+    /// local fabric first drives to a main road — the way drivers actually plan.
+    /// Halves the routing solve and startup cost; rebuilds the router on toggle
+    /// (a brief hitch on a city map).
+    pub fn set_arterial_routing(&mut self, on: bool) {
+        self.world.set_arterial_routing(on);
+    }
+
+    /// Toggle targeted route refresh: reroute cycles skip destination fields whose
+    /// answers still price correctly, and solve the rest only far enough to cover
+    /// the cars (and spawn gateways) that will actually read them — the rest of
+    /// each field keeps its previous, still-valid values. On by default; uncheck
+    /// to run every cycle exhaustively for comparison.
+    pub fn set_targeted_routing(&mut self, on: bool) {
+        self.world.set_targeted_routing(on);
+    }
+
     /// Toggle the cache-friendly per-lane/per-corridor sort (a flat position-key array instead
     /// of reading a vehicle row per comparison). On by default; a display-neutral performance
     /// option — the simulation result is identical either way.

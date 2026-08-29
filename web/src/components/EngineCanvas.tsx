@@ -129,6 +129,10 @@ export default function EngineCanvas() {
   const [smoothPlayback, setSmoothPlayback] = useState(true); // frame budget on: smooth view, sim slows under load
   const [showCrashes, setShowCrashes] = useState(false); // crash-location overlay, off by default
   const [cacheSort, setCacheSort] = useState(true); // cache-friendly sort, on by default (see net_world default)
+  const [stopCostRouting, setStopCostRouting] = useState(true); // control-aware routing, on by default (see net_world default)
+  const [laneEvalStagger, setLaneEvalStagger] = useState(true); // human-cadence lane decisions, on by default (see net_world default)
+  const [arterialRouting, setArterialRouting] = useState(false); // arterial-first fields, off by default (see net_world default)
+  const [targetedRouting, setTargetedRouting] = useState(true); // targeted route refresh, on by default (see net_world default)
   const [startSpeedMps, setStartSpeedMps] = useState(36); // ≥ every road limit ⇒ "enter at limit"
   const [units, setUnits] = useState<"mi" | "km">("mi");
   const unitsRef = useRef<"mi" | "km">("mi"); // read inside the per-frame HUD update (avoids stale closure)
@@ -785,6 +789,66 @@ export default function EngineCanvas() {
                 }}
               />
               Smooth playback
+            </label>
+            <label
+              className={styles.zoomLabel}
+              title="Drivers plan around control delay: a link ending at a stop sign costs ~9 s extra (a yield ~3 s) in the route planner, keeping through-traffic on the arterials instead of rat-running the stop-sign grid — the way real drivers path. Applies from the next reroute cycle. On by default."
+            >
+              <input
+                type="checkbox"
+                checked={stopCostRouting}
+                disabled={!ready}
+                onChange={(e) => {
+                  sessionRef.current?.applyControl({ type: "stopCostRouting", value: e.target.checked });
+                  setStopCostRouting(e.target.checked);
+                }}
+              />
+              Stop-sign-aware routing
+            </label>
+            <label
+              className={styles.zoomLabel}
+              title="Away from a junction (or standing in queue) a driver re-weighs a discretionary lane change about once a second, not five times — spread those scans on a ~1 s staggered cadence. Mandatory turn positioning near intersections still evaluates every tick. Cuts the lane-change phase substantially at city scale. On by default."
+            >
+              <input
+                type="checkbox"
+                checked={laneEvalStagger}
+                disabled={!ready}
+                onChange={(e) => {
+                  sessionRef.current?.applyControl({ type: "laneEvalStagger", value: e.target.checked });
+                  setLaneEvalStagger(e.target.checked);
+                }}
+              />
+              Relaxed lane decisions
+            </label>
+            <label
+              className={styles.zoomLabel}
+              title="Plan trips the way drivers do: over the arterial network, with local streets only near each trip's ends (a car deep in local fabric first heads for a main road). Roughly halves routing solve and startup cost and shifts through-traffic onto arterials. Toggling rebuilds the router — expect a brief pause on a city map. Off by default."
+            >
+              <input
+                type="checkbox"
+                checked={arterialRouting}
+                disabled={!ready}
+                onChange={(e) => {
+                  sessionRef.current?.applyControl({ type: "arterialRouting", value: e.target.checked });
+                  setArterialRouting(e.target.checked);
+                }}
+              />
+              Arterial-first routing
+            </label>
+            <label
+              className={styles.zoomLabel}
+              title="Refresh routing the way it's actually read: skip destinations whose routes still price correctly, and solve the rest only far enough to cover the cars (and entrances) that will query them — untouched parts of a field keep their previous, still-valid answers, and every field is fully refreshed on a bounded cadence. Cuts routing recompute work severalfold and makes rerouting react faster. On by default — uncheck to run every cycle exhaustively."
+            >
+              <input
+                type="checkbox"
+                checked={targetedRouting}
+                disabled={!ready}
+                onChange={(e) => {
+                  sessionRef.current?.applyControl({ type: "targetedRouting", value: e.target.checked });
+                  setTargetedRouting(e.target.checked);
+                }}
+              />
+              Targeted route refresh
             </label>
             <label
               className={styles.zoomLabel}

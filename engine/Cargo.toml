@@ -85,3 +85,11 @@ lto = true
 [[example]]
 name = "route_probe"
 required-features = ["import"]
+
+[[example]]
+name = "toggle_probe"
+required-features = ["import"]
+
+[[example]]
+name = "geom_probe"
+required-features = ["import"]

@@ -242,6 +242,20 @@ pub struct NetWorld {
     crashed: u32,
     /// Tick-vehicle count of lateral divergence-guard activations in `track_path`.
     divergences: u64,
+    /// Routing prices stop/yield control delay into link costs (see [`STOP_COST_MS`]).
+    control_aware_routing: bool,
+    /// Free-flow cars re-evaluate discretionary lane choice on the
+    /// [`FREEFLOW_LC_PERIOD`] cadence instead of every tick.
+    lane_eval_stagger: bool,
+    /// Route over the arterial trunk with local access neighborhoods (see
+    /// [`FieldRouter::new_with_trunk`]) instead of whole-graph fields.
+    arterial_routing: bool,
+    /// Reroute cycles solve only what will be read: dirty fields, early-stopped
+    /// at their querying links (see [`FieldRouter::begin_recompute_targeted`]).
+    targeted_routing: bool,
+    /// Entry links observed spawning traffic toward each destination — the
+    /// spawn-gateway targets a field must keep covered for future arrivals.
+    dest_entries: HashMap<u32, Vec<u32>>,
     /// Vehicles crashed per [`CrashKind`], indexed by the kind's discriminant —
     /// the artifact-vs-realism breakdown the flat `crashed` tally can't give.
     crashed_by: [u32; 2],
@@ -768,6 +782,25 @@ const SLEEP_SPEED_EPS: f64 = 0.02;
 /// slow-timescale, and skipping the MOBIL scan for sleepers is a third of the
 /// lane-change pass at gridlock.
 const SLEEPER_LC_PERIOD: u64 = 5;
+/// Lane-decision stagger diagnostics, counted only when `LC_DEBUG` is set (the
+/// `CRASH_DEBUG` convention): how many per-car evaluations the gate skipped vs
+/// ran, across the process.
+pub static GATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static EVALED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Cadence (ticks, id-staggered) at which a *free-flowing* car re-evaluates its
+/// discretionary lane choice when [`NetWorld::lane_eval_stagger`] is on: a driver
+/// cruising at speed with no one around and no junction in sight isn't weighing
+/// a lane change five times a second. Mandatory decisions are untouched — any
+/// car below free-flow speed, mid-change, or within [`DECISION_HORIZON`] of its
+/// link end (where turn-lane positioning lives) still evaluates every tick.
+const FREEFLOW_LC_PERIOD: u64 = 5;
+/// Perceived control delay (ms) a driver plans around at a stop sign / yield when
+/// [`NetWorld::control_aware_routing`] is on — why real traffic stays on the
+/// arterials instead of rat-running the four-way-stop grid. Signals carry no
+/// penalty: they mostly meter the arterials themselves, and pricing them would
+/// push through-traffic back onto the side streets.
+const STOP_COST_MS: f64 = 9_000.0;
+const YIELD_COST_MS: f64 = 3_000.0;
 /// Parallel crossover (vehicle count) for the *light* per-car passes — the
 /// MOBIL lane-change scan and the in-lane integrate. Their per-car work is far
 /// below the accel gather's, so rayon's dispatch+collect overhead only pays
@@ -1141,7 +1174,9 @@ impl NetWorld {
         let junctions = Junctions::build(&network);
         let congestion = CongestionLod::new(network.links.len());
         Self {
-            network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0, divergences: 0, crashed_by: [0; 2], crash_log: Vec::new(),
+            network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0, divergences: 0,
+            control_aware_routing: true, lane_eval_stagger: true, arterial_routing: false,
+            targeted_routing: true, dest_entries: HashMap::new(), crashed_by: [0; 2], crash_log: Vec::new(),
             merges, link_straight, turn_caps, merge_feeder_lane, through_next, corridor_of, corridor_offset, seam_primary, signals, link_entries, router: None, external_reroute: false,
             meters: Vec::new(), metering_on: false, day_secs: 0.0, pm_plan: false, rail_preempts,
             timetable: rail::Timetable::default(), crossing_sets: HashMap::new(), weekend: false, day_rate: 1.0,
@@ -1317,7 +1352,56 @@ impl NetWorld {
     /// [`NetWorld::spawn_to`] then route by the field and reroute live.
     pub fn install_router(&mut self, dests: &[LinkId]) {
         let costs = self.live_link_costs();
-        self.router = Some(FieldRouter::new(&self.network, dests, &costs));
+        let trunk = self.arterial_routing.then(|| {
+            self.network.links.iter().map(|l| !matches!(l.kind, crate::sim::network::RoadKind::Local)).collect()
+        });
+        self.router = Some(FieldRouter::new_with_trunk(&self.network, dests, &costs, trunk));
+    }
+
+    /// Toggle stop/yield control delay in routing costs; takes effect on the next
+    /// reroute cycle (forced by resetting the fingerprint).
+    pub fn set_control_aware_routing(&mut self, on: bool) {
+        if self.control_aware_routing != on {
+            self.control_aware_routing = on;
+            self.route_fingerprint = u64::MAX; // any live fingerprint differs → recompute
+        }
+    }
+
+    /// Toggle the free-flow lane-evaluation stagger.
+    pub fn set_lane_eval_stagger(&mut self, on: bool) {
+        self.lane_eval_stagger = on;
+    }
+
+    /// Toggle targeted route refresh (dirty gating + early-terminated solves).
+    /// Turning it off forces the next cycle to run exhaustively.
+    pub fn set_targeted_routing(&mut self, on: bool) {
+        if self.targeted_routing != on {
+            self.targeted_routing = on;
+            self.route_fingerprint = u64::MAX;
+        }
+    }
+
+    /// `(solved, skipped)` destination fields in the router's last targeted cycle.
+    pub fn route_cycle_stats(&self) -> (usize, usize) {
+        self.router.as_ref().map_or((0, 0), |r| r.last_cycle_stats())
+    }
+
+    /// Whether a budgeted reroute cycle is currently in flight.
+    pub fn route_recompute_pending(&self) -> bool {
+        self.router.as_ref().is_some_and(|r| r.recompute_pending())
+    }
+
+    /// Toggle arterial-first routing. Rebuilds the router in place (same
+    /// destinations) so the change applies immediately.
+    pub fn set_arterial_routing(&mut self, on: bool) {
+        if self.arterial_routing == on {
+            return;
+        }
+        self.arterial_routing = on;
+        if let Some(r) = &self.router {
+            let dests: Vec<LinkId> = r.destinations().to_vec();
+            self.install_router(&dests);
+        }
     }
 
     /// Configure the congestion level-of-detail. Turning it off returns every link to
@@ -1467,6 +1551,12 @@ impl NetWorld {
         self.cfg.sleep_scheduler = on;
     }
 
+    /// The router's current next hop from `from` toward `dest` — read-only probe
+    /// access for audits and tests (the same lookup `intended_movement` makes).
+    pub fn router_next_hop(&self, dest: LinkId, from: LinkId) -> Option<LinkId> {
+        self.router.as_ref()?.next_hop(dest, from)
+    }
+
     pub fn router_knows(&self, dest: LinkId) -> bool {
         self.router.as_ref().is_some_and(|r| r.knows(dest))
     }
@@ -1603,6 +1693,12 @@ impl NetWorld {
         // report. Excess demand waits at the gateway (metered), as it already does.
         let admit_gap = driver.min_gap + speed * driver.time_headway;
         let Some(lane) = self.entry_lane_toward(entry_link, admit_gap, id, Some(dest)) else { return false };
+        // Remember this gateway→destination pairing: the destination's routing
+        // field must keep the gateway covered for the cars that spawn here later.
+        let gates = self.dest_entries.entry(dest.0).or_default();
+        if !gates.contains(&entry_link.0) {
+            gates.push(entry_link.0);
+        }
         let speed = self.safe_entry_speed(lane, speed, &driver);
         self.link_entries[entry_link.idx()] += 1;
         let kin = Self::spawn_kin(&self.network, lane, 0.0, &driver);
@@ -1762,7 +1858,16 @@ impl NetWorld {
                 let jam = (lane.length / 7.0 * link.lane_count as f64).max(1.0);
                 let ratio = (count[i as usize] as f64 / jam).min(3.0);
                 let base = self.network.link_travel_time_ms(LinkId(i)) as f64;
-                (base * (1.0 + 2.0 * ratio)) as u64
+                let ctrl = if self.control_aware_routing {
+                    match self.network.node(link.to).control {
+                        NodeControl::Stop => STOP_COST_MS,
+                        NodeControl::Yield => YIELD_COST_MS,
+                        _ => 0.0,
+                    }
+                } else {
+                    0.0
+                };
+                (base * (1.0 + 2.0 * ratio) + ctrl) as u64
             })
             .collect()
     }
@@ -2328,6 +2433,7 @@ impl NetWorld {
         // work split). It gets its own floor rather than riding `par_threshold`.
         let threshold = self.par_threshold.max(LIGHT_PAR_THRESHOLD);
         let (backend, n) = (self.active_backend(), self.fleet.rows.len());
+        let dbg = std::env::var_os("LC_DEBUG").is_some();
         let decided: Vec<Option<(usize, LaneId)>> = map_collect(backend, threshold, n, |i| {
             if self.fleet.rows[i].wreck.is_some() {
                 return None; // wrecks don't change lanes
@@ -2354,6 +2460,36 @@ impl NetWorld {
                     return None;
                 }
             }
+            // Away from its link end a car has only a *discretionary* choice to
+            // make — and no driver re-weighs that five times a second. Spread
+            // those scans over the [`FREEFLOW_LC_PERIOD`] cadence (~1 s,
+            // id-staggered like the sleeper gate above): the human decision
+            // rate, not the sim tick rate. Everything that is genuinely
+            // per-tick stays per-tick — a change in flight (abort logic) and
+            // the approach zone where mandatory turn positioning and merges
+            // live. That zone scales with the link: on a city block "the last
+            // 180 m" would be the whole link and the gate would never apply;
+            // half the block (up to the full horizon on long roads) keeps
+            // positioning responsive everywhere.
+            if self.lane_eval_stagger {
+                let v = &self.fleet.rows[i];
+                let lane = self.network.lane(v.lane);
+                let guard = (0.5 * lane.length).min(DECISION_HORIZON);
+                // A car standing in queue is on the same human cadence wherever
+                // it stands — this is the sleeper gate above generalized to runs
+                // without the sleep scheduler (a parked car's choice can't
+                // change tick-to-tick, and queue-jumps were already designed
+                // around this exact period).
+                let parked = v.speed < SLEEP_SPEED_EPS;
+                if v.lane_change.is_none()
+                    && (parked || lane.length - v.position > guard)
+                    && (self.tick.wrapping_add(v.id as u64)) % FREEFLOW_LC_PERIOD != 0
+                {
+                    if dbg { GATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                    return None;
+                }
+            }
+            if dbg { EVALED.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
             self.best_lane_change(i, &by_lane).map(|t| (i, t))
         });
         for (i, target) in decided.into_iter().flatten() {
@@ -3094,7 +3230,19 @@ impl NetWorld {
             self.route_cycle_tick = self.tick;
             let costs = self.live_link_costs();
             let width = self.route_field_width();
-            if let Some(r) = self.router.as_mut() {
+            if self.targeted_routing {
+                // The links each field will actually be read from this cycle:
+                // every car bound for the destination, plus its spawn gateways.
+                let mut targets = self.dest_entries.clone();
+                for v in &self.fleet.rows {
+                    if let Some(d) = v.dest {
+                        targets.entry(d.0).or_default().push(self.network.lane(v.lane).link.0);
+                    }
+                }
+                if let Some(r) = self.router.as_mut() {
+                    r.begin_recompute_targeted(costs, width, &targets);
+                }
+            } else if let Some(r) = self.router.as_mut() {
                 r.begin_recompute(costs, width);
             }
         }
@@ -9332,6 +9480,54 @@ mod tests {
         }
         assert_eq!(world.exited(), 1, "the car completes the route");
         assert_eq!(lane_at_a_end, Some(0), "it pre-positioned on A for the turn two blocks out");
+    }
+
+    #[test]
+    fn routing_prices_stop_control_like_a_driver() {
+        // Two parallel arms to the same destination: the stop-signed arm is
+        // slightly shorter, so pure travel-time routing rat-runs it — exactly
+        // what real drivers don't do. With control-aware costs (the default) the
+        // ~9 s a four-way stop actually costs makes the uncontrolled arm win.
+        // Judged at the upstream feeder's next-hop — the entering-cost model
+        // charges a link's stop penalty to the decision that turns onto it.
+        let net = || {
+            OsmMap {
+                nodes: vec![
+                    NodeSpec::uncontrolled(0, -200.0, 0.0),
+                    NodeSpec::uncontrolled(1, 0.0, 0.0),
+                    NodeSpec::stop(2, 500.0, -30.0), // shorter arm, stop-controlled
+                    NodeSpec::uncontrolled(3, 500.0, 150.0), // longer arm, free
+                    NodeSpec::uncontrolled(4, 1000.0, 0.0),
+                    NodeSpec::uncontrolled(5, 1200.0, 0.0),
+                ],
+                links: vec![
+                    LinkSpec::oneway(1, 2, 1, 15.0), // 0: short arm in (ends at the stop)
+                    LinkSpec::oneway(2, 4, 1, 15.0), // 1: short arm out
+                    LinkSpec::oneway(1, 3, 1, 15.0), // 2: long arm in
+                    LinkSpec::oneway(3, 4, 1, 15.0), // 3: long arm out
+                    LinkSpec::oneway(4, 5, 1, 15.0), // 4: destination
+                    LinkSpec::oneway(0, 1, 1, 15.0), // 5: feeder making the choice
+                ],
+            }
+            .build()
+        };
+        let (dest, feeder) = (LinkId(4), LinkId(5));
+        let mut world = NetWorld::new(net(), cfg());
+        world.install_router(&[dest]);
+        assert_eq!(
+            world.router.as_ref().unwrap().next_hop(dest, feeder),
+            Some(LinkId(2)),
+            "control-aware: the driver takes the free arm despite the stop arm being shorter"
+        );
+
+        let mut world = NetWorld::new(net(), cfg());
+        world.set_control_aware_routing(false);
+        world.install_router(&[dest]);
+        assert_eq!(
+            world.router.as_ref().unwrap().next_hop(dest, feeder),
+            Some(LinkId(0)),
+            "with the toggle off, raw travel time rat-runs the stop-signed shortcut again"
+        );
     }
 
     #[test]
