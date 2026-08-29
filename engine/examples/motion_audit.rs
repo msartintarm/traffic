@@ -1,11 +1,13 @@
-//! Spin audit: run the committed Millbrae map under whole-city demand and hunt
-//! for physically-impossible rotation — cars whose heading swings faster than
-//! any real vehicle can yaw. Classifies each event (one-tick flip, sustained
-//! spin, impossibly tight arc), tallies them per street, and dumps short pose
-//! traces of the worst offenders so the responsible code path can be read off.
+//! Motion audit: run the committed Millbrae map under whole-city demand and
+//! check every vehicle's motion against what a steered four-wheeled car can
+//! physically do. Beyond the original spin hunts (one-tick flips, spin windows,
+//! impossibly tight arcs) it audits the bicycle-model invariants: **crab**
+//! (velocity direction versus heading — four wheels cannot slide sideways),
+//! **curvature** (|Δθ|/Δs bounded by steering geometry), and the tracker's
+//! divergence-guard count (clusters mark geometry the model cannot follow).
 //!
 //! ```text
-//! cargo run --release --example spin_audit --features import [-- <ticks>]
+//! cargo run --release --example motion_audit --features import [-- <ticks>]
 //! ```
 
 use std::collections::HashMap;
@@ -34,6 +36,7 @@ const WINDOW: usize = 10;
 #[derive(Clone, Copy)]
 struct Tick {
     pose: [f64; 3],
+    rear: [f64; 2],
     dtheta: f64,
     speed: f64,
     crossing: bool,
@@ -45,6 +48,7 @@ struct Tally {
     flips: usize,
     spins: usize,
     tight: usize,
+    crab: usize,
 }
 
 fn main() {
@@ -64,10 +68,13 @@ fn main() {
         world.step();
     }
 
+    let base_div = world.kinematic_divergences();
     let mut hist: HashMap<u32, Vec<Tick>> = HashMap::new();
     let mut per_link: HashMap<u32, Tally> = HashMap::new();
     let mut worst: Vec<(f64, u32, usize, Vec<Tick>)> = Vec::new(); // (score, id, tick, trace)
-    let (mut flips, mut spins, mut tight) = (0usize, 0usize, 0usize);
+    let (mut flips, mut spins, mut tight, mut crabs) = (0usize, 0usize, 0usize, 0usize);
+    let (mut worst_crab, mut worst_kappa) = (0.0f64, 0.0f64);
+    let mut moving_ticks = 0u64;
 
     for t in 0..ticks {
         gen.step(&mut world, cfg.dt);
@@ -78,8 +85,14 @@ fn main() {
             let link = world.network.lane(v.lane).link.0;
             let mut h = hist.remove(&v.id).unwrap_or_default();
             let dtheta = h.last().map_or(0.0, |p| shortest_angle(p.pose[2], pose[2]));
-            let ds = h.last().map_or(0.0, |p| ((pose[0] - p.pose[0]).powi(2) + (pose[1] - p.pose[1]).powi(2)).sqrt());
-            h.push(Tick { pose, dtheta, speed: v.speed, crossing: v.is_crossing(), link });
+            // Displacements at the rear axle: the bicycle model's ground truth.
+            // The front bumper legitimately sweeps sideways during a turn (its
+            // velocity tilts by atan(kappa * axle_offset) from the heading), so
+            // crab judged there would flag every real corner.
+            let rear = v.rear_axle();
+            let (dx, dy) = h.last().map_or((0.0, 0.0), |p| (rear[0] - p.rear[0], rear[1] - p.rear[1]));
+            let ds = dx.hypot(dy);
+            h.push(Tick { pose, rear, dtheta, speed: v.speed, crossing: v.is_crossing(), link });
             if h.len() > TRACE_LEN {
                 h.remove(0);
             }
@@ -103,6 +116,18 @@ fn main() {
                 tally.spins += 1;
                 score = score.max(wsum.abs().to_degrees() + 1000.0); // rank true spins first
             }
+            // Bicycle-model invariants, judged only while genuinely moving.
+            if v.speed > 3.0 && ds > 0.3 {
+                moving_ticks += 1;
+                let crab = shortest_angle(pose[2], dy.atan2(dx)).abs().to_degrees();
+                worst_crab = worst_crab.max(crab);
+                if crab >= 15.0 {
+                    crabs += 1;
+                    tally.crab += 1;
+                    score = score.max(crab + 500.0);
+                }
+                worst_kappa = worst_kappa.max(dtheta.abs() / ds);
+            }
             if score > 0.0 {
                 worst.push((score, v.id, t, h.clone()));
             }
@@ -113,18 +138,26 @@ fn main() {
 
     println!("audited {ticks} ticks ({:.1} sim-min), fleet ~{} cars", ticks as f64 * cfg.dt / 60.0, world.vehicles().len());
     println!("events: {flips} one-tick flips (>=100 deg), {spins} spin-window hits (>=300 deg / 2 s), {tight} tight arcs (r < 2 m at >=20 deg)");
+    println!(
+        "kinematics over {moving_ticks} moving car-ticks: {crabs} crab events (>=15 deg), worst crab {worst_crab:.1} deg, worst curvature {worst_kappa:.3} 1/m (steering limit ~0.26)",
+    );
+    println!("divergence-guard activations: {}", world.kinematic_divergences() - base_div);
 
-    let mut by_link: Vec<_> = per_link.into_iter().filter(|(_, t)| t.flips + t.spins + t.tight > 0).collect();
-    by_link.sort_by_key(|(_, t)| std::cmp::Reverse(t.flips + t.spins + t.tight));
-    println!("\ntop streets by event count:");
+    let mut by_link: Vec<_> = per_link.into_iter().filter(|(_, t)| t.flips + t.spins + t.tight + t.crab > 0).collect();
+    by_link.sort_by_key(|(_, t)| std::cmp::Reverse(t.flips + t.spins + t.tight + t.crab));
+    if !by_link.is_empty() {
+        println!("\ntop streets by event count:");
+    }
     for (link, t) in by_link.iter().take(15) {
         let name = &world.network.link_names[*link as usize];
-        println!("  link {link:5} {name:40} flips={} spins={} tight={}", t.flips, t.spins, t.tight);
+        println!("  link {link:5} {name:40} flips={} spins={} tight={} crab={}", t.flips, t.spins, t.tight, t.crab);
     }
 
     worst.sort_by(|a, b| b.0.total_cmp(&a.0));
     let mut seen = std::collections::HashSet::new();
-    println!("\nworst offender traces (newest last; heading deg, dtheta deg, speed, link, X=crossing):");
+    if !worst.is_empty() {
+        println!("\nworst offender traces (newest last; heading deg, dtheta deg, speed, link, X=crossing):");
+    }
     for (score, id, tick, trace) in worst.iter().filter(|(_, id, ..)| seen.insert(*id)).take(6) {
         println!("-- car {id} at tick {tick} (score {score:.0}):");
         for p in trace {

@@ -27,12 +27,14 @@ pub struct NetVehicle {
     pub lane: LaneId,
     pub position: f64,
     pub speed: f64,
-    /// Kinematic heading (rad): steers toward the path tangent each step but can
-    /// only slew as fast as a real car yaws (see [`NetWorld::settle_headings`]),
-    /// so no geometry defect — a kinked polyline, a degenerate interior — can
-    /// render as a physically impossible rotation. This is the heading the world
+    /// Kinematic pose `[x, y, heading]` at the **rear axle**: a bicycle-model
+    /// state advanced by [`NetWorld::track_path`] — heading steers (bounded by
+    /// steering geometry and grip), position follows the wheels. The arc position
+    /// is the *reference being tracked*, not the pose itself, so no geometry
+    /// defect — a kinked polyline, a degenerate interior, a mouth overlap — can
+    /// render as motion a four-wheeled car cannot produce. This is what the world
     /// pose, the render, and the collision footprint all see.
-    heading: f64,
+    kin: [f64; 3],
     pub driver: DriverConfig,
     pub route: Vec<LinkId>,
     pub route_idx: usize,
@@ -159,6 +161,14 @@ fn record_history(hist: &mut History, len: &mut u8, position: f64, speed: f64) {
 }
 
 impl NetVehicle {
+    /// The rear-axle point of the kinematic pose — the bicycle model's ground
+    /// truth. By construction it moves (almost exactly) along the heading, so
+    /// this is where slip/crab invariants should be measured; the front bumper
+    /// legitimately sweeps sideways through turns.
+    pub fn rear_axle(&self) -> [f64; 2] {
+        [self.kin[0], self.kin[1]]
+    }
+
     /// Whether the vehicle is currently inside a node traversing a movement's
     /// interior path (`position` counts on past its `lane`'s length; the overrun
     /// is the interior arc).
@@ -230,6 +240,8 @@ pub struct NetWorld {
     exited: u32,
     leaked: u32,
     crashed: u32,
+    /// Tick-vehicle count of lateral divergence-guard activations in `track_path`.
+    divergences: u64,
     /// Vehicles crashed per [`CrashKind`], indexed by the kind's discriminant —
     /// the artifact-vs-realism breakdown the flat `crashed` tally can't give.
     crashed_by: [u32; 2],
@@ -770,13 +782,30 @@ const DECISION_HORIZON: f64 = 180.0;
 /// far ahead a curve is read.
 const A_LAT: f64 = 3.0;
 const CURVE_LOOKAHEAD: f64 = 45.0;
-/// Bounds on how fast the kinematic heading can slew (see `settle_headings`):
-/// the sharpest curvature a car's steering geometry allows (tan 35° over a 2.7 m
-/// wheelbase — a ~3.9 m minimum turning radius) and the tyre-grip lateral limit
-/// (m/s², ~0.7 g) that caps yaw at speed. Together: `ω ≤ min(v·κ, grip/v)` —
-/// zero when stationary, peaking near 77°/s at ~5 m/s.
-const YAW_KAPPA_MAX: f64 = 0.26;
+/// Bicycle-model bounds for [`NetWorld::track_path`]. Steering geometry:
+/// maximum front-wheel angle tan 35°; the wheelbase is [`AXLE_WHEELBASE`] of the
+/// vehicle length (car ≈ 2.7 m of 4.5 → ~3.9 m minimum turning radius; a bus
+/// proportionally wider), and the rear axle sits [`AXLE_FRONT`] of the length
+/// behind the front bumper (the pose anchor the rest of the sim uses). Grip:
+/// the tyre lateral limit (m/s², ~0.7 g) that caps curvature at speed —
+/// `κ ≤ min(tan δ_max / wheelbase, grip / v²)`.
+const AXLE_STEER_TAN: f64 = 0.7;
+const AXLE_WHEELBASE: f64 = 0.6;
+const AXLE_FRONT: f64 = 0.8;
 const YAW_GRIP_LAT: f64 = 7.0;
+/// Pure-pursuit lookahead: `0.8·v` clamped to this range (m). Short enough to
+/// hug residential corners, long enough not to oscillate at highway speed.
+const LOOKAHEAD_MIN: f64 = 2.0;
+const LOOKAHEAD_MAX: f64 = 12.0;
+/// The divergence guard — the knob that trades path-hugging against full
+/// kinematics. Lateral deviation of the kinematic pose from the arc reference
+/// beyond this (m) bleeds back at the given rate (m/s) and is counted
+/// (`kinematic_divergences`); a cluster of counts marks defective geometry.
+/// Longitudinal deviation is corrected *exactly* every tick instead: queue
+/// spacing, stop lines, and leader gaps are arc-truth, and the drawn car must
+/// sit where the sim says it is along the road.
+const LAT_DIVERGE_MAX: f64 = 3.0;
+const LAT_CORRECT_RATE: f64 = 2.0;
 /// Maximum physical deceleration (m/s², ~0.9 g of tyre grip). IDM's interaction term is
 /// unbounded as the gap shrinks, so an unclamped car could compute hundreds of m/s² and
 /// teleport from highway speed to a dead stop in one tick. `integrate`/`advance_crossing`
@@ -1110,7 +1139,7 @@ impl NetWorld {
         let junctions = Junctions::build(&network);
         let congestion = CongestionLod::new(network.links.len());
         Self {
-            network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0, crashed_by: [0; 2], crash_log: Vec::new(),
+            network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0, divergences: 0, crashed_by: [0; 2], crash_log: Vec::new(),
             merges, link_straight, turn_caps, merge_feeder_lane, through_next, corridor_of, corridor_offset, seam_primary, signals, link_entries, router: None, external_reroute: false,
             meters: Vec::new(), metering_on: false, day_secs: 0.0, pm_plan: false, rail_preempts,
             timetable: rail::Timetable::default(), crossing_sets: HashMap::new(), weekend: false, day_rate: 1.0,
@@ -1499,9 +1528,9 @@ impl NetWorld {
 
     pub fn spawn(&mut self, id: u32, lane: LaneId, position: f64, speed: f64, driver: DriverConfig) {
         self.link_entries[self.network.lane(lane).link.idx()] += 1;
-        let heading = self.network.lane_point(lane, position)[2];
+        let kin = Self::spawn_kin(&self.network, lane, position, &driver);
         self.fleet.push(NetVehicle {
-            id, lane, position, speed, heading, driver, route: Vec::new(), route_idx: 0, dest: None,
+            id, lane, position, speed, kin, driver, route: Vec::new(), route_idx: 0, dest: None,
             stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
         });
     }
@@ -1530,9 +1559,9 @@ impl NetWorld {
         let Some(lane) = lane else { return false };
         let speed = self.safe_entry_speed(lane, speed, &driver);
         self.link_entries[first.idx()] += 1;
-        let heading = self.network.lane_point(lane, 0.0)[2];
+        let kin = Self::spawn_kin(&self.network, lane, 0.0, &driver);
         self.fleet.push(NetVehicle {
-            id, lane, position: 0.0, speed, heading, driver, route, route_idx: 0, dest: None,
+            id, lane, position: 0.0, speed, kin, driver, route, route_idx: 0, dest: None,
             stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
         });
         true
@@ -1554,9 +1583,9 @@ impl NetWorld {
             return false;
         }
         self.link_entries[first.idx()] += 1;
-        let heading = self.network.lane_point(lane, pos)[2];
+        let kin = Self::spawn_kin(&self.network, lane, pos, &driver);
         self.fleet.push(NetVehicle {
-            id, lane, position: pos, speed, heading, driver, route, route_idx: 0, dest: None,
+            id, lane, position: pos, speed, kin, driver, route, route_idx: 0, dest: None,
             stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
         });
         true
@@ -1574,9 +1603,9 @@ impl NetWorld {
         let Some(lane) = self.entry_lane_toward(entry_link, admit_gap, id, Some(dest)) else { return false };
         let speed = self.safe_entry_speed(lane, speed, &driver);
         self.link_entries[entry_link.idx()] += 1;
-        let heading = self.network.lane_point(lane, 0.0)[2];
+        let kin = Self::spawn_kin(&self.network, lane, 0.0, &driver);
         self.fleet.push(NetVehicle {
-            id, lane, position: 0.0, speed, heading, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
+            id, lane, position: 0.0, speed, kin, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
             stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
         });
         true
@@ -1651,9 +1680,9 @@ impl NetWorld {
     #[cfg(test)]
     pub fn spawn_to_in_lane(&mut self, id: u32, lane: LaneId, position: f64, dest: LinkId, speed: f64, driver: DriverConfig) {
         self.link_entries[self.network.lane(lane).link.idx()] += 1;
-        let heading = self.network.lane_point(lane, position)[2];
+        let kin = Self::spawn_kin(&self.network, lane, position, &driver);
         self.fleet.push(NetVehicle {
-            id, lane, position, speed, heading, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
+            id, lane, position, speed, kin, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
             stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
         });
     }
@@ -1777,13 +1806,22 @@ impl NetWorld {
     }
 
 
-    /// A vehicle's current world pose `[x, y, heading]`: its position from the
-    /// path geometry, its heading from the kinematic state — the tangent-tracking,
-    /// yaw-rate-limited angle [`settle_headings`](Self::settle_headings) advances,
-    /// which is what the render and the collision footprint should see.
+    /// A vehicle's current world pose `[x, y, heading]` at the front bumper —
+    /// the anchor `car_rect` and the render use — derived from the rear-axle
+    /// bicycle state [`track_path`](Self::track_path) advances. Heading steers,
+    /// position follows the wheels: the pose can only move the way a steered
+    /// four-wheeled vehicle moves.
     pub fn vehicle_world_pose(&self, v: &NetVehicle) -> [f64; 3] {
-        let p = self.path_pose(v);
-        [p[0], p[1], v.heading]
+        let f = AXLE_FRONT * v.driver.vehicle_length;
+        [v.kin[0] + f * v.kin[2].cos(), v.kin[1] + f * v.kin[2].sin(), v.kin[2]]
+    }
+
+    /// A freshly spawned vehicle's kinematic state: rear axle placed so the
+    /// front bumper sits exactly on the lane point, heading along the tangent.
+    fn spawn_kin(net: &Network, lane: LaneId, position: f64, driver: &DriverConfig) -> [f64; 3] {
+        let p = net.lane_point(lane, position);
+        let f = AXLE_FRONT * driver.vehicle_length;
+        [p[0] - f * p[2].cos(), p[1] - f * p[2].sin(), p[2]]
     }
 
     /// The pose pure path geometry dictates — the interior crossing path when
@@ -1812,29 +1850,114 @@ impl NetWorld {
         self.fleet.rows.iter().find(|v| v.id == id)
     }
 
-    /// Advance every vehicle's kinematic heading toward its path tangent, at no
-    /// more than the yaw rate a real car can produce at its current speed. The
-    /// path tangent can step discontinuously (a polyline vertex, an interior
-    /// seam, a landing); this is the layer that guarantees the *pose* never does —
-    /// whatever the geometry, a rendered car physically cannot spin in place, and
-    /// a stationary car cannot rotate at all.
-    fn settle_headings(&mut self, dt: f64) {
+    /// The world point the tracker steers toward: `ld` metres further along the
+    /// path than the vehicle's arc position — through the interior and onto the
+    /// landing lane when the lookahead crosses a node (geometric continuity, the
+    /// same `skip` the landing rebase applies), clamped at the stop line before
+    /// a boundary is committed (a car aims at the stop bar until its crossing
+    /// starts, then the reference sweeps through the turn). Reads the *target*
+    /// lane during a lane change — that jump in the reference, chased through
+    /// the lookahead, is precisely what makes the change a steered S-curve.
+    fn reference_point(&self, v: &NetVehicle, ld: f64) -> [f64; 2] {
+        if let Some(c) = v.crossing {
+            let it = self.network.interior(c.movement);
+            let s = self.crossing_arc(v) + ld;
+            if s <= it.len {
+                let p = self.network.interior_point(c.movement, s.max(0.0));
+                return [p[0], p[1]];
+            }
+            let to = self.network.movement(c.movement).to_lane;
+            let start = self.network.lane_point(to, 0.0);
+            let skip = ((it.exit[0] - start[0]) * start[2].cos() + (it.exit[1] - start[1]) * start[2].sin()).max(0.0);
+            let p = self.network.lane_point(to, (s - it.len + skip).min(self.network.lane(to).length));
+            return [p[0], p[1]];
+        }
+        let lane = self.network.lane(v.lane);
+        let p = self.network.lane_point(v.lane, (v.position + ld).min(lane.length));
+        [p[0], p[1]]
+    }
+
+    /// Advance every moving vehicle's bicycle-model pose one tick: pure pursuit
+    /// of the lookahead reference bounds curvature to what steering geometry and
+    /// grip allow, then the rear axle rolls forward along the new heading. The
+    /// arc reference can step discontinuously (a polyline vertex, a seam, a
+    /// landing, a lane-change retarget); this layer guarantees the *pose* never
+    /// does — a car physically cannot spin in place, crab sideways, or rotate
+    /// while stationary. Longitudinal error against the canonical arc pose is
+    /// zeroed each tick (visual queue spacing is arc-truth); lateral error is
+    /// resolved by steering alone unless it exceeds the divergence guard.
+    fn track_path(&mut self, dt: f64) {
         for i in 0..self.fleet.rows.len() {
             let v = &self.fleet.rows[i];
             if v.speed <= 0.05 {
                 continue;
             }
-            let target = self.path_pose(v)[2];
-            let omega = (v.speed * YAW_KAPPA_MAX).min(YAW_GRIP_LAT / v.speed);
-            let d = shortest_angle(v.heading, target).clamp(-omega * dt, omega * dt);
-            let h = &mut self.fleet.rows[i].heading;
-            *h += d;
-            if *h > std::f64::consts::PI {
-                *h -= std::f64::consts::TAU;
-            } else if *h <= -std::f64::consts::PI {
-                *h += std::f64::consts::TAU;
+            let len = v.driver.vehicle_length;
+            let [x, y, th] = v.kin;
+            let ld = (0.8 * v.speed).clamp(LOOKAHEAD_MIN, LOOKAHEAD_MAX);
+            let r = self.reference_point(v, ld);
+            let (dx, dy) = (r[0] - x, r[1] - y);
+            let dist = dx.hypot(dy);
+            let kappa_cmd = if dist > 0.5 { 2.0 * shortest_angle(th, dy.atan2(dx)).sin() / dist } else { 0.0 };
+            let kappa_max = (AXLE_STEER_TAN / (AXLE_WHEELBASE * len)).min(YAW_GRIP_LAT / (v.speed * v.speed));
+            let kappa = kappa_cmd.clamp(-kappa_max, kappa_max);
+            // The wheels only roll *forward*, and rolling doubles as the
+            // longitudinal sync: ground distance this tick is whatever keeps the
+            // front bumper level with the arc pose along the car's axis, floored
+            // at zero and capped just above the speed's own step. An arc hold
+            // (stop-line clamp) rolls zero and the car simply stops; a backward
+            // arc jump (a degenerate-mouth landing the skip rebase can't express)
+            // becomes a short pause while the arc catches up — never a rendered
+            // backslide; a forward jump is a brief bounded catch-up. Heading
+            // advances by κ·ds — rolling geometry: a car that isn't moving cannot
+            // rotate. The maneuver floor breaks the one fixed point that rule
+            // has: a car pointed well off its line projects ~nothing forward and
+            // would otherwise freeze mid-recovery — like a real driver, it keeps
+            // rolling (at half pace) so steering can bring it back.
+            let p = self.path_pose(v);
+            let (c0, s0) = (th.cos(), th.sin());
+            let (ex0, ey0) = (p[0] - (x + AXLE_FRONT * len * c0), p[1] - (y + AXLE_FRONT * len * s0));
+            let long = ex0 * c0 + ey0 * s0;
+            let lat0 = -ex0 * s0 + ey0 * c0;
+            let mut ds = long.clamp(0.0, v.speed * dt * 1.5 + 0.3);
+            if lat0.abs() > 1.0 {
+                ds = ds.max(0.5 * v.speed * dt);
+            }
+            let mut th2 = th + kappa * ds;
+            if th2 > std::f64::consts::PI {
+                th2 -= std::f64::consts::TAU;
+            } else if th2 <= -std::f64::consts::PI {
+                th2 += std::f64::consts::TAU;
+            }
+            let (c, s) = (th2.cos(), th2.sin());
+            let mut x2 = x + ds * c;
+            let mut y2 = y + ds * s;
+            // Lateral residual against the arc pose: resolved by steering alone
+            // unless it exceeds the divergence guard, which bleeds it at a
+            // bounded rate and counts the activation.
+            let (ex, ey) = (p[0] - (x2 + AXLE_FRONT * len * c), p[1] - (y2 + AXLE_FRONT * len * s));
+            let lat = -ex * s + ey * c;
+            let diverged = lat.abs() > LAT_DIVERGE_MAX;
+            if diverged {
+                // Capped to a fraction of the rolled distance so even the guard
+                // cannot make the car slide at more than ~14° to its heading —
+                // steering and the maneuver floor do the real recovery work.
+                let lat_fix = (lat.abs() - LAT_DIVERGE_MAX).min(LAT_CORRECT_RATE * dt).min(0.25 * ds) * lat.signum();
+                x2 -= lat_fix * s;
+                y2 += lat_fix * c;
+            }
+            self.fleet.rows[i].kin = [x2, y2, th2];
+            if diverged {
+                self.divergences += 1;
             }
         }
+    }
+
+    /// How many tick-vehicle lateral divergence-guard activations have occurred
+    /// (see [`track_path`](Self::track_path)) — a health metric: clusters mark
+    /// geometry the tracker cannot physically follow.
+    pub fn kinematic_divergences(&self) -> u64 {
+        self.divergences
     }
 
     fn intended_movement(&self, veh: &NetVehicle) -> Option<MovementId> {
@@ -3200,7 +3323,7 @@ impl NetWorld {
         self.fleet.hist = hist;
         self.fleet.hist_len = hist_len;
         self.exited += exited;
-        self.settle_headings(dt);
+        self.track_path(dt);
         prof.lap(6);
         self.time += dt;
         self.tick += 1;
@@ -8545,7 +8668,7 @@ mod tests {
                 .filter(|&id| {
                     let d = DriverConfig::car().sample(w.cfg.seed, id);
                     let probe = NetVehicle {
-                        id, lane: LaneId(0), position: 0.0, speed: 0.0, heading: 0.0, driver: d,
+                        id, lane: LaneId(0), position: 0.0, speed: 0.0, kin: [0.0; 3], driver: d,
                         route: Vec::new(), route_idx: 0, dest: None, stopped_at: None,
                         wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
                     };
@@ -9159,6 +9282,98 @@ mod tests {
     }
 
     #[test]
+    fn a_lane_change_is_a_steered_s_curve() {
+        // Same fixture as the slide test, judged kinematically: the lateral move
+        // must be *driven* — the car yaws toward the target lane and back
+        // (finite deviation both ways), and its rear axle never slides sideways.
+        let net = OsmMap {
+            nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 3000.0, 0.0)],
+            links: vec![LinkSpec::oneway(1, 2, 2, 25.0)],
+        }
+        .build();
+        let mut world = NetWorld::new(net, cfg());
+        let lanes: Vec<LaneId> = world.network.lanes_of(LinkId(0)).collect();
+        world.spawn(1, lanes[0], 50.0, 20.0, DriverConfig { accel_noise: 0.0, ..DriverConfig::car() });
+        let mut prev_rear: Option<[f64; 2]> = None;
+        let (mut max_dev, mut worst_crab, mut changed) = (0.0f64, 0.0f64, false);
+        let mut final_dev = 0.0f64;
+        for _ in 0..120 {
+            world.step();
+            let Some(v) = world.vehicle(1) else { break };
+            let pose = world.vehicle_world_pose(v);
+            let dev = pose[2]; // the link runs along +x, so tangent heading = 0
+            changed |= world.network.lane(v.lane).index_in_link == 1;
+            max_dev = max_dev.max(dev.abs());
+            final_dev = dev.abs();
+            let rear = v.rear_axle();
+            if let Some(p) = prev_rear {
+                let (dx, dy) = (rear[0] - p[0], rear[1] - p[1]);
+                if dx.hypot(dy) > 0.5 {
+                    worst_crab = worst_crab.max(shortest_angle(pose[2], dy.atan2(dx)).abs());
+                }
+            }
+            prev_rear = Some(rear);
+        }
+        assert!(changed, "the car changed lanes");
+        assert!(
+            (1.0..=15.0).contains(&max_dev.to_degrees()),
+            "the change is steered — a finite, human-scale yaw excursion: peak {:.1}°",
+            max_dev.to_degrees()
+        );
+        assert!(final_dev.to_degrees() < 1.0, "and the car straightens out after it: {:.1}°", final_dev.to_degrees());
+        assert!(worst_crab.to_degrees() < 10.0, "the rear axle never slides sideways: crab {:.1}°", worst_crab.to_degrees());
+    }
+
+    #[test]
+    fn a_right_turn_sweeps_like_a_car() {
+        // A 90° corner: the heading must sweep monotonically through the turn at
+        // no more curvature than the steering geometry allows — never pivot,
+        // never wiggle, never slide.
+        let net = OsmMap {
+            nodes: vec![
+                NodeSpec::uncontrolled(1, -200.0, 0.0),
+                NodeSpec::uncontrolled(2, 0.0, 0.0),
+                NodeSpec::uncontrolled(3, 0.0, -200.0),
+            ],
+            links: vec![LinkSpec::oneway(1, 2, 1, 15.0), LinkSpec::oneway(2, 3, 1, 15.0)],
+        }
+        .build();
+        let mut world = NetWorld::new(net, cfg());
+        assert!(world.spawn_routed(1, vec![LinkId(0), LinkId(1)], 10.0, DriverConfig { accel_noise: 0.0, ..DriverConfig::car() }));
+        let kappa_lim = AXLE_STEER_TAN / (AXLE_WHEELBASE * DriverConfig::car().vehicle_length);
+        let mut prev: Option<([f64; 3], [f64; 2])> = None;
+        let (mut total, mut worst_crab, mut wrong_way) = (0.0f64, 0.0f64, 0.0f64);
+        for _ in 0..600 {
+            world.step();
+            let Some(v) = world.vehicle(1) else { break };
+            let (pose, rear) = (world.vehicle_world_pose(v), v.rear_axle());
+            if let Some((pp, pr)) = prev {
+                let dth = shortest_angle(pp[2], pose[2]);
+                let (dx, dy) = (rear[0] - pr[0], rear[1] - pr[1]);
+                let ds = dx.hypot(dy);
+                total += dth;
+                wrong_way = wrong_way.max(dth); // a right turn only ever yaws negative
+                assert!(
+                    dth.abs() <= kappa_lim * (ds + 0.1) + 1e-6,
+                    "rotation is rolling geometry, bounded by steering: {:.1}° over {ds:.2} m",
+                    dth.to_degrees()
+                );
+                if ds > 0.5 {
+                    worst_crab = worst_crab.max(shortest_angle(pose[2], dy.atan2(dx)).abs());
+                }
+            }
+            prev = Some((pose, rear));
+        }
+        assert!(
+            (-100.0..=-80.0).contains(&total.to_degrees()),
+            "the car came out of the corner 90° right of where it went in: {:.1}°",
+            total.to_degrees()
+        );
+        assert!(wrong_way.to_degrees() < 2.0, "and never yawed the wrong way: {:.1}°", wrong_way.to_degrees());
+        assert!(worst_crab.to_degrees() < 15.0, "rear axle tracked, not slid: crab {:.1}°", worst_crab.to_degrees());
+    }
+
+    #[test]
     fn a_lane_change_slides_the_pose_across_gradually() {
         let net = OsmMap {
             nodes: vec![
@@ -9176,7 +9391,10 @@ mod tests {
         let (mut changed_at, mut settled) = (None, false);
         let mut prev_y = world.vehicle_world_pose(world.vehicle(1).unwrap())[1];
         let mut max_jump = 0.0f64;
-        let settle_ticks = (LANE_CHANGE_DURATION / cfg().dt) as u32 + 2;
+        // One extra second past the blend duration: the steered S-curve settles
+        // asymptotically (a real car straightens out over its lookahead), unlike
+        // the old linear pose slide which snapped onto the centerline exactly.
+        let settle_ticks = ((LANE_CHANGE_DURATION + 1.0) / cfg().dt) as u32 + 2;
         for t in 0..80 {
             world.step();
             let v = world.vehicle(1).unwrap();

@@ -5,6 +5,43 @@ vehicle moves — through corners, through degenerate geometry, and through lane
 changes — with scenario regression tests as the tuning harness. References are
 by **file + function/symbol**, per TODO.md convention.
 
+## Status (2026-08-28): P1–P3 executed
+
+Implemented and green (`cargo test --features import`: 373 lib + 16 load + 3
+validation). What shipped, including deviations from the design below:
+
+- **P1** `net_world.rs::track_path` replaces `settle_headings`: rear-axle
+  state `NetVehicle::kin` (pose = `kin` + `AXLE_FRONT·len` forward), pure
+  pursuit over `reference_point` (lane → interior → landing-lane walk with the
+  same geometric-continuity `skip` as `land_or_hold`), κ clamped by
+  `AXLE_STEER_TAN/(AXLE_WHEELBASE·len)` and grip. Two design corrections found
+  by the motion audit: (1) **rolling is the longitudinal sync** — `ds =
+  clamp(long-projection, 0, 1.5·v·dt + 0.3)` and `θ += κ·ds`, so wheels never
+  roll backward, arc holds stop the car exactly, backward arc jumps become a
+  short pause, and no rotation happens without ground motion; a **maneuver
+  floor** (`ds ≥ 0.5·v·dt` when lateral error > 1 m) breaks the frozen-heading
+  fixed point of pure projection. (2) The divergence bleed is capped at
+  `0.25·ds`, making rear-axle slip structurally ≤ ~14°.
+- **P2** came free: the pose ignores the lateral blend (which lives on as the
+  divergence/longitudinal reference), and the tracker chasing the target-lane
+  reference produces the steered S-curve.
+- **P3** `examples/motion_audit.rs` (renamed from spin_audit): crab and
+  curvature judged **at the rear axle** — the front bumper legitimately sweeps
+  `atan(κ·axle)` sideways in turns, so measuring there flags every real
+  corner. Millbrae, 10 sim-min: 0 flips / 0 spins / 0 tight arcs / 0 crab
+  events, worst curvature 0.233 < 0.26 limit, divergences 0.38 % of moving
+  car-ticks (clustered at the known degenerate mouths). Tests:
+  `a_lane_change_is_a_steered_s_curve`, `a_right_turn_sweeps_like_a_car`
+  (net_world.rs); `valencia_madera_turns_are_physical` (passage-graded),
+  extended `no_impossible_yaw_rates_under_city_demand` (+crab, +curvature,
+  +divergence-rate bound) in tests/load.rs. The U-turn scenario was dropped:
+  `map.rs` never builds U-turn movements, so the behavior doesn't exist.
+- Cost: step 5.9 → 6.5 ms at ~5.3 k cars (the tail lap; parallelizable if it
+  ever matters).
+- Open: the fresh-build Valencia × Madera spins the sim cannot reproduce —
+  suspected render-side (bridge prev-pose interpolation / id reuse per the
+  render-id invariant); verify in the browser after the next wasm deploy.
+
 ## The three reports, diagnosed
 
 1. **"Cars don't turn like 4-wheeled cars."** Correct, structurally: today the

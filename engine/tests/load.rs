@@ -601,8 +601,12 @@ fn no_impossible_yaw_rates_under_city_demand() {
     world.install_router(&gen.destinations());
     ramp(&mut world, &mut gen, cfg.dt, 400);
     let window = (2.0 / cfg.dt) as usize;
-    let mut hist: HashMap<u32, ([f64; 3], Vec<f64>)> = HashMap::new();
-    let (mut flips, mut spins) = (0usize, 0usize);
+    // Per id: (pose, rear axle, rotation window). Crab and curvature are judged
+    // at the rear axle — the bicycle model's ground truth; the front bumper
+    // legitimately sweeps sideways through a turn.
+    let mut hist: HashMap<u32, ([f64; 3], [f64; 2], Vec<f64>)> = HashMap::new();
+    let (mut flips, mut spins, mut crabs, mut kappas) = (0usize, 0usize, 0usize, 0usize);
+    let mut car_ticks = 0u64;
     let mut example = String::new();
     for _ in 0..800 {
         gen.step(&mut world, cfg.dt);
@@ -610,10 +614,29 @@ fn no_impossible_yaw_rates_under_city_demand() {
         let mut alive = HashMap::with_capacity(hist.len());
         for v in world.vehicles() {
             let pose = world.vehicle_world_pose(v);
+            let rear = v.rear_axle();
+            car_ticks += 1;
+            let link = world.network.lane(v.lane).link;
+            let at = format!(
+                "car {} at ({:.0}, {:.0}) on {} (link {})",
+                v.id, pose[0], pose[1], world.network.link_names[link.0 as usize], link.0
+            );
             let (dtheta, mut deltas) = match hist.remove(&v.id) {
-                Some((prev, deltas)) => {
+                Some((prev, prev_rear, deltas)) => {
                     let ds = ((pose[0] - prev[0]).powi(2) + (pose[1] - prev[1]).powi(2)).sqrt();
                     let d = shortest_angle(prev[2], pose[2]);
+                    let (rx, ry) = (rear[0] - prev_rear[0], rear[1] - prev_rear[1]);
+                    let rds = rx.hypot(ry);
+                    if v.speed > 3.0 && rds > 0.3 {
+                        if shortest_angle(pose[2], ry.atan2(rx)).abs().to_degrees() >= 20.0 {
+                            crabs += 1;
+                            example = at.clone();
+                        }
+                        if d.abs() / rds > 0.30 {
+                            kappas += 1;
+                            example = at.clone();
+                        }
+                    }
                     (if ds > 0.05 { d } else { 0.0 }, deltas)
                 }
                 None => (0.0, Vec::new()),
@@ -622,11 +645,6 @@ fn no_impossible_yaw_rates_under_city_demand() {
             if deltas.len() > window {
                 deltas.remove(0);
             }
-            let link = world.network.lane(v.lane).link;
-            let at = format!(
-                "car {} at ({:.0}, {:.0}) on {} (link {})",
-                v.id, pose[0], pose[1], world.network.link_names[link.0 as usize], link.0
-            );
             if dtheta.abs().to_degrees() >= 100.0 {
                 flips += 1;
                 example = at;
@@ -635,15 +653,131 @@ fn no_impossible_yaw_rates_under_city_demand() {
                 example = at;
                 deltas.clear();
             }
-            alive.insert(v.id, (pose, deltas));
+            alive.insert(v.id, (pose, rear, deltas));
         }
         hist = alive;
     }
     assert!(
-        flips == 0 && spins == 0,
-        "physically impossible rotation under demand: {flips} one-tick heading flips (≥100°/0.2 s while moving), \
-         {spins} spin windows (≥300°/2 s); e.g. {example}"
+        flips == 0 && spins == 0 && crabs == 0 && kappas == 0,
+        "physically impossible motion under demand: {flips} one-tick heading flips (≥100°/0.2 s while moving), \
+         {spins} spin windows (≥300°/2 s), {crabs} rear-axle crab events (≥20°), \
+         {kappas} curvature events (>0.30 1/m, steering limit ~0.26); e.g. {example}"
     );
+    // The divergence guard is last-resort telemetry, not routine machinery: it
+    // may fire around the known degenerate-mouth nodes but must stay rare.
+    assert!(
+        (world.kinematic_divergences() as f64) < car_ticks as f64 * 0.01,
+        "divergence guard fired {} times over {car_ticks} car-ticks (≥1%) — geometry the tracker cannot follow",
+        world.kinematic_divergences()
+    );
+}
+
+/// The intersection named in the 2026-08-28 spin report, pinned by name: every
+/// vehicle passing Valencia Drive × Madera Way must move like a steered car.
+/// Captures each vehicle's full passage through a 25 m radius of the node and
+/// judges it as a whole — net rotation no larger than any turn the node offers,
+/// at most one yaw-direction reversal (a steering correction, not a wobble),
+/// bounded per-tick rotation, and no rear-axle sideslip.
+#[test]
+fn valencia_madera_turns_are_physical() {
+    let Some(net) = real_map() else { return };
+    let node = (0..net.nodes.len() as u32).map(NodeId).find(|&nd| {
+        let names: Vec<&str> = net
+            .links
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.from == nd || l.to == nd)
+            .map(|(i, _)| net.link_names[i].as_str())
+            .collect();
+        names.iter().any(|n| n.contains("Valencia Drive")) && names.iter().any(|n| n.contains("Madera Way"))
+    });
+    let Some(node) = node else { return }; // a re-scraped map may not include it
+    let center = net.node(node).position;
+    let cfg = SimConfig::default_config();
+    let mut world = NetWorld::new(net, cfg);
+    let pairs = demand::od_pairs(&world.network, 0, 600, DemandSources::new(true, true));
+    let mut gen = DemandGenerator::new(&world, &pairs, 0);
+    world.install_router(&gen.destinations());
+    ramp(&mut world, &mut gen, cfg.dt, 800);
+
+    // id -> (pose, rear, net rotation, reversals, last yaw sign, worst crab, worst dtheta, ticks)
+    struct Passage {
+        pose: [f64; 3],
+        rear: [f64; 2],
+        rot: f64,
+        reversals: u32,
+        sign: i32,
+        crab: f64,
+        peak: f64,
+        ticks: u32,
+    }
+    let mut open: HashMap<u32, Passage> = HashMap::new();
+    let mut done = 0usize;
+    for _ in 0..2200 {
+        gen.step(&mut world, cfg.dt);
+        world.step();
+        let mut present: HashMap<u32, Passage> = HashMap::new();
+        for v in world.vehicles() {
+            let pose = world.vehicle_world_pose(v);
+            if (pose[0] - center[0]).hypot(pose[1] - center[1]) > 25.0 {
+                continue;
+            }
+            let rear = v.rear_axle();
+            let mut p = open.remove(&v.id).unwrap_or(Passage {
+                pose,
+                rear,
+                rot: 0.0,
+                reversals: 0,
+                sign: 0,
+                crab: 0.0,
+                peak: 0.0,
+                ticks: 0,
+            });
+            let d = shortest_angle(p.pose[2], pose[2]);
+            p.rot += d;
+            p.peak = p.peak.max(d.abs());
+            let sign = if d > 0.02 { 1 } else if d < -0.02 { -1 } else { 0 };
+            if sign != 0 {
+                if p.sign != 0 && sign != p.sign {
+                    p.reversals += 1;
+                }
+                p.sign = sign;
+            }
+            let (rx, ry) = (rear[0] - p.rear[0], rear[1] - p.rear[1]);
+            if rx.hypot(ry) > 0.3 && v.speed > 3.0 {
+                p.crab = p.crab.max(shortest_angle(pose[2], ry.atan2(rx)).abs());
+            }
+            p.pose = pose;
+            p.rear = rear;
+            p.ticks += 1;
+            present.insert(v.id, p);
+        }
+        for (id, p) in open.drain() {
+            if p.ticks < 8 {
+                continue;
+            }
+            done += 1;
+            assert!(
+                p.rot.abs().to_degrees() <= 150.0,
+                "car {id}: {:.0}° of net rotation through Valencia × Madera — no movement there turns that far",
+                p.rot.abs().to_degrees()
+            );
+            assert!(p.reversals <= 1, "car {id}: {} yaw reversals — wobbling, not steering", p.reversals);
+            assert!(
+                p.peak.to_degrees() <= 20.0,
+                "car {id}: {:.1}°/tick peak rotation — beyond any steering geometry at these speeds",
+                p.peak.to_degrees()
+            );
+            assert!(
+                p.crab.to_degrees() < 15.0,
+                "car {id}: rear axle slid {:.1}° off its heading — four wheels cannot do that",
+                p.crab.to_degrees()
+            );
+        }
+        open = present;
+    }
+    eprintln!("valencia × madera: {done} clean passages");
+    assert!(done >= 5, "demand actually exercised the intersection: {done} passages");
 }
 
 /// The whole-city San Francisco map (~10k nodes, ~66k movements) must build and
