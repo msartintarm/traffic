@@ -3,6 +3,14 @@
 //! line, and lane hand-off across a node when the movement is served.
 //! Accelerations read committed pre-step state and apply in a second pass.
 
+mod fleet;
+mod groups;
+mod tracker;
+pub use fleet::NetVehicle;
+use fleet::{record_history, Crossing, Fate, Fleet, LaneChange};
+use groups::GroupMap;
+use tracker::*;
+
 use std::collections::HashMap;
 
 use super::config::{DriverConfig, SimConfig, VehicleClass};
@@ -21,176 +29,7 @@ use super::signal::SignalState;
 #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 use super::accel_gpu::GpuAccel;
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct NetVehicle {
-    pub id: u32,
-    pub lane: LaneId,
-    pub position: f64,
-    pub speed: f64,
-    /// Kinematic pose `[x, y, heading]` at the **rear axle**: a bicycle-model
-    /// state advanced by [`NetWorld::track_path`] — heading steers (bounded by
-    /// steering geometry and grip), position follows the wheels. The arc position
-    /// is the *reference being tracked*, not the pose itself, so no geometry
-    /// defect — a kinked polyline, a degenerate interior, a mouth overlap — can
-    /// render as motion a four-wheeled car cannot produce. This is what the world
-    /// pose, the render, and the collision footprint all see.
-    kin: [f64; 3],
-    /// Current steered path curvature (1/m, left-positive) — the wheel position.
-    /// [`NetWorld::track_path`] slews it toward its command at [`STEER_RATE`],
-    /// so lock builds and unwinds at a human pace instead of snapping.
-    steer: f64,
-    pub driver: DriverConfig,
-    pub route: Vec<LinkId>,
-    pub route_idx: usize,
-    /// Destination link for flow-field routing; when set (with a world router)
-    /// it supersedes `route` and reroutes live around congestion.
-    pub dest: Option<LinkId>,
-    /// The stop-controlled node this vehicle has already halted at, so a stop
-    /// sign is enforced once rather than forever.
-    stopped_at: Option<NodeId>,
-    /// Consecutive ticks spent essentially stopped — drives yield impatience.
-    wait_ticks: u32,
-    /// When set, the vehicle has crossed its current lane's stop line and is
-    /// traversing this movement's node interior. `position` keeps counting past
-    /// `lane.length`, so the interior arc is `position - lane.length` — the road
-    /// is one continuous corridor across the seam. Cleared when it lands on the
-    /// destination lane (`position` rebased to the new lane's frame).
-    crossing: Option<Crossing>,
-    lane_change: Option<LaneChange>,
-    /// Whether the active-set scheduler classified this car as sleeping on the
-    /// last step — read by the next step's lane-change pass to stagger the
-    /// (slow-timescale) queue-jump evaluation of parked cars.
-    slept: bool,
-    /// Ticks until this wreck is cleared from the road. `None` = not crashed. A
-    /// wreck holds its pose at speed 0 and blocks traffic like any stopped car
-    /// (leader chains, box occupancy) until the timer removes it.
-    wreck: Option<u16>,
-}
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Crossing {
-    movement: MovementId,
-    /// Lateral metres (right-positive) the car sat off its lane line when it hit
-    /// the boundary — a lane-change blend still in flight. Carried through the
-    /// crossing so the seam-landing blend starts from where the car actually is.
-    lat_shift: f64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct LaneChange {
-    from: LaneId,
-    progress: f64,
-}
-
-/// Outcome of advancing a vehicle one tick.
-enum Fate {
-    Alive,
-    /// Crossed onto a new link (its id, for entry counting).
-    Entered(LinkId),
-    /// Left the network legitimately — reached its destination, finished its
-    /// route, or ran off a genuine dead end.
-    Exited,
-    /// Removed at an interior node despite still having a routable next hop — a
-    /// vehicle that *disappeared* at an intersection. Should never happen; counted
-    /// so a regression in movement resolution is caught rather than silent.
-    Leaked,
-}
-
-/// How many `(position, speed)` samples to retain — enough for the largest
-/// plausible reaction delay at the fixed timestep.
-const HISTORY_LEN: usize = 8;
-
-type History = [(f64, f64); HISTORY_LEN];
-
-/// Vehicle storage as columns: the rows plus the per-vehicle reaction-delay
-/// history kept out of the row (it is only read for a leader, not while iterating
-/// every row). Columns stay index-aligned; mutations go through here.
-#[derive(Clone, Debug, Default)]
-struct Fleet {
-    rows: Vec<NetVehicle>,
-    hist: Vec<History>,
-    hist_len: Vec<u8>,
-}
-
-impl Fleet {
-    fn push(&mut self, v: NetVehicle) {
-        let mut h = [(0.0, 0.0); HISTORY_LEN];
-        h[0] = (v.position, v.speed);
-        self.hist.push(h);
-        self.hist_len.push(1);
-        self.rows.push(v);
-    }
-
-    fn clear(&mut self) {
-        self.rows.clear();
-        self.hist.clear();
-        self.hist_len.clear();
-    }
-
-    /// Row `i`'s `(position, speed)` `ticks` steps ago (clamped to the oldest kept).
-    fn delayed(&self, i: usize, ticks: usize) -> (f64, f64) {
-        let n = self.hist_len[i] as usize;
-        self.hist[i][n - 1 - ticks.min(n - 1)]
-    }
-
-    /// Whether row `i` has more than `ticks` samples on its *current* lane, so a
-    /// `ticks`-delayed lookup is a real in-frame position rather than one clamped back
-    /// to (or across) a recent segment crossing. History is reset on crossing, so this
-    /// gates the reaction-delay model back on only once the car has settled.
-    fn settled(&self, i: usize, ticks: usize) -> bool {
-        self.hist_len[i] as usize > ticks
-    }
-
-    /// Drop row `i`'s retained history down to just `(position, speed)`, so its
-    /// delayed leader-gap lookup falls back to the true current gap until it has
-    /// re-accumulated a full window — used when a lane change moves the car to a new
-    /// lane (and thus a new leader) whose old-frame positions would phantom-brake it.
-    fn reset_history(&mut self, i: usize, position: f64, speed: f64) {
-        self.hist[i][0] = (position, speed);
-        self.hist_len[i] = 1;
-    }
-}
-
-/// Append the current `(position, speed)` to a history column entry, dropping the
-/// oldest sample once full.
-fn record_history(hist: &mut History, len: &mut u8, position: f64, speed: f64) {
-    let n = *len as usize;
-    if n < HISTORY_LEN {
-        hist[n] = (position, speed);
-        *len += 1;
-    } else {
-        hist.copy_within(1.., 0);
-        hist[HISTORY_LEN - 1] = (position, speed);
-    }
-}
-
-impl NetVehicle {
-    /// The rear-axle point of the kinematic pose — the bicycle model's ground
-    /// truth. By construction it moves (almost exactly) along the heading, so
-    /// this is where slip/crab invariants should be measured; the front bumper
-    /// legitimately sweeps sideways through turns.
-    pub fn rear_axle(&self) -> [f64; 2] {
-        [self.kin[0], self.kin[1]]
-    }
-
-    /// Whether the vehicle is currently inside a node traversing a movement's
-    /// interior path (`position` counts on past its `lane`'s length; the overrun
-    /// is the interior arc).
-    pub fn is_crossing(&self) -> bool {
-        self.crossing.is_some()
-    }
-
-    /// Whether this vehicle is a crashed wreck awaiting clearance.
-    pub fn is_wrecked(&self) -> bool {
-        self.wreck.is_some()
-    }
-
-    /// Consecutive ticks spent essentially stopped — the wait the yield
-    /// impatience and the HUD's junction readout run on.
-    pub fn wait_ticks(&self) -> u32 {
-        self.wait_ticks
-    }
-}
 
 /// Which detector took a vehicle off the road — the *nature* of a crash, so
 /// artifact hunting and realism tuning can tell rear-end chains from junction
@@ -257,6 +96,11 @@ pub struct NetWorld {
     /// Reroute cycles solve only what will be read: dirty fields, early-stopped
     /// at their querying links (see [`FieldRouter::begin_recompute_targeted`]).
     targeted_routing: bool,
+    /// Persistent neighbor index and lane-change grouping, reused across ticks so
+    /// a steady-state step allocates no group storage (see [`groups::GroupMap`]).
+    nb_pool: Neighbors,
+    lc_groups: GroupMap,
+    crash_groups: GroupMap,
     /// Periodically permute the fleet into (lane, position) order so the per-car
     /// passes' neighbor reads walk adjacent memory instead of pointer-chasing a
     /// shuffled ~250-byte-row array — the memory-bound closures are why the
@@ -825,59 +669,6 @@ const LIGHT_PAR_THRESHOLD: usize = 8000;
 /// constraint (signal/box/yield/stop) can yet bind — [`NetWorld::gather_context`] LOD-skips
 /// the node stack, and the active-set scheduler's free-car path applies from here out.
 const DECISION_HORIZON: f64 = 180.0;
-/// Speed-dependent comfortable lateral acceleration (m/s²), AASHTO
-/// side-friction style: drivers accept ~0.35–0.4 g threading an intersection at
-/// walking-to-jogging speed and only ~0.12 g at highway speed, falling roughly
-/// linearly in between (Green Book side-friction factors ≈ 0.38 at 15 km/h down
-/// to ≈ 0.09–0.12 at 110+ km/h). One envelope drives both how fast a car takes
-/// a curve of radius r and how hard the tracker may steer at its current speed.
-fn comfort_lat(v: f64) -> f64 {
-    (3.9 - 0.145 * v).clamp(1.2, 3.9)
-}
-/// The speed a driver chooses for a curve of radius `r` under the envelope:
-/// solve `v² = r · a(v)` with the linear branch of [`comfort_lat`], capped by
-/// the low-speed plateau.
-fn comfort_speed(r: f64) -> f64 {
-    if !r.is_finite() {
-        return f64::INFINITY;
-    }
-    let quad = (-0.145 * r + (0.021025 * r * r + 15.6 * r).sqrt()) * 0.5;
-    quad.min((3.9 * r).sqrt())
-}
-/// How far ahead a curve is read.
-const CURVE_LOOKAHEAD: f64 = 45.0;
-/// Bicycle-model bounds for [`NetWorld::track_path`]. Steering geometry:
-/// maximum front-wheel angle tan 35° (a 10.5–12 m curb-to-curb turning circle —
-/// rear-axle path radius ≈ 3.9 m for a 4.5 m car); the wheelbase is [`AXLE_WHEELBASE`] of the
-/// vehicle length (car ≈ 2.7 m of 4.5 → ~3.9 m minimum turning radius; a bus
-/// proportionally wider), and the rear axle sits [`AXLE_FRONT`] of the length
-/// behind the front bumper (the pose anchor the rest of the sim uses). Grip:
-/// the tyre lateral limit (m/s², ~0.7 g) that caps curvature at speed —
-/// `κ ≤ min(tan δ_max / wheelbase, grip / v²)`.
-const AXLE_STEER_TAN: f64 = 0.70;
-const AXLE_WHEELBASE: f64 = 0.6;
-const AXLE_FRONT: f64 = 0.8;
-const YAW_GRIP_LAT: f64 = 7.0;
-/// Road-wheel steering rate (rad/s): a driver winds lock on and off through the
-/// steering ratio, reaching full lock from centre in ~1.3 s — the wheel cannot
-/// snap. Divided by the wheelbase this bounds how fast the tracked curvature
-/// may change per second.
-const STEER_RATE: f64 = 0.55;
-/// Pure-pursuit lookahead from the rear axle: `0.8·v` clamped to this range
-/// (m). The floor sits just above the wheelbase — tight enough to hug a city
-/// corner, stable enough not to oscillate; the ceiling keeps highway tracking
-/// calm.
-const LOOKAHEAD_MIN: f64 = 2.8;
-const LOOKAHEAD_MAX: f64 = 12.0;
-/// The divergence guard — the knob that trades path-hugging against full
-/// kinematics. Lateral deviation of the kinematic pose from the arc reference
-/// beyond this (m) bleeds back at the given rate (m/s) and is counted
-/// (`kinematic_divergences`); a cluster of counts marks defective geometry.
-/// Longitudinal deviation is corrected *exactly* every tick instead: queue
-/// spacing, stop lines, and leader gaps are arc-truth, and the drawn car must
-/// sit where the sim says it is along the road.
-const LAT_DIVERGE_MAX: f64 = 3.0;
-const LAT_CORRECT_RATE: f64 = 2.0;
 /// Maximum physical deceleration (m/s², ~0.9 g of tyre grip). IDM's interaction term is
 /// unbounded as the gap shrinks, so an unclamped car could compute hundreds of m/s² and
 /// teleport from highway speed to a dead stop in one tick. `integrate`/`advance_crossing`
@@ -896,18 +687,7 @@ const MERGE_APPROACH: f64 = 45.0;
 /// (so it notices a queue starting to build just past the next node).
 const LEADER_HORIZON_MIN: f64 = 30.0;
 
-/// Signed shortest rotation `a → b`, in (-π, π] — so the heading slew always
-/// turns the short way round.
-fn shortest_angle(a: f64, b: f64) -> f64 {
-    let mut d = (b - a) % std::f64::consts::TAU;
-    if d > std::f64::consts::PI {
-        d -= std::f64::consts::TAU;
-    }
-    if d <= -std::f64::consts::PI {
-        d += std::f64::consts::TAU;
-    }
-    d
-}
+
 
 /// How far ahead a car needs to see to brake comfortably: its reaction (headway) distance
 /// plus its stopping distance at comfortable deceleration. The cross-boundary leader walk
@@ -1213,7 +993,8 @@ impl NetWorld {
         Self {
             network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0, divergences: 0,
             control_aware_routing: true, lane_eval_stagger: true, arterial_routing: false,
-            targeted_routing: true, dest_entries: HashMap::new(), locality_sort: false, crashed_by: [0; 2], crash_log: Vec::new(),
+            targeted_routing: true, dest_entries: HashMap::new(), locality_sort: false,
+            nb_pool: Neighbors::default(), lc_groups: GroupMap::default(), crash_groups: GroupMap::default(), crashed_by: [0; 2], crash_log: Vec::new(),
             merges, link_straight, turn_caps, merge_feeder_lane, through_next, corridor_of, corridor_offset, seam_primary, signals, link_entries, router: None, external_reroute: false,
             meters: Vec::new(), metering_on: false, day_secs: 0.0, pm_plan: false, rail_preempts,
             timetable: rail::Timetable::default(), crossing_sets: HashMap::new(), weekend: false, day_rate: 1.0,
@@ -1955,236 +1736,6 @@ impl NetWorld {
     }
 
 
-    /// A vehicle's current world pose `[x, y, heading]` at the front bumper —
-    /// the anchor `car_rect` and the render use — derived from the rear-axle
-    /// bicycle state [`track_path`](Self::track_path) advances. Heading steers,
-    /// position follows the wheels: the pose can only move the way a steered
-    /// four-wheeled vehicle moves.
-    pub fn vehicle_world_pose(&self, v: &NetVehicle) -> [f64; 3] {
-        let f = AXLE_FRONT * v.driver.vehicle_length;
-        [v.kin[0] + f * v.kin[2].cos(), v.kin[1] + f * v.kin[2].sin(), v.kin[2]]
-    }
-
-    /// A freshly spawned vehicle's kinematic state: rear axle placed so the
-    /// front bumper sits exactly on the lane point, heading along the tangent.
-    fn spawn_kin(net: &Network, lane: LaneId, position: f64, driver: &DriverConfig) -> [f64; 3] {
-        let p = net.lane_point(lane, position);
-        let f = AXLE_FRONT * driver.vehicle_length;
-        [p[0] - f * p[2].cos(), p[1] - f * p[2].sin(), p[2]]
-    }
-
-    /// The pose pure path geometry dictates (public for audits/tests): where the
-    /// sim's arc position puts the front bumper, against which the kinematic pose
-    /// is synced. See [`path_pose`](Self::vehicle_arc_pose).
-    pub fn vehicle_arc_pose(&self, v: &NetVehicle) -> [f64; 3] {
-        self.path_pose(v)
-    }
-
-    /// The pose pure path geometry dictates — the interior crossing path when
-    /// inside a node, otherwise the lane position. Its heading is the raw path
-    /// tangent (it can step discontinuously at a vertex or a seam); the kinematic
-    /// heading steers toward it but never faster than a car can yaw.
-    fn path_pose(&self, v: &NetVehicle) -> [f64; 3] {
-        if let Some(c) = v.crossing {
-            let s = self.crossing_arc(v).clamp(0.0, self.network.interior(c.movement).len);
-            return self.network.interior_point(c.movement, s);
-        }
-        let cur = self.network.lane_point(v.lane, v.position);
-        let Some(lc) = v.lane_change else { return cur };
-        let arc = self.network.lane(v.lane).start_offset + v.position;
-        let from_lane = self.network.lane(lc.from);
-        let from_pos = arc - from_lane.start_offset;
-        if from_pos < 0.0 || from_pos > from_lane.length {
-            return cur;
-        }
-        let from = self.network.lane_point(lc.from, from_pos);
-        let t = lc.progress.clamp(0.0, 1.0);
-        [from[0] + (cur[0] - from[0]) * t, from[1] + (cur[1] - from[1]) * t, cur[2]]
-    }
-
-    pub fn vehicle(&self, id: u32) -> Option<&NetVehicle> {
-        self.fleet.rows.iter().find(|v| v.id == id)
-    }
-
-    /// The world point the tracker steers toward: `ld` metres further along the
-    /// path than the vehicle's arc position — through the interior and onto the
-    /// landing lane when the lookahead crosses a node (geometric continuity, the
-    /// same `skip` the landing rebase applies), clamped at the stop line before
-    /// a boundary is committed (a car aims at the stop bar until its crossing
-    /// starts, then the reference sweeps through the turn). Reads the *target*
-    /// lane during a lane change — that jump in the reference, chased through
-    /// the lookahead, is precisely what makes the change a steered S-curve.
-    fn reference_point(&self, v: &NetVehicle, ld: f64) -> [f64; 2] {
-        if let Some(c) = v.crossing {
-            let it = self.network.interior(c.movement);
-            let s = self.crossing_arc(v) + ld;
-            if s <= it.len {
-                let p = self.network.interior_point(c.movement, s.max(0.0));
-                return [p[0], p[1]];
-            }
-            let to = self.network.movement(c.movement).to_lane;
-            let start = self.network.lane_point(to, 0.0);
-            let skip = ((it.exit[0] - start[0]) * start[2].cos() + (it.exit[1] - start[1]) * start[2].sin()).max(0.0);
-            let p = self.network.lane_point(to, (s - it.len + skip).min(self.network.lane(to).length));
-            return [p[0], p[1]];
-        }
-        let lane = self.network.lane(v.lane);
-        let p = self.network.lane_point(v.lane, (v.position + ld).min(lane.length));
-        [p[0], p[1]]
-    }
-
-    /// Advance every moving vehicle's bicycle-model pose one tick: pure pursuit
-    /// of the lookahead reference bounds curvature to what steering geometry and
-    /// grip allow, then the rear axle rolls forward along the new heading. The
-    /// arc reference can step discontinuously (a polyline vertex, a seam, a
-    /// landing, a lane-change retarget); this layer guarantees the *pose* never
-    /// does — a car physically cannot spin in place, crab sideways, or rotate
-    /// while stationary. Longitudinal error against the canonical arc pose is
-    /// zeroed each tick (visual queue spacing is arc-truth); lateral error is
-    /// resolved by steering alone unless it exceeds the divergence guard.
-    fn track_path(&mut self, dt: f64) {
-        // Per-car and read-only against shared state, so the compute half fans
-        // across cores; the tiny write-back stays serial. `None` = untouched
-        // (parked) row.
-        let n = self.fleet.rows.len();
-        let (backend, threshold) = (self.active_backend(), self.par_threshold.max(LIGHT_PAR_THRESHOLD));
-        let updates: Vec<Option<([f64; 3], f64, bool)>> = map_collect(backend, threshold, n, |i| self.track_one(i, dt));
-        for (i, u) in updates.into_iter().enumerate() {
-            if let Some((kin, steer, diverged)) = u {
-                self.fleet.rows[i].kin = kin;
-                self.fleet.rows[i].steer = steer;
-                if diverged {
-                    self.divergences += 1;
-                }
-            }
-        }
-    }
-
-    /// One vehicle's tracker step: the new kinematic pose, wheel position, and
-    /// whether the divergence guard fired — or `None` for a parked car.
-    fn track_one(&self, i: usize, dt: f64) -> Option<([f64; 3], f64, bool)> {
-        {
-            let v = &self.fleet.rows[i];
-            if v.speed <= 0.05 {
-                return None;
-            }
-            let len = v.driver.vehicle_length;
-            let [x, y, th] = v.kin;
-            // Lookahead measured from the *rear axle* — the point doing the
-            // chasing. The arc reference is stationed at the front bumper, so the
-            // path offset subtracts the axle offset; at corner speeds the target
-            // sits barely past the bumper and the car tracks the turn tightly
-            // instead of lazily cutting toward a point a car-length beyond it.
-            let ld = (0.8 * v.speed).clamp(LOOKAHEAD_MIN, LOOKAHEAD_MAX);
-            let r = self.reference_point(v, ld - AXLE_FRONT * len);
-            let (dx, dy) = (r[0] - x, r[1] - y);
-            let dist = dx.hypot(dy);
-            let alpha = shortest_angle(th, dy.atan2(dx));
-            // Steering authority, in three nested bounds: what the steering
-            // geometry can do at all (tan 35° over the wheelbase — the 10.5–12 m
-            // curb-to-curb circle of a real car), what a driver is *willing* to
-            // pull laterally at this speed (the AASHTO-style comfort envelope:
-            // ~0.4 g threading an intersection, ~0.12 g at highway speed), and —
-            // only during a recovery crank, where comfort is beside the point —
-            // raw tyre grip.
-            let kappa_geo = AXLE_STEER_TAN / (AXLE_WHEELBASE * len);
-            let v2 = v.speed * v.speed;
-            let kappa_max = kappa_geo.min(comfort_lat(v.speed) / v2);
-            // Past the shoulder line pure pursuit's sin(α) goes blind (a
-            // displaced car would roll straight on, diverging forever; a held
-            // car's arc once drove 874 m away). A real driver cranks the wheel:
-            // full lock toward the shorter side until the target is ahead again —
-            // a bounded, steering-legal loop of a few seconds at worst, confined
-            // to the handful of degenerate-mouth handoffs.
-            let mut kappa_cmd = if alpha.abs() > std::f64::consts::FRAC_PI_2 {
-                kappa_geo.min(YAW_GRIP_LAT / v2) * alpha.signum()
-            } else if dist > 0.5 {
-                2.0 * alpha.sin() / dist
-            } else {
-                0.0
-            };
-            // Feed-forward through the node: steer with the interior's own
-            // curvature and let pursuit correct the residual, instead of
-            // discovering a tight turn only through accumulating error.
-            if let Some(c) = v.crossing {
-                kappa_cmd += self.network.interior_curvature(c.movement, self.crossing_arc(v));
-            }
-            let clamp_hi = if alpha.abs() > std::f64::consts::FRAC_PI_2 { kappa_geo.min(YAW_GRIP_LAT / v2) } else { kappa_max };
-            // The wheel winds, it doesn't snap: curvature approaches its command
-            // at the steering rate, so lock builds over ~a second — the visible
-            // ease-in/ease-out of a real turn.
-            let target = kappa_cmd.clamp(-clamp_hi, clamp_hi);
-            let dk = (STEER_RATE / (AXLE_WHEELBASE * len)) * dt;
-            let kappa = v.steer + (target - v.steer).clamp(-dk, dk);
-            // The wheels only roll *forward*, and rolling doubles as the
-            // longitudinal sync: ground distance this tick is whatever keeps the
-            // front bumper level with the arc pose along the car's axis, floored
-            // at zero and capped just above the speed's own step. An arc hold
-            // (stop-line clamp) rolls zero and the car simply stops; a backward
-            // arc jump (a degenerate-mouth landing the skip rebase can't express)
-            // becomes a short pause while the arc catches up — never a rendered
-            // backslide; a forward jump is a brief bounded catch-up. Heading
-            // advances by κ·ds — rolling geometry: a car that isn't moving cannot
-            // rotate. The maneuver floor breaks the one fixed point that rule
-            // has: a car pointed well off its line projects ~nothing forward and
-            // would otherwise freeze mid-recovery — like a real driver, it keeps
-            // rolling (at half pace) so steering can bring it back.
-            let p = self.path_pose(v);
-            let (c0, s0) = (th.cos(), th.sin());
-            let (ex0, ey0) = (p[0] - (x + AXLE_FRONT * len * c0), p[1] - (y + AXLE_FRONT * len * s0));
-            let long = ex0 * c0 + ey0 * s0;
-            let lat0 = -ex0 * s0 + ey0 * c0;
-            let mut ds = long.clamp(0.0, v.speed * dt * 1.5 + 0.3);
-            // Ahead-ness measured in the *path's* frame: how far the drawn front
-            // sits past the sim's station along the road. The maneuver floor may
-            // only roll while the car is not ahead — without this guard a car
-            // recovering a lateral error against a stalled arc (a queue, a box
-            // admission gate) crept unboundedly into the intersection (32 m ahead
-            // observed), parked there until its arc caught up, and its phantom
-            // body triggered junction crashes the arc-based conflict logic never
-            // scheduled.
-            let ahead = -(ex0 * p[2].cos() + ey0 * p[2].sin());
-            if lat0.abs() > 1.0 && ahead < 0.5 {
-                ds = ds.max(0.5 * v.speed * dt);
-            }
-            // Hard cap in the path frame: rolling may never take the drawn front
-            // more than half a metre past the sim's station (mid-turn, the
-            // car-frame projection alone can't see this). A car that got ahead
-            // rolls nothing until the arc catches up.
-            ds = ds.min((v.speed * dt + 0.5 - ahead).max(0.0));
-            let mut th2 = th + kappa * ds;
-            if th2 > std::f64::consts::PI {
-                th2 -= std::f64::consts::TAU;
-            } else if th2 <= -std::f64::consts::PI {
-                th2 += std::f64::consts::TAU;
-            }
-            let (c, s) = (th2.cos(), th2.sin());
-            let mut x2 = x + ds * c;
-            let mut y2 = y + ds * s;
-            // Lateral residual against the arc pose: resolved by steering alone
-            // unless it exceeds the divergence guard, which bleeds it at a
-            // bounded rate and counts the activation.
-            let (ex, ey) = (p[0] - (x2 + AXLE_FRONT * len * c), p[1] - (y2 + AXLE_FRONT * len * s));
-            let lat = -ex * s + ey * c;
-            let diverged = lat.abs() > LAT_DIVERGE_MAX;
-            if diverged {
-                // Capped to a fraction of the rolled distance so even the guard
-                // cannot make the car slide at more than ~14° to its heading —
-                // steering and the maneuver floor do the real recovery work.
-                let lat_fix = (lat.abs() - LAT_DIVERGE_MAX).min(LAT_CORRECT_RATE * dt).min(0.25 * ds) * lat.signum();
-                x2 -= lat_fix * s;
-                y2 += lat_fix * c;
-            }
-            Some(([x2, y2, th2], kappa, diverged))
-        }
-    }
-
-    /// How many tick-vehicle lateral divergence-guard activations have occurred
-    /// (see [`track_path`](Self::track_path)) — a health metric: clusters mark
-    /// geometry the tracker cannot physically follow.
-    pub fn kinematic_divergences(&self) -> u64 {
-        self.divergences
-    }
 
     fn intended_movement(&self, veh: &NetVehicle) -> Option<MovementId> {
         let lane = self.network.lane(veh.lane);
@@ -2405,62 +1956,81 @@ impl NetWorld {
             .map(|k| MovementId(start.0 + k as u32))
     }
 
+    /// A freshly allocated neighbor index — the cold path (census, tests). The
+    /// step reuses a persistent [`Neighbors`] via [`rebuild_neighbors`]
+    /// (Self::rebuild_neighbors) instead, which allocates nothing at steady state.
     fn neighbors(&self) -> Neighbors {
-        let mut by_lane: IntMap<Vec<usize>> = IntMap::default();
-        let mut by_corridor: IntMap<Vec<usize>> = IntMap::default();
-        let mut approaching: IntMap<Vec<usize>> = IntMap::default();
-        let mut crossing_at: IntMap<Vec<usize>> = IntMap::default();
-        let mut crossing_mvs: IntMap<Vec<MovementId>> = IntMap::default();
-        let mut moving_crossing_mvs: IntMap<Vec<MovementId>> = IntMap::default();
+        let mut nb = Neighbors::default();
+        self.rebuild_neighbors(&mut nb);
+        nb
+    }
+
+    fn rebuild_neighbors(&self, nb: &mut Neighbors) {
+        nb.by_lane.begin_tick();
+        nb.by_corridor.begin_tick();
+        nb.approaching.begin_tick();
+        nb.crossing_at.begin_tick();
+        nb.crossing_mvs.begin_tick();
+        nb.moving_crossing_mvs.begin_tick();
+        nb.lane_front.clear();
+        nb.leader_of.clear();
+        nb.leader_of.resize(self.fleet.rows.len(), None);
         for (i, v) in self.fleet.rows.iter().enumerate() {
             // Every car (crossers included, at their continuous corridor position) joins the
             // leader chain for its corridor, so a follower keeps its leader across a seam.
-            by_corridor.entry(self.corridor_of[v.lane.0 as usize]).or_default().push(i);
+            nb.by_corridor.push(self.corridor_of[v.lane.0 as usize], i);
             if let Some(c) = v.crossing {
                 let node = self.network.movement(c.movement).node;
                 let key = self.network.intersection_key(node);
-                crossing_at.entry(key).or_default().push(i);
-                let mut path = vec![c.movement];
+                nb.crossing_at.push(key, i);
+                let mut path = [c.movement; 5];
+                let mut path_len = 1;
                 let mut lane = self.network.movement(c.movement).to_lane;
                 for _ in 0..4 {
                     if !self.junction_internal_lane(lane) {
                         break;
                     }
                     let Some(next) = self.movement_from_lane_for(v, lane) else { break };
-                    path.push(next);
+                    path[path_len] = next;
+                    path_len += 1;
                     lane = self.network.movement(next).to_lane;
                 }
-                if v.speed >= 0.5 {
-                    moving_crossing_mvs.entry(key).or_default().extend(path.iter().copied());
+                for &m in &path[..path_len] {
+                    if v.speed >= 0.5 {
+                        nb.moving_crossing_mvs.push(key, m);
+                    }
+                    nb.crossing_mvs.push(key, m);
                 }
-                crossing_mvs.entry(key).or_default().extend(path);
-                by_lane.entry(v.lane.0).or_default().push(i);
+                nb.by_lane.push(v.lane.0, i);
                 continue;
             }
-            by_lane.entry(v.lane.0).or_default().push(i);
-            approaching.entry(self.network.intersection_key(self.downstream_node(v.lane))).or_default().push(i);
+            nb.by_lane.push(v.lane.0, i);
+            nb.approaching.push(self.network.intersection_key(self.downstream_node(v.lane)), i);
         }
         // Flat sort keys (contiguous, cache-friendly) precomputed once when the cache-sort
         // option is on; empty when off, so the helpers read each vehicle row instead.
         let (pos, cpos) = (self.position_keys(), self.corridor_keys());
         // The leader chain runs along the whole corridor (grade-separated 1:1 through-lanes
         // coalesced), so `leader_of` never loses the car ahead at a segment boundary.
-        let mut leader_of = vec![None; self.fleet.rows.len()];
-        for members in by_corridor.values_mut() {
-            self.sort_corridor_members(members, &cpos);
+        for gi in 0..nb.by_corridor.len() {
+            let (_, members) = nb.by_corridor.group_mut_at(gi);
+            let mut members = std::mem::take(members);
+            self.sort_corridor_members(&mut members, &cpos);
             for w in members.windows(2) {
-                leader_of[w[0]] = Some(w[1]);
+                nb.leader_of[w[0]] = Some(w[1]);
             }
+            *nb.by_corridor.group_mut_at(gi).1 = members;
         }
         // Nearest-to-entrance car per physical lane — for the box gate and lateral checks,
         // which stay per-lane (a lane change targets a physical lane, not a corridor).
-        let mut lane_front: IntMap<usize> = IntMap::default();
-        for members in by_lane.values_mut() {
-            self.sort_lane_members(members, &pos);
-            let front = *members.first().unwrap();
-            lane_front.insert(self.fleet.rows[front].lane.0, front);
+        for gi in 0..nb.by_lane.len() {
+            let (_, members) = nb.by_lane.group_mut_at(gi);
+            let mut members = std::mem::take(members);
+            self.sort_lane_members(&mut members, &pos);
+            let front = members[0];
+            nb.lane_front.insert(self.fleet.rows[front].lane.0, front);
+            *nb.by_lane.group_mut_at(gi).1 = members;
         }
-        Neighbors { leader_of, lane_front, by_lane, approaching, crossing_at, crossing_mvs, moving_crossing_mvs }
     }
 
     fn downstream_node(&self, lane: LaneId) -> NodeId {
@@ -2485,16 +2055,21 @@ impl NetWorld {
     /// longitudinal update. Discretionary (overtake a slow leader into a freer
     /// lane) and mandatory (move to a lane that serves the route's next link).
     fn lane_changes(&mut self) {
-        let mut by_lane: IntMap<Vec<usize>> = IntMap::default();
+        // Reuse the persistent grouping (taken out of `self` for the tick).
+        let mut by_lane = std::mem::take(&mut self.lc_groups);
+        by_lane.begin_tick();
         for (i, v) in self.fleet.rows.iter().enumerate() {
             if v.crossing.is_some() {
                 continue; // no lane changes mid-intersection
             }
-            by_lane.entry(v.lane.0).or_default().push(i);
+            by_lane.push(v.lane.0, i);
         }
         let pos = self.position_keys();
-        for m in by_lane.values_mut() {
-            self.sort_lane_members(m, &pos);
+        for gi in 0..by_lane.len() {
+            let (_, m) = by_lane.group_mut_at(gi);
+            let mut m = std::mem::take(m);
+            self.sort_lane_members(&mut m, &pos);
+            *by_lane.group_mut_at(gi).1 = m;
         }
         // Decide each car's best lane change. This is the expensive MOBIL scan and it reads only
         // committed state (positions + the sorted `by_lane`), so it parallelizes across cores
@@ -2593,7 +2168,7 @@ impl NetWorld {
         }
     }
 
-    fn best_lane_change(&self, i: usize, by_lane: &IntMap<Vec<usize>>) -> Option<LaneId> {
+    fn best_lane_change(&self, i: usize, by_lane: &GroupMap) -> Option<LaneId> {
         let v = &self.fleet.rows[i];
         let lane = *self.network.lane(v.lane);
         let link = *self.network.link(lane.link);
@@ -2697,13 +2272,13 @@ impl NetWorld {
     // `by_lane` lists are sorted ascending by position, so the neighbour just
     // ahead/behind is found by a binary partition instead of a full lane scan
     // (this ran ~7× per vehicle in `best_lane_change`).
-    fn nearest_ahead(&self, lane: LaneId, pos: f64, by_lane: &IntMap<Vec<usize>>, exclude: usize) -> Option<usize> {
+    fn nearest_ahead(&self, lane: LaneId, pos: f64, by_lane: &GroupMap, exclude: usize) -> Option<usize> {
         let list = by_lane.get(&lane.0)?;
         let idx = list.partition_point(|&j| self.fleet.rows[j].position <= pos);
         list[idx..].iter().copied().find(|&j| j != exclude)
     }
 
-    fn nearest_behind(&self, lane: LaneId, pos: f64, by_lane: &IntMap<Vec<usize>>, exclude: usize) -> Option<usize> {
+    fn nearest_behind(&self, lane: LaneId, pos: f64, by_lane: &GroupMap, exclude: usize) -> Option<usize> {
         let list = by_lane.get(&lane.0)?;
         let idx = list.partition_point(|&j| self.fleet.rows[j].position < pos);
         list[..idx].iter().rev().copied().find(|&j| j != exclude)
@@ -3330,27 +2905,7 @@ impl NetWorld {
         }
     }
 
-    /// Permute the fleet (rows + histories, together) into (lane, arc-position)
-    /// order. Any order is a valid simulation; this one makes every per-car
-    /// pass's neighbor reads mostly-sequential in memory.
-    fn locality_reorder(&mut self) {
-        let n = self.fleet.rows.len();
-        let mut order: Vec<u32> = (0..n as u32).collect();
-        order.sort_by(|&a, &b| {
-            let (va, vb) = (&self.fleet.rows[a as usize], &self.fleet.rows[b as usize]);
-            (va.lane.0, va.position).partial_cmp(&(vb.lane.0, vb.position)).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let rows = std::mem::take(&mut self.fleet.rows);
-        let hist = std::mem::take(&mut self.fleet.hist);
-        let hist_len = std::mem::take(&mut self.fleet.hist_len);
-        let mut rows: Vec<Option<NetVehicle>> = rows.into_iter().map(Some).collect();
-        let mut hist: Vec<Option<History>> = hist.into_iter().map(Some).collect();
-        for &i in &order {
-            self.fleet.rows.push(rows[i as usize].take().unwrap());
-            self.fleet.hist.push(hist[i as usize].take().unwrap());
-            self.fleet.hist_len.push(hist_len[i as usize]);
-        }
-    }
+
 
     pub fn step(&mut self) {
         let dt = self.cfg.dt;
@@ -3369,7 +2924,13 @@ impl NetWorld {
         }
         self.lane_changes();
         prof.lap(2);
-        let nb = self.neighbors();
+        // Reuse the persistent neighbor index: taken out of `self` for the tick
+        // (so the borrow checker sees it as a local) and returned at the end.
+        let nb = {
+            let mut nb = std::mem::take(&mut self.nb_pool);
+            self.rebuild_neighbors(&mut nb);
+            nb
+        };
         prof.lap(3);
 
         let mut cross_by_mv: IntMap<Vec<usize>> = IntMap::default();
@@ -3548,7 +3109,12 @@ impl NetWorld {
 
         // Crash detection on the fully-advanced positions, before assembly drops any row
         // (indices still align with the pre-step fleet and `nb`).
-        let crashes = self.detect_crashes(&taken, &fates, &nb);
+        let crashes = {
+            let mut groups = std::mem::take(&mut self.crash_groups);
+            let crashes = self.detect_crashes(&taken, &fates, &nb, &mut groups);
+            self.crash_groups = groups;
+            crashes
+        };
 
         // Assembly — apply each fate's bookkeeping and keep/drop in index order, identical to
         // the former single-pass loop; freshly crashed cars become wrecks (or are cleared
@@ -3610,6 +3176,7 @@ impl NetWorld {
         self.fleet.hist_len = hist_len;
         self.exited += exited;
         self.track_path(dt);
+        self.nb_pool = nb;
         prof.lap(6);
         self.time += dt;
         self.tick += 1;
@@ -4382,61 +3949,95 @@ impl NetWorld {
     ///
     /// A live car hitting an existing wreck is a fresh crash for the live car only;
     /// wreck–wreck contact in a pileup is not re-counted.
-    fn detect_crashes(&self, taken: &[NetVehicle], fates: &[Fate], nb: &Neighbors) -> Vec<Option<(CrashKind, f32)>> {
+    /// Whether follower `i` has physically overrun its corridor leader this tick
+    /// — `Some(closing speed)` on contact. Pure and read-only (the parallel arm
+    /// of [`detect_crashes`](Self::detect_crashes)).
+    fn rear_end_verdict(&self, i: usize, taken: &[NetVehicle], fates: &[Fate], nb: &Neighbors) -> Option<f32> {
+        let on_road = |i: usize| matches!(fates[i], Fate::Alive | Fate::Entered(_));
         const OVERLAP_TOL: f64 = 0.5;
+        let li = nb.leader_of[i]?;
+        if !on_road(i) || !on_road(li) || taken[i].wreck.is_some() {
+            return None;
+        }
+        let (f, l) = (&taken[i], &taken[li]);
+        // The chain was built per corridor; a leader that has since landed on a
+        // different corridor left this coordinate frame (the landing gates kept
+        // the entrance clear behind it).
+        if self.corridor_of[f.lane.0 as usize] != self.corridor_of[l.lane.0 as usize] {
+            return None;
+        }
+        // Two in-node crossers share the scalar coordinate only on the *same*
+        // interior path; on movements fanning out from one lane the arcs diverge
+        // in the world, so an arc "overlap" there is not a touch (their genuine
+        // collisions are the body-overlap detector's concern).
+        if let (Some(cf), Some(cl)) = (f.crossing, l.crossing) {
+            if cf.movement != cl.movement {
+                return None;
+            }
+        }
+        if self.corridor_gap(f, l) < -OVERLAP_TOL {
+            let closing = (f.speed - l.speed).abs() as f32;
+            if std::env::var_os("CRASH_DEBUG").is_some() {
+                eprintln!(
+                    "RE tick={} gap={:.2} f=(id{} lane{} pos{:.1} v{:.1} cross{} fate{:?}) l=(id{} lane{} pos{:.1} v{:.1} cross{} wreck{})",
+                    self.tick,
+                    self.corridor_gap(f, l),
+                    f.id, f.lane.0, f.position, f.speed, f.crossing.is_some(), matches!(fates[i], Fate::Entered(_)),
+                    l.id, l.lane.0, l.position, l.speed, l.crossing.is_some(), l.wreck.is_some(),
+                );
+            }
+            return Some(closing);
+        }
+        None
+    }
+
+    fn detect_crashes(&self, taken: &[NetVehicle], fates: &[Fate], nb: &Neighbors, by_node: &mut GroupMap) -> Vec<Option<(CrashKind, f32)>> {
         let mut hit: Vec<Option<(CrashKind, f32)>> = vec![None; taken.len()];
         let on_road = |i: usize| matches!(fates[i], Fate::Alive | Fate::Entered(_));
 
-        for i in 0..taken.len() {
-            let Some(li) = nb.leader_of[i] else { continue };
-            if !on_road(i) || !on_road(li) || taken[i].wreck.is_some() {
-                continue;
-            }
-            let (f, l) = (&taken[i], &taken[li]);
-            // The chain was built per corridor; a leader that has since landed on a
-            // different corridor left this coordinate frame (the landing gates kept
-            // the entrance clear behind it).
-            if self.corridor_of[f.lane.0 as usize] != self.corridor_of[l.lane.0 as usize] {
-                continue;
-            }
-            // Two in-node crossers share the scalar coordinate only on the *same*
-            // interior path; on movements fanning out from one lane the arcs diverge
-            // in the world, so an arc "overlap" there is not a touch (their genuine
-            // collisions are the body-overlap detector's concern).
-            if let (Some(cf), Some(cl)) = (f.crossing, l.crossing) {
-                if cf.movement != cl.movement {
-                    continue;
-                }
-            }
-            if self.corridor_gap(f, l) < -OVERLAP_TOL {
-                let closing = (f.speed - l.speed).abs() as f32;
-                if std::env::var_os("CRASH_DEBUG").is_some() {
-                    eprintln!(
-                        "RE tick={} gap={:.2} f=(id{} lane{} pos{:.1} v{:.1} cross{} fate{:?}) l=(id{} lane{} pos{:.1} v{:.1} cross{} wreck{})",
-                        self.tick,
-                        self.corridor_gap(f, l),
-                        f.id, f.lane.0, f.position, f.speed, f.crossing.is_some(), matches!(fates[i], Fate::Entered(_)),
-                        l.id, l.lane.0, l.position, l.speed, l.crossing.is_some(), l.wreck.is_some(),
-                    );
-                }
-                hit[i] = Some((CrashKind::RearEnd, closing));
-                if l.wreck.is_none() {
-                    hit[li] = Some((CrashKind::RearEnd, closing));
-                }
+        // Deliberately serial (like the integrate arm): the per-follower verdict
+        // is a handful of reads — fanning it out was measured slower (crashes
+        // lap 1.9 → 3.4 ms) than just walking the array.
+        let rear: Vec<Option<f32>> = (0..taken.len()).map(|i| self.rear_end_verdict(i, taken, fates, nb)).collect();
+        for (i, closing) in rear.into_iter().enumerate() {
+            let Some(closing) = closing else { continue };
+            let li = nb.leader_of[i].unwrap();
+            hit[i] = Some((CrashKind::RearEnd, closing));
+            if taken[li].wreck.is_none() {
+                hit[li] = Some((CrashKind::RearEnd, closing));
             }
         }
 
-        let mut by_node: IntMap<Vec<usize>> = IntMap::default();
+        by_node.begin_tick();
         for (i, v) in taken.iter().enumerate() {
             if let Some(c) = v.crossing {
                 if on_road(i) {
                     let node = self.network.movement(c.movement).node;
-                    by_node.entry(self.network.intersection_key(node)).or_default().push(i);
+                    by_node.push(self.network.intersection_key(node), i);
                 }
             }
         }
-        for group in by_node.values() {
-            for a in 0..group.len() {
+        // Every crosser belongs to exactly one node group, so the pairwise
+        // body-overlap checks fan across groups; per-group hits merge serially
+        // in group order — the same order (and result) the serial sweep gave.
+        let groups: Vec<&Vec<usize>> = (0..by_node.len()).map(|gi| by_node.group_at(gi)).collect();
+        let jx: Vec<Vec<(usize, f32)>> = groups.iter().map(|g| self.junction_hits_in(g, taken)).collect();
+        for pair_hits in jx {
+            for (i, closing) in pair_hits {
+                if taken[i].wreck.is_none() {
+                    hit[i] = Some((CrashKind::Junction, closing));
+                }
+            }
+        }
+        hit
+    }
+
+    /// Pairwise body-overlap sweep of one node's crossers (read-only; the
+    /// parallel arm of [`detect_crashes`](Self::detect_crashes)). Returns the
+    /// indices to mark, both cars per contact.
+    fn junction_hits_in(&self, group: &[usize], taken: &[NetVehicle]) -> Vec<(usize, f32)> {
+        let mut out = Vec::new();
+        for a in 0..group.len() {
                 for b in a + 1..group.len() {
                     let (i, j) = (group[a], group[b]);
                     let (vi, vj) = (&taken[i], &taken[j]);
@@ -4475,17 +4076,12 @@ impl NetWorld {
                                 vj.id, idj.0, mv(idj), vj.speed, self.crossing_arc(vj), self.network.interior(idj).len, vj.driver.vehicle_length,
                             );
                         }
-                        if vi.wreck.is_none() {
-                            hit[i] = Some((CrashKind::Junction, closing));
-                        }
-                        if vj.wreck.is_none() {
-                            hit[j] = Some((CrashKind::Junction, closing));
-                        }
+                        out.push((i, closing));
+                        out.push((j, closing));
                     }
                 }
-            }
         }
-        hit
+        out
     }
 
     /// Tally one crashed vehicle and append its bounded log record (kind, closing
@@ -5234,25 +4830,29 @@ impl NetWorld {
     }
 }
 
+#[derive(Default)]
 struct Neighbors {
     leader_of: Vec<Option<usize>>,
     lane_front: IntMap<usize>,
-    by_lane: IntMap<Vec<usize>>,
-    approaching: IntMap<Vec<usize>>,
+    by_lane: GroupMap,
+    approaching: GroupMap,
+    /// Per-corridor build scratch: consumed while wiring `leader_of`, persisted
+    /// only so its group vectors keep their capacity across ticks.
+    by_corridor: GroupMap,
     /// Vehicles currently inside each node (traversing an interior), by node id.
-    crossing_at: IntMap<Vec<usize>>,
+    crossing_at: GroupMap,
     /// Movements each intersection's crossers occupy *or will still traverse*
     /// before leaving it: the current interior plus every following hop while the
     /// path stays on junction-internal links. Box gating tests against this, so a
     /// crosser mid-cluster reserves the conflicting movement it is about to swing
     /// onto — not only the stub it happens to be on this tick.
-    crossing_mvs: IntMap<Vec<MovementId>>,
+    crossing_mvs: GroupMap<MovementId>,
     /// The same reservation restricted to *moving* crossers (v ≥ 0.5). The in-box
     /// next-hop brake yields only to these: a stalled crosser is the conflict-point
     /// serializer's problem (which totally orders and cannot deadlock), and holding
     /// mid-box for a stationary one builds hold-for-each-other cycles that camp
     /// cars inside the junction.
-    moving_crossing_mvs: IntMap<Vec<MovementId>>,
+    moving_crossing_mvs: GroupMap<MovementId>,
 }
 
 /// IDM acceleration for a vehicle placed at `pos`/`speed` on a lane with the
@@ -6113,7 +5713,7 @@ mod tests {
     fn accel_wgsl_parses_and_validates() {
         // The GPU accel kernel must parse and type-check under plain `cargo test`, so a
         // WGSL typo fails CI here rather than silently in a browser (no adapter needed).
-        let src = include_str!("accel.wgsl");
+        let src = include_str!("../accel.wgsl");
         let module = naga::front::wgsl::parse_str(src).expect("accel.wgsl should parse");
         naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
             .validate(&module)
