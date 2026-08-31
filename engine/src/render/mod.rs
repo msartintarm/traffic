@@ -281,4 +281,16 @@ mod tests {
         .validate(&module)
         .expect("scene.wgsl should type-check");
     }
+
+    #[test]
+    fn blit_wgsl_parses_and_validates() {
+        let src = include_str!("blit.wgsl");
+        let module = naga::front::wgsl::parse_str(src).expect("blit.wgsl should parse");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("blit.wgsl should type-check");
+    }
 }

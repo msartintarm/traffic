@@ -82,6 +82,8 @@ export type Sim = {
   begin_warmup?(simSecs: number): void;
   /** `[done, target, fleet]` while a warmup runs; empty otherwise. */
   warmup_progress?(): Float64Array;
+  /** One timer-driven warmup burst; false once the warmup finishes. */
+  pump_warmup?(): boolean;
   cache_sort(): boolean;
   set_demand_sources(highway: boolean, surface: boolean): void;
   demand_highway(): boolean;

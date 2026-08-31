@@ -67,6 +67,16 @@ fn blink_on() -> bool {
     (now_ms() * (1.0 / 700.0)).rem_euclid(1.0) < 0.5
 }
 
+/// One baked static-world payload, each part present until exported (see
+/// [`Simulation::take_baked`]).
+struct RenderBake {
+    world_v: Option<Vec<StaticVertex>>,
+    world_i: Option<Vec<u32>>,
+    mark_v: Option<Vec<StaticVertex>>,
+    mark_i: Option<Vec<u32>>,
+    dir: Option<Vec<u32>>,
+}
+
 #[wasm_bindgen]
 pub struct Simulation {
     world: NetWorld,
@@ -110,6 +120,16 @@ pub struct Simulation {
     prev_crossing: IntMap<bool>,
     /// The link the user has selected (clicked), highlighted in the density pass.
     selected: Option<usize>,
+    /// Baked static-world render payload, built once and *handed off*: each
+    /// export moves its buffer out to JS, so after `set_world_mesh` has pulled
+    /// all five arrays the wasm side retains none of it (Columbus's meshes are
+    /// ~535 MB — keeping them resident starved the sim of headroom and OOM'd).
+    /// A consumed part re-bakes, so out-of-order or repeated export calls stay
+    /// correct, just slower.
+    render_bake: Option<RenderBake>,
+    /// This frame's density-overlay indices, stashed by [`Self::density_vertices`]
+    /// so [`Self::density_indices`] doesn't rebuild the whole mesh a second time.
+    density_index_cache: Vec<u32>,
     /// Curbside signal-head placements `(group, pos, heading, is_left)` — static
     /// geometry computed once at assembly; each frame only pairs them with live colours.
     signal_heads: Vec<(usize, [f32; 2], f32, bool)>,
@@ -219,7 +239,7 @@ impl Simulation {
             day_compression: demand::DEFAULT_DAY_COMPRESSION, wreck_clear_day_minutes: None,
             warmup: None,
             metering_enabled: true, transit_lines: Vec::new(), transit_json: None, transit_enabled: true, camera,
-            prev: PoseMap::default(), prev_lane: IntMap::default(), prev_crossing: IntMap::default(), selected: None, signal_heads,
+            prev: PoseMap::default(), prev_lane: IntMap::default(), prev_crossing: IntMap::default(), selected: None, render_bake: None, density_index_cache: Vec::new(), signal_heads,
             gpu: None, gpu_pending: None, gpu_relax: None, gpu_generation: 0, gpu_cost: Vec::new(), gpu_last: 0.0, gpu_fingerprint: 0,
             effective_speed: 0.0, throttled: false, last_advance_ms: 0.0, last_camera_ms: 0.0,
             speed_sim_accum: 0.0, speed_wall_accum: 0.0, speed_dropped: false,
@@ -654,6 +674,15 @@ impl Simulation {
             Some(w) => vec![w.done_secs, w.target_secs, self.world.vehicles().len() as f64],
             None => Vec::new(),
         }
+    }
+
+    /// One timer-driven warmup burst: the host chains these off `setTimeout`
+    /// instead of the render loop, so pre-population isn't paced (or, in a
+    /// hidden tab, stalled) by `requestAnimationFrame`. Returns whether the
+    /// warmup is still in flight — `false` stops the chain.
+    pub fn pump_warmup(&mut self) -> bool {
+        self.advance_warmup();
+        self.warmup.is_some()
     }
 
     /// One frame's slice of an in-flight warmup: as many headless ticks as fit
@@ -1260,44 +1289,60 @@ impl Simulation {
     // --- WebGPU renderer feed -------------------------------------------------
 
     /// Roads + junctions as flat `StaticVertex` floats (drawn at all zooms).
-    pub fn world_mesh_vertices(&self) -> Vec<f32> {
-        flatten_static_vertices(self.world_mesh().vertices)
+    /// Moves the baked buffer out — see the `render_bake` field docs.
+    pub fn world_mesh_vertices(&mut self) -> Vec<f32> {
+        flatten_static_vertices(self.take_baked(|b| &mut b.world_v))
     }
 
-    pub fn world_mesh_indices(&self) -> Vec<u32> {
-        self.world_mesh().indices
+    pub fn world_mesh_indices(&mut self) -> Vec<u32> {
+        self.take_baked(|b| &mut b.world_i)
     }
 
     /// Lane markings as flat `StaticVertex` floats (drawn only when zoomed in).
-    pub fn marking_mesh_vertices(&self) -> Vec<f32> {
-        flatten_static_vertices(geometry::marking_mesh(&self.world.network).vertices)
+    pub fn marking_mesh_vertices(&mut self) -> Vec<f32> {
+        flatten_static_vertices(self.take_baked(|b| &mut b.mark_v))
     }
 
-    pub fn marking_mesh_indices(&self) -> Vec<u32> {
-        geometry::marking_mesh(&self.world.network).indices
+    pub fn marking_mesh_indices(&mut self) -> Vec<u32> {
+        self.take_baked(|b| &mut b.mark_i)
     }
 
-    /// Painter's-order draw ranges into the world/marking index buffers, four
-    /// `u32`s per render band: `[world_index_start, world_index_count,
-    /// marking_index_start, marking_index_count]`. The renderer draws each band's
-    /// fill then its markings in order, so a higher grade layer's fill covers the
-    /// road and lane lines it crosses over (see [`geometry::world_bands`]). The
-    /// ranges line up with `world_mesh_*`/`marking_mesh_*`, which concatenate the
-    /// same bands in the same order.
-    pub fn render_band_ranges(&self) -> Vec<u32> {
-        let mut out = Vec::new();
-        let (mut wi, mut mi) = (0u32, 0u32);
-        for band in geometry::world_bands(&self.world.network) {
-            let (wc, mc) = (band.fill.indices.len() as u32, band.marking.indices.len() as u32);
-            out.extend_from_slice(&[wi, wc, mi, mc]);
-            wi += wc;
-            mi += mc;
+    /// The serialized band directory for the renderer: painter's-order bands
+    /// with spatial tile ranges into the `world_mesh_*` / `marking_mesh_*`
+    /// buffers (see [`geometry::world_geometry`]), so the GPU can cull draws to
+    /// the tiles in view.
+    pub fn render_band_ranges(&mut self) -> Vec<u32> {
+        self.take_baked(|b| &mut b.dir)
+    }
+
+    /// Hand off one part of the baked render payload, baking (or re-baking a
+    /// consumed part) as needed; drops the bake entirely once every part is out.
+    fn take_baked<T>(&mut self, pick: fn(&mut RenderBake) -> &mut Option<T>) -> T {
+        for _ in 0..2 {
+            let bake = self.render_bake.get_or_insert_with(|| {
+                let g = geometry::world_geometry(&self.world.network);
+                RenderBake {
+                    world_v: Some(g.world.vertices),
+                    world_i: Some(g.world.indices),
+                    mark_v: Some(g.marking.vertices),
+                    mark_i: Some(g.marking.indices),
+                    dir: Some(g.directory),
+                }
+            });
+            if let Some(part) = pick(bake).take() {
+                if bake.world_v.is_none()
+                    && bake.world_i.is_none()
+                    && bake.mark_v.is_none()
+                    && bake.mark_i.is_none()
+                    && bake.dir.is_none()
+                {
+                    self.render_bake = None;
+                }
+                return part;
+            }
+            self.render_bake = None; // part already handed off — re-bake
         }
-        out
-    }
-
-    fn world_mesh(&self) -> StaticMesh {
-        geometry::world_mesh(&self.world.network)
+        unreachable!("a fresh bake has every part")
     }
 
     /// Column-major 4×4 view-projection for the current camera.
@@ -1472,12 +1517,16 @@ impl Simulation {
     /// a blue presence tint for a car or two, the percentage congestion heatmap once a
     /// link fills up — emitted for every link that has cars. `StaticVertex` floats; pair
     /// with [`density_indices`].
-    pub fn density_vertices(&self) -> Vec<f32> {
-        bytemuck::cast_slice(&self.density_mesh().vertices).to_vec()
+    pub fn density_vertices(&mut self) -> Vec<f32> {
+        let mesh = self.density_mesh();
+        self.density_index_cache = mesh.indices;
+        flatten_static_vertices(mesh.vertices)
     }
 
-    pub fn density_indices(&self) -> Vec<u32> {
-        self.density_mesh().indices
+    /// The indices matching the *last* [`Self::density_vertices`] call — the pair
+    /// is built once per frame, not twice.
+    pub fn density_indices(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.density_index_cache)
     }
 
     fn density_mesh(&self) -> StaticMesh {
@@ -1486,7 +1535,14 @@ impl Simulation {
         for v in self.world.vehicles() {
             counts[net.lane(v.lane).link.idx()] += 1;
         }
-        geometry::occupancy_mesh(net, &counts, self.selected)
+        let mpp = self.camera.meters_per_pixel;
+        let view = [
+            self.camera.center[0],
+            self.camera.center[1],
+            self.camera.viewport[0] * mpp * 0.5,
+            self.camera.viewport[1] * mpp * 0.5,
+        ];
+        geometry::occupancy_mesh(net, &counts, self.selected, view)
     }
 
     fn signal_instance_vec(&self) -> Vec<Instance> {

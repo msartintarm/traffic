@@ -11,6 +11,7 @@
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
+use super::geometry::{parse_world_directory, DirBand, MeshTile};
 use super::{scene, Instance, StaticVertex, Vertex};
 
 const CLEAR: wgpu::Color = wgpu::Color { r: 0.043, g: 0.055, b: 0.075, a: 1.0 };
@@ -55,13 +56,40 @@ pub struct Renderer {
     density_icap: u64,
     world: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
     markings: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
-    /// Painter's-order draw ranges `[world_idx_start, world_idx_count,
-    /// mark_idx_start, mark_idx_count]` per render band (grade layer, then road
-    /// class) — each band's fill then its markings, so overpasses layer over the
-    /// roads they cross. Empty until `set_world_mesh`; then the whole buffers are
-    /// one band.
-    bands: Vec<[u32; 4]>,
+    /// Painter's-order render bands (grade layer, then road class) with per-band
+    /// zoom cutoffs and spatial tile ranges — each band's fill then its markings,
+    /// so overpasses layer over the roads they cross. Empty until `set_world_mesh`.
+    bands: Vec<DirBand>,
+    /// The static world cached as a texture: rendered over an expanded viewport
+    /// only when the camera leaves the cached margin (or zooms, or the mesh /
+    /// surface changes), then composited per frame as one fullscreen triangle —
+    /// the whole road network costs three vertices while the camera rests.
+    cache: Option<CacheLayer>,
+    /// The view-projection the cache was rendered with; `None` = cache stale.
+    cached_vp: Option<[f32; 16]>,
+    /// Last frame's view-projection: the cache is only (re)built on a frame
+    /// where the camera has stopped moving, so interaction frames pay the
+    /// plain direct draw — never the margin-sized cache render.
+    last_vp: Vec<f32>,
+    cam_cache_buf: wgpu::Buffer,
+    cam_cache_bind_group: wgpu::BindGroup,
+    blit_pipeline: wgpu::RenderPipeline,
+    blit_bgl: wgpu::BindGroupLayout,
+    blit_params_buf: wgpu::Buffer,
+    blit_sampler: wgpu::Sampler,
 }
+
+/// Size-dependent half of the static-layer cache (rebuilt on resize).
+struct CacheLayer {
+    view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
+    w: u32,
+    h: u32,
+}
+
+/// How much wider than the viewport the cache is rendered, so small pans stay
+/// inside it. Kept modest: the texture costs `MARGIN_K²`× the canvas in pixels.
+const MARGIN_K: f32 = 1.3;
 
 #[wasm_bindgen]
 impl Renderer {
@@ -214,6 +242,96 @@ async fn from_surface(
         let instanced_pipeline =
             make_pipeline("instanced", "vs_instanced", &[vertex_layout, instance_layout]);
 
+        let cam_cache_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("camera-cache"),
+            size: 80,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let cam_cache_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cam-cache-bg"),
+            layout: &cam_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: cam_cache_buf.as_entire_binding() }],
+        });
+
+        let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("blit.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("blit.wgsl").into()),
+        });
+        let blit_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blit-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let blit_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("blit-pl"),
+            bind_group_layouts: &[&blit_bgl],
+            push_constant_ranges: &[],
+        });
+        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("blit"),
+            layout: Some(&blit_pl),
+            vertex: wgpu::VertexState {
+                module: &blit_shader,
+                entry_point: Some("vs_blit"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &blit_shader,
+                entry_point: Some("fs_blit"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        let blit_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("blit-params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let blit_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("blit-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
         let car = scene::unit_car_mesh();
         let car_vbuf = buffer_init(&device, "car-v", bytemuck::cast_slice(&car.vertices), wgpu::BufferUsages::VERTEX);
         let car_ibuf = buffer_init(&device, "car-i", bytemuck::cast_slice(&car.indices), wgpu::BufferUsages::INDEX);
@@ -263,6 +381,15 @@ async fn from_surface(
             world: None,
             markings: None,
             bands: Vec::new(),
+            cache: None,
+            cached_vp: None,
+            last_vp: Vec::new(),
+            cam_cache_buf,
+            cam_cache_bind_group,
+            blit_pipeline,
+            blit_bgl,
+            blit_params_buf,
+            blit_sampler,
         })
 }
 
@@ -274,13 +401,18 @@ impl Renderer {
     pub fn set_world_mesh(&mut self, world_v: Vec<f32>, world_i: Vec<u32>, mark_v: Vec<f32>, mark_i: Vec<u32>, bands: Vec<u32>) {
         self.world = Some(self.upload_mesh("world", &world_v, &world_i));
         self.markings = Some(self.upload_mesh("markings", &mark_v, &mark_i));
-        // Four u32 per band: [world_idx_start, world_idx_count, mark_idx_start,
-        // mark_idx_count]. Fall back to a single band spanning both buffers if
-        // the caller supplied none (keeps a valid draw).
-        self.bands = bands.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
+        // Tiled band directory (or the legacy flat ranges — both parse). Fall
+        // back to one whole-buffer band if the caller supplied none.
+        self.bands = parse_world_directory(&bands);
         if self.bands.is_empty() {
-            self.bands = vec![[0, world_i.len() as u32, 0, mark_i.len() as u32]];
+            const ALL: [f32; 4] = [f32::MIN, f32::MIN, f32::MAX, f32::MAX];
+            self.bands = vec![DirBand {
+                max_mpp: 0.0,
+                fill_tiles: vec![MeshTile { start: 0, count: world_i.len() as u32, bbox: ALL }],
+                mark_tiles: vec![MeshTile { start: 0, count: mark_i.len() as u32, bbox: ALL }],
+            }];
         }
+        self.cached_vp = None;
     }
 
     fn upload_mesh(&self, label: &str, vertices: &[f32], indices: &[u32]) -> (wgpu::Buffer, wgpu::Buffer, u32) {
@@ -294,6 +426,7 @@ impl Renderer {
             self.config.width = width;
             self.config.height = height;
             self.surface.configure(&self.device, &self.config);
+            self.cached_vp = None;
         }
     }
 
@@ -357,6 +490,85 @@ impl Renderer {
             self.queue.write_buffer(&self.density_ibuf, 0, ibytes);
         }
 
+        // ---- static-layer cache maintenance ----
+        // Recreate the cache texture on resize; even margin so the fresh cache
+        // samples land exactly on texel centres (the border is whole pixels).
+        let limit = self.device.limits().max_texture_dimension_2d;
+        let margin = |px: u32| ((px as f32 * (MARGIN_K - 1.0)).ceil() as u32 + 1) & !1u32;
+        let cw = (self.config.width + margin(self.config.width)).min(limit);
+        let ch = (self.config.height + margin(self.config.height)).min(limit);
+        if self.cache.as_ref().is_none_or(|c| c.w != cw || c.h != ch) {
+            let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("world-cache"),
+                size: wgpu::Extent3d { width: cw, height: ch, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.config.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&Default::default());
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("blit-bg"),
+                layout: &self.blit_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.blit_params_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.blit_sampler) },
+                ],
+            });
+            self.cache = Some(CacheLayer { view, bind_group, w: cw, h: ch });
+            self.cached_vp = None;
+        }
+        // The cache is fresh while the live view still maps inside it at the
+        // same zoom: `a·ndc + b` sends frame NDC into cache NDC (the camera is a
+        // pure scale + translate), so the corners staying in [-1, 1] is exactly
+        // "the viewport is inside the cached margin".
+        let (kx, ky) = (cw as f32 / self.config.width as f32, ch as f32 / self.config.height as f32);
+        let map_to_cache = |c: &[f32; 16]| {
+            let (ax, ay) = (c[0] / view_proj[0], c[5] / view_proj[5]);
+            (ax, ay, c[12] - ax * view_proj[12], c[13] - ay * view_proj[13])
+        };
+        let fresh = self.cached_vp.as_ref().map(map_to_cache).is_some_and(|(ax, ay, bx, by)| {
+            (ax * kx - 1.0).abs() < 1e-3
+                && (ay * ky - 1.0).abs() < 1e-3
+                && ax.abs() + bx.abs() <= 1.0
+                && ay.abs() + by.abs() <= 1.0
+        });
+        // Only build the cache once the camera has settled: while it moves,
+        // frames draw the world directly (the pre-cache path, culled to the
+        // viewport), so interaction never pays the margin-sized cache render.
+        let build_cache = !fresh && self.last_vp == view_proj;
+        if build_cache {
+            let mut cvp = [0f32; 16];
+            cvp.copy_from_slice(&view_proj);
+            for i in [0usize, 4, 8, 12] {
+                cvp[i] /= kx;
+            }
+            for i in [1usize, 5, 9, 13] {
+                cvp[i] /= ky;
+            }
+            let mut ccam = [0f32; 20];
+            ccam[..16].copy_from_slice(&cvp);
+            ccam[16] = alpha;
+            ccam[17] = mpp;
+            self.queue.write_buffer(&self.cam_cache_buf, 0, bytemuck::cast_slice(&ccam));
+            self.cached_vp = Some(cvp);
+        }
+        let use_cache = fresh || build_cache;
+        if use_cache {
+            let cvp = self.cached_vp.expect("fresh or just built");
+            let (ax, ay, bx, by) = map_to_cache(&cvp);
+            // Snap the pan offset to whole cache texels: the static layer stays
+            // crisp while dragging (at most half a pixel of skew against the
+            // live layers) instead of going soft under linear filtering.
+            let bx = (bx * cw as f32 * 0.5).round() / (cw as f32 * 0.5);
+            let by = (by * ch as f32 * 0.5).round() / (ch as f32 * 0.5);
+            self.queue.write_buffer(&self.blit_params_buf, 0, bytemuck::cast_slice(&[ax, ay, bx, by]));
+        }
+        self.last_vp = view_proj.clone();
+
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(_) => {
@@ -366,6 +578,54 @@ impl Renderer {
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        // World-space rect a view-projection covers, for tile culling.
+        let rect_of = |m: &[f32]| {
+            let span = |sc: f32, t: f32| {
+                let (a, b) = ((-1.0 - t) / sc, (1.0 - t) / sc);
+                (a.min(b), a.max(b))
+            };
+            let (x0, x1) = span(m[0], m[12]);
+            let (y0, y1) = span(m[5], m[13]);
+            [x0, y0, x1, y1]
+        };
+        // Painter's-order bands culled to `rect`: each band's fill then its
+        // markings (zoom-gated), so overpasses layer over what they cross.
+        let zoomed_in = mpp < MARKING_MAX_MPP;
+        let draw_world = |pass: &mut wgpu::RenderPass<'_>, bands: &[DirBand], rect: [f32; 4]| {
+            if let (Some((wv, wi, _)), Some((mv, mi, _))) = (&self.world, &self.markings) {
+                pass.set_pipeline(&self.static_pipeline);
+                for band in bands {
+                    if !band.fill_tiles.is_empty() {
+                        pass.set_vertex_buffer(0, wv.slice(..));
+                        pass.set_index_buffer(wi.slice(..), wgpu::IndexFormat::Uint32);
+                        draw_visible_tiles(pass, &band.fill_tiles, rect);
+                    }
+                    if zoomed_in && !band.mark_tiles.is_empty() {
+                        pass.set_vertex_buffer(0, mv.slice(..));
+                        pass.set_index_buffer(mi.slice(..), wgpu::IndexFormat::Uint32);
+                        draw_visible_tiles(pass, &band.mark_tiles, rect);
+                    }
+                }
+            }
+        };
+        if build_cache && self.world.is_some() {
+            let cvp = self.cached_vp.expect("just built");
+            let cache = self.cache.as_ref().expect("created above");
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("world-cache"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &cache.view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(CLEAR), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_bind_group(0, &self.cam_cache_bind_group, &[]);
+            draw_world(&mut pass, &self.bands, rect_of(&cvp));
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene"),
@@ -379,28 +639,20 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_bind_group(0, &self.cam_bind_group, &[]);
-
-            pass.set_pipeline(&self.static_pipeline);
-            // Painter's-order render bands (grade layer, then road class), bottom
-            // to top: each band's fill then its markings, so a higher grade
-            // layer's opaque fill covers the road and lane lines it crosses over.
-            // Markings are still zoom-gated (skipped when zoomed out).
-            let zoomed_in = mpp < MARKING_MAX_MPP;
-            if let (Some((wv, wi, _)), Some((mv, mi, _))) = (&self.world, &self.markings) {
-                for &[ws, wc, ms, mc] in &self.bands {
-                    if wc > 0 {
-                        pass.set_vertex_buffer(0, wv.slice(..));
-                        pass.set_index_buffer(wi.slice(..), wgpu::IndexFormat::Uint32);
-                        pass.draw_indexed(ws..ws + wc, 0, 0..1);
-                    }
-                    if zoomed_in && mc > 0 {
-                        pass.set_vertex_buffer(0, mv.slice(..));
-                        pass.set_index_buffer(mi.slice(..), wgpu::IndexFormat::Uint32);
-                        pass.draw_indexed(ms..ms + mc, 0, 0..1);
-                    }
-                }
+            // At rest the whole static world is the cached texture, composited
+            // as one fullscreen triangle; while the camera moves it draws
+            // directly (viewport-culled), same as before the cache existed.
+            if use_cache && self.world.is_some() {
+                let cache = self.cache.as_ref().expect("ensured above");
+                pass.set_pipeline(&self.blit_pipeline);
+                pass.set_bind_group(0, &cache.bind_group, &[]);
+                pass.draw(0..3, 0..1);
+                pass.set_bind_group(0, &self.cam_bind_group, &[]);
+            } else {
+                pass.set_bind_group(0, &self.cam_bind_group, &[]);
+                draw_world(&mut pass, &self.bands, rect_of(&view_proj));
             }
+            pass.set_pipeline(&self.static_pipeline);
 
             // The occupancy tint is a translucent overlay on top of the layered
             // world (it and the opaque markings blend, both readable).
@@ -471,6 +723,34 @@ fn index_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
         usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     })
+}
+
+/// Draw the tiles of one band that intersect `rect` (`[min_x, min_y, max_x,
+/// max_y]`, world m), coalescing contiguous visible runs into single draws — a
+/// fully visible band collapses back to one `draw_indexed`.
+fn draw_visible_tiles(pass: &mut wgpu::RenderPass<'_>, tiles: &[MeshTile], rect: [f32; 4]) {
+    let mut run: Option<(u32, u32)> = None;
+    for t in tiles {
+        let visible = t.count > 0
+            && t.bbox[0] <= rect[2]
+            && t.bbox[2] >= rect[0]
+            && t.bbox[1] <= rect[3]
+            && t.bbox[3] >= rect[1];
+        if !visible {
+            continue;
+        }
+        run = Some(match run {
+            Some((s, e)) if e == t.start => (s, t.start + t.count),
+            Some((s, e)) => {
+                pass.draw_indexed(s..e, 0, 0..1);
+                (t.start, t.start + t.count)
+            }
+            None => (t.start, t.start + t.count),
+        });
+    }
+    if let Some((s, e)) = run {
+        pass.draw_indexed(s..e, 0, 0..1);
+    }
 }
 
 fn err<E: std::fmt::Display>(e: E) -> JsValue {

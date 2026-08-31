@@ -1036,6 +1036,7 @@ export default function EngineCanvas() {
  * already-isolated, and the threaded wasm loads with no further reload. */
 function SplashScreen() {
   const [splitJunctions, setSplitJunctions] = useState(true);
+  const [prePopulate, setPrePopulate] = useState(false);
   useEffect(() => {
     void ensureCrossOriginIsolation();
   }, []);
@@ -1045,6 +1046,8 @@ function SplashScreen() {
     // Junction alignment is the default; opt out with `?split=0`. Chosen before the map loads.
     if (splitJunctions) url.searchParams.delete("split");
     else url.searchParams.set("split", "0");
+    if (prePopulate) url.searchParams.set("warmup", "1");
+    else url.searchParams.delete("warmup");
     window.location.href = url.toString();
   };
   return (
@@ -1059,6 +1062,14 @@ function SplashScreen() {
         >
           <input type="checkbox" checked={splitJunctions} onChange={(e) => setSplitJunctions(e.target.checked)} />
           Align large junctions
+        </label>
+        <label
+          className={styles.splashSubtitle}
+          style={{ display: "flex", alignItems: "center", gap: "0.5em", cursor: "pointer", marginBottom: "0.5em" }}
+          title="Fast-forward up to an hour of simulated travel headlessly before the map appears, so roads start realistically busy instead of empty. Runs in the background at full speed; progress shows on the loading screen."
+        >
+          <input type="checkbox" checked={prePopulate} onChange={(e) => setPrePopulate(e.target.checked)} />
+          Pre-populate traffic
         </label>
         <div className={styles.splashGrid}>
           {SCENARIOS.map((s) => (

@@ -57,6 +57,152 @@ pub fn world_bands(net: &Network) -> Vec<RenderBand> {
     bands.into_values().collect()
 }
 
+/// Spatial tile of a mesh's index buffer: `count` indices at `start`, whose
+/// vertices all lie inside `bbox` (`[min_x, min_y, max_x, max_y]`, world m).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeshTile {
+    pub start: u32,
+    pub count: u32,
+    pub bbox: [f32; 4],
+}
+
+/// Reorder a mesh's index buffer into spatial grid tiles (triangles bucketed by
+/// centroid cell, deterministic cell order) so a renderer can draw only the
+/// tiles a viewport touches. Returns the reordered indices — the same
+/// triangles, same vertex buffer — plus the per-tile ranges.
+pub fn tile_indices(mesh: &StaticMesh, tile_m: f32) -> (Vec<u32>, Vec<MeshTile>) {
+    use std::collections::BTreeMap;
+    let pos = |i: u32| {
+        let v = &mesh.vertices[i as usize];
+        [v.center[0] + v.offset[0], v.center[1] + v.offset[1]]
+    };
+    let mut cells: BTreeMap<(i32, i32), Vec<usize>> = BTreeMap::new();
+    for t in (0..mesh.indices.len()).step_by(3) {
+        let p = pos(mesh.indices[t]);
+        cells.entry(((p[0] / tile_m).floor() as i32, (p[1] / tile_m).floor() as i32)).or_default().push(t);
+    }
+    let mut out = Vec::with_capacity(mesh.indices.len());
+    let mut tiles = Vec::with_capacity(cells.len());
+    for tris in cells.values() {
+        let start = out.len() as u32;
+        let mut bbox = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+        for &t in tris {
+            for k in 0..3 {
+                let idx = mesh.indices[t + k];
+                out.push(idx);
+                let p = pos(idx);
+                bbox = [bbox[0].min(p[0]), bbox[1].min(p[1]), bbox[2].max(p[0]), bbox[3].max(p[1])];
+            }
+        }
+        tiles.push(MeshTile { start, count: out.len() as u32 - start, bbox });
+    }
+    (out, tiles)
+}
+
+/// First word of the serialized band directory, so the renderer can tell the
+/// tiled format from the legacy flat `[ws, wc, ms, mc]` chunks.
+pub const WORLD_DIR_MAGIC: u32 = 0xB0AD_D1B1;
+/// Tile edge for [`world_geometry`]'s spatial index ranges.
+const WORLD_TILE_M: f32 = 512.0;
+
+/// One parsed render band: its zoom cutoff plus the fill/marking tile ranges
+/// into the concatenated world/marking buffers.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DirBand {
+    pub max_mpp: f32,
+    pub fill_tiles: Vec<MeshTile>,
+    pub mark_tiles: Vec<MeshTile>,
+}
+
+/// The complete static-world render payload: band fills and markings
+/// concatenated in painter's order with tile-grouped index buffers, plus the
+/// serialized directory ([`parse_world_directory`] is its inverse).
+pub struct WorldGeometry {
+    pub world: StaticMesh,
+    pub marking: StaticMesh,
+    pub directory: Vec<u32>,
+}
+
+/// Bake everything the GPU renderer needs to draw the static world with zoom
+/// LOD and viewport culling. Directory layout (all `u32`):
+/// `[MAGIC, band_count]`, then per band `[max_mpp_milli, fill_tile_count,
+/// mark_tile_count]` followed by that many fill then mark tiles, each
+/// `[start, count, min_x, min_y, max_x, max_y]` (bbox floats as bits, ranges
+/// absolute into the concatenated buffers).
+pub fn world_geometry(net: &Network) -> WorldGeometry {
+    let mut world = StaticMesh::default();
+    let mut marking = StaticMesh::default();
+    let bands = world_bands(net);
+    let mut dir = vec![WORLD_DIR_MAGIC, bands.len() as u32];
+    let push_tiles = |dir: &mut Vec<u32>, dst: &mut StaticMesh, src: &StaticMesh, tiles: Vec<MeshTile>, idx: Vec<u32>| {
+        let (vbase, ibase) = (dst.vertices.len() as u32, dst.indices.len() as u32);
+        dst.vertices.extend_from_slice(&src.vertices);
+        dst.indices.extend(idx.iter().map(|i| i + vbase));
+        for t in tiles {
+            dir.extend_from_slice(&[t.start + ibase, t.count]);
+            dir.extend(t.bbox.iter().map(|f| f.to_bits()));
+        }
+    };
+    for band in &bands {
+        let (fi, ftiles) = tile_indices(&band.fill, WORLD_TILE_M);
+        let (mi, mtiles) = tile_indices(&band.marking, WORLD_TILE_M);
+        // max_mpp is reserved (always 0 = draw at every zoom): class-based LOD
+        // was tried and reverted — hiding minor roads read as a broken map.
+        dir.extend_from_slice(&[0, ftiles.len() as u32, mtiles.len() as u32]);
+        push_tiles(&mut dir, &mut world, &band.fill, ftiles, fi);
+        push_tiles(&mut dir, &mut marking, &band.marking, mtiles, mi);
+    }
+    WorldGeometry { world, marking, directory: dir }
+}
+
+/// Parse a band directory back into per-band tile lists. Accepts both the
+/// tiled format ([`world_geometry`]) and the legacy flat `[ws, wc, ms, mc]`
+/// chunks (mapped to one always-visible whole-range tile per mesh), so a
+/// renderer fed by a stale engine build still draws.
+pub fn parse_world_directory(data: &[u32]) -> Vec<DirBand> {
+    const ALL: [f32; 4] = [f32::MIN, f32::MIN, f32::MAX, f32::MAX];
+    if data.first() != Some(&WORLD_DIR_MAGIC) {
+        return data
+            .chunks_exact(4)
+            .map(|c| DirBand {
+                max_mpp: 0.0,
+                fill_tiles: if c[1] > 0 { vec![MeshTile { start: c[0], count: c[1], bbox: ALL }] } else { vec![] },
+                mark_tiles: if c[3] > 0 { vec![MeshTile { start: c[2], count: c[3], bbox: ALL }] } else { vec![] },
+            })
+            .collect();
+    }
+    let mut out = Vec::new();
+    let mut k = 2;
+    let read_tiles = |k: &mut usize, n: u32| -> Vec<MeshTile> {
+        (0..n)
+            .map(|_| {
+                let t = MeshTile {
+                    start: data[*k],
+                    count: data[*k + 1],
+                    bbox: [
+                        f32::from_bits(data[*k + 2]),
+                        f32::from_bits(data[*k + 3]),
+                        f32::from_bits(data[*k + 4]),
+                        f32::from_bits(data[*k + 5]),
+                    ],
+                };
+                *k += 6;
+                t
+            })
+            .collect()
+    };
+    for _ in 0..data.get(1).copied().unwrap_or(0) {
+        let (max_mpp_milli, fc, mc) = (data[k], data[k + 1], data[k + 2]);
+        k += 3;
+        out.push(DirBand {
+            max_mpp: max_mpp_milli as f32 / 1000.0,
+            fill_tiles: read_tiles(&mut k, fc),
+            mark_tiles: read_tiles(&mut k, mc),
+        });
+    }
+    out
+}
+
 /// Junction band priority: above every road class, so the box covers its
 /// at-grade approaches; still below a higher grade layer's roads (and below
 /// the rail band — rails stay visible across a level crossing's box).
@@ -1160,7 +1306,13 @@ const CONGESTED_RATIO: f64 = 0.2;
 /// occupancy-percentage congestion colour, so heavier traffic still reads as congestion.
 /// `light = 3` triggers the shader's translucent branch. Iterates *links* (a curved link
 /// is several segments), so it's independent of the strip count.
-pub fn occupancy_mesh(net: &Network, counts: &[u32], selected: Option<usize>) -> StaticMesh {
+/// `view` is `[center_x, center_y, half_w, half_h]` in world metres; links
+/// whose endpoint bbox is clear of the viewport (with a margin for curvature)
+/// emit nothing. The selected link always draws (its highlight is the
+/// selection UI).
+pub fn occupancy_mesh(net: &Network, counts: &[u32], selected: Option<usize>, view: [f64; 4]) -> StaticMesh {
+    const CULL_MARGIN_M: f64 = 60.0;
+    let (hx, hy) = (view[2] + CULL_MARGIN_M, view[3] + CULL_MARGIN_M);
     let mut mesh = StaticMesh::default();
     for i in 0..net.links.len() {
         let is_selected = selected == Some(i);
@@ -1168,6 +1320,16 @@ pub fn occupancy_mesh(net: &Network, counts: &[u32], selected: Option<usize>) ->
             continue; // no cars: leave the base grey road showing through
         }
         let link = net.link(LinkId(i as u32));
+        if !is_selected {
+            let (a, b) = (net.node(link.from).position, net.node(link.to).position);
+            if (a[0].min(b[0]) - view[0] > hx)
+                || (view[0] - a[0].max(b[0]) > hx)
+                || (a[1].min(b[1]) - view[1] > hy)
+                || (view[1] - a[1].max(b[1]) > hy)
+            {
+                continue; // endpoint bbox clear of the viewport
+            }
+        }
         let lane = net.lane(link.lane_start);
         let ratio = mass::occupancy_ratio(counts[i] as f64, (lane.length / 7.0 * link.lane_count as f64).max(1.0));
         let color = if is_selected {
@@ -1509,6 +1671,75 @@ mod tests {
         }
     }
 
+    /// The tiled payload is the same geometry as the flat band concatenation:
+    /// identical vertex buffers, index buffers that are a per-band permutation
+    /// of the same triangles, tile ranges that partition the buffers exactly,
+    /// and bboxes that bound their triangles. The directory round-trips.
+    #[cfg(feature = "import")]
+    #[test]
+    fn world_geometry_tiles_partition_and_roundtrip() {
+        for net in [map::millbrae_junction(0), map::arterial_intersection()] {
+            let geom = world_geometry(&net);
+            assert_eq!(geom.world.vertices, world_mesh(&net).vertices);
+            assert_eq!(geom.marking.vertices, marking_mesh(&net).vertices);
+            let tri_set = |idx: &[u32]| {
+                let mut t: Vec<[u32; 3]> = idx.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+                t.sort_unstable();
+                t
+            };
+            assert_eq!(tri_set(&geom.world.indices), tri_set(&world_mesh(&net).indices));
+            assert_eq!(tri_set(&geom.marking.indices), tri_set(&marking_mesh(&net).indices));
+
+            let bands = parse_world_directory(&geom.directory);
+            assert_eq!(bands.len(), world_bands(&net).len());
+            let pos = |m: &StaticMesh, i: u32| {
+                let v = &m.vertices[i as usize];
+                [v.center[0] + v.offset[0], v.center[1] + v.offset[1]]
+            };
+            for (mesh, tiles) in [
+                (&geom.world, bands.iter().flat_map(|b| &b.fill_tiles).collect::<Vec<_>>()),
+                (&geom.marking, bands.iter().flat_map(|b| &b.mark_tiles).collect::<Vec<_>>()),
+            ] {
+                let mut covered = 0u32;
+                for t in tiles {
+                    assert_eq!(t.start, covered, "tile ranges are contiguous in draw order");
+                    covered += t.count;
+                    for &i in &mesh.indices[t.start as usize..(t.start + t.count) as usize] {
+                        let p = pos(mesh, i);
+                        assert!(
+                            p[0] >= t.bbox[0] && p[1] >= t.bbox[1] && p[0] <= t.bbox[2] && p[1] <= t.bbox[3],
+                            "tile bbox bounds its vertices"
+                        );
+                    }
+                }
+                assert_eq!(covered, mesh.indices.len() as u32, "tiles cover the whole buffer");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_flat_band_ranges_still_parse() {
+        let bands = parse_world_directory(&[0, 12, 0, 6, 12, 30, 6, 0]);
+        assert_eq!(bands.len(), 2);
+        assert_eq!(bands[0].max_mpp, 0.0);
+        assert_eq!((bands[0].fill_tiles[0].start, bands[0].fill_tiles[0].count), (0, 12));
+        assert_eq!((bands[1].fill_tiles[0].start, bands[1].fill_tiles[0].count), (12, 30));
+        assert!(bands[1].mark_tiles.is_empty(), "zero-count legacy ranges emit no tile");
+    }
+
+    #[test]
+    fn occupancy_mesh_culls_offscreen_links() {
+        let net = map::arterial_intersection();
+        let counts = vec![3u32; net.links.len()];
+        let full = occupancy_mesh(&net, &counts, None, [0.0, 0.0, 1e6, 1e6]);
+        assert!(!full.is_empty());
+        let offscreen = occupancy_mesh(&net, &counts, None, [1e5, 1e5, 100.0, 100.0]);
+        assert!(offscreen.is_empty(), "viewport far away: nothing emitted");
+        // The selected link always draws, wherever the camera is.
+        let sel = occupancy_mesh(&net, &counts, Some(0), [1e5, 1e5, 100.0, 100.0]);
+        assert!(!sel.is_empty());
+    }
+
     #[test]
     fn same_grade_bands_order_by_road_class() {
         // Two crossing roads at grade, different class: the band model orders
@@ -1719,14 +1950,14 @@ mod tests {
             links: vec![LinkSpec { from_osm: 1, to_osm: 2, lanes: 2, speed_limit: 20.0, geometry: vec![[100.0, 0.0], [150.0, 50.0]], layer: 0, name: String::new(), road_class: String::new(), highway_ref: String::new(), turn_lanes: String::new(), hov_lanes: String::new(), aadt: 0.0, res_weight: 0.0, attr_weight: 0.0, sign: LinkSign::None }],
         }
         .build();
-        let mesh = occupancy_mesh(&net, &[999], None); // link 0 heavily congested
+        let mesh = occupancy_mesh(&net, &[999], None, [0.0, 0.0, 1e6, 1e6]); // link 0 heavily congested
         assert!(!mesh.is_empty(), "a congested curved link should shade");
         assert!(mesh.indices.iter().all(|&i| (i as usize) < mesh.vertices.len()), "indices in range");
         // an empty count → nothing shaded, unless selected
-        assert!(occupancy_mesh(&net, &[0], None).is_empty());
-        assert!(!occupancy_mesh(&net, &[0], Some(0)).is_empty(), "a selected link is highlighted even when empty");
+        assert!(occupancy_mesh(&net, &[0], None, [0.0, 0.0, 1e6, 1e6]).is_empty());
+        assert!(!occupancy_mesh(&net, &[0], Some(0), [0.0, 0.0, 1e6, 1e6]).is_empty(), "a selected link is highlighted even when empty");
         // a single car tints in blue (the light-traffic presence colour), not the heatmap
-        let one = occupancy_mesh(&net, &[1], None);
+        let one = occupancy_mesh(&net, &[1], None, [0.0, 0.0, 1e6, 1e6]);
         assert!(!one.is_empty(), "one car tints its segment");
         assert!(one.vertices.iter().any(|v| v.color == OCCUPIED_ONE_COLOR), "one car uses the dark-blue presence tint");
     }

@@ -287,11 +287,26 @@ export async function startEngineSession(
     };
   };
 
+  // Warmup runs on a self-chaining timer, not the render loop: bursts pack the
+  // event loop back-to-back (RAF would idle ~16 ms between them and stops
+  // entirely in a hidden tab), while the RAF loop keeps rendering progress.
+  let warmupTimer: ReturnType<typeof setTimeout> | null = null;
+  const pumpWarmup = () => {
+    warmupTimer = null;
+    if (disposed) return;
+    if (sim.pump_warmup?.()) warmupTimer = setTimeout(pumpWarmup, 0);
+  };
+
   const draw = (now: number) => {
     if (disposed) return;
     const dt = Math.min((now - last) / 1000, 0.1);
     last = now;
-    sim.advance(dt);
+    const warmingUp = (sim.warmup_progress?.().length ?? 0) > 0;
+    if (!warmingUp) {
+      sim.advance(dt);
+    } else if (warmupTimer === null && sim.pump_warmup) {
+      pumpWarmup(); // self-heal: never let an in-flight warmup sit undriven
+    }
     // ASCII view: the engine rasterises the same geometry to text; the pixel render is
     // skipped (the overlay covers the canvas) so it costs nothing while the toggle is on.
     // A stale wasm build lacking `ascii_view` just falls through to the normal render.
@@ -352,7 +367,12 @@ export async function startEngineSession(
       case "targetedRouting": sim.set_targeted_routing?.(c.value); break;
       case "localitySort": sim.set_locality_sort?.(c.value); break;
       case "sharding": sim.set_sharding?.(c.value); break;
-      case "warmup": sim.begin_warmup?.(c.seconds); break;
+      case "warmup": {
+        sim.begin_warmup?.(c.seconds);
+        // Old builds without pump_warmup fall back to the RAF-driven path.
+        if (warmupTimer === null && sim.pump_warmup) pumpWarmup();
+        break;
+      }
       case "showCrashes": sim.set_show_crashes(c.value); break;
       case "clearCrashes": sim.clear_crashes(); break;
       case "entrySpeedCap": sim.set_entry_speed_cap(c.value); break;
@@ -398,6 +418,7 @@ export async function startEngineSession(
     dispose: () => {
       disposed = true;
       unschedule(rafId);
+      if (warmupTimer !== null) clearTimeout(warmupTimer);
     },
   };
 }
