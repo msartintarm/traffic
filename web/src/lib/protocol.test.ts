@@ -32,8 +32,8 @@ test("isControl accepts every declared control and rejects the rest", () => {
 });
 
 test("CONTROL_TYPES is the complete control set", () => {
-  assert.equal(CONTROL_TYPES.size, 32);
-  for (const t of ["speed", "fit", "resize", "select", "demandSources", "hover", "play", "pause", "frameBudget", "parallelRouting", "cacheSort", "stopCostRouting", "laneEvalStagger", "arterialRouting", "targetedRouting", "localitySort", "showCrashes", "clearCrashes", "ascii", "transit"]) {
+  assert.equal(CONTROL_TYPES.size, 33);
+  for (const t of ["speed", "fit", "resize", "select", "demandSources", "hover", "play", "pause", "frameBudget", "parallelRouting", "cacheSort", "stopCostRouting", "laneEvalStagger", "arterialRouting", "targetedRouting", "localitySort", "warmup", "showCrashes", "clearCrashes", "ascii", "transit"]) {
     assert.equal(CONTROL_TYPES.has(t as Control["type"]), true);
   }
 });
@@ -56,6 +56,7 @@ const snap: StatsSnapshot = {
   rushHourFlows: [1200, 800, 300, 200],
   camera: [100, 200, 10, 800, 600],
   metersPerPixel: 10,
+  warmup: null,
 };
 
 test("overlayFromSnapshot projects the snapshot into overlay strings", () => {

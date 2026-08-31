@@ -122,6 +122,7 @@ export default function EngineCanvas() {
   const [parThreshold, setParThreshold] = useState(500); // matches engine DEFAULT_PAR_THRESHOLD
   const [parallelRouting, setParallelRouting] = useState(true); // on by default (see net_world default)
   const [demandRate, setDemandRate] = useState(1);
+  const warmupRef = useRef<HTMLSpanElement>(null); // live pre-population progress under the demand panel
   const [congestionEnabled, setCongestionEnabled] = useState(false);
   const [congestionEngage, setCongestionEngage] = useState(0.85);
   const [sleepScheduler, setSleepScheduler] = useState(true); // on by default (see bridge assemble)
@@ -351,6 +352,10 @@ export default function EngineCanvas() {
             fitMppRef.current = r.fitMpp;
             setCongestionEnabled(r.congestionEnabled);
             setReady(true);
+            // `?warmup=1` (settable from the splash) pre-populates on load.
+            if (new URL(window.location.href).searchParams.get("warmup") === "1") {
+              sessionRef.current?.applyControl({ type: "warmup", seconds: 3600 });
+            }
           },
           onFrame: (f) => {
             fitMppRef.current = f.fitMpp;
@@ -368,6 +373,12 @@ export default function EngineCanvas() {
             }
             const o = overlayFromSnapshot(f.snapshot, { fitMpp: f.fitMpp, zoomRange: ZOOM_RANGE }, smootherRef.current);
             if (statsRef.current) statsRef.current.textContent = o.stats;
+            if (warmupRef.current) {
+              const w = f.snapshot.warmup;
+              warmupRef.current.textContent = w
+                ? `pre-populating… ${Math.round((100 * w[0]) / w[1])}% · ${Math.round(w[0] / 60)} sim-min · ${w[2]} vehicles`
+                : "";
+            }
             if (rushClockRef.current) rushClockRef.current.textContent = o.rushClock ?? "";
             if (sliderRef.current) sliderRef.current.value = String(o.sliderValue);
             if (panelRef.current) {
@@ -664,6 +675,18 @@ export default function EngineCanvas() {
                 }}
               />
             </label>
+            <button
+              className={styles.button}
+              disabled={!ready}
+              title="Fast-forward up to one simulated hour of travel headlessly, so the roads start realistically full instead of empty: the day clock holds at the current hour (traffic fills in at this hour's demand) and the run stops early once the network reaches steady state. The page stays responsive; watch progress below. Click again to stop early and keep whatever traffic exists."
+              onClick={() => {
+                const active = !!warmupRef.current?.textContent;
+                sessionRef.current?.applyControl({ type: "warmup", seconds: active ? 0 : 3600 });
+              }}
+            >
+              Pre-populate traffic (≤1 sim-hour)
+            </button>
+            <span ref={warmupRef} className={styles.zoomLabel} />
             <label className={styles.zoomLabel} title="Cap on the speed vehicles enter the map at — still never above the origin road's own speed limit.">
               {startSpeedLabel(startSpeedMps, units)}
               <input

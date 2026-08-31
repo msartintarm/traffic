@@ -560,8 +560,15 @@ fn movement_interiors_never_run_backward() {
             let mid = MovementId(i as u32);
             let mv = net.movement(mid);
             let (fl, tl) = (net.lane(mv.from_lane).link, net.lane(mv.to_lane).link);
-            let arr = net.arrival_dir(fl);
-            let dep = net.departure_dir(tl);
+            // Mouth-frame directions, matching build_interiors: the chart
+            // tangent at each mouth, falling back to the link end-direction
+            // where the chart folds.
+            let mouth_dir = |p: [f64; 3], fallback: [f64; 2]| {
+                let t = [p[2].cos(), p[2].sin()];
+                if t[0] * fallback[0] + t[1] * fallback[1] > 0.0 { t } else { fallback }
+            };
+            let arr = mouth_dir(net.lane_point(mv.from_lane, net.lane(mv.from_lane).length), net.arrival_dir(fl));
+            let dep = mouth_dir(net.lane_point(mv.to_lane, 0.0), net.departure_dir(tl));
             let it = net.interior(mid);
             let n = 32;
             let backward = (0..=n).any(|k| {

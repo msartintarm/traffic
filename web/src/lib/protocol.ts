@@ -40,6 +40,7 @@ export type Control =
   | { type: "arterialRouting"; value: boolean }
   | { type: "targetedRouting"; value: boolean }
   | { type: "localitySort"; value: boolean }
+  | { type: "warmup"; seconds: number }
   | { type: "showCrashes"; value: boolean }
   | { type: "clearCrashes" }
   | { type: "entrySpeedCap"; value: number }
@@ -63,7 +64,7 @@ export type ControlType = Control["type"];
 
 export const CONTROL_TYPES: ReadonlySet<ControlType> = new Set([
   "speed", "demandRate", "rushHour", "dayCompression", "rampMetering", "sleepScheduler",
-  "parThreshold", "parallelRouting", "cacheSort", "stopCostRouting", "laneEvalStagger", "arterialRouting", "targetedRouting", "localitySort",
+  "parThreshold", "parallelRouting", "cacheSort", "stopCostRouting", "laneEvalStagger", "arterialRouting", "targetedRouting", "localitySort", "warmup",
   "showCrashes", "clearCrashes", "entrySpeedCap", "congestionEngage", "congestionEnabled",
   "demandSources", "fit", "metersPerPixel", "zoomAt", "panBy", "resize", "select",
   "hover", "play", "pause", "frameBudget", "ascii", "transit",
@@ -100,6 +101,8 @@ export type StatsSnapshot = {
   rushHourFlows: [number, number, number, number];
   camera: [number, number, number, number, number];
   metersPerPixel: number;
+  /** `[doneSecs, targetSecs, fleet]` while a pre-population warmup runs; null otherwise. */
+  warmup: [number, number, number] | null;
 };
 
 export type Overlay = {

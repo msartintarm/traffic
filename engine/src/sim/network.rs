@@ -878,10 +878,27 @@ impl Network {
         let built: Vec<(Interior, bool)> = (0..self.movements.len() as u32)
             .map(|m| {
                 let mv = self.movement(MovementId(m));
-                let entry = point2(self.lane_point(mv.from_lane, self.lane(mv.from_lane).length));
-                let exit = point2(self.lane_point(mv.to_lane, 0.0));
-                let arr = self.arrival_dir(self.lane(mv.from_lane).link);
-                let dep = self.departure_dir(self.lane(mv.to_lane).link);
+                let entry_p = self.lane_point(mv.from_lane, self.lane(mv.from_lane).length);
+                let exit_p = self.lane_point(mv.to_lane, 0.0);
+                let entry = point2(entry_p);
+                let exit = point2(exit_p);
+                // Tangents at the *mouths*, not the link end-directions sampled
+                // near the node: when a setback pushes a mouth past a bend in
+                // its road (a wide avenue turning right at the junction), the
+                // node-side direction is the pre-bend heading — an interior
+                // built with it left the mouth backwards and swerved a chicane
+                // to a landing pointing 80° elsewhere. The lane chart's own
+                // tangent at each mouth is what the car actually arrives and
+                // departs along — unless the chart is *folded* there (tangent
+                // opposing the link's own direction, a wide road bent tighter
+                // than its width can chart); then the end-direction is the only
+                // trustworthy frame.
+                let end_arr = self.arrival_dir(self.lane(mv.from_lane).link);
+                let end_dep = self.departure_dir(self.lane(mv.to_lane).link);
+                let mouth_arr = [entry_p[2].cos(), entry_p[2].sin()];
+                let mouth_dep = [exit_p[2].cos(), exit_p[2].sin()];
+                let arr = if mouth_arr[0] * end_arr[0] + mouth_arr[1] * end_arr[1] > 0.0 { mouth_arr } else { end_arr };
+                let dep = if mouth_dep[0] * end_dep[0] + mouth_dep[1] * end_dep[1] > 0.0 { mouth_dep } else { end_dep };
                 // A straight run along the arrival direction, as far forward as the
                 // exit sits (a stub when it doesn't); the landing blend eases any
                 // lateral offset on the next link.
@@ -919,13 +936,38 @@ impl Network {
                     if t > 0.0 && s > 0.0 {
                         // Floored so a degenerate corner (a stop line nearly on
                         // the tangent crossing) can't collapse a handle to zero
-                        // and rotate the end tangency off its road.
-                        k1 = (t * 0.85).clamp(k * 0.45, k);
-                        k2 = (s * 0.85).clamp(k * 0.45, k);
+                        // and rotate the end tangency off its road. Left turns
+                        // get a higher floor: near a shared arm one left's exit
+                        // corridor is its counterpart's entry corridor (adjacent
+                        // lanes of the same road), and short handles cut that
+                        // corner into the neighbour's lane — the curve must run
+                        // along its own lane line longer before sweeping.
+                        let floor = if (arr[0] * dep[1] - arr[1] * dep[0]).atan2(arr[0] * dep[0] + arr[1] * dep[1]) > 0.5 { 0.65 } else { 0.45 };
+                        k1 = (t * 0.85).clamp(k * floor, k);
+                        k2 = (s * 0.85).clamp(k * floor, k);
                     }
                 }
-                let c1 = [entry[0] + arr[0] * k1, entry[1] + arr[1] * k1];
-                let c2 = [exit[0] - dep[0] * k2, exit[1] - dep[1] * k2];
+                let mut c1 = [entry[0] + arr[0] * k1, entry[1] + arr[1] * k1];
+                let mut c2 = [exit[0] - dep[0] * k2, exit[1] - dep[1] * k2];
+                // Keep-right through the box: a left turn's path bows toward its
+                // own side, the way real drivers sweep a left. Without this the
+                // counterpart left (the same two streets, opposite sense) runs
+                // the mirror curve through the same middle corridor and the two
+                // bodies touch with no driving error at all — the dominant
+                // "junction crash". Half a lane of bow separates the pair by a
+                // full lane, like the opposing directions of a curved road.
+                let ang = (arr[0] * dep[1] - arr[1] * dep[0]).atan2(arr[0] * dep[0] + arr[1] * dep[1]);
+                if ang > 0.5 {
+                    // Proportional to the handles so the end tangencies rotate
+                    // by at most ~8.5° (atan 0.15) — inside the "leaves along
+                    // the arrival heading" tolerance — and capped at just under
+                    // half a lane.
+                    let bow = (k1.min(k2) * 0.15).min(1.5);
+                    c1[0] += arr[1] * bow;
+                    c1[1] -= arr[0] * bow;
+                    c2[0] += dep[1] * bow;
+                    c2[1] -= dep[0] * bow;
+                }
                 let mut it = Interior { entry, c1, c2, exit, len: 0.0 };
                 it.len = interior_polyline(&it).last().map_or(0.0, |&(_, s)| s);
                 // Drivability check: a well-formed path never points backward
@@ -1620,7 +1662,7 @@ impl Network {
     }
 
     /// The stored boundary chart for a link, when built and usable.
-    fn link_bounds(&self, link: LinkId) -> Option<&LaneBounds> {
+    pub(crate) fn link_bounds(&self, link: LinkId) -> Option<&LaneBounds> {
         self.lane_bounds.get(link.idx()).filter(|lb| lb.stations.len() >= 2)
     }
 
@@ -2079,7 +2121,14 @@ mod tests {
             }
             let it = net.interior(mid);
             let (fl, tl) = (net.lane(mv.from_lane).link, net.lane(mv.to_lane).link);
-            let (arr, dep) = (net.arrival_dir(fl), net.departure_dir(tl));
+            // Mouth-frame directions, matching what build_interiors now uses
+            // (chart tangent at each mouth, end-direction where the chart folds).
+            let mouth_dir = |p: [f64; 3], fallback: [f64; 2]| {
+                let t = [p[2].cos(), p[2].sin()];
+                if t[0] * fallback[0] + t[1] * fallback[1] > 0.0 { t } else { fallback }
+            };
+            let arr = mouth_dir(net.lane_point(mv.from_lane, net.lane(mv.from_lane).length), net.arrival_dir(fl));
+            let dep = mouth_dir(net.lane_point(mv.to_lane, 0.0), net.departure_dir(tl));
             let cross = arr[0] * dep[1] - arr[1] * dep[0];
             if cross.abs() < 0.05 {
                 continue;
@@ -2105,7 +2154,13 @@ mod tests {
                 }
                 worst = worst.max(outside);
             }
-            if worst > 0.5 {
+            // Left turns now *bow to their own side by design* (keep-right
+            // through the box separates counterpart lefts that used to share
+            // one corridor and touch bodies) — up to ~1.5 m outside the direct
+            // tangent wedge is intended for them. Everything else, right turns
+            // especially, must still hug its corner.
+            let left = (arr[0] * dep[1] - arr[1] * dep[0]).atan2(arr[0] * dep[0] + arr[1] * dep[1]) > 0.5;
+            if worst > if left { 2.1 } else { 0.5 } {
                 bulged += 1;
             }
             deepest = deepest.max(worst);
@@ -2116,7 +2171,9 @@ mod tests {
         // sub-metre sliver; what the clamp must guarantee is that no turn takes
         // the multi-metre swing across neighbouring lanes it used to.
         assert!(bulged <= 8, "{bulged} turn interiors swing outside their tangent triangle");
-        assert!(deepest < 1.2, "a turn interior bulges {deepest:.2} m outside its tangent triangle");
+        // Left turns bow outward by design (≤ ~1.5 m keep-right sweep) plus the
+        // pre-existing degenerate-corner sliver allowance.
+        assert!(deepest < 2.1, "a turn interior bulges {deepest:.2} m outside its tangent triangle");
 
         let mut groups: std::collections::HashMap<(u32, u32, u32), Vec<(u32, u32)>> = Default::default();
         for mv in &net.movements {

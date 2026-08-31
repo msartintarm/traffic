@@ -586,8 +586,19 @@ mod tests {
             // Same invariants as the synthetic cases, now on real complexity.
             for m in (0..net.movements.len() as u32).map(MovementId) {
                 let mv = net.movement(m);
-                let arr = net.arrival_dir(net.lane(mv.from_lane).link);
-                let dep = net.departure_dir(net.lane(mv.to_lane).link);
+                // The interior contract is the *mouth* frame: the chart tangent
+                // where the car actually leaves/lands (falling back to the link
+                // end-direction where the chart folds) — a mouth pushed past a
+                // road bend legitimately points away from the near-node heading.
+                let mouth_dir = |p: [f64; 3], fallback: [f64; 2]| {
+                    let t = [p[2].cos(), p[2].sin()];
+                    if t[0] * fallback[0] + t[1] * fallback[1] > 0.0 { t } else { fallback }
+                };
+                let arr = mouth_dir(
+                    net.lane_point(mv.from_lane, net.lane(mv.from_lane).length),
+                    net.arrival_dir(net.lane(mv.from_lane).link),
+                );
+                let dep = mouth_dir(net.lane_point(mv.to_lane, 0.0), net.departure_dir(net.lane(mv.to_lane).link));
                 let te = tangent_at(&net, m, 0.0);
                 let tx = tangent_at(&net, m, net.interior(m).len);
                 let dot = |a: [f64; 2], b: [f64; 2]| a[0] * b[0] + a[1] * b[1];

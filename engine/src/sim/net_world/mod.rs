@@ -107,6 +107,10 @@ pub struct NetWorld {
     /// threads backend gains nothing. Off by default: any row order is a valid
     /// sim, but apply-order tie-breaks shift, so goldens/tests stay exact.
     locality_sort: bool,
+    /// Whether the kinematic pose layer runs each step. Warmup pre-population
+    /// disables it (nothing is rendered, so tracking poses is wasted work) and
+    /// calls [`sync_kinematics`](Self::sync_kinematics) once at the end.
+    kinematics_enabled: bool,
     /// Entry links observed spawning traffic toward each destination — the
     /// spawn-gateway targets a field must keep covered for future arrivals.
     dest_entries: HashMap<u32, Vec<u32>>,
@@ -939,6 +943,14 @@ impl NetWorld {
                     return f64::INFINITY;
                 }
                 let r = network.interior_min_radius(mid);
+                // A movement's cap also honors the *landing lane's* first metres:
+                // when a road bends sharply right past a junction mouth (the
+                // clearance bend-cap deliberately keeps such bends inside the
+                // lane span), a car crossing a straight interior would otherwise
+                // land hot 1–2 m before an 80° bend it physically cannot take,
+                // and sweep tens of metres wide. Static geometry, computed once.
+                let r_land = network.min_radius_ahead(network.movement(mid).to_lane, 0.0, 20.0);
+                let r = r.min(r_land);
                 if r.is_finite() {
                     comfort_speed(r).clamp(2.5, 10.0)
                 } else {
@@ -994,7 +1006,8 @@ impl NetWorld {
             network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0, divergences: 0,
             control_aware_routing: true, lane_eval_stagger: true, arterial_routing: false,
             targeted_routing: true, dest_entries: HashMap::new(), locality_sort: false,
-            nb_pool: Neighbors::default(), lc_groups: GroupMap::default(), crash_groups: GroupMap::default(), crashed_by: [0; 2], crash_log: Vec::new(),
+            nb_pool: Neighbors::default(), lc_groups: GroupMap::default(), crash_groups: GroupMap::default(),
+            kinematics_enabled: true, crashed_by: [0; 2], crash_log: Vec::new(),
             merges, link_straight, turn_caps, merge_feeder_lane, through_next, corridor_of, corridor_offset, seam_primary, signals, link_entries, router: None, external_reroute: false,
             meters: Vec::new(), metering_on: false, day_secs: 0.0, pm_plan: false, rail_preempts,
             timetable: rail::Timetable::default(), crossing_sets: HashMap::new(), weekend: false, day_rate: 1.0,
@@ -1188,6 +1201,24 @@ impl NetWorld {
     /// Toggle the free-flow lane-evaluation stagger.
     pub fn set_lane_eval_stagger(&mut self, on: bool) {
         self.lane_eval_stagger = on;
+    }
+
+    /// Enable/disable the kinematic pose layer (see the field docs). Re-enabling
+    /// does not resync poses — call [`sync_kinematics`](Self::sync_kinematics).
+    pub fn set_kinematics_enabled(&mut self, on: bool) {
+        self.kinematics_enabled = on;
+    }
+
+    /// Snap every vehicle's kinematic state onto its arc pose — after a headless
+    /// warmup (or any bulk state change), the drawn fleet starts exactly where
+    /// the sim says it is, wheels straight.
+    pub fn sync_kinematics(&mut self) {
+        let poses: Vec<[f64; 3]> = self.fleet.rows.iter().map(|v| self.path_pose(v)).collect();
+        for (v, p) in self.fleet.rows.iter_mut().zip(poses) {
+            let f = AXLE_FRONT * v.driver.vehicle_length;
+            v.kin = [p[0] - f * p[2].cos(), p[1] - f * p[2].sin(), p[2]];
+            v.steer = 0.0;
+        }
     }
 
     /// Toggle the periodic fleet locality reorder (see the field docs).
@@ -2414,7 +2445,7 @@ impl NetWorld {
 
     /// Current colour of a movement under the actuated signal runtime
     /// (unsignalized movements are always green).
-    fn movement_state(&self, mid: MovementId) -> SignalState {
+    pub fn movement_state(&self, mid: MovementId) -> SignalState {
         self.signals.movement_state(&self.network, mid)
     }
 
@@ -3175,7 +3206,9 @@ impl NetWorld {
         self.fleet.hist = hist;
         self.fleet.hist_len = hist_len;
         self.exited += exited;
-        self.track_path(dt);
+        if self.kinematics_enabled {
+            self.track_path(dt);
+        }
         self.nb_pool = nb;
         prof.lap(6);
         self.time += dt;
@@ -3919,7 +3952,9 @@ impl NetWorld {
                 }
                 // A stationary car genuinely short of the point — a mid-box
                 // waiter standing its hold — doesn't claim it; the moment it
-                // launches it is a mover again and contests normally.
+                // launches it is a mover again and contests normally. (Standing
+                // *bodies* near the path are handled exactly, by the swept-body
+                // clearance below — point arithmetic can't see widths.)
                 if o.speed < 0.5 && their_dist > 1.5 {
                     continue;
                 }
@@ -3928,6 +3963,40 @@ impl NetWorld {
                     let stop_gap = (my_dist - 1.0).max(0.05); // hold ~1 m short of the point
                     accel = accel.min(idm::acceleration(&d, veh.speed, veh.speed, stop_gap));
                 }
+            }
+        }
+
+        // Swept-body clearance against *standing* conflicting crossers: the
+        // point arbitration above treats paths as centerlines, but wide bodies
+        // on shallow-adjacent interiors touch metres away from the registered
+        // point — the residual left-vs-left junction crash was a mover clipping
+        // a parked waiter its point arithmetic said was clear. Sample the
+        // vehicle's own upcoming poses with the *same* oriented-body test the
+        // crash detector uses, and brake short of the first contact: avoidance
+        // and detection can no longer disagree.
+        let key = self.network.intersection_key(node);
+        let my_w = VehicleClass::from_length(veh.driver.vehicle_length).width();
+        for &j in nb.crossing_at.get(&key).into_iter().flatten() {
+            let o = &self.fleet.rows[j];
+            if o.id == veh.id || o.speed >= 0.5 {
+                continue;
+            }
+            let Some(oc) = o.crossing else { continue };
+            if oc.movement == c.movement || !self.network.movements_conflict(c.movement, oc.movement) {
+                continue;
+            }
+            let opose = self.vehicle_arc_pose(o);
+            let ow = VehicleClass::from_length(o.driver.vehicle_length).width();
+            let ilen = self.network.interior(c.movement).len;
+            let mut ahead = 0.5;
+            while ahead <= 9.0 && c_s + ahead <= ilen {
+                let p = self.network.interior_point(c.movement, c_s + ahead);
+                if body_overlap(p, veh.driver.vehicle_length, my_w, opose, o.driver.vehicle_length, ow) {
+                    let stop_gap = (ahead - 0.8).max(0.05);
+                    accel = accel.min(idm::acceleration(&d, veh.speed, veh.speed, stop_gap));
+                    break;
+                }
+                ahead += 1.0;
             }
         }
         accel
@@ -4054,6 +4123,10 @@ impl NetWorld {
                     if !self.network.movements_conflict(idi, idj) {
                         continue;
                     }
+                    // Any genuine body contact between conflicting paths is a
+                    // crash — the paths themselves are laterally honest now
+                    // (left turns bow to their own side, so counterpart lefts
+                    // pass offset instead of sharing one corridor).
                     // Judged in the sim's arc frame, the same frame the conflict
                     // points and box scheduling live in — two bodies genuinely
                     // meeting on their paths. The kinematic pose is the *drawn*
@@ -9219,6 +9292,70 @@ mod tests {
             Some(LinkId(0)),
             "with the toggle off, raw travel time rat-runs the stop-signed shortcut again"
         );
+    }
+
+    #[test]
+    fn headless_stepping_matches_live_and_resyncs_poses() {
+        // Warmup runs with the kinematic layer off. The layer is visual-only, so
+        // the *simulation* must be bit-identical either way — and one
+        // `sync_kinematics` at the end must land every drawn car exactly on its
+        // arc pose, wheels straight.
+        let make = || {
+            let net = OsmMap {
+                nodes: vec![
+                    NodeSpec::uncontrolled(1, -300.0, 0.0),
+                    NodeSpec::uncontrolled(2, 0.0, 0.0),
+                    NodeSpec::uncontrolled(3, 0.0, -300.0),
+                ],
+                links: vec![LinkSpec::oneway(1, 2, 2, 15.0), LinkSpec::oneway(2, 3, 1, 15.0)],
+            }
+            .build();
+            let mut w = NetWorld::new(net, cfg());
+            for id in 0..12 {
+                w.spawn_routed(id, vec![LinkId(0), LinkId(1)], 8.0, DriverConfig::car().sample(7, id));
+            }
+            w
+        };
+        let (mut live, mut headless) = (make(), make());
+        headless.set_kinematics_enabled(false);
+        for _ in 0..300 {
+            live.step();
+            headless.step();
+        }
+        let sim_state = |w: &NetWorld| {
+            w.vehicles().iter().map(|v| (v.id, v.lane.0, v.position.to_bits(), v.speed.to_bits())).collect::<Vec<_>>()
+        };
+        assert_eq!(sim_state(&live), sim_state(&headless), "the kinematic layer never touches the simulation");
+        headless.set_kinematics_enabled(true);
+        headless.sync_kinematics();
+        for v in headless.vehicles() {
+            let (pose, arc) = (headless.vehicle_world_pose(v), headless.vehicle_arc_pose(v));
+            let d = (pose[0] - arc[0]).hypot(pose[1] - arc[1]);
+            assert!(d < 1e-9 && shortest_angle(pose[2], arc[2]).abs() < 1e-9, "car {} resynced onto its arc pose", v.id);
+        }
+    }
+
+    #[test]
+    fn a_frozen_day_clock_holds_the_hour_while_sim_time_runs() {
+        let net = OsmMap {
+            nodes: vec![NodeSpec::uncontrolled(1, 0.0, 0.0), NodeSpec::uncontrolled(2, 2000.0, 0.0)],
+            links: LinkSpec::twoway(1, 2, 1, 15.0).to_vec(),
+        }
+        .build();
+        let mut world = NetWorld::new(net, cfg());
+        let pairs = crate::sim::demand::od_pairs(&world.network, 0, 60, crate::sim::demand::DemandSources::new(true, true));
+        let mut gen = crate::sim::demand::DemandGenerator::new(&world, &pairs, 0);
+        gen.set_rush_hour(&world.network, true);
+        let before = gen.day_secs(world.time());
+        gen.set_day_frozen(true);
+        for _ in 0..200 {
+            gen.step(&mut world, cfg().dt);
+            world.step();
+        }
+        assert_eq!(gen.day_secs(world.time()), before, "the frozen hour holds while 40 sim-seconds pass");
+        gen.set_day_frozen(false);
+        gen.step(&mut world, cfg().dt);
+        assert!(gen.day_secs(world.time()) > before, "and resumes on unfreeze");
     }
 
     #[test]

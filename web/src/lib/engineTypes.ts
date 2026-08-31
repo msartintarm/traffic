@@ -76,6 +76,10 @@ export type Sim = {
   set_targeted_routing?(on: boolean): void;
   /** Periodic fleet memory-locality reorder (cache-friendly neighbor reads). */
   set_locality_sort?(on: boolean): void;
+  /** Headless pre-population: fast-forward up to `simSecs` of travel time. */
+  begin_warmup?(simSecs: number): void;
+  /** `[done, target, fleet]` while a warmup runs; empty otherwise. */
+  warmup_progress?(): Float64Array;
   cache_sort(): boolean;
   set_demand_sources(highway: boolean, surface: boolean): void;
   demand_highway(): boolean;

@@ -19,8 +19,20 @@ pub fn control_point(
     let prev_link = net.lane(LaneId(pl)).link;
     let cur_link = net.lane(LaneId(cur_lane)).link;
     if prev_link != cur_link && net.link(prev_link).to == net.link(cur_link).from {
+        // Pull toward the corner node, but never farther off the chord than the
+        // chord itself is long: for tick-adjacent poses (a couple of metres) the
+        // path is locally straight and a full node pull bulged the car metres
+        // off its interior; a big catch-up hop still sweeps the corner.
         let np = net.node(net.link(cur_link).from).position;
-        [np[0] as f32, np[1] as f32]
+        let (dx, dy) = (np[0] as f32 - mid[0], np[1] as f32 - mid[1]);
+        let d = (dx * dx + dy * dy).sqrt();
+        let chord = (cur[0] - prev[0]).hypot(cur[1] - prev[1]);
+        let max_off = 0.5 * chord;
+        if d <= max_off || d < 1e-6 {
+            [np[0] as f32, np[1] as f32]
+        } else {
+            [mid[0] + dx / d * max_off, mid[1] + dy / d * max_off]
+        }
     } else {
         mid
     }

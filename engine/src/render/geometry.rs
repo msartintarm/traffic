@@ -308,12 +308,12 @@ pub fn junction_mesh(net: &Network) -> StaticMesh {
 /// ≥ 2 distinct streets — gets the junction marker outline; a chain node (a
 /// widened stop-line stub, an attribute change, a collinear pass-through with a
 /// driveway) still paves its box (it bridges the flare) but is never outlined.
-struct NodeBox {
-    node: u32,
-    apex: [f64; 2],
-    arms: usize,
-    streets: usize,
-    ring: Vec<[f64; 2]>,
+pub struct NodeBox {
+    pub node: u32,
+    pub apex: [f64; 2],
+    pub arms: usize,
+    pub streets: usize,
+    pub ring: Vec<[f64; 2]>,
 }
 
 /// One junction cluster's paved region. A *compact* cluster (every member node
@@ -326,8 +326,8 @@ struct NodeBox {
 /// cross-sections): four small crossings joined by the interior links' own
 /// pavement, with the real median islands left unpaved, instead of one hull
 /// paved edge to edge.
-struct ClusterRing {
-    boxes: Vec<NodeBox>,
+pub struct ClusterRing {
+    pub boxes: Vec<NodeBox>,
 }
 
 /// Diagnostic accessor: per-cluster marked-box metrics (node, arms, streets,
@@ -413,6 +413,22 @@ fn outlined_boxes(net: &Network, ci: usize, boxes: &[NodeBox]) -> Vec<usize> {
 /// decomposition finds no clean multi-crossing structure (a complex tangle, not
 /// a divided arterial — decomposing it leaves sub-threshold boxes and no
 /// unifying outline).
+/// The mid-link cross-section of a junction-interior link, from its boundary
+/// chart — where the drawn per-node boxes of the two member nodes should abut.
+fn interior_mid_mouth(net: &Network, link: LinkId) -> Option<([f64; 2], [f64; 2])> {
+    let lb = net.link_bounds(link)?;
+    let n = net.link(link).lane_count as usize;
+    let last = lb.stations.len().checked_sub(1)?;
+    let target = (lb.stations[0] + lb.stations[last]) * 0.5;
+    let si = lb
+        .stations
+        .iter()
+        .enumerate()
+        .min_by(|a, b| (a.1 - target).abs().total_cmp(&(b.1 - target).abs()))
+        .map(|(i, _)| i)?;
+    Some((lb.bounds[0][si], lb.bounds[n][si]))
+}
+
 fn whole_cluster_box(j: &Junction) -> NodeBox {
     let streets = {
         let axes: Vec<[f64; 2]> = j.mouths.iter().map(|m| m.dir).collect();
@@ -446,7 +462,16 @@ fn decompose_cluster(net: &Network, ci: usize, j: &Junction, cluster: &[Option<u
             let arms: Vec<BoxArm> = at[nd.idx()]
                 .iter()
                 .map(|&(li, to)| {
-                    let (m, o) = net.arm_mouth(LinkId(li), to);
+                    // An arm *internal* to this cluster keeps most of its length
+                    // as vehicle storage (the stop-line trims that used to end at
+                    // ~half the link were relaxed), so its chart end sits a
+                    // couple of metres from the node — too close to span a box.
+                    // The drawn boxes should still meet at the link's middle,
+                    // where the halves belong to the two member nodes: take the
+                    // mid cross-section for internal arms.
+                    let l = net.link(LinkId(li));
+                    let internal = cluster[l.from.idx()] == Some(ci) && cluster[l.to.idx()] == Some(ci);
+                    let (m, o) = if internal { interior_mid_mouth(net, LinkId(li)).unwrap_or_else(|| net.arm_mouth(LinkId(li), to)) } else { net.arm_mouth(LinkId(li), to) };
                     let axis = if to { net.arrival_dir(LinkId(li)) } else { net.departure_dir(LinkId(li)) };
                     BoxArm { m, o, axis }
                 })
@@ -475,12 +500,12 @@ fn decompose_cluster(net: &Network, ci: usize, j: &Junction, cluster: &[Option<u
 
 /// Every cluster's local boxes plus the node→cluster map, so the fill and the
 /// marking/signal-head placement work from one shared boundary.
-struct JunctionRings {
-    cluster: Vec<Option<usize>>,
-    rings: Vec<ClusterRing>,
+pub struct JunctionRings {
+    pub cluster: Vec<Option<usize>>,
+    pub rings: Vec<ClusterRing>,
 }
 
-fn junction_rings(net: &Network) -> JunctionRings {
+pub fn junction_rings(net: &Network) -> JunctionRings {
     let (cluster, ncl) = intersection_clusters(net);
     // Incident at-grade links per node, once — the per-node box loop is then
     // O(cluster members · node degree) instead of O(members · links).
@@ -585,7 +610,7 @@ fn point_on_polyline(poly: &[[f64; 2]], s: f64) -> [f64; 2] {
 }
 
 /// Even-odd ray-cast point-in-polygon.
-fn point_in_ring(ring: &[[f64; 2]], p: [f64; 2]) -> bool {
+pub fn point_in_ring(ring: &[[f64; 2]], p: [f64; 2]) -> bool {
     let (n, mut inside) = (ring.len(), false);
     let mut j = n - 1;
     for i in 0..n {

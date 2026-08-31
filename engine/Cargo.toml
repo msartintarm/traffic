@@ -91,5 +91,5 @@ name = "toggle_probe"
 required-features = ["import"]
 
 [[example]]
-name = "geom_probe"
+name = "junction_probe"
 required-features = ["import"]

@@ -84,6 +84,8 @@ pub struct Simulation {
     /// Day-seconds per sim second the simulated day plays at, carried across demand
     /// rebuilds like the other demand controls. 1.0 = real time.
     day_compression: f64,
+    /// In-flight headless pre-population (see [`Simulation::begin_warmup`]).
+    warmup: Option<Warmup>,
     /// Ramp-metering master switch; actual activation follows the day-clock
     /// peak windows (see `apply_meter_schedule`).
     metering_enabled: bool,
@@ -215,6 +217,7 @@ impl Simulation {
         Simulation {
             world, clock, seed: cfg.seed, demand, demand_sources, commute: None, demand_rate, entry_speed_cap,
             day_compression: demand::DEFAULT_DAY_COMPRESSION, wreck_clear_day_minutes: None,
+            warmup: None,
             metering_enabled: true, transit_lines: Vec::new(), transit_json: None, transit_enabled: true, camera,
             prev: PoseMap::default(), prev_lane: IntMap::default(), prev_crossing: IntMap::default(), selected: None, signal_heads,
             gpu: None, gpu_pending: None, gpu_relax: None, gpu_generation: 0, gpu_cost: Vec::new(), gpu_last: 0.0, gpu_fingerprint: 0,
@@ -606,6 +609,90 @@ impl Simulation {
         .to_vec()
     }
 
+    /// Begin (or cancel, with `sim_secs <= 0`) a headless pre-population run:
+    /// the sim fast-forwards up to `sim_secs` of simulated travel time — capped
+    /// at one hour, on the argument that almost no trip in the area is longer —
+    /// with the day clock frozen at the current hour (traffic fills in at *this*
+    /// hour's demand pattern, and schedule-driven transit holds position) and
+    /// the visual-only kinematic layer switched off. Runs inside the normal
+    /// frame loop under the frame budget, so the page stays responsive and
+    /// progress is observable via [`warmup_progress`](Self::warmup_progress);
+    /// finishes early once the fleet reaches steady state (three consecutive
+    /// sim-minutes within tolerance), since light demand converges long before
+    /// the cap while saturated demand never does.
+    pub fn begin_warmup(&mut self, sim_secs: f64) {
+        if sim_secs <= 0.0 {
+            if self.warmup.take().is_some() {
+                self.finish_warmup();
+            }
+            return;
+        }
+        self.demand.set_day_frozen(true);
+        self.world.set_kinematics_enabled(false);
+        self.warmup = Some(Warmup {
+            target_secs: sim_secs.min(3600.0),
+            done_secs: 0.0,
+            fleet_window: Vec::new(),
+            next_sample: 60.0,
+        });
+    }
+
+    fn finish_warmup(&mut self) {
+        self.demand.set_day_frozen(false);
+        self.world.set_kinematics_enabled(true);
+        self.world.sync_kinematics();
+        // The render interpolates prev → current; after a bulk jump both must be
+        // the warmed state or every car would sweep across the map in one frame.
+        self.prev = self.snapshot();
+        self.prev_lane = self.snapshot_lanes();
+        self.prev_crossing = self.snapshot_crossing();
+    }
+
+    /// `[done_secs, target_secs, fleet]` while a warmup runs; empty otherwise.
+    pub fn warmup_progress(&self) -> Vec<f64> {
+        match &self.warmup {
+            Some(w) => vec![w.done_secs, w.target_secs, self.world.vehicles().len() as f64],
+            None => Vec::new(),
+        }
+    }
+
+    /// One frame's slice of an in-flight warmup: as many headless ticks as fit
+    /// the frame budget. Returns whether a warmup consumed this frame.
+    fn advance_warmup(&mut self) -> bool {
+        let Some(mut w) = self.warmup.take() else { return false };
+        let dt = self.clock.dt();
+        let start = now_ms();
+        let mut finished = false;
+        while now_ms() - start < IDLE_BURST_MS {
+            self.demand.step(&mut self.world, dt);
+            self.world.step();
+            w.done_secs += dt;
+            if w.done_secs >= w.next_sample {
+                w.next_sample += 60.0;
+                w.fleet_window.push(self.world.vehicles().len());
+                if w.fleet_window.len() > 3 {
+                    w.fleet_window.remove(0);
+                }
+            }
+            // Converged: three consecutive sim-minute samples within 2% (or ±20
+            // cars) of each other — the road is as full as this demand gets.
+            let converged = w.fleet_window.len() == 3 && {
+                let (a, c) = (w.fleet_window[0] as f64, w.fleet_window[2] as f64);
+                (a - c).abs() <= (0.02 * c).max(20.0)
+            };
+            if w.done_secs >= w.target_secs || converged {
+                finished = true;
+                break;
+            }
+        }
+        if finished {
+            self.finish_warmup();
+        } else {
+            self.warmup = Some(w);
+        }
+        true
+    }
+
     pub fn play(&mut self) {
         self.clock.play();
     }
@@ -630,6 +717,12 @@ impl Simulation {
     }
 
     pub fn advance(&mut self, real_elapsed_secs: f64) -> u32 {
+        if self.advance_warmup() {
+            // Pre-populating: every frame goes to headless catch-up; the clock
+            // isn't advanced, so no backlog accumulates behind the warmup.
+            self.last_advance_ms = now_ms();
+            return 0;
+        }
         // Wall-clock delta since the previous frame (uncapped, unlike the JS-capped
         // `real_elapsed_secs`), clamped so a backgrounded tab's huge gap can't skew
         // the speed meter.
@@ -1662,4 +1755,13 @@ fn flatten<const N: usize>(rows: Vec<[f64; N]>) -> Vec<f32> {
         out.extend(row.iter().map(|&v| v as f32));
     }
     out
+}
+
+/// An in-flight headless pre-population run (see [`Simulation::begin_warmup`]).
+struct Warmup {
+    target_secs: f64,
+    done_secs: f64,
+    /// Trailing per-sim-minute fleet sizes for the convergence check.
+    fleet_window: Vec<usize>,
+    next_sample: f64,
 }

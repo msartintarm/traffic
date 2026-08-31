@@ -876,6 +876,7 @@ impl OsmMap {
         }
         net.build_hov_lanes();
         net.build_junctions();
+        relax_junction_interior_storage(&mut net);
         // Stop control is a property of the *intersection*: OSM surveys the sign
         // per approach, so a multi-node cluster ends up with Stop on some member
         // nodes and Uncontrolled on the rest — and the uncontrolled street then
@@ -2500,6 +2501,44 @@ fn enforce_mouth_ordering(net: &mut Network) {
         if !changed {
             break;
         }
+    }
+}
+
+/// Give back a junction cluster's internal storage. `set_junction_setbacks`
+/// (which runs before clusters exist) applies stop-line setbacks to both ends of
+/// every link; for the short links *between* one cluster's member nodes the two
+/// setbacks exceed the link and the clamp leaves a ~1 m lane — so no car ever
+/// fits any interior of a split junction (admission needs a vehicle length plus
+/// a gap), and El Camino × Millbrae Ave served ~66 veh/h across 19 approach
+/// lanes while its signals sat green. With the *final* clustering known, cap
+/// interior link ends at a small mouth and rebuild the trim-derived geometry
+/// (bounds → seam stitching → mouth ordering → interiors) so every consumer —
+/// dividers, box decomposition, admission — agrees on what is interior.
+fn relax_junction_interior_storage(net: &mut Network) {
+    const INTERIOR_MOUTH: f64 = 2.5;
+    let mut changed = false;
+    for i in 0..net.links.len() {
+        if !net.link_is_junction_interior(LinkId(i as u32)) {
+            continue;
+        }
+        let link = net.links[i];
+        let full: f64 = net.polylines[i].windows(2).map(|w| distance(w[0], w[1])).sum();
+        for lane in link.lane_start.0..link.lane_start.0 + link.lane_count {
+            let l = &mut net.lanes[lane as usize];
+            let r1 = (full - l.start_offset - l.length).min(INTERIOR_MOUTH).max(0.0);
+            let r0 = l.start_offset.min(INTERIOR_MOUTH);
+            if (l.start_offset - r0).abs() > 0.01 || (full - r0 - r1 - l.length).abs() > 0.01 {
+                l.start_offset = r0;
+                l.length = full - r0 - r1;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        net.build_lane_bounds();
+        stitch_seam_bounds(net);
+        enforce_mouth_ordering(net);
+        net.build_interiors();
     }
 }
 

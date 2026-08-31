@@ -799,6 +799,9 @@ mod golden {
         );
 
         assert!(max_fixed < 0.5, "the fixed join hugs the true crossing path everywhere (worst {max_fixed:.2} m)");
-        assert!(worst_legacy > 1.5, "the legacy interpolation bulged back through the node ({worst_legacy:.2} m) — the enter/exit jump this fixes");
+        // The legacy (non-crossing-aware) path used to bulge > 1.5 m through the
+        // node; the chord-clamped corner control fixed it at the source, so both
+        // modes must now stay tight.
+        assert!(worst_legacy < 1.5, "even the legacy interpolation stays near the path ({worst_legacy:.2} m)");
     }
 }

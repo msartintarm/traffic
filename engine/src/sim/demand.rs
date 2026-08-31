@@ -479,6 +479,10 @@ pub struct DemandGenerator {
     /// Simulated seconds-into-day while the rush-hour profile is driving the freeway
     /// streams; `None` off-peak. Advances by `day_compression` each sim second.
     rush_clock: Option<f64>,
+    /// Freeze the day clock (warmup pre-population): demand keeps spawning at the
+    /// frozen hour's rates and schedule-driven transit holds position, while sim
+    /// time (trips, physics) runs normally underneath.
+    day_frozen: bool,
     /// Day-seconds per sim second the rush clock advances at (1.0 = real time).
     day_compression: f64,
     /// Days the rush clock has wrapped since it was switched on: `day % 7 ≥ 5` is a
@@ -628,7 +632,7 @@ impl DemandGenerator {
             .collect();
         Self {
             pairs, transit: Vec::new(), seed, tick: 0, next_id: 0, spawned: 0, dropped: 0,
-            rate_scale: 1.0, entry_speed_cap: f64::INFINITY, rush_clock: None,
+            rate_scale: 1.0, entry_speed_cap: f64::INFINITY, rush_clock: None, day_frozen: false,
             day_compression: DEFAULT_DAY_COMPRESSION,
             day: 0, sim_secs: 0.0, churn_epoch: 0,
             queues: std::collections::BTreeMap::new(),
@@ -830,6 +834,11 @@ impl DemandGenerator {
         self.rush_clock.unwrap_or(RUSH_START_HOUR * 3600.0 + sim_time) % 86_400.0
     }
 
+    /// Freeze/unfreeze the day clock (see the field docs).
+    pub fn set_day_frozen(&mut self, on: bool) {
+        self.day_frozen = on;
+    }
+
     /// Scale every stream's spawn rate (1.0 = as configured; 0.0 = no spawning).
     pub fn set_rate_scale(&mut self, scale: f64) {
         self.rate_scale = scale.max(0.0);
@@ -1015,16 +1024,24 @@ impl DemandGenerator {
         // Per-tick day clock for day-scheduled infrastructure (crossings,
         // trains, bus holding) — finer than the bridge's per-frame feed, and
         // the only feed in headless runs.
-        let day_rate = if self.rush_clock.is_some() { self.day_compression } else { 1.0 };
+        let day_rate = if self.day_frozen {
+            0.0 // trains hold position; nothing day-scheduled moves during warmup
+        } else if self.rush_clock.is_some() {
+            self.day_compression
+        } else {
+            1.0
+        };
         world.set_day_clock(day_now, day_rate, weekend);
         self.step_transit(world, day_now);
 
         if let Some(t) = &mut self.rush_clock {
-            let next = (*t + dt * self.day_compression).rem_euclid(86_400.0);
-            if next < *t {
-                self.day += 1;
+            if !self.day_frozen {
+                let next = (*t + dt * self.day_compression).rem_euclid(86_400.0);
+                if next < *t {
+                    self.day += 1;
+                }
+                *t = next;
             }
-            *t = next;
         }
         self.sim_secs += dt;
         let churn = (self.sim_secs / CHURN_PERIOD_SECS) as u64;

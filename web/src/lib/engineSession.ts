@@ -260,6 +260,10 @@ export async function startEngineSession(
       rushHourTime: sim.rush_hour_time(),
       rushHourFlows: [flows[0], flows[1], flows[2], flows[3]],
       camera: [cam[0], cam[1], cam[2], cam[3], cam[4]],
+      warmup: (() => {
+        const w = sim.warmup_progress?.();
+        return w && w.length >= 3 ? ([w[0], w[1], w[2]] as [number, number, number]) : null;
+      })(),
       metersPerPixel: sim.meters_per_pixel(),
     };
   };
@@ -347,6 +351,7 @@ export async function startEngineSession(
       case "arterialRouting": sim.set_arterial_routing?.(c.value); break;
       case "targetedRouting": sim.set_targeted_routing?.(c.value); break;
       case "localitySort": sim.set_locality_sort?.(c.value); break;
+      case "warmup": sim.begin_warmup?.(c.seconds); break;
       case "showCrashes": sim.set_show_crashes(c.value); break;
       case "clearCrashes": sim.clear_crashes(); break;
       case "entrySpeedCap": sim.set_entry_speed_cap(c.value); break;
