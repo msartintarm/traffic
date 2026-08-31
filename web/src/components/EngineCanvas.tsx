@@ -134,6 +134,7 @@ export default function EngineCanvas() {
   const [arterialRouting, setArterialRouting] = useState(false); // arterial-first fields, off by default (see net_world default)
   const [targetedRouting, setTargetedRouting] = useState(true); // targeted route refresh, on by default (see net_world default)
   const [localitySort, setLocalitySort] = useState(false); // fleet memory-locality reorder, off by default (see net_world default)
+  const [sharding, setSharding] = useState(false); // sharded boundary resolution, off by default (measured net loss on bench hardware)
   const [startSpeedMps, setStartSpeedMps] = useState(36); // ≥ every road limit ⇒ "enter at limit"
   const [units, setUnits] = useState<"mi" | "km">("mi");
   const unitsRef = useRef<"mi" | "km">("mi"); // read inside the per-frame HUD update (avoids stale closure)
@@ -886,6 +887,21 @@ export default function EngineCanvas() {
                 }}
               />
               Memory locality sort
+            </label>
+            <label
+              className={styles.zoomLabel}
+              title="Split intersection/boundary resolution into 8 spatial shards (whole junction clusters each) resolved on separate cores. Deterministic, but tie-breaks can differ from the unsharded engine. Measured slightly slower on the development machine — exposed as an experiment for hardware where the parallel win beats the dispatch overhead. Off by default."
+            >
+              <input
+                type="checkbox"
+                checked={sharding}
+                disabled={!ready}
+                onChange={(e) => {
+                  sessionRef.current?.applyControl({ type: "sharding", value: e.target.checked });
+                  setSharding(e.target.checked);
+                }}
+              />
+              Sharded intersections
             </label>
             <label
               className={styles.zoomLabel}

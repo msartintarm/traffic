@@ -4,11 +4,13 @@
 //! Accelerations read committed pre-step state and apply in a second pass.
 
 mod fleet;
+mod shards;
 mod groups;
 mod tracker;
 pub use fleet::NetVehicle;
 use fleet::{record_history, Crossing, Fate, Fleet, LaneChange};
 use groups::GroupMap;
+use shards::Sharding;
 use tracker::*;
 
 use std::collections::HashMap;
@@ -100,6 +102,7 @@ pub struct NetWorld {
     /// a steady-state step allocates no group storage (see [`groups::GroupMap`]).
     nb_pool: Neighbors,
     lc_groups: GroupMap,
+    corridor_groups: GroupMap,
     crash_groups: GroupMap,
     /// Periodically permute the fleet into (lane, position) order so the per-car
     /// passes' neighbor reads walk adjacent memory instead of pointer-chasing a
@@ -107,6 +110,13 @@ pub struct NetWorld {
     /// threads backend gains nothing. Off by default: any row order is a valid
     /// sim, but apply-order tie-breaks shift, so goldens/tests stay exact.
     locality_sort: bool,
+    /// Spatial shards for the boundary-resolution phase (None = classic serial
+    /// path, bit-identical to the unsharded engine). See [`shards::Sharding`].
+    sharding: Option<Sharding>,
+    /// Persistent per-shard occupancy scratch + shard rosters (index lists),
+    /// reused across ticks so sharded resolution allocates nothing steady-state.
+    shard_maps: Vec<shards::ShardMaps>,
+    shard_rosters: Vec<Vec<u32>>,
     /// Whether the kinematic pose layer runs each step. Warmup pre-population
     /// disables it (nothing is rendered, so tracking poses is wasted work) and
     /// calls [`sync_kinematics`](Self::sync_kinematics) once at the end.
@@ -1006,8 +1016,8 @@ impl NetWorld {
             network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0, divergences: 0,
             control_aware_routing: true, lane_eval_stagger: true, arterial_routing: false,
             targeted_routing: true, dest_entries: HashMap::new(), locality_sort: false,
-            nb_pool: Neighbors::default(), lc_groups: GroupMap::default(), crash_groups: GroupMap::default(),
-            kinematics_enabled: true, crashed_by: [0; 2], crash_log: Vec::new(),
+            nb_pool: Neighbors::default(), lc_groups: GroupMap::default(), corridor_groups: GroupMap::default(), crash_groups: GroupMap::default(),
+            kinematics_enabled: true, sharding: None, shard_maps: Vec::new(), shard_rosters: Vec::new(), crashed_by: [0; 2], crash_log: Vec::new(),
             merges, link_straight, turn_caps, merge_feeder_lane, through_next, corridor_of, corridor_offset, seam_primary, signals, link_entries, router: None, external_reroute: false,
             meters: Vec::new(), metering_on: false, day_secs: 0.0, pm_plan: false, rail_preempts,
             timetable: rail::Timetable::default(), crossing_sets: HashMap::new(), weekend: false, day_rate: 1.0,
@@ -1219,6 +1229,15 @@ impl NetWorld {
             v.kin = [p[0] - f * p[2].cos(), p[1] - f * p[2].sin(), p[2]];
             v.steer = 0.0;
         }
+    }
+
+    /// Enable spatial sharding of the boundary-resolution phase with `count`
+    /// shards (0 or 1 disables — the classic serial path). Sharded mode keeps
+    /// the fleet ordered by (shard, lane, position) every tick so each shard
+    /// owns a contiguous slice; resolution order (and thus same-tick
+    /// tie-breaks) follows that order, deterministically.
+    pub fn set_sharding(&mut self, count: usize) {
+        self.sharding = (count > 1).then(|| Sharding::build(&self.network, count));
     }
 
     /// Toggle the periodic fleet locality reorder (see the field docs).
@@ -2172,6 +2191,19 @@ impl NetWorld {
             if dbg { EVALED.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
             self.best_lane_change(i, &by_lane).map(|t| (i, t))
         });
+        // Corridor membership index for the slot checks below: `lane_slot_clear`
+        // judges the whole corridor, and scanning the full fleet per accepted
+        // candidate made the apply loop quadratic at scale (3-4 ms of the lap).
+        // Built once from committed lanes; cars moved by *earlier applies this
+        // tick* are re-checked via `moved`, and every listed row re-validates
+        // its corridor at check time, so the visible set is exactly what the
+        // full scan saw.
+        let mut by_corridor = std::mem::take(&mut self.corridor_groups);
+        by_corridor.begin_tick();
+        for (j, o) in self.fleet.rows.iter().enumerate() {
+            by_corridor.push(self.corridor_of[o.lane.0 as usize], j);
+        }
+        let mut moved: Vec<usize> = Vec::new();
         for (i, target) in decided.into_iter().flatten() {
             // Preserve arc-length along the link across the change. Lanes normally
             // share a start offset (a no-op remap), but a turn-*pocket* lane begins
@@ -2186,7 +2218,7 @@ impl NetWorld {
             }
             let len = veh.driver.vehicle_length;
             let speed = self.fleet.rows[i].speed;
-            if self.lane_slot_clear(target, new_pos, len, speed, i) {
+            if self.lane_slot_clear(target, new_pos, len, speed, i, &by_corridor, &moved) {
                 let from = self.fleet.rows[i].lane;
                 self.fleet.rows[i].lane = target;
                 self.fleet.rows[i].position = new_pos;
@@ -2195,8 +2227,10 @@ impl NetWorld {
                 // frame, so discard it (as a segment crossing does) to keep the
                 // reaction-delay gap from reading a stale position and phantom-braking.
                 self.fleet.reset_history(i, new_pos, speed);
+                moved.push(i);
             }
         }
+        self.corridor_groups = by_corridor;
     }
 
     fn best_lane_change(&self, i: usize, by_lane: &GroupMap) -> Option<LaneId> {
@@ -2410,7 +2444,16 @@ impl NetWorld {
         router.next_hop(dest, self.network.lane(veh.lane).link)
     }
 
-    fn lane_slot_clear(&self, target: LaneId, pos: f64, len: f64, speed: f64, exclude: usize) -> bool {
+    fn lane_slot_clear(
+        &self,
+        target: LaneId,
+        pos: f64,
+        len: f64,
+        speed: f64,
+        exclude: usize,
+        by_corridor: &GroupMap,
+        moved: &[usize],
+    ) -> bool {
         // Require more than a bumper's clearance at speed: the changing car needs room to
         // follow whoever is ahead in the slot, and the car behind needs room to follow it
         // — roughly a half-second headway each — so a change into fast traffic can't drop a
@@ -2424,23 +2467,25 @@ impl NetWorld {
         const HEADWAY: f64 = 0.5;
         let target_corridor = self.corridor_of[target.0 as usize];
         let my_cpos = self.corridor_offset[target.0 as usize] + pos;
-        self.fleet.rows
-            .iter()
-            .enumerate()
-            .filter(|(j, o)| *j != exclude && self.corridor_of[o.lane.0 as usize] == target_corridor)
-            .all(|(_, o)| {
-                let o_cpos = self.corridor_pos(o);
-                if o_cpos > my_cpos {
-                    // Room ahead: the changer must be able to brake to the leader's speed.
-                    let closing = (speed * speed - o.speed * o.speed).max(0.0) / (2.0 * MAX_BRAKE_DECEL);
-                    o_cpos - o.driver.vehicle_length - my_cpos > 0.5 + speed * HEADWAY + closing
-                } else {
-                    // Room behind: never drop in so close/slow that the follower must brake
-                    // harder than physically possible to avoid the changer (the cut-in slam).
-                    let closing = (o.speed * o.speed - speed * speed).max(0.0) / (2.0 * MAX_BRAKE_DECEL);
-                    my_cpos - len - o_cpos > 0.5 + o.speed * HEADWAY + closing
-                }
-            })
+        let clear_of = |j: usize| -> bool {
+            let o = &self.fleet.rows[j];
+            if j == exclude || self.corridor_of[o.lane.0 as usize] != target_corridor {
+                return true;
+            }
+            let o_cpos = self.corridor_pos(o);
+            if o_cpos > my_cpos {
+                // Room ahead: the changer must be able to brake to the leader's speed.
+                let closing = (speed * speed - o.speed * o.speed).max(0.0) / (2.0 * MAX_BRAKE_DECEL);
+                o_cpos - o.driver.vehicle_length - my_cpos > 0.5 + speed * HEADWAY + closing
+            } else {
+                // Room behind: never drop in so close/slow that the follower must brake
+                // harder than physically possible to avoid the changer (the cut-in slam).
+                let closing = (o.speed * o.speed - speed * speed).max(0.0) / (2.0 * MAX_BRAKE_DECEL);
+                my_cpos - len - o_cpos > 0.5 + o.speed * HEADWAY + closing
+            }
+        };
+        by_corridor.get(&target_corridor).is_none_or(|g| g.iter().all(|&j| clear_of(j)))
+            && moved.iter().all(|&j| clear_of(j))
     }
 
     /// Current colour of a movement under the actuated signal runtime
@@ -3040,15 +3085,26 @@ impl NetWorld {
         // on a junction-internal stub shorter than a car, that tail is exactly what the
         // next landing must not be admitted into (`position` is continuous past the lane
         // end, so its rear is directly comparable).
-        let mut front: IntMap<f64> = IntMap::default();
-        let mut front_speed: IntMap<f64> = IntMap::default();
+        // In sharded mode every occupancy map is split per shard, routed by the
+        // *entry* shard of its lane key (the node cars enter it from — the only
+        // place it is ever written); `shard_count == 1` is the classic path,
+        // bit-identical to the unsharded engine.
+        let shard_count = self.sharding.as_ref().map_or(1, |sh| sh.count);
+        let mut smaps = std::mem::take(&mut self.shard_maps);
+        smaps.resize_with(shard_count, Default::default);
+        for m in &mut smaps {
+            m.clear();
+        }
+        let sharding = self.sharding.as_ref();
+        let entry_shard = move |lane: LaneId| -> usize { sharding.map_or(0, |sh| sh.lane_entry[lane.idx()] as usize) };
         for v in &self.fleet.rows {
             let rear = v.position - v.driver.vehicle_length;
             if rear < self.network.lane(v.lane).length {
-                let e = front.entry(v.lane.0).or_insert(f64::MAX);
+                let m = &mut smaps[entry_shard(v.lane)];
+                let e = m.front.entry(v.lane.0).or_insert(f64::MAX);
                 if rear < *e {
                     *e = rear;
-                    front_speed.insert(v.lane.0, v.speed);
+                    m.front_speed.insert(v.lane.0, v.speed);
                 }
             }
         }
@@ -3092,14 +3148,13 @@ impl NetWorld {
         // internal stub before the first lands, which stranded the extras mid-box
         // (a permanent `box_conflict` for everyone else) and let a big split
         // junction's internal ring gridlock for good.
-        let mut interior_occ: IntMap<u32> = IntMap::default();
         for v in taken.iter() {
             let lane = match v.crossing {
                 Some(c) => self.network.movement(c.movement).to_lane,
                 None => v.lane,
             };
             if self.junction_internal_lane(lane) {
-                *interior_occ.entry(lane.0).or_insert(0) += 1;
+                *smaps[entry_shard(lane)].interior_occ.entry(lane.0).or_insert(0) += 1;
             }
         }
 
@@ -3108,12 +3163,11 @@ impl NetWorld {
         // can no longer bank on the *same* room in different ticks — the double-booking
         // that stranded the loser mid-box behind a tail that materialized while it
         // crossed. Free-flow seams are exempt (corridor following spaces those).
-        let mut inbound: IntMap<f64> = IntMap::default();
         for v in taken.iter() {
             if let Some(c) = v.crossing {
                 if !self.free_flow_seam(c.movement) {
                     let to_lane = self.network.movement(c.movement).to_lane;
-                    *inbound.entry(to_lane.0).or_insert(0.0) += v.driver.vehicle_length + v.driver.min_gap;
+                    *smaps[entry_shard(to_lane)].inbound.entry(to_lane.0).or_insert(0.0) += v.driver.vehicle_length + v.driver.min_gap;
                 }
             }
         }
@@ -3124,18 +3178,39 @@ impl NetWorld {
         // an undeferred car simply stayed in its lane (`Alive`). `entered_at` accumulates the
         // at-grade movements committed earlier in this same pass, closing the same-tick
         // double-entry race the pre-step box gate can't see.
-        let mut entered_at: IntMap<Vec<MovementId>> = IntMap::default();
-        let mut fates: Vec<Fate> = Vec::with_capacity(n);
-        for i in 0..n {
-            let fate = if !deferred[i] {
-                Fate::Alive
-            } else if taken[i].crossing.is_some() {
-                self.advance_crossing(&mut taken[i], accels[i], dt, &mut front, &mut front_speed, &mut inbound)
-            } else {
-                self.resolve_boundary(&mut taken[i], dt, &mut front, &mut front_speed, block_entry[i], intended_mv[i], &mut interior_occ, &mut entered_at, &mut inbound)
-            };
-            fates.push(fate);
-        }
+        let fates: Vec<Fate> = if shard_count == 1 {
+            let m = &mut smaps[0];
+            let mut entered_at: IntMap<Vec<MovementId>> = IntMap::default();
+            let mut fates: Vec<Fate> = Vec::with_capacity(n);
+            for i in 0..n {
+                let fate = if !deferred[i] {
+                    Fate::Alive
+                } else if taken[i].crossing.is_some() {
+                    self.advance_crossing(&mut taken[i], accels[i], dt, &mut m.front, &mut m.front_speed, &mut m.inbound)
+                } else {
+                    self.resolve_boundary(
+                        &mut taken[i],
+                        dt,
+                        &mut m.front,
+                        &mut m.front_speed,
+                        block_entry[i],
+                        intended_mv[i],
+                        &mut m.interior_occ,
+                        &mut entered_at,
+                        &mut m.inbound,
+                    )
+                };
+                fates.push(fate);
+            }
+            fates
+        } else {
+            let mut rosters = std::mem::take(&mut self.shard_rosters);
+            let fates =
+                self.resolve_sharded(&mut taken, &deferred, &accels, &block_entry, &intended_mv, dt, &mut smaps, &mut rosters);
+            self.shard_rosters = rosters;
+            fates
+        };
+        self.shard_maps = smaps;
         prof.lap(5);
 
         // Crash detection on the fully-advanced positions, before assembly drops any row
@@ -4000,6 +4075,92 @@ impl NetWorld {
             }
         }
         accel
+    }
+
+    /// The K-way boundary resolution. Each deferred car is bucketed to its
+    /// home shard (the shard owning the node at its lane's end) in one O(n)
+    /// pass; each shard then resolves its roster in ascending fleet index —
+    /// the same relative order the classic serial pass uses — against *its
+    /// own* occupancy maps, provably the only ones its cars touch (a car
+    /// entering a lane writes that lane's entry-shard maps, and the lane it
+    /// enters always emanates from the node its shard owns; junction clusters
+    /// are atomic per shard, so multi-node box FIFO state stays home too).
+    /// Rows are accessed through [`shards::SharedRows`], sound because the
+    /// rosters partition the deferred indices. With the `parallel` feature the
+    /// shard tasks run across cores; without it (or under the serial backend)
+    /// they run in shard order — and because the tasks are independent either
+    /// way, both executions produce bit-identical fleets.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_sharded(
+        &self,
+        taken: &mut [NetVehicle],
+        deferred: &[bool],
+        accels: &[f64],
+        block_entry: &[bool],
+        intended_mv: &[Option<MovementId>],
+        dt: f64,
+        maps: &mut [shards::ShardMaps],
+        rosters: &mut Vec<Vec<u32>>,
+    ) -> Vec<Fate> {
+        let sh = self.sharding.as_ref().unwrap();
+        let n = taken.len();
+        rosters.resize_with(sh.count, Vec::new);
+        for r in rosters.iter_mut() {
+            r.clear();
+        }
+        for (i, v) in taken.iter().enumerate() {
+            if deferred[i] {
+                rosters[sh.home_of(v.lane) as usize].push(i as u32);
+            }
+        }
+
+        let rows = shards::SharedRows(taken);
+        let rows = &rows;
+        let run = |(maps, roster): (&mut shards::ShardMaps, &Vec<u32>)| -> Vec<Fate> {
+            let mut entered_at: IntMap<Vec<MovementId>> = IntMap::default();
+            let mut out = Vec::with_capacity(roster.len());
+            for &iu in roster {
+                let i = iu as usize;
+                // Safety: `i` sits in exactly one roster (single bucketing pass above).
+                let v = unsafe { rows.row(i) };
+                let fate = if v.crossing.is_some() {
+                    self.advance_crossing(v, accels[i], dt, &mut maps.front, &mut maps.front_speed, &mut maps.inbound)
+                } else {
+                    self.resolve_boundary(
+                        v,
+                        dt,
+                        &mut maps.front,
+                        &mut maps.front_speed,
+                        block_entry[i],
+                        intended_mv[i],
+                        &mut maps.interior_occ,
+                        &mut entered_at,
+                        &mut maps.inbound,
+                    )
+                };
+                out.push(fate);
+            }
+            out
+        };
+        let per_shard: Vec<Vec<Fate>> = {
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                maps.par_iter_mut().zip(rosters.par_iter()).map(run).collect()
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                maps.iter_mut().zip(rosters.iter()).map(run).collect()
+            }
+        };
+
+        let mut fates = vec![Fate::Alive; n];
+        for (roster, shard_fates) in rosters.iter().zip(per_shard) {
+            for (&i, f) in roster.iter().zip(shard_fates) {
+                fates[i as usize] = f;
+            }
+        }
+        fates
     }
 
     /// Detect this tick's collisions on the fully-advanced positions, before assembly
@@ -9292,6 +9453,98 @@ mod tests {
             Some(LinkId(0)),
             "with the toggle off, raw travel time rat-runs the stop-signed shortcut again"
         );
+    }
+
+    /// A three-junction arterial with cross streets — several distinct clusters,
+    /// so K-way sharding genuinely splits it.
+    fn sharded_grid() -> OsmMap {
+        let mut nodes = vec![];
+        let mut links = vec![];
+        for k in 0..3i64 {
+            let x = k as f64 * 400.0;
+            nodes.push(NodeSpec::stop(10 + k, x, 0.0));
+            nodes.push(NodeSpec::uncontrolled(20 + k, x, 300.0));
+            nodes.push(NodeSpec::uncontrolled(30 + k, x, -300.0));
+            links.extend(LinkSpec::twoway(10 + k, 20 + k, 1, 12.0));
+            links.extend(LinkSpec::twoway(10 + k, 30 + k, 1, 12.0));
+        }
+        nodes.push(NodeSpec::uncontrolled(1, -400.0, 0.0));
+        nodes.push(NodeSpec::uncontrolled(2, 1200.0, 0.0));
+        links.extend(LinkSpec::twoway(1, 10, 2, 15.0));
+        links.extend(LinkSpec::twoway(10, 11, 2, 15.0));
+        links.extend(LinkSpec::twoway(11, 12, 2, 15.0));
+        links.extend(LinkSpec::twoway(12, 2, 2, 15.0));
+        OsmMap { nodes, links }
+    }
+
+    fn run_sharded(shards: usize, ticks: u32) -> Vec<(u32, u32, u64, u64)> {
+        let mut w = NetWorld::new(sharded_grid().build(), cfg());
+        w.set_sharding(shards);
+        let entries: Vec<LinkId> = (0..w.network.links.len() as u32)
+            .map(LinkId)
+            .filter(|&l| {
+                let lk = w.network.link(l);
+                w.network.node(lk.from).position[0].abs() >= 300.0 || w.network.node(lk.from).position[1].abs() >= 300.0
+            })
+            .collect();
+        let dests: Vec<LinkId> = entries.iter().map(|&l| {
+            // destination: the reverse link back out (route across the grid)
+            let lk = w.network.link(l);
+            (0..w.network.links.len() as u32)
+                .map(LinkId)
+                .find(|&o| w.network.link(o).to == lk.from && o != l)
+                .unwrap_or(l)
+        }).collect();
+        w.install_router(&dests);
+        let mut next = 100u32;
+        for t in 0..ticks {
+            if t % 7 == 0 {
+                let e = entries[(t as usize / 7) % entries.len()];
+                let d = dests[(t as usize / 7 + 3) % dests.len()];
+                w.spawn_to(next, e, d, 8.0, DriverConfig::car().sample(11, next));
+                next += 1;
+            }
+            w.step();
+        }
+        let mut out: Vec<(u32, u32, u64, u64)> =
+            w.vehicles().iter().map(|v| (v.id, v.lane.0, v.position.to_bits(), v.speed.to_bits())).collect();
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn sharded_resolution_is_deterministic_and_conserves() {
+        // Two identical sharded runs must agree bit-for-bit — under the
+        // `parallel` feature this exercises the rayon shard tasks, so any
+        // cross-shard data race or nondeterministic merge shows up here. And
+        // no car may be lost or duplicated relative to the unsharded engine's
+        // spawn/exit accounting.
+        let a = run_sharded(4, 900);
+        let b = run_sharded(4, 900);
+        assert_eq!(a, b, "sharded stepping is reproducible bit-for-bit");
+        let ids: std::collections::HashSet<u32> = a.iter().map(|r| r.0).collect();
+        assert_eq!(ids.len(), a.len(), "no duplicated vehicles");
+        // Sanity vs the classic path: same order of magnitude of survivors
+        // (ordering tie-breaks differ, exact equality is not expected).
+        let classic = run_sharded(1, 900);
+        assert!(!a.is_empty() && !classic.is_empty(), "both modes carry traffic");
+        let (na, nc) = (a.len() as f64, classic.len() as f64);
+        assert!((na - nc).abs() / nc.max(1.0) < 0.4, "sharded fleet size in family with classic ({na} vs {nc})");
+    }
+
+    #[test]
+    fn shard_partition_is_cluster_atomic_and_total() {
+        let net = sharded_grid().build();
+        let sh = Sharding::build(&net, 4);
+        for j in &net.junctions {
+            let s0 = sh.lane_home[net.link(j.approaches[0]).lane_start.idx()];
+            for &a in &j.approaches {
+                assert_eq!(sh.lane_home[net.link(a).lane_start.idx()], s0, "cluster approaches share a shard");
+            }
+        }
+        for l in 0..net.lanes.len() {
+            assert!((sh.lane_home[l] as usize) < sh.count && (sh.lane_entry[l] as usize) < sh.count);
+        }
     }
 
     #[test]

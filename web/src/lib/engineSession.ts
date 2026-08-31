@@ -351,6 +351,7 @@ export async function startEngineSession(
       case "arterialRouting": sim.set_arterial_routing?.(c.value); break;
       case "targetedRouting": sim.set_targeted_routing?.(c.value); break;
       case "localitySort": sim.set_locality_sort?.(c.value); break;
+      case "sharding": sim.set_sharding?.(c.value); break;
       case "warmup": sim.begin_warmup?.(c.seconds); break;
       case "showCrashes": sim.set_show_crashes(c.value); break;
       case "clearCrashes": sim.clear_crashes(); break;

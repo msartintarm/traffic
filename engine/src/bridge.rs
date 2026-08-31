@@ -927,6 +927,14 @@ impl Simulation {
         self.world.set_locality_sort(on);
     }
 
+    /// Toggle spatially sharded boundary resolution (8 junction-cluster-atomic
+    /// shards resolved in parallel under the threads backend). Deterministic
+    /// either way; off by default — measured a small net loss on the bench
+    /// hardware, exposed for experimentation elsewhere.
+    pub fn set_sharding(&mut self, on: bool) {
+        self.world.set_sharding(if on { 8 } else { 0 });
+    }
+
     /// Toggle the cache-friendly per-lane/per-corridor sort (a flat position-key array instead
     /// of reading a vehicle row per comparison). On by default; a display-neutral performance
     /// option — the simulation result is identical either way.

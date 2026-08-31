@@ -76,6 +76,8 @@ export type Sim = {
   set_targeted_routing?(on: boolean): void;
   /** Periodic fleet memory-locality reorder (cache-friendly neighbor reads). */
   set_locality_sort?(on: boolean): void;
+  /** Spatially sharded boundary resolution (threads backend experiment). */
+  set_sharding?(on: boolean): void;
   /** Headless pre-population: fast-forward up to `simSecs` of travel time. */
   begin_warmup?(simSecs: number): void;
   /** `[done, target, fleet]` while a warmup runs; empty otherwise. */

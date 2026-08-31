@@ -67,6 +67,7 @@ pub(super) struct LaneChange {
 }
 
 /// Outcome of advancing a vehicle one tick.
+#[derive(Clone, Copy)]
 pub(super) enum Fate {
     Alive,
     /// Crossed onto a new link (its id, for entry counting).
@@ -182,10 +183,13 @@ impl NetWorld {
     /// pass's neighbor reads mostly-sequential in memory.
     pub(super) fn locality_reorder(&mut self) {
         let n = self.fleet.rows.len();
+        let shard_of = |lane: LaneId| self.sharding.as_ref().map_or(0, |sh| sh.home_of(lane));
         let mut order: Vec<u32> = (0..n as u32).collect();
         order.sort_by(|&a, &b| {
             let (va, vb) = (&self.fleet.rows[a as usize], &self.fleet.rows[b as usize]);
-            (va.lane.0, va.position).partial_cmp(&(vb.lane.0, vb.position)).unwrap_or(std::cmp::Ordering::Equal)
+            (shard_of(va.lane), va.lane.0, va.position)
+                .partial_cmp(&(shard_of(vb.lane), vb.lane.0, vb.position))
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         let rows = std::mem::take(&mut self.fleet.rows);
         let hist = std::mem::take(&mut self.fleet.hist);
