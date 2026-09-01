@@ -134,7 +134,7 @@ export default function EngineCanvas() {
   const [arterialRouting, setArterialRouting] = useState(false); // arterial-first fields, off by default (see net_world default)
   const [targetedRouting, setTargetedRouting] = useState(true); // targeted route refresh, on by default (see net_world default)
   const [localitySort, setLocalitySort] = useState(false); // fleet memory-locality reorder, off by default (see net_world default)
-  const [sharding, setSharding] = useState(false); // sharded boundary resolution, off by default (measured net loss on bench hardware)
+  const [sharding, setSharding] = useState(true); // sharded (SPMD) execution, on by default; `?shard=0` (splash toggle) opts out
   const [startSpeedMps, setStartSpeedMps] = useState(36); // ≥ every road limit ⇒ "enter at limit"
   const [units, setUnits] = useState<"mi" | "km">("mi");
   const unitsRef = useRef<"mi" | "km">("mi"); // read inside the per-frame HUD update (avoids stale closure)
@@ -353,8 +353,14 @@ export default function EngineCanvas() {
             fitMppRef.current = r.fitMpp;
             setCongestionEnabled(r.congestionEnabled);
             setReady(true);
+            // Sharded (SPMD) execution is the default; `?shard=0` (settable
+            // from the splash) keeps the classic fork-join engine.
+            const params = new URL(window.location.href).searchParams;
+            const shard = params.get("shard") !== "0";
+            setSharding(shard);
+            if (shard) sessionRef.current?.applyControl({ type: "sharding", value: true });
             // `?warmup=1` (settable from the splash) pre-populates on load.
-            if (new URL(window.location.href).searchParams.get("warmup") === "1") {
+            if (params.get("warmup") === "1") {
               sessionRef.current?.applyControl({ type: "warmup", seconds: 3600 });
             }
           },
@@ -1037,6 +1043,7 @@ export default function EngineCanvas() {
 function SplashScreen() {
   const [splitJunctions, setSplitJunctions] = useState(true);
   const [prePopulate, setPrePopulate] = useState(false);
+  const [sharded, setSharded] = useState(true);
   useEffect(() => {
     void ensureCrossOriginIsolation();
   }, []);
@@ -1048,6 +1055,8 @@ function SplashScreen() {
     else url.searchParams.set("split", "0");
     if (prePopulate) url.searchParams.set("warmup", "1");
     else url.searchParams.delete("warmup");
+    if (sharded) url.searchParams.delete("shard");
+    else url.searchParams.set("shard", "0");
     window.location.href = url.toString();
   };
   return (
@@ -1070,6 +1079,14 @@ function SplashScreen() {
         >
           <input type="checkbox" checked={prePopulate} onChange={(e) => setPrePopulate(e.target.checked)} />
           Pre-populate traffic
+        </label>
+        <label
+          className={styles.splashSubtitle}
+          style={{ display: "flex", alignItems: "center", gap: "0.5em", cursor: "pointer", marginBottom: "0.5em" }}
+          title="Divide the map into regions that separate CPU cores carry through the simulation step (SPMD execution). On by default; uncheck to run the classic single-region engine. Also toggleable live under Performance."
+        >
+          <input type="checkbox" checked={sharded} onChange={(e) => setSharded(e.target.checked)} />
+          Sharded parallelism
         </label>
         <div className={styles.splashGrid}>
           {SCENARIOS.map((s) => (
