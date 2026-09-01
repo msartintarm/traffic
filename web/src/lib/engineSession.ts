@@ -240,6 +240,14 @@ export async function startEngineSession(
   cb.onProgress(1, "Ready");
   cb.onReady({ backend, mapLabel, gpuRouting, fitMpp, congestionEnabled });
 
+  // `?debug=1`: expose the sim on the worker global (external probes evaluate
+  // against it) and publish per-frame advance/render wall times there too.
+  let shardStatsOn = false;
+  if (config.debug) {
+    (globalThis as { __sim?: unknown }).__sim = sim;
+    shardStatsOn = true; // debug probes always want the per-shard rows
+  }
+  let lastFrame = { advance: 0, render: 0 };
   const snapshot = (): StatsSnapshot => {
     const cam = sim.camera_params();
     const flows = sim.rush_hour_flows();
@@ -265,6 +273,8 @@ export async function startEngineSession(
         return w && w.length >= 3 ? ([w[0], w[1], w[2]] as [number, number, number]) : null;
       })(),
       metersPerPixel: sim.meters_per_pixel(),
+      shards: shardStatsOn && sim.shard_stats ? Array.from(sim.shard_stats()) : null,
+      ...(config.debug ? { frameAdvanceMs: lastFrame.advance, frameRenderMs: lastFrame.render } : {}),
     };
   };
 
@@ -301,12 +311,14 @@ export async function startEngineSession(
     if (disposed) return;
     const dt = Math.min((now - last) / 1000, 0.1);
     last = now;
+    const t0 = config.debug ? performance.now() : 0;
     const warmingUp = (sim.warmup_progress?.().length ?? 0) > 0;
     if (!warmingUp) {
       sim.advance(dt);
     } else if (warmupTimer === null && sim.pump_warmup) {
       pumpWarmup(); // self-heal: never let an in-flight warmup sit undriven
     }
+    const t1 = config.debug ? performance.now() : 0;
     // ASCII view: the engine rasterises the same geometry to text; the pixel render is
     // skipped (the overlay covers the canvas) so it costs nothing while the toggle is on.
     // A stale wasm build lacking `ascii_view` just falls through to the normal render.
@@ -330,6 +342,7 @@ export async function startEngineSession(
         render2d(canvas, sim, scene);
       }
     }
+    if (config.debug) lastFrame = { advance: t1 - t0, render: performance.now() - t1 };
     cb.onFrame({ snapshot: snapshot(), selected: selectedInfo(), fitMpp, ascii });
     rafId = schedule(draw);
   };
@@ -368,6 +381,8 @@ export async function startEngineSession(
       case "localitySort": sim.set_locality_sort?.(c.value); break;
       case "sharding": sim.set_sharding?.(c.value); break;
       case "asyncRouting": sim.set_async_routing?.(c.value); break;
+      case "followerLod": sim.set_follower_lod?.(c.value); break;
+      case "shardStats": shardStatsOn = c.value; break;
       case "warmup": {
         sim.begin_warmup?.(c.seconds);
         // Old builds without pump_warmup fall back to the RAF-driven path.

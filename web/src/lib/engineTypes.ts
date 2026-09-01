@@ -80,6 +80,10 @@ export type Sim = {
   set_sharding?(on: boolean): void;
   /** Overlapped reroute: flow-field solves on a background pool task. */
   set_async_routing?(on: boolean): void;
+  /** Front-of-lane LOD: followers skip O(node) scans (topology-independent cost). */
+  set_follower_lod?(on: boolean): void;
+  /** Flattened per-shard `[cars, deferred, accelUs, resolveUs]` rows. */
+  shard_stats?(): Uint32Array;
   /** Headless pre-population: fast-forward up to `simSecs` of travel time. */
   begin_warmup?(simSecs: number): void;
   /** `[done, target, fleet]` while a warmup runs; empty otherwise. */

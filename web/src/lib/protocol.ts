@@ -42,6 +42,8 @@ export type Control =
   | { type: "localitySort"; value: boolean }
   | { type: "sharding"; value: boolean }
   | { type: "asyncRouting"; value: boolean }
+  | { type: "followerLod"; value: boolean }
+  | { type: "shardStats"; value: boolean }
   | { type: "warmup"; seconds: number }
   | { type: "showCrashes"; value: boolean }
   | { type: "clearCrashes" }
@@ -66,7 +68,7 @@ export type ControlType = Control["type"];
 
 export const CONTROL_TYPES: ReadonlySet<ControlType> = new Set([
   "speed", "demandRate", "rushHour", "dayCompression", "rampMetering", "sleepScheduler",
-  "parThreshold", "parallelRouting", "cacheSort", "stopCostRouting", "laneEvalStagger", "arterialRouting", "targetedRouting", "localitySort", "sharding", "asyncRouting", "warmup",
+  "parThreshold", "parallelRouting", "cacheSort", "stopCostRouting", "laneEvalStagger", "arterialRouting", "targetedRouting", "localitySort", "sharding", "asyncRouting", "followerLod", "shardStats", "warmup",
   "showCrashes", "clearCrashes", "entrySpeedCap", "congestionEngage", "congestionEnabled",
   "demandSources", "fit", "metersPerPixel", "zoomAt", "panBy", "resize", "select",
   "hover", "play", "pause", "frameBudget", "ascii", "transit",
@@ -105,6 +107,12 @@ export type StatsSnapshot = {
   metersPerPixel: number;
   /** `[doneSecs, targetSecs, fleet]` while a pre-population warmup runs; null otherwise. */
   warmup: [number, number, number] | null;
+  /** Per-shard work rows, flattened `[cars, deferred, accelUs, resolveUs]` — present
+   * only while the per-thread stats toggle is on and the engine is sharded. */
+  shards?: number[] | null;
+  /** `?debug=1` only: previous frame's sim advance / render wall times (ms). */
+  frameAdvanceMs?: number;
+  frameRenderMs?: number;
 };
 
 export type Overlay = {
@@ -137,6 +145,7 @@ export function overlayFromSnapshot(s: StatsSnapshot, opts: OverlayOpts, smoothe
     idleSkipped: n("idleSkipped", s.idleSkipped),
     linksQueued: n("linksQueued", s.linksQueued),
     waiting: n("waiting", s.waiting),
+    shards: s.shards ?? null,
   };
   const t = mppToSlider(s.metersPerPixel, opts.fitMpp, opts.zoomRange);
   return {
@@ -168,6 +177,8 @@ export type InitConfig = {
   height: number;
   congestionEngage: number;
   zoomRange: number;
+  /** `?debug=1`: expose the sim handle + frame timings on the worker global for external probes. */
+  debug?: boolean;
 };
 
 // main → worker init (carries the transferred canvas). Distinct from `Control` because it

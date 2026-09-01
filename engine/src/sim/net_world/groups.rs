@@ -31,6 +31,11 @@ impl<T> GroupMap<T> {
         }
     }
 
+    /// This tick's non-empty groups, keyed.
+    pub(super) fn iter(&self) -> impl Iterator<Item = (u32, &Vec<T>)> {
+        self.touched.iter().filter_map(|k| self.map.get(k).map(|g| (*k, g)))
+    }
+
     pub(super) fn push(&mut self, key: u32, value: T) {
         let group = self.map.entry(key).or_default();
         if group.is_empty() {

@@ -136,6 +136,8 @@ export default function EngineCanvas() {
   const [localitySort, setLocalitySort] = useState(false); // fleet memory-locality reorder, off by default (see net_world default)
   const [sharding, setSharding] = useState(true); // sharded (SPMD) execution, on by default; `?shard=0` (splash toggle) opts out
   const [asyncRouting, setAsyncRouting] = useState(true); // background reroute solves, on by default (threads backend only)
+  const [followerLod, setFollowerLod] = useState(false); // front-of-lane LOD prototype, default off (shifts intersection discharge)
+  const [shardStats, setShardStats] = useState(false); // per-thread work rows in the diagnostics overlay
   const [startSpeedMps, setStartSpeedMps] = useState(36); // ≥ every road limit ⇒ "enter at limit"
   const [units, setUnits] = useState<"mi" | "km">("mi");
   const unitsRef = useRef<"mi" | "km">("mi"); // read inside the per-frame HUD update (avoids stale closure)
@@ -346,6 +348,7 @@ export default function EngineCanvas() {
           height: h,
           congestionEngage,
           zoomRange: ZOOM_RANGE,
+          debug: params.get("debug") === "1",
         };
         sessionRef.current = createSession(canvas, config, {
           onReady: (r) => {
@@ -369,6 +372,10 @@ export default function EngineCanvas() {
           onFrame: (f) => {
             fitMppRef.current = f.fitMpp;
             cameraRef.current = cameraFromParams(f.snapshot.camera);
+            if (params.get("debug") === "1") {
+              (window as { __stats?: unknown }).__stats = f.snapshot;
+              (window as { __ctl?: unknown }).__ctl = (c: Control) => sessionRef.current?.applyControl(c);
+            }
             const pre = asciiRef.current;
             const box = pre?.parentElement;
             if (pre && box) {
@@ -928,6 +935,21 @@ export default function EngineCanvas() {
             </label>
             <label
               className={styles.zoomLabel}
+              title="Front-of-lane LOD: a car queued behind another skips the right-of-way and box scans its leader already runs, so a driver's decision cost stops scaling with queue depth and junction size. Off by default — it slightly changes how intersections discharge (a prototype under evaluation)."
+            >
+              <input
+                type="checkbox"
+                checked={followerLod}
+                disabled={!ready}
+                onChange={(e) => {
+                  sessionRef.current?.applyControl({ type: "followerLod", value: e.target.checked });
+                  setFollowerLod(e.target.checked);
+                }}
+              />
+              Front-of-lane LOD
+            </label>
+            <label
+              className={styles.zoomLabel}
               title="Cache-friendly sort: order the per-lane vehicle groups (for following, lane changes, and crash checks) against a compact position array instead of reading a full vehicle record per comparison. The simulation result is identical; this is purely a speed option. On by default — uncheck to compare."
             >
               <input
@@ -1026,6 +1048,22 @@ export default function EngineCanvas() {
         {ready && <span>• {backend}</span>}
         {ready && <span>• {mapLabel}</span>}
         {ready && <span ref={statsRef} className={styles.statusStats} />}
+        {ready && (
+          <label
+            className={styles.zoomLabel}
+            title="Show one row per shard thread — its car count, cars at node boundaries, and (native builds) its pass times — to see how evenly the regions load the cores. Costs one small array copy per frame while on."
+          >
+            <input
+              type="checkbox"
+              checked={shardStats}
+              onChange={(e) => {
+                sessionRef.current?.applyControl({ type: "shardStats", value: e.target.checked });
+                setShardStats(e.target.checked);
+              }}
+            />
+            Per-thread stats
+          </label>
+        )}
         {error && <span style={{ color: "#ff7b72" }}>• engine failed: {error}</span>}
       </Collapsible>
 

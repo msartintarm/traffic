@@ -801,7 +801,13 @@ impl Simulation {
                     self.prev_crossing = self.snapshot_crossing();
                 }
                 self.demand.step(&mut self.world, dt); // stream routed vehicles in
+                // Kinematic pose is draw-only: defer it on interior catch-up ticks
+                // and run it once on the tick whose state actually renders.
+                self.world.set_defer_kinematics(!last);
                 self.world.step();
+                if last {
+                    self.world.apply_kinematics();
+                }
                 ran += 1;
                 if last {
                     if over_budget {
@@ -969,6 +975,51 @@ impl Simulation {
     /// backend only; a no-op elsewhere).
     pub fn set_async_routing(&mut self, on: bool) {
         self.world.set_async_routing(on);
+    }
+
+    /// Toggle front-of-lane LOD: followers behind an un-crossed same-lane leader
+    /// skip the O(cars-at-node) right-of-way / box scans, so a driver's decision
+    /// cost stops scaling with queue depth and junction size. Off by default —
+    /// it changes intersection discharge dynamics (a prototype under evaluation).
+    pub fn set_follower_lod(&mut self, on: bool) {
+        self.world.set_follower_lod(on);
+    }
+
+    /// Debug-only clean per-tick bench: run `n` bare `world.step()`s (no demand,
+    /// no render, no catch-up budget) and return total elapsed ms — the honest
+    /// per-tick cost, unconfounded by the frame catch-up loop. Native uses
+    /// Instant; the browser uses `performance.now()` on the worker thread.
+    pub fn debug_bench_steps(&mut self, n: u32) -> f64 {
+        let start = now_ms();
+        for _ in 0..n {
+            self.world.step();
+        }
+        now_ms() - start
+    }
+
+    /// Debug-only: set an exact shard count (0/1 = classic) for the threads
+    /// sweep, bypassing the boolean UI control.
+    pub fn debug_set_shard_count(&mut self, count: usize) {
+        self.world.set_sharding(count);
+    }
+
+    /// Debug-only: the current parallel-dispatch threshold, so the sweep can
+    /// confirm the fleet is above it (else the threaded arms run serial).
+    pub fn debug_par_threshold(&self) -> u32 {
+        self.world.par_threshold() as u32
+    }
+
+    /// Debug-only: per-shard gather (true) vs work-stealing index chunks (false)
+    /// when sharded. Resolve stays sharded either way.
+    pub fn debug_set_shard_accel(&mut self, on: bool) {
+        self.world.set_shard_accel(on);
+    }
+
+    /// Last tick's per-shard work snapshot, flattened `[cars, deferred,
+    /// accel_us, resolve_us]` per shard; empty when unsharded (timings 0 in
+    /// the browser — its worker threads have no clock).
+    pub fn shard_stats(&self) -> Vec<u32> {
+        self.world.shard_stats().iter().flat_map(|r| r.iter().copied()).collect()
     }
 
     /// Toggle the cache-friendly per-lane/per-corridor sort (a flat position-key array instead

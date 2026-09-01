@@ -221,3 +221,29 @@ impl<T> SyncSlice<T> {
         unsafe { &mut *self.0.add(i) }
     }
 }
+
+/// Reusable per-shard parallel region — the primitive the tick pipeline moves
+/// work into (Amdahl: anything a shard can compute over its owned cars/nodes
+/// belongs here, off the serial path). Runs `f(shard_index, roster)` for every
+/// shard, in parallel on the shared pool under the `parallel` feature and in
+/// shard order without it; the closure reads any committed state and returns a
+/// per-shard result, merged by the caller (the well-defined sync point). Pure
+/// by contract — no shard writes another shard's owned state — so the parallel
+/// and serial executions are equivalent.
+#[cfg(feature = "parallel")]
+pub(super) fn shard_map<T, F>(rosters: &[Vec<u32>], f: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(usize, &[u32]) -> T + Sync,
+{
+    use rayon::prelude::*;
+    rosters.par_iter().enumerate().map(|(s, r)| f(s, r)).collect()
+}
+
+#[cfg(not(feature = "parallel"))]
+pub(super) fn shard_map<T, F>(rosters: &[Vec<u32>], f: F) -> Vec<T>
+where
+    F: Fn(usize, &[u32]) -> T,
+{
+    rosters.iter().enumerate().map(|(s, r)| f(s, r)).collect()
+}

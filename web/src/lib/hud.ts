@@ -33,6 +33,8 @@ export type Stats = {
   idleSkipped: number;
   linksQueued: number;
   waiting: number;
+  /** Per-shard `[cars, deferred, accelUs, resolveUs]` rows, flattened; only while the toggle is on. */
+  shards?: number[] | null;
 };
 
 // The stats overlay, one metric per line; the clock leads when the sim reports a
@@ -43,7 +45,21 @@ export function statsLines(s: Stats): string[] {
   if (s.idleSkipped > 0) lines.push(`${s.idleSkipped} idle-skipped`);
   if (s.linksQueued > 0) lines.push(`${s.linksQueued} links queued`);
   if (s.waiting > 0) lines.push(`${s.waiting} waiting to enter`);
+  if (s.shards && s.shards.length >= 4) lines.push(...shardLines(s.shards));
   return lines;
+}
+
+// One compact line per shard thread: its car count, boundary-deferred count, and
+// (native only — the browser's worker threads have no clock) the fused-pass and
+// resolve-span times. The imbalance between rows is the point of the display.
+export function shardLines(flat: number[]): string[] {
+  const out: string[] = [];
+  for (let s = 0; s + 3 < flat.length; s += 4) {
+    const [cars, deferred, accelUs, resolveUs] = [flat[s], flat[s + 1], flat[s + 2], flat[s + 3]];
+    const t = accelUs + resolveUs > 0 ? ` · ${((accelUs + resolveUs) / 1000).toFixed(1)}ms` : "";
+    out.push(`shard ${s / 4}: ${cars} cars · ${deferred} at nodes${t}`);
+  }
+  return out;
 }
 
 // Fractional hour → "HH:MM" wall-clock text.
