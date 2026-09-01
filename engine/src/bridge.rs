@@ -964,6 +964,13 @@ impl Simulation {
         self.world.set_sharding(if on { 8 } else { 0 });
     }
 
+    /// Toggle the overlapped reroute cycle: flow-field solves run on a
+    /// background pool task instead of amortized inside the tick (threads
+    /// backend only; a no-op elsewhere).
+    pub fn set_async_routing(&mut self, on: bool) {
+        self.world.set_async_routing(on);
+    }
+
     /// Toggle the cache-friendly per-lane/per-corridor sort (a flat position-key array instead
     /// of reading a vehicle row per comparison). On by default; a display-neutral performance
     /// option — the simulation result is identical either way.

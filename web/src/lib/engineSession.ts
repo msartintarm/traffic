@@ -367,6 +367,7 @@ export async function startEngineSession(
       case "targetedRouting": sim.set_targeted_routing?.(c.value); break;
       case "localitySort": sim.set_locality_sort?.(c.value); break;
       case "sharding": sim.set_sharding?.(c.value); break;
+      case "asyncRouting": sim.set_async_routing?.(c.value); break;
       case "warmup": {
         sim.begin_warmup?.(c.seconds);
         // Old builds without pump_warmup fall back to the RAF-driven path.

@@ -376,6 +376,12 @@ impl FieldRouter {
     }
 
     /// The destinations this router routes to.
+    /// The predecessor graph the field solves walk (reverse adjacency) — an
+    /// external/overlapped solver runs `flowfield::distances_to_with` on it.
+    pub fn pred(&self) -> &[Vec<u32>] {
+        &self.pred
+    }
+
     pub fn destinations(&self) -> &[LinkId] {
         &self.dests
     }

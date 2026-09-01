@@ -135,6 +135,7 @@ export default function EngineCanvas() {
   const [targetedRouting, setTargetedRouting] = useState(true); // targeted route refresh, on by default (see net_world default)
   const [localitySort, setLocalitySort] = useState(false); // fleet memory-locality reorder, off by default (see net_world default)
   const [sharding, setSharding] = useState(true); // sharded (SPMD) execution, on by default; `?shard=0` (splash toggle) opts out
+  const [asyncRouting, setAsyncRouting] = useState(true); // background reroute solves, on by default (threads backend only)
   const [startSpeedMps, setStartSpeedMps] = useState(36); // ≥ every road limit ⇒ "enter at limit"
   const [units, setUnits] = useState<"mi" | "km">("mi");
   const unitsRef = useRef<"mi" | "km">("mi"); // read inside the per-frame HUD update (avoids stale closure)
@@ -359,6 +360,7 @@ export default function EngineCanvas() {
             const shard = params.get("shard") !== "0";
             setSharding(shard);
             if (shard) sessionRef.current?.applyControl({ type: "sharding", value: true });
+            sessionRef.current?.applyControl({ type: "asyncRouting", value: true });
             // `?warmup=1` (settable from the splash) pre-populates on load.
             if (params.get("warmup") === "1") {
               sessionRef.current?.applyControl({ type: "warmup", seconds: 3600 });
@@ -908,6 +910,21 @@ export default function EngineCanvas() {
                 }}
               />
               Sharded intersections
+            </label>
+            <label
+              className={styles.zoomLabel}
+              title="Solve rerouting flow-fields on a spare CPU core in the background instead of spreading the work across simulation ticks — routes update when a solve lands. Only active on the threads compute backend. On by default."
+            >
+              <input
+                type="checkbox"
+                checked={asyncRouting}
+                disabled={!ready}
+                onChange={(e) => {
+                  sessionRef.current?.applyControl({ type: "asyncRouting", value: e.target.checked });
+                  setAsyncRouting(e.target.checked);
+                }}
+              />
+              Background rerouting
             </label>
             <label
               className={styles.zoomLabel}

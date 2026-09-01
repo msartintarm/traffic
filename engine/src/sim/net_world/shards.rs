@@ -155,27 +155,48 @@ impl ShardMaps {
 }
 
 /// A shard task's window onto the fleet: write only rows the shard owns. This
-/// is the seam Option C swaps — under separate memories the deref becomes a
-/// per-region row store (plus replicated ghosts for any read-only foreign
-/// access a phase declares), and the phase code above it does not change.
+/// is the seam Option C swaps, and both backends exist today:
 ///
-/// Soundness of the aliasing: writes go only to roster-owned indices (each
-/// fleet index is in exactly one shard's roster), so no row is ever accessed
-/// by two tasks.
-pub(super) struct ShardView<'a>(pub(super) &'a mut [NetVehicle]);
+/// - `Shared` — one fleet buffer, all threads share memory (Option A). The
+///   deref is a raw index.
+/// - `Regions` — each shard's rows live in a private buffer, indexed through a
+///   global→(shard, slot) map (Option C's dry-run: the SPMD span runs with the
+///   regions genuinely unable to see each other's rows, proving no phase
+///   smuggles a foreign access; the copy-in/merge-out around it is exactly the
+///   migration a real worker-per-region split performs over the wire).
+///
+/// Soundness of the aliasing in both: writes go only to roster-owned indices
+/// (each fleet index is in exactly one shard's roster), so no row is ever
+/// accessed by two tasks.
+pub(super) enum ShardView<'a> {
+    Shared(&'a mut [NetVehicle]),
+    Regions { bufs: Vec<*mut NetVehicle>, index: &'a [(u32, u32)] },
+}
 
 unsafe impl Sync for ShardView<'_> {}
+unsafe impl Send for ShardView<'_> {}
 
-impl ShardView<'_> {
+impl<'a> ShardView<'a> {
+    /// Region-isolated backend over per-shard buffers (`index` maps a global
+    /// fleet index to its shard and slot).
+    pub(super) fn regions(buffers: &'a mut [Vec<NetVehicle>], index: &'a [(u32, u32)]) -> Self {
+        Self::Regions { bufs: buffers.iter_mut().map(|b| b.as_mut_ptr()).collect(), index }
+    }
+
     /// Mutable access to a row this shard owns.
     ///
     /// # Safety
     /// `i` must be owned by the calling shard's roster this tick.
     #[allow(clippy::mut_from_ref)]
     pub(super) unsafe fn row(&self, i: usize) -> &mut NetVehicle {
-        unsafe { &mut *(self.0.as_ptr().add(i) as *mut NetVehicle) }
+        match self {
+            Self::Shared(rows) => unsafe { &mut *(rows.as_ptr().add(i) as *mut NetVehicle) },
+            Self::Regions { bufs, index } => {
+                let (s, l) = index[i];
+                unsafe { &mut *bufs[s as usize].add(l as usize) }
+            }
+        }
     }
-
 }
 
 /// Disjoint per-index `&mut` access to a slice from simultaneously running

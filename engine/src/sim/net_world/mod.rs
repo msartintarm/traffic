@@ -113,6 +113,22 @@ pub struct NetWorld {
     /// Spatial shards for the boundary-resolution phase (None = classic serial
     /// path, bit-identical to the unsharded engine). See [`shards::Sharding`].
     sharding: Option<Sharding>,
+    /// Option C dry-run: run the SPMD span on per-region row copies (see
+    /// `ShardView::Regions`). Validation mode — costs two row copies per tick.
+    region_isolation: bool,
+    /// Option B: overlap the flow-field recompute on one background pool task
+    /// — a heterogeneous core solving routes while ticks run on the rest —
+    /// publishing generation-guarded when it lands. Threads backend only;
+    /// falls back to the amortized in-tick recompute otherwise.
+    async_routing: bool,
+    /// Bumped on every router (re)install so a background solve dispatched
+    /// against a replaced router is collected but never published.
+    router_generation: u64,
+    route_async_cycles: u32,
+    #[cfg(feature = "parallel")]
+    route_pred: Option<std::sync::Arc<Vec<Vec<u32>>>>,
+    #[cfg(feature = "parallel")]
+    route_job: Option<RouteJob>,
     /// Persistent per-shard occupancy scratch + shard rosters (index lists),
     /// reused across ticks so sharded resolution allocates nothing steady-state.
     shard_maps: Vec<shards::ShardMaps>,
@@ -363,6 +379,17 @@ pub const MAX_CRASH_SITES: usize = 8192;
 /// `n < threshold` (rayon overhead isn't worth it below the crossover). Order-preserving
 /// on every backend, so the collected result is bit-for-bit the serial one — the
 /// per-vehicle passes it drives read only committed pre-step state.
+/// An in-flight background flow-field solve (see `refresh_routes_async`):
+/// the cost snapshot it solves against, and the channel its distances land on.
+#[cfg(feature = "parallel")]
+struct RouteJob {
+    generation: u64,
+    costs: Vec<u64>,
+    /// Mutex only to keep `NetWorld: Sync` (mpsc receivers aren't) — it is
+    /// only ever locked from `&mut self` polling, never contended.
+    rx: std::sync::Mutex<std::sync::mpsc::Receiver<Vec<Vec<u64>>>>,
+}
+
 fn map_collect<T, F>(backend: AccelBackend, threshold: usize, n: usize, f: F) -> Vec<T>
 where
     T: Send,
@@ -1017,7 +1044,11 @@ impl NetWorld {
             control_aware_routing: true, lane_eval_stagger: true, arterial_routing: false,
             targeted_routing: true, dest_entries: HashMap::new(), locality_sort: false,
             nb_pool: Neighbors::default(), lc_groups: GroupMap::default(), corridor_groups: GroupMap::default(), crash_groups: GroupMap::default(),
-            kinematics_enabled: true, sharding: None, shard_maps: Vec::new(), shard_rosters: Vec::new(), crashed_by: [0; 2], crash_log: Vec::new(),
+            kinematics_enabled: true, sharding: None, region_isolation: false, async_routing: false, router_generation: 0, route_async_cycles: 0,
+            #[cfg(feature = "parallel")]
+            route_pred: None,
+            #[cfg(feature = "parallel")]
+            route_job: None, shard_maps: Vec::new(), shard_rosters: Vec::new(), crashed_by: [0; 2], crash_log: Vec::new(),
             merges, link_straight, turn_caps, merge_feeder_lane, through_next, corridor_of, corridor_offset, seam_primary, signals, link_entries, router: None, external_reroute: false,
             meters: Vec::new(), metering_on: false, day_secs: 0.0, pm_plan: false, rail_preempts,
             timetable: rail::Timetable::default(), crossing_sets: HashMap::new(), weekend: false, day_rate: 1.0,
@@ -1197,6 +1228,12 @@ impl NetWorld {
             self.network.links.iter().map(|l| !matches!(l.kind, crate::sim::network::RoadKind::Local)).collect()
         });
         self.router = Some(FieldRouter::new_with_trunk(&self.network, dests, &costs, trunk));
+        self.router_generation = self.router_generation.wrapping_add(1);
+        #[cfg(feature = "parallel")]
+        {
+            self.route_pred = None;
+            self.route_job = None;
+        }
     }
 
     /// Toggle stop/yield control delay in routing costs; takes effect on the next
@@ -1236,6 +1273,12 @@ impl NetWorld {
     /// the fleet ordered by (shard, lane, position) every tick so each shard
     /// owns a contiguous slice; resolution order (and thus same-tick
     /// tie-breaks) follows that order, deterministically.
+    /// Option C dry-run: run the sharded span on per-region row copies with a
+    /// copy-in/merge-out exchange, proving the isolation contract end-to-end.
+    pub fn set_region_isolation(&mut self, on: bool) {
+        self.region_isolation = on;
+    }
+
     pub fn set_sharding(&mut self, count: usize) {
         self.sharding = (count > 1).then(|| Sharding::build(&self.network, count));
     }
@@ -2940,6 +2983,11 @@ impl NetWorld {
         if self.router.is_none() || self.external_reroute {
             return;
         }
+        #[cfg(feature = "parallel")]
+        if self.async_routing && matches!(self.active_backend(), AccelBackend::Threads) {
+            self.refresh_routes_async();
+            return;
+        }
         // Recompute routing only when the cost landscape actually moves. The fields from
         // `install_router` are optimal for free-flow; while traffic stays light or static the
         // congestion fingerprint doesn't change, so we skip the O(links) rebuild entirely —
@@ -2979,6 +3027,72 @@ impl NetWorld {
         if let Some(r) = self.router.as_mut() {
             r.advance_recompute(ROUTE_SETTLE_BUDGET);
         }
+    }
+
+    /// The overlapped reroute cycle (Option B — see the `shards` module's phase
+    /// table: `refresh_routes` reads committed state and writes only router
+    /// tables, so the whole solve can leave the tick). Dispatch snapshots the
+    /// live link costs and hands every destination's field solve to one
+    /// `rayon::spawn` task on the shared pool; each tick merely polls the
+    /// channel and, when the batch lands, publishes it — unless the router was
+    /// reinstalled since dispatch (generation guard, the same discipline as
+    /// the GPU readback path). Routes lag congestion by the solve time instead
+    /// of by the amortized in-tick budget — the same staleness the sync path
+    /// already accepts, without its per-tick cost.
+    #[cfg(feature = "parallel")]
+    fn refresh_routes_async(&mut self) {
+        let polled = self.route_job.as_ref().map(|job| job.rx.lock().expect("uncontended").try_recv());
+        match polled {
+            Some(Ok(dists)) => {
+                let job = self.route_job.take().expect("just polled");
+                if job.generation == self.router_generation {
+                    if let Some(r) = self.router.as_mut() {
+                        r.recompute_from_distances(&job.costs, &dists);
+                        self.route_async_cycles = self.route_async_cycles.wrapping_add(1);
+                    }
+                }
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => self.route_job = None,
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => {}
+        }
+        if self.route_job.is_some() {
+            return;
+        }
+        let fp = self.congestion_fingerprint();
+        let interval_ticks = (REROUTE_INTERVAL_SECS / self.cfg.dt).max(1.0) as u64;
+        if fp == self.route_fingerprint || self.tick.saturating_sub(self.route_cycle_tick) < interval_ticks {
+            return;
+        }
+        self.route_fingerprint = fp;
+        self.route_cycle_tick = self.tick;
+        let router = self.router.as_ref().expect("gated by caller");
+        let pred = self
+            .route_pred
+            .get_or_insert_with(|| std::sync::Arc::new(router.pred().to_vec()))
+            .clone();
+        let dests: Vec<LinkId> = router.dests_in_slot_order().to_vec();
+        let costs = self.live_link_costs();
+        let task_costs = costs.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        rayon::spawn(move || {
+            let dists: Vec<Vec<u64>> = dests
+                .iter()
+                .map(|&d| crate::sim::flowfield::distances_to_with(&pred, d, &task_costs))
+                .collect();
+            let _ = tx.send(dists);
+        });
+        self.route_job = Some(RouteJob { generation: self.router_generation, costs, rx: std::sync::Mutex::new(rx) });
+    }
+
+    /// Background reroute cycles published so far (observability for tests
+    /// and diagnostics; only advances in async mode).
+    pub fn route_async_cycles(&self) -> u32 {
+        self.route_async_cycles
+    }
+
+    /// Toggle the overlapped reroute cycle (no-op without the threads pool).
+    pub fn set_async_routing(&mut self, on: bool) {
+        self.async_routing = on;
     }
 
 
@@ -4202,11 +4316,67 @@ impl NetWorld {
             }
         }
 
-        let rows = shards::ShardView(taken);
-        let rows = &rows;
+        // Phases 2+3 run through a `ShardView` in one of its two backends. The
+        // `Regions` path is Option C's dry-run: each shard's rows are copied
+        // into a private buffer (the future migration payload), the span runs
+        // with regions genuinely unable to reach each other's rows, and the
+        // merge-back below is the return leg of the exchange.
+        let spans = if self.region_isolation {
+            let mut index = vec![(0u32, 0u32); n];
+            let mut bufs: Vec<Vec<NetVehicle>> = rosters
+                .iter()
+                .enumerate()
+                .map(|(s, roster)| {
+                    roster
+                        .iter()
+                        .enumerate()
+                        .map(|(l, &iu)| {
+                            index[iu as usize] = (s as u32, l as u32);
+                            taken[iu as usize].clone()
+                        })
+                        .collect()
+                })
+                .collect();
+            let view = shards::ShardView::regions(&mut bufs, &index);
+            let spans = self.run_shard_span(&view, maps, rosters, accels, block_entry, intended_mv, dt);
+            for (roster, buf) in rosters.iter().zip(&bufs) {
+                for (&iu, row) in roster.iter().zip(buf) {
+                    taken[iu as usize] = row.clone();
+                }
+            }
+            spans
+        } else {
+            let view = shards::ShardView::Shared(taken);
+            self.run_shard_span(&view, maps, rosters, accels, block_entry, intended_mv, dt)
+        };
 
-        // Phases 2+3, fused: one task per shard, each touching only rows and
-        // maps its shard owns (`ShardView` writes are roster-disjoint).
+        // The exchange point: every cross-shard effect of this tick flows
+        // through here (and, under a future worker-per-region split, over the
+        // wire) — per-shard fates scattered into the global vec in shard-major
+        // order, deterministically.
+        let mut fates = vec![Fate::Alive; n];
+        for (deferred, shard_fates) in &spans {
+            for (&i, &f) in deferred.iter().zip(shard_fates) {
+                fates[i as usize] = f;
+            }
+        }
+        fates
+    }
+
+    /// One fused integrate+resolve task per shard over `view` (see
+    /// [`step_spmd`](Self::step_spmd)); returns each shard's deferred indices
+    /// paired with their fates.
+    #[allow(clippy::too_many_arguments)]
+    fn run_shard_span(
+        &self,
+        rows: &shards::ShardView,
+        maps: &mut [shards::ShardMaps],
+        rosters: &[Vec<u32>],
+        accels: &[f64],
+        block_entry: &[bool],
+        intended_mv: &[Option<MovementId>],
+        dt: f64,
+    ) -> Vec<(Vec<u32>, Vec<Fate>)> {
         struct Task<'a> {
             m: &'a mut shards::ShardMaps,
             roster: &'a [u32],
@@ -4260,18 +4430,7 @@ impl NetWorld {
         }
         #[cfg(not(feature = "parallel"))]
         tasks.iter_mut().for_each(run);
-
-        // The exchange point: every cross-shard effect of this tick flows
-        // through here (and, under a future worker-per-region split, over the
-        // wire) — per-shard fates scattered into the global vec in shard-major
-        // order, deterministically.
-        let mut fates = vec![Fate::Alive; n];
-        for t in &tasks {
-            for (&i, &f) in t.deferred.iter().zip(&t.fates) {
-                fates[i as usize] = f;
-            }
-        }
-        fates
+        tasks.into_iter().map(|t| (t.deferred, t.fates)).collect()
     }
 
     /// Detect this tick's collisions on the fully-advanced positions, before assembly
@@ -9589,8 +9748,13 @@ mod tests {
     }
 
     fn run_sharded(shards: usize, ticks: u32) -> Vec<(u32, u32, u64, u64)> {
+        run_sharded_with(shards, ticks, false)
+    }
+
+    fn run_sharded_with(shards: usize, ticks: u32, region_isolation: bool) -> Vec<(u32, u32, u64, u64)> {
         let mut w = NetWorld::new(sharded_grid().build(), cfg());
         w.set_sharding(shards);
+        w.set_region_isolation(region_isolation);
         let entries: Vec<LinkId> = (0..w.network.links.len() as u32)
             .map(LinkId)
             .filter(|&l| {
@@ -9638,6 +9802,63 @@ mod tests {
         assert!(!a.is_empty() && !classic.is_empty(), "both modes carry traffic");
         let (na, nc) = (a.len() as f64, classic.len() as f64);
         assert!((na - nc).abs() / nc.max(1.0) < 0.4, "sharded fleet size in family with classic ({na} vs {nc})");
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn async_routing_publishes_background_solves() {
+        // Option B: with the overlap enabled, a congestion change must
+        // eventually be solved on the background task and published — the
+        // router keeps routing throughout, and at least one async cycle lands.
+        let mut w = NetWorld::new(sharded_grid().build(), cfg());
+        w.set_accel_backend(AccelBackend::Threads);
+        w.set_async_routing(true);
+        let entries: Vec<LinkId> = (0..w.network.links.len() as u32)
+            .map(LinkId)
+            .filter(|&l| {
+                let lk = w.network.link(l);
+                w.network.node(lk.from).position[0].abs() >= 300.0 || w.network.node(lk.from).position[1].abs() >= 300.0
+            })
+            .collect();
+        w.install_router(&entries);
+        let mut next = 900u32;
+        for t in 0..2000u32 {
+            if t % 5 == 0 && next < 1000 {
+                let e = entries[(t as usize / 5) % entries.len()];
+                let d = entries[(t as usize / 5 + 2) % entries.len()];
+                w.spawn_to(next, e, d, 8.0, DriverConfig::car().sample(3, next));
+                next += 1;
+            }
+            if t % 40 == 10 {
+                // A light test fleet may never trip the congestion fingerprint
+                // on its own; poke it so a cycle is due (same lever the
+                // control-aware toggle uses).
+                w.route_fingerprint = u64::MAX;
+            }
+            w.step();
+            if w.route_async_cycles() > 0 {
+                break;
+            }
+            if t % 50 == 49 {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        assert!(w.route_async_cycles() > 0, "a background reroute cycle landed");
+        assert!(w.router.as_ref().is_some_and(|r| r.destination_count() > 0));
+    }
+
+    #[test]
+    fn spmd_region_isolation_contract_holds() {
+        // Option C's dry-run: the same run on the `Regions` ShardView backend —
+        // each shard working a private copy of exactly its own rows, merged
+        // back through the exchange — must agree with the shared-memory
+        // backend. This is a *contract* test, not a scheduling golden:
+        // within-shard execution is sequential under both backends, so any
+        // disagreement means a phase reached a foreign row through shared
+        // memory (the thing a real worker-per-region split cannot allow).
+        let shared = run_sharded_with(4, 600, false);
+        let regions = run_sharded_with(4, 600, true);
+        assert_eq!(shared, regions, "region-isolated execution matches shared memory");
     }
 
     #[test]

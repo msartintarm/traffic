@@ -41,6 +41,7 @@ export type Control =
   | { type: "targetedRouting"; value: boolean }
   | { type: "localitySort"; value: boolean }
   | { type: "sharding"; value: boolean }
+  | { type: "asyncRouting"; value: boolean }
   | { type: "warmup"; seconds: number }
   | { type: "showCrashes"; value: boolean }
   | { type: "clearCrashes" }
@@ -65,7 +66,7 @@ export type ControlType = Control["type"];
 
 export const CONTROL_TYPES: ReadonlySet<ControlType> = new Set([
   "speed", "demandRate", "rushHour", "dayCompression", "rampMetering", "sleepScheduler",
-  "parThreshold", "parallelRouting", "cacheSort", "stopCostRouting", "laneEvalStagger", "arterialRouting", "targetedRouting", "localitySort", "sharding", "warmup",
+  "parThreshold", "parallelRouting", "cacheSort", "stopCostRouting", "laneEvalStagger", "arterialRouting", "targetedRouting", "localitySort", "sharding", "asyncRouting", "warmup",
   "showCrashes", "clearCrashes", "entrySpeedCap", "congestionEngage", "congestionEnabled",
   "demandSources", "fit", "metersPerPixel", "zoomAt", "panBy", "resize", "select",
   "hover", "play", "pause", "frameBudget", "ascii", "transit",
