@@ -10,6 +10,20 @@
 
 use super::signal::{SignalProgram, SignalState};
 
+/// Parallel `(0..n).map(f).collect()` when the `parallel` feature is on, serial
+/// otherwise — for the embarrassingly-parallel per-movement / per-link geometry
+/// build passes (each element independent, read-only against `&self`). Keeps the
+/// whole-city map build off the multi-second serial critical path.
+#[cfg(feature = "parallel")]
+pub(crate) fn pmap<T: Send, F: Fn(usize) -> T + Sync + Send>(n: usize, f: F) -> Vec<T> {
+    use rayon::prelude::*;
+    (0..n).into_par_iter().map(f).collect()
+}
+#[cfg(not(feature = "parallel"))]
+pub(crate) fn pmap<T, F: Fn(usize) -> T>(n: usize, f: F) -> Vec<T> {
+    (0..n).map(f).collect()
+}
+
 macro_rules! index_type {
     ($name:ident) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -875,8 +889,8 @@ impl Network {
     /// depart to different links, and their interior paths pass within a lane
     /// width of each other — a genuine crossing, not a merge or a diverge.
     pub fn build_interiors(&mut self) {
-        let built: Vec<(Interior, bool)> = (0..self.movements.len() as u32)
-            .map(|m| {
+        let built: Vec<(Interior, bool)> = pmap(self.movements.len(), |m| {
+                let m = m as u32;
                 let mv = self.movement(MovementId(m));
                 let entry_p = self.lane_point(mv.from_lane, self.lane(mv.from_lane).length);
                 let exit_p = self.lane_point(mv.to_lane, 0.0);
@@ -994,12 +1008,11 @@ impl Network {
                     return straight();
                 }
                 (it, false)
-            })
-            .collect();
+            });
         (self.interiors, self.straight_seams) = built.into_iter().unzip();
 
-        let polys: Vec<Vec<([f64; 2], f64)>> = self.interiors.iter().map(interior_polyline).collect();
-        let bboxes: Vec<[f64; 4]> = polys.iter().map(|p| poly_bbox(p)).collect();
+        let polys: Vec<Vec<([f64; 2], f64)>> = pmap(self.interiors.len(), |i| interior_polyline(&self.interiors[i]));
+        let bboxes: Vec<[f64; 4]> = pmap(polys.len(), |i| poly_bbox(&polys[i]));
         // Only movements sharing a node can cross, so group by node and pair within
         // each node — O(Σ node_movements²) instead of O(movements²), which is what
         // lets a whole-city map build in reasonable time.

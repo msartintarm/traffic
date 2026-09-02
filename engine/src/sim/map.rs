@@ -2570,7 +2570,7 @@ fn set_junction_setbacks(net: &mut Network) {
     // no stop bar: the ramp peels off the mainline edge. Collapse its box so the
     // carriageways run together instead of pulling back into an intersection-like
     // gap, keeping only a hairline setback for numerical safety.
-    let interchange: Vec<bool> = (0..net.nodes.len()).map(|n| net.is_interchange_node(NodeId(n as u32))).collect();
+    let interchange: Vec<bool> = crate::sim::network::pmap(net.nodes.len(), |n| net.is_interchange_node(NodeId(n as u32)));
     for n in 0..net.nodes.len() {
         if interchange[n] {
             box_r[n] = box_r[n].min(0.5);
@@ -2581,7 +2581,7 @@ fn set_junction_setbacks(net: &mut Network) {
     // bands below (and every later consumer) see the road's real stop-line direction.
     net.build_end_dirs();
 
-    let full_len: Vec<f64> = net.polylines.iter().map(|p| p.windows(2).map(|w| distance(w[0], w[1])).sum()).collect();
+    let full_len: Vec<f64> = crate::sim::network::pmap(net.polylines.len(), |i| net.polylines[i].windows(2).map(|w| distance(w[0], w[1])).sum());
     let n = net.nodes.len();
 
     // Cluster nodes exactly as `build_junctions` will (short internal links between
