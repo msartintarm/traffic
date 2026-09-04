@@ -137,7 +137,7 @@ export default function EngineCanvas() {
   const [sharding, setSharding] = useState(true); // sharded (SPMD) execution, on by default; `?shard=0` (splash toggle) opts out
   const [asyncRouting, setAsyncRouting] = useState(true); // background reroute solves, on by default (threads backend only)
   const [followerLod, setFollowerLod] = useState(false); // front-of-lane LOD toggle; measured ~0% runtime benefit on SF, so off by default (deadlock now fixed, so safe if wanted)
-  const [localRouting, setLocalRouting] = useState(true); // per-driver bounded-search routing, default on (map-size-independent, congestion-aware, faster than the field)
+  const [localRouting, setLocalRouting] = useState(true); // per-driver bounded-search routing, default on (map-size-independent, measured faster than the field)
   const [shardStats, setShardStats] = useState(false); // per-thread work rows in the diagnostics overlay
   const [startSpeedMps, setStartSpeedMps] = useState(36); // ≥ every road limit ⇒ "enter at limit"
   const [units, setUnits] = useState<"mi" | "km">("mi");
@@ -365,9 +365,11 @@ export default function EngineCanvas() {
             setSharding(shard);
             if (shard) sessionRef.current?.applyControl({ type: "sharding", value: true });
             sessionRef.current?.applyControl({ type: "asyncRouting", value: true });
-            if (params.get("localrouting") !== "0") {
-              sessionRef.current?.applyControl({ type: "localRouting", value: true });
-            } else {
+            // Local routing is the boot default (set in the engine before the
+            // router install, so no flow-field is built). Only opt OUT to the
+            // global field router here; the default needs no control message.
+            if (params.get("localrouting") === "0") {
+              sessionRef.current?.applyControl({ type: "localRouting", value: false });
               setLocalRouting(false);
             }
             // `?warmup=1` (settable from the splash) pre-populates on load.

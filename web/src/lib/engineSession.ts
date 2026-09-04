@@ -85,6 +85,38 @@ async function fingerprint(basePath: string, dir: string): Promise<string> {
   return "";
 }
 
+// Per-map shared-memory ceiling. A shared WebAssembly.Memory reserves its full `maximum`
+// up front, so a one-size-fits-all ceiling forces small maps to carry big-map memory
+// pressure (measurably slower — a fixed 2 GiB ceiling regressed SF). With --import-memory
+// the threads build lets JS create the memory, so size its `maximum` to the map instead.
+// The uncompressed map JSON byte count is a strong proxy for the network size that drives
+// peak memory (graph + render mesh + routing). Linear fit through two measured anchors:
+// SF (~6.55 MB JSON) runs fast at 1.5 GiB, Columbus (~31.8 MB JSON) needs ~2 GiB to boot.
+// Only maps that need the headroom get it; SF and smaller stay at their lighter, faster
+// ceiling. The module is built with a 2 GiB declared ceiling purely so this may request up
+// to that; the reservation is whatever this returns. Falls back to the prior fixed 1.5 GiB
+// when the size can't be read (a HEAD failure), which keeps SF-class maps fast and lets a
+// larger map degrade to the single-threaded build if it then overruns.
+async function threadsMemory(config: InitConfig): Promise<WebAssembly.Memory | undefined> {
+  const GiB = 1024 * 1024 * 1024;
+  const PAGE = 65536;
+  let bytes = 1.5 * GiB;
+  const file = REAL_MAPS[config.scenario]?.file;
+  if (file) {
+    try {
+      const r = await fetch(`${config.basePath}/${file}`, { method: "HEAD", cache: "no-store" });
+      const len = Number(r.headers.get("content-length"));
+      if (r.ok && Number.isFinite(len) && len > 0) bytes = 1_471_000_000 + 21.3 * len;
+    } catch {}
+  }
+  bytes = Math.min(2 * GiB, Math.max(GiB, bytes));
+  try {
+    return new WebAssembly.Memory({ initial: 24, maximum: Math.ceil(bytes / PAGE), shared: true });
+  } catch {
+    return undefined; // let the glue create its default if the browser rejects these limits
+  }
+}
+
 async function loadEngine(config: InitConfig): Promise<{ mod: EngineModule; threadsReady: boolean }> {
   const wantThreads = config.compute === "threads";
   const isolated = !!globalThis.crossOriginIsolated;
@@ -92,7 +124,8 @@ async function loadEngine(config: InitConfig): Promise<{ mod: EngineModule; thre
     try {
       const q = await fingerprint(config.basePath, "wasm-pkg-threads");
       const t = (await import(/* webpackIgnore: true */ `${config.basePath}/wasm-pkg-threads/engine.js${q}`)) as ThreadedEngineModule;
-      await t.default({ module_or_path: `${config.basePath}/wasm-pkg-threads/engine_bg.wasm${q}` });
+      const memory = await threadsMemory(config);
+      await t.default({ module_or_path: `${config.basePath}/wasm-pkg-threads/engine_bg.wasm${q}`, memory });
       // Bound the pool init so a build whose workers can't boot degrades instead of hanging.
       await Promise.race([
         t.initThreadPool(navigator.hardwareConcurrency || 4),

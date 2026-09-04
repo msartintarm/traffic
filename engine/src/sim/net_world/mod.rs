@@ -240,6 +240,11 @@ pub struct NetWorld {
     /// merges, diverges, lane-drops, and at-grade nodes.
     corridor_of: Vec<u32>,
     corridor_offset: Vec<f64>,
+    /// `approach_key_of[lane]` = the intersection key of the lane's downstream node,
+    /// precomputed (pure topology). The per-tick neighbor grouping hits this once
+    /// per non-crossing car instead of chasing lane → link → to-node →
+    /// `intersection_key` (three scattered reads) in the hottest serial loop.
+    approach_key_of: Vec<u32>,
     /// Per-movement: a continuation seam taken by its exit link's *through approach* —
     /// the freeway mainline at a merge, the ramp itself on a ramp-to-ramp chain. These
     /// cross ungated like corridor seams (a freeway never brake-checks at a segment
@@ -1018,6 +1023,12 @@ impl NetWorld {
                 });
             }
         }
+        let approach_key_of: Vec<u32> = (0..network.lanes.len())
+            .map(|l| {
+                let node = network.link(network.lane(LaneId(l as u32)).link).to;
+                network.intersection_key(node)
+            })
+            .collect();
 
         // Per-link straightness: does the tightest curve anywhere on the link still allow
         // its speed limit? If so, a car on it is never curve-limited, so the free-car path
@@ -1102,18 +1113,30 @@ impl NetWorld {
         let link_entries = vec![0u32; network.links.len()];
         let junctions = Junctions::build(&network);
         let congestion = CongestionLod::new(network.links.len());
+        // Direct-indexed grouping for the full-fleet per-tick maps (keys are dense
+        // ids: lane, corridor, intersection node). Skips the hash in the hottest
+        // serial loop; buckets are allocated once here and reused across ticks.
+        let (n_lanes, n_corr, n_nodes) = (network.lanes.len(), next_corridor as usize, network.nodes.len());
+        let mut nb_pool = Neighbors::default();
+        nb_pool.by_lane.reserve_dense(n_lanes);
+        nb_pool.by_corridor.reserve_dense(n_corr);
+        nb_pool.approaching.reserve_dense(n_nodes);
+        let mut lc_groups = GroupMap::default();
+        lc_groups.reserve_dense(n_lanes);
+        let mut corridor_groups = GroupMap::default();
+        corridor_groups.reserve_dense(n_corr);
         Self {
             network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0, divergences: 0,
             control_aware_routing: true, lane_eval_stagger: true, arterial_routing: false,
             targeted_routing: true, dest_entries: HashMap::new(), locality_sort: false,
-            nb_pool: Neighbors::default(), lc_groups: GroupMap::default(), corridor_groups: GroupMap::default(), crash_groups: GroupMap::default(),
+            nb_pool, lc_groups, corridor_groups, crash_groups: GroupMap::default(),
             kinematics_enabled: true, defer_kinematics: false, sharding: None, region_isolation: false, follower_lod: false, shard_accel: false, async_routing: false, router_generation: 0, route_async_cycles: 0,
             approach_ctx: IntMap::default(), standing_pose: IntMap::default(), shard_stats: Vec::new(),
             #[cfg(feature = "parallel")]
             route_pred: None,
             #[cfg(feature = "parallel")]
             route_job: None, shard_maps: Vec::new(), shard_rosters: Vec::new(), crashed_by: [0; 2], crash_log: Vec::new(),
-            merges, link_straight, turn_caps, merge_feeder_lane, through_next, corridor_of, corridor_offset, seam_primary, signals, link_entries, router: None, local_router: None, local_routing: false, external_reroute: false,
+            merges, link_straight, turn_caps, merge_feeder_lane, through_next, corridor_of, corridor_offset, approach_key_of, seam_primary, signals, link_entries, router: None, local_router: None, local_routing: false, external_reroute: false,
             meters: Vec::new(), metering_on: false, day_secs: 0.0, pm_plan: false, rail_preempts,
             timetable: rail::Timetable::default(), crossing_sets: HashMap::new(), weekend: false, day_rate: 1.0,
             bus_schedules: HashMap::new(),
@@ -2261,7 +2284,7 @@ impl NetWorld {
                 continue;
             }
             nb.by_lane.push(v.lane.0, i);
-            nb.approaching.push(self.network.intersection_key(self.downstream_node(v.lane)), i);
+            nb.approaching.push(self.approach_key_of[v.lane.0 as usize], i);
         }
         // Flat sort keys (contiguous, cache-friendly) precomputed once when the cache-sort
         // option is on; empty when off, so the helpers read each vehicle row instead.

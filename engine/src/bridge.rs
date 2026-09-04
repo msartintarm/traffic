@@ -227,6 +227,11 @@ impl Simulation {
         let cfg = SimConfig { seed: seed as u64, sleep_scheduler: true, ..SimConfig::default_config() };
         let camera = Camera::fit_bounds(network.bounds(), [900.0, 600.0], 24.0);
         let mut world = NetWorld::new(network, cfg);
+        // Browser default: per-driver local routing (map-size-independent, and
+        // measured faster than the flow-field). Set BEFORE the install so only the
+        // cheap ALT local router is built — the global flow-field is never built
+        // unless the user opts out via the toggle. Engine default stays field for tests.
+        world.set_local_routing(true);
         let demand_sources = DemandSources::new(true, true); // freeway + surface by default
         let (demand_rate, entry_speed_cap) = (1.0, f64::INFINITY);
         let demand = build_demand(&world, cfg.seed, demand_sources, demand_rate, entry_speed_cap, None);

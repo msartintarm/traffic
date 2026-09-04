@@ -10,16 +10,19 @@
 
 use super::signal::{SignalProgram, SignalState};
 
-/// Parallel `(0..n).map(f).collect()` when the `parallel` feature is on, serial
-/// otherwise — for the embarrassingly-parallel per-movement / per-link geometry
-/// build passes (each element independent, read-only against `&self`). Keeps the
-/// whole-city map build off the multi-second serial critical path.
-#[cfg(feature = "parallel")]
+/// Parallel `(0..n).map(f).collect()` for the embarrassingly-parallel per-movement
+/// / per-link geometry build passes (each element independent, read-only against
+/// `&self`). Parallel only on NATIVE with the `parallel` feature — in wasm it is
+/// serial even in the threads build: rayon during the *map build* (before the
+/// step loop) hangs the browser worker at city scale (Columbus), and map-build
+/// latency is off the gameplay critical path anyway, so there is nothing to gain
+/// there. The per-tick step's parallelism is unaffected (that runs later).
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 pub(crate) fn pmap<T: Send, F: Fn(usize) -> T + Sync + Send>(n: usize, f: F) -> Vec<T> {
     use rayon::prelude::*;
     (0..n).into_par_iter().map(f).collect()
 }
-#[cfg(not(feature = "parallel"))]
+#[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
 pub(crate) fn pmap<T, F: Fn(usize) -> T>(n: usize, f: F) -> Vec<T> {
     (0..n).map(f).collect()
 }
