@@ -61,6 +61,10 @@ impl SignalRuntime {
 /// vehicle world only has to supply which links currently have waiting demand.
 pub struct SignalController {
     signals: Vec<SignalRuntime>,
+    /// Reverse of `approaches`: each feeder lane → the programs it can call, so
+    /// `advance` builds the active set from the (small) demand set in O(demand)
+    /// and skips resting programs instead of scanning all of them.
+    lane_programs: std::collections::HashMap<u32, Vec<usize>>,
     /// Approach *lanes* per program, per group bit — the from-lanes of each
     /// group's movements. Lane-grained like a real stop-line detector, so a
     /// through queue never calls the adjacent bay's protected-left phase.
@@ -107,7 +111,18 @@ impl SignalController {
                 }
             }
         }
-        Self { signals, approaches, time: 0.0 }
+        let mut lane_programs: std::collections::HashMap<u32, Vec<usize>> = std::collections::HashMap::new();
+        for (pid, bits) in approaches.iter().enumerate() {
+            for lanes in bits {
+                for l in lanes {
+                    let e = lane_programs.entry(l.0).or_default();
+                    if !e.contains(&pid) {
+                        e.push(pid);
+                    }
+                }
+            }
+        }
+        Self { signals, approaches, time: 0.0, lane_programs }
     }
 
     fn group_state(&self, net: &Network, program: ProgramId, bit: u8) -> SignalState {
@@ -165,7 +180,28 @@ impl SignalController {
         /// controllers abbreviate, never instantly kill, a conflicting phase).
         const PREEMPT_GRACE: f64 = 3.0;
         self.time += dt;
+        // Skip resting programs cheaply: a program not called by any demanded
+        // lane and not mid-transition/preempted/coordinated only holds green, so
+        // its expensive per-approach demand checks are pointless — advance its
+        // timer and move on. Cuts the per-tick signal work to O(demanded
+        // programs) + a cheap O(programs) skip scan.
+        let mut active: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for &lane in demand {
+            if let Some(pids) = self.lane_programs.get(&lane) {
+                active.extend(pids.iter().copied());
+            }
+        }
         for pid in 0..self.signals.len() {
+            let rt0 = self.signals[pid];
+            if !active.contains(&pid)
+                && !rt0.yellow
+                && rt0.all_red <= 0.0
+                && !forced.contains_key(&pid)
+                && !net.programs[pid].coordinated
+            {
+                self.signals[pid].elapsed += dt;
+                continue;
+            }
             let (n_phases, green_mask, yellow_dur) = {
                 let program = &net.programs[pid];
                 if program.phases.is_empty() {

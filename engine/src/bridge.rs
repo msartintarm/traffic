@@ -945,6 +945,16 @@ impl Simulation {
         self.world.set_arterial_routing(on);
     }
 
+    /// Toggle per-driver local routing (bounded-neighbourhood ALT search) —
+    /// experimental. Routes cars identically to the flow-field but with map-size-
+    /// independent per-driver cost (no global field maintenance); currently a
+    /// higher constant factor, so a research/experiment option. Rebuilds routing.
+    pub fn set_local_routing(&mut self, on: bool) {
+        self.world.set_local_routing(on);
+        let dests = self.demand.destinations();
+        self.world.install_router(&dests);
+    }
+
     /// Toggle targeted route refresh: reroute cycles skip destination fields whose
     /// answers still price correctly, and solve the rest only far enough to cover
     /// the cars (and spawn gateways) that will actually read them — the rest of

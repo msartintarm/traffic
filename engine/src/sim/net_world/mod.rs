@@ -25,6 +25,7 @@ use super::mobil::{self, MobilParams};
 use super::junction::{self, Junctions, SignalController};
 use super::network::{Lane, LaneId, LinkId, MovementId, Network, NodeControl, NodeId, RoadKind, TurnType};
 use super::rail;
+use super::local_router::LocalRouter;
 use super::router::FieldRouter;
 use super::signal::SignalState;
 
@@ -253,6 +254,11 @@ pub struct NetWorld {
     /// Flow-field router for destination-based vehicles, rebuilt periodically
     /// against live costs so in-flight cars reroute around congestion.
     router: Option<FieldRouter>,
+    /// Per-driver local routing (ALT landmarks) — an O(1)-in-map-size alternative
+    /// to the flow-field. When `local_routing`, all next-hop/distance queries go
+    /// here and the flow-field is neither installed nor refreshed.
+    local_router: Option<LocalRouter>,
+    local_routing: bool,
     /// When set, an external driver (the browser GPU flow-field) owns the routing
     /// recompute and feeds fresh fields in; the internal CPU recompute stands down.
     external_reroute: bool,
@@ -867,6 +873,15 @@ const LANE_ROUTE_DEPTH: usize = 3;
 /// waiter stands (front bumper): enough that an oncoming through's swept
 /// corridor clears the waiter's nose with a real margin at any crossing angle.
 const PERMISSIVE_HOLD_MARGIN: f64 = 3.0;
+/// A permissive-left waiter that has been held short of its conflict point for
+/// this long stops honoring the conservative early-hold and creeps out — the
+/// real "left-turn sneaker" that clears the box at the end of the phase (when
+/// oncoming stops) or forces a small gap. The conflict-point avoidance and the
+/// body-overlap crash detector remain the safety backstops, so this only
+/// removes the *pre-emptive* yield, never the collision check. Without it a
+/// continuous oncoming platoon (e.g. when following cars don't ease for the
+/// occupied box) can trap the turner mid-intersection forever.
+const PERMISSIVE_SNEAK_SECS: f64 = 25.0;
 
 /// A vehicle's decision state for the active-set scheduler. `Free` and `Frozen` are the
 /// analytically-predictable states that may sleep; `Deciding` must run the full step.
@@ -1098,7 +1113,7 @@ impl NetWorld {
             route_pred: None,
             #[cfg(feature = "parallel")]
             route_job: None, shard_maps: Vec::new(), shard_rosters: Vec::new(), crashed_by: [0; 2], crash_log: Vec::new(),
-            merges, link_straight, turn_caps, merge_feeder_lane, through_next, corridor_of, corridor_offset, seam_primary, signals, link_entries, router: None, external_reroute: false,
+            merges, link_straight, turn_caps, merge_feeder_lane, through_next, corridor_of, corridor_offset, seam_primary, signals, link_entries, router: None, local_router: None, local_routing: false, external_reroute: false,
             meters: Vec::new(), metering_on: false, day_secs: 0.0, pm_plan: false, rail_preempts,
             timetable: rail::Timetable::default(), crossing_sets: HashMap::new(), weekend: false, day_rate: 1.0,
             bus_schedules: HashMap::new(),
@@ -1286,6 +1301,16 @@ impl NetWorld {
     /// Install a flow-field router covering `dests`; vehicles spawned via
     /// [`NetWorld::spawn_to`] then route by the field and reroute live.
     pub fn install_router(&mut self, dests: &[LinkId]) {
+        if self.local_routing {
+            // Local routing needs no per-destination field — build the ALT
+            // landmark index once (O(K·links)) and route every driver from it.
+            if self.local_router.is_none() {
+                self.local_router = Some(LocalRouter::build(&self.network));
+            }
+            self.router = None;
+            self.router_generation = self.router_generation.wrapping_add(1);
+            return;
+        }
         let costs = self.live_link_costs();
         let trunk = self.arterial_routing.then(|| {
             self.network.links.iter().map(|l| !matches!(l.kind, crate::sim::network::RoadKind::Local)).collect()
@@ -1297,6 +1322,38 @@ impl NetWorld {
             self.route_pred = None;
             self.route_job = None;
         }
+    }
+
+    /// Toggle per-driver local routing (ALT). Takes effect on the next
+    /// `install_router`; a live switch rebuilds routing on the following spawn.
+    pub fn set_local_routing(&mut self, on: bool) {
+        self.local_routing = on;
+    }
+
+    /// Whether any router (field or local) can answer queries.
+    fn routing_installed(&self) -> bool {
+        if self.local_routing {
+            self.local_router.is_some()
+        } else {
+            self.router.is_some()
+        }
+    }
+
+    /// Next link from `from` toward `dest` — dispatched to whichever router is
+    /// active. `None` = arrived (or no onward hop).
+    fn route_hop(&self, dest: LinkId, from: LinkId) -> Option<LinkId> {
+        if self.local_routing {
+            return self.local_router.as_ref()?.next_hop(dest, from);
+        }
+        self.router.as_ref()?.next_hop(dest, from)
+    }
+
+    /// Distance estimate `from → dest` for ranking fallbacks — dispatched.
+    fn route_dist(&self, dest: LinkId, from: LinkId) -> Option<u64> {
+        if self.local_routing {
+            return self.local_router.as_ref()?.distance(dest, from);
+        }
+        self.router.as_ref()?.distance(dest, from)
     }
 
     /// Toggle stop/yield control delay in routing costs; takes effect on the next
@@ -1537,6 +1594,9 @@ impl NetWorld {
     }
 
     pub fn router_knows(&self, dest: LinkId) -> bool {
+        if self.local_routing {
+            return self.local_router.as_ref().is_some_and(|r| r.knows(dest));
+        }
         self.router.as_ref().is_some_and(|r| r.knows(dest))
     }
 
@@ -1602,7 +1662,7 @@ impl NetWorld {
         let kin = Self::spawn_kin(&self.network, lane, position, &driver);
         self.fleet.push(NetVehicle {
             id, lane, position, speed, kin, steer: 0.0, driver, route: Vec::new(), route_idx: 0, dest: None,
-            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
+            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false, next_link: None,
         });
     }
 
@@ -1610,6 +1670,18 @@ impl NetWorld {
     /// route-consistent movement at each intersection and exits on the last link.
     /// Returns `false` (spawn refused) if the route is empty or the entrance is
     /// still occupied, so demand can't stack vehicles on top of each other.
+    /// Local routing: set the just-spawned car's first turn (bounded search).
+    /// No-op for field-routed cars or when local routing is off.
+    fn init_local_next_link(&mut self) {
+        if !self.local_routing {
+            return;
+        }
+        let Some(i) = self.fleet.rows.len().checked_sub(1) else { return };
+        let (Some(d), from) = (self.fleet.rows[i].dest, self.network.lane(self.fleet.rows[i].lane).link) else { return };
+        let nl = self.local_router.as_ref().and_then(|lr| lr.next_hop(d, from));
+        self.fleet.rows[i].next_link = nl;
+    }
+
     pub fn spawn_routed(&mut self, id: u32, route: Vec<LinkId>, speed: f64, driver: DriverConfig) -> bool {
         let Some(&first) = route.first() else { return false };
         // Prefer a lane that already serves the route's next link (see
@@ -1633,7 +1705,7 @@ impl NetWorld {
         let kin = Self::spawn_kin(&self.network, lane, 0.0, &driver);
         self.fleet.push(NetVehicle {
             id, lane, position: 0.0, speed, kin, steer: 0.0, driver, route, route_idx: 0, dest: None,
-            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
+            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false, next_link: None,
         });
         true
     }
@@ -1657,7 +1729,7 @@ impl NetWorld {
         let kin = Self::spawn_kin(&self.network, lane, pos, &driver);
         self.fleet.push(NetVehicle {
             id, lane, position: pos, speed, kin, steer: 0.0, driver, route, route_idx: 0, dest: None,
-            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
+            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false, next_link: None,
         });
         true
     }
@@ -1683,8 +1755,9 @@ impl NetWorld {
         let kin = Self::spawn_kin(&self.network, lane, 0.0, &driver);
         self.fleet.push(NetVehicle {
             id, lane, position: 0.0, speed, kin, steer: 0.0, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
-            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
+            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false, next_link: None,
         });
+        self.init_local_next_link();
         true
     }
 
@@ -1730,12 +1803,12 @@ impl NetWorld {
                 (!self.network.lane_is_hov(lane) || hov_eligible(self.cfg.seed, id))
                     && self.entrance_clear(lane, clearance)
             });
-        if let (Some(d), Some(router)) = (dest, self.router.as_ref()) {
+        if let Some(d) = dest.filter(|_| self.routing_installed()) {
             let score = |lane: LaneId| -> u64 {
                 self.network
                     .movements_of(lane)
                     .iter()
-                    .filter_map(|m| router.distance(d, self.network.lane(m.to_lane).link))
+                    .filter_map(|m| self.route_dist(d, self.network.lane(m.to_lane).link))
                     .min()
                     .unwrap_or(u64::MAX)
             };
@@ -1760,8 +1833,9 @@ impl NetWorld {
         let kin = Self::spawn_kin(&self.network, lane, position, &driver);
         self.fleet.push(NetVehicle {
             id, lane, position, speed, kin, steer: 0.0, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
-            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
+            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false, next_link: None,
         });
+        self.init_local_next_link();
     }
 
     /// Whether a vehicle can be placed at the start of `lane` without overlapping
@@ -1899,8 +1973,17 @@ impl NetWorld {
         // link. `None` here means the car couldn't reach a lane that serves that
         // link, *not* that it should leave: a car that has arrived (no next hop) or
         // finished its route returns early below, before this fallback.
-        let preferred = if let (Some(dest), Some(router)) = (veh.dest, self.router.as_ref()) {
-            match router.next_hop(dest, lane.link) {
+        let preferred = if self.local_routing && veh.dest.is_some() {
+            // Local routing: follow the turn the driver decided on entering this
+            // link (bounded neighbourhood search, cached in `next_link`) — O(1)
+            // here, no map-wide field. `None` = arrived / dead end → leave.
+            match veh.next_link {
+                None => return None,
+                Some(next_link) => self.movement_to(veh.lane, next_link),
+            }
+        } else if veh.dest.is_some() && self.routing_installed() {
+            let dest = veh.dest.unwrap();
+            match self.route_hop(dest, lane.link) {
                 None => return None, // reached the destination → leave the network
                 Some(next_link) => self.movement_to(veh.lane, next_link),
             }
@@ -1933,13 +2016,16 @@ impl NetWorld {
     /// backtracking) movement and looping back. `None` for non-routed cars or when
     /// no movement reaches the destination.
     fn forward_movement(&self, veh: &NetVehicle, lane: LaneId) -> Option<MovementId> {
-        let (dest, router) = (veh.dest?, self.router.as_ref()?);
+        let dest = veh.dest?;
+        if !self.routing_installed() {
+            return None;
+        }
         let l = self.network.lane(lane);
         (0..l.movement_count)
             .filter_map(|k| {
                 let mid = MovementId(l.movement_start.0 + k);
                 let to_link = self.network.lane(self.network.movement(mid).to_lane).link;
-                router.distance(dest, to_link).map(|d| (d, mid))
+                self.route_dist(dest, to_link).map(|d| (d, mid))
             })
             .min_by_key(|&(d, _)| d)
             .map(|(_, mid)| mid)
@@ -1984,8 +2070,22 @@ impl NetWorld {
         if self.network.lane(lane).movement_count == 0 {
             return None;
         }
-        let (dest, router) = (veh.dest?, self.router.as_ref()?);
-        let next = router.next_hop(dest, self.network.lane(lane).link)?;
+        let dest = veh.dest?;
+        if !self.routing_installed() {
+            return None;
+        }
+        // Local routing: reuse the cached decision for the driver's current link
+        // (no per-tick bounded search); only pay a search for a *different* lane's
+        // link (rare — lane-change lookahead).
+        let next = if self.local_routing {
+            if self.network.lane(lane).link == self.network.lane(veh.lane).link {
+                veh.next_link?
+            } else {
+                self.route_hop(dest, self.network.lane(lane).link)?
+            }
+        } else {
+            self.route_hop(dest, self.network.lane(lane).link)?
+        };
         self.movement_to(lane, next)
     }
 
@@ -2509,9 +2609,15 @@ impl NetWorld {
             }
             return hops;
         }
-        if let (Some(dest), Some(router)) = (veh.dest, self.router.as_ref()) {
+        if self.local_routing {
+            // Local drivers position for the immediate turn only (their cached
+            // `next_link`); multi-hop bounded searches every tick would defeat
+            // the O(1)-in-map goal. `next` already IS that decision.
+            return hops;
+        }
+        if let Some(dest) = veh.dest.filter(|_| self.routing_installed()) {
             while hops.len() < LANE_ROUTE_DEPTH {
-                match router.next_hop(dest, *hops.last().unwrap()) {
+                match self.route_hop(dest, *hops.last().unwrap()) {
                     Some(l) => hops.push(l),
                     None => break,
                 }
@@ -2546,8 +2652,11 @@ impl NetWorld {
         if !veh.route.is_empty() {
             return (veh.route_idx + 1 < veh.route.len()).then(|| veh.route[veh.route_idx + 1]);
         }
-        let (dest, router) = (veh.dest?, self.router.as_ref()?);
-        router.next_hop(dest, self.network.lane(veh.lane).link)
+        let dest = veh.dest?;
+        if !self.routing_installed() {
+            return None;
+        }
+        self.route_hop(dest, self.network.lane(veh.lane).link)
     }
 
     fn lane_slot_clear(
@@ -3086,6 +3195,25 @@ impl NetWorld {
     }
 
     fn refresh_routes(&mut self) {
+        if self.local_routing {
+            // Local routing keeps no field, but its bounded search still steers
+            // around jams: refresh per-link congestion penalties on the reroute
+            // interval (O(occupied) ≈ O(drivers), not O(map)).
+            let interval = (REROUTE_INTERVAL_SECS / self.cfg.dt).max(1.0) as u64;
+            if self.tick.saturating_sub(self.route_cycle_tick) >= interval {
+                self.route_cycle_tick = self.tick;
+                if self.local_router.is_some() {
+                    let mut counts: IntMap<u32> = IntMap::default();
+                    for v in &self.fleet.rows {
+                        *counts.entry(self.network.lane(v.lane).link.0).or_default() += 1;
+                    }
+                    if let Some(lr) = self.local_router.as_mut() {
+                        lr.update_congestion(&counts);
+                    }
+                }
+            }
+            return;
+        }
         if self.router.is_none() || self.external_reroute {
             return;
         }
@@ -3585,6 +3713,9 @@ impl NetWorld {
         // bound as `integrate` applies: in-box avoidance cannot brake beyond physics.
         veh.speed = (veh.speed + accel.max(-MAX_BRAKE_DECEL) * dt).max(0.0);
         veh.position += veh.speed * dt;
+        if let Some(c) = veh.crossing.as_mut() {
+            c.held = c.held.saturating_add(1);
+        }
         self.land_or_hold(veh, front, front_speed, dt, inbound)
     }
 
@@ -3740,7 +3871,7 @@ impl NetWorld {
                     }
                     *inbound.entry(to_lane.0).or_insert(0.0) += veh.driver.vehicle_length + veh.driver.min_gap;
                 }
-                veh.crossing = Some(Crossing { movement: mid, lat_shift });
+                veh.crossing = Some(Crossing { movement: mid, lat_shift, held: 0 });
                 veh.lane_change = None;
                 self.land_or_hold(veh, front, front_speed, dt, inbound)
             }
@@ -3825,6 +3956,11 @@ impl NetWorld {
         if veh.route_idx + 1 < veh.route.len() && veh.route[veh.route_idx + 1] == to_link {
             veh.route_idx += 1;
         }
+        // Local routing: the driver decides its next turn on arriving at this
+        // link — one bounded neighbourhood search per link entry (not per tick).
+        if self.local_routing {
+            veh.next_link = veh.dest.and_then(|d| self.local_router.as_ref().and_then(|lr| lr.next_hop(d, to_link)));
+        }
         Fate::Entered(to_link)
     }
 
@@ -3865,8 +4001,8 @@ impl NetWorld {
     /// Whether the vehicle still has an onward hop it hasn't taken — a routed next
     /// link or an unfinished explicit route. Used to tell a genuine exit from a leak.
     fn still_has_a_route(&self, veh: &NetVehicle, from: LinkId) -> bool {
-        match (veh.dest, self.router.as_ref()) {
-            (Some(dest), Some(router)) => router.next_hop(dest, from).is_some(),
+        match (veh.dest, self.routing_installed()) {
+            (Some(dest), true) => self.route_hop(dest, from).is_some(),
             _ => veh.route_idx + 1 < veh.route.len(),
         }
     }
@@ -4295,9 +4431,14 @@ impl NetWorld {
                 let hold = first - PERMISSIVE_HOLD_MARGIN;
                 if c_s < hold - 0.1 {
                     let d = veh.driver.capped_to(self.network.lane(to_lane).speed_limit);
-                    let pressed = self.permissive_pressure(i, c.movement, node, nb, &|my_s| {
-                        (my_s > c_s + 0.3).then(|| my_s - c_s)
-                    });
+                    // Sneaker: once stuck past the patience window, drop the
+                    // conservative hold and creep to the point — the avoidance
+                    // below (and the crash detector) still gate the actual entry.
+                    let patient = (c.held as f64 * self.cfg.dt) < PERMISSIVE_SNEAK_SECS;
+                    let pressed = patient
+                        && self.permissive_pressure(i, c.movement, node, nb, &|my_s| {
+                            (my_s > c_s + 0.3).then(|| my_s - c_s)
+                        });
                     if pressed {
                         accel = accel.min(idm::acceleration(&d, veh.speed, veh.speed, (hold - c_s).max(0.05)));
                     }
@@ -9378,7 +9519,7 @@ mod tests {
                     let probe = NetVehicle {
                         id, lane: LaneId(0), position: 0.0, speed: 0.0, kin: [0.0; 3], steer: 0.0, driver: d,
                         route: Vec::new(), route_idx: 0, dest: None, stopped_at: None,
-                        wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false,
+                        wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false, next_link: None,
                     };
                     w.runs_red(&probe, node)
                 })

@@ -82,6 +82,8 @@ export type Sim = {
   set_async_routing?(on: boolean): void;
   /** Front-of-lane LOD: followers skip O(node) scans (topology-independent cost). */
   set_follower_lod?(on: boolean): void;
+  /** Per-driver local routing (bounded ALT search) — map-size-independent, experimental. */
+  set_local_routing?(on: boolean): void;
   /** Flattened per-shard `[cars, deferred, accelUs, resolveUs]` rows. */
   shard_stats?(): Uint32Array;
   /** Headless pre-population: fast-forward up to `simSecs` of travel time. */

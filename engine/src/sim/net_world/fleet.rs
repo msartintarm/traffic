@@ -45,6 +45,10 @@ pub struct NetVehicle {
     /// last step — read by the next step's lane-change pass to stagger the
     /// (slow-timescale) queue-jump evaluation of parked cars.
     pub(super) slept: bool,
+    /// Local routing only: the next link this driver intends to take, decided
+    /// on link entry by a bounded neighbourhood search and read O(1) each tick
+    /// (`None` for field-routed cars, or a local car that has arrived).
+    pub(super) next_link: Option<LinkId>,
     /// Ticks until this wreck is cleared from the road. `None` = not crashed. A
     /// wreck holds its pose at speed 0 and blocks traffic like any stopped car
     /// (leader chains, box occupancy) until the timer removes it.
@@ -58,6 +62,9 @@ pub(super) struct Crossing {
     /// the boundary — a lane-change blend still in flight. Carried through the
     /// crossing so the seam-landing blend starts from where the car actually is.
     pub(super) lat_shift: f64,
+    /// Ticks elapsed since this crossing began — lets a permissive-left waiter
+    /// stuck mid-box past the sneaker window creep out (see `PERMISSIVE_SNEAK_SECS`).
+    pub(super) held: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -136,7 +136,8 @@ export default function EngineCanvas() {
   const [localitySort, setLocalitySort] = useState(false); // fleet memory-locality reorder, off by default (see net_world default)
   const [sharding, setSharding] = useState(true); // sharded (SPMD) execution, on by default; `?shard=0` (splash toggle) opts out
   const [asyncRouting, setAsyncRouting] = useState(true); // background reroute solves, on by default (threads backend only)
-  const [followerLod, setFollowerLod] = useState(false); // front-of-lane LOD prototype, default off (shifts intersection discharge)
+  const [followerLod, setFollowerLod] = useState(false); // front-of-lane LOD toggle; measured ~0% runtime benefit on SF, so off by default (deadlock now fixed, so safe if wanted)
+  const [localRouting, setLocalRouting] = useState(true); // per-driver bounded-search routing, default on (map-size-independent, congestion-aware, faster than the field)
   const [shardStats, setShardStats] = useState(false); // per-thread work rows in the diagnostics overlay
   const [startSpeedMps, setStartSpeedMps] = useState(36); // ≥ every road limit ⇒ "enter at limit"
   const [units, setUnits] = useState<"mi" | "km">("mi");
@@ -364,6 +365,11 @@ export default function EngineCanvas() {
             setSharding(shard);
             if (shard) sessionRef.current?.applyControl({ type: "sharding", value: true });
             sessionRef.current?.applyControl({ type: "asyncRouting", value: true });
+            if (params.get("localrouting") !== "0") {
+              sessionRef.current?.applyControl({ type: "localRouting", value: true });
+            } else {
+              setLocalRouting(false);
+            }
             // `?warmup=1` (settable from the splash) pre-populates on load.
             if (params.get("warmup") === "1") {
               sessionRef.current?.applyControl({ type: "warmup", seconds: 3600 });
@@ -947,6 +953,21 @@ export default function EngineCanvas() {
                 }}
               />
               Front-of-lane LOD
+            </label>
+            <label
+              className={styles.zoomLabel}
+              title="Route each driver by a bounded local search toward the destination (ALT landmarks) instead of a global flow-field — a driver only searches its own neighbourhood, as a real driver would, so per-driver cost is independent of map size. Delivers cars identically to the field, is congestion-aware (steers around jams), and is faster on large maps. On by default; uncheck for the classic global router. Rebuilds routing when toggled."
+            >
+              <input
+                type="checkbox"
+                checked={localRouting}
+                disabled={!ready}
+                onChange={(e) => {
+                  sessionRef.current?.applyControl({ type: "localRouting", value: e.target.checked });
+                  setLocalRouting(e.target.checked);
+                }}
+              />
+              Local routing
             </label>
             <label
               className={styles.zoomLabel}

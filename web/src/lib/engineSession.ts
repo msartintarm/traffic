@@ -382,6 +382,7 @@ export async function startEngineSession(
       case "sharding": sim.set_sharding?.(c.value); break;
       case "asyncRouting": sim.set_async_routing?.(c.value); break;
       case "followerLod": sim.set_follower_lod?.(c.value); break;
+      case "localRouting": sim.set_local_routing?.(c.value); break;
       case "shardStats": shardStatsOn = c.value; break;
       case "warmup": {
         sim.begin_warmup?.(c.seconds);

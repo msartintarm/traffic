@@ -15,6 +15,7 @@ pub mod hash;
 #[cfg(any(feature = "gpu", target_arch = "wasm32"))]
 pub mod flowfield_gpu;
 pub mod idm;
+pub mod local_router;
 pub mod junction;
 pub mod map;
 pub mod measure;
