@@ -77,6 +77,34 @@ struct RampMeter {
     since_update: f64,
 }
 
+/// A read-only snapshot of one vehicle's current decision — what it perceives
+/// and the constraint that binds its throttle right now — for the UI's driver
+/// introspection panel. Built on demand by [`NetWorld::explain`]; `None` fields
+/// mean that input isn't active this instant (no leader, no stop line, …).
+#[derive(Clone, Debug, Default)]
+pub struct DriverReport {
+    /// The binding reason / high-level state (e.g. "following car ahead").
+    pub state: String,
+    pub speed_mps: f64,
+    pub desired_mps: f64,
+    pub speed_limit_mps: f64,
+    /// Chosen acceleration this instant (m/s²; negative = braking).
+    pub accel: f64,
+    pub leader_gap: Option<f64>,
+    pub leader_speed: Option<f64>,
+    pub stop_line: Option<f64>,
+    pub stop_sign: Option<f64>,
+    pub yield_line: Option<f64>,
+    pub curve_speed: Option<f64>,
+    pub merge_gap: Option<f64>,
+    pub lane_index: u32,
+    pub lane_count: u32,
+    pub turn: &'static str,
+    pub next_road: String,
+    pub changing_lanes: bool,
+    pub wait_secs: f64,
+}
+
 pub struct NetWorld {
     pub network: Network,
     cfg: SimConfig,
@@ -615,6 +643,26 @@ impl VehicleContext {
             curve: opt(self.curve_dist).map(|distance| SpeedTarget { speed: self.curve_speed, distance }),
         };
         constraint::binding_acceleration(&ctx, constraint::DEFAULT)
+    }
+
+    /// The binding acceleration together with the index (into [`constraint::DEFAULT`]
+    /// / [`constraint::DEFAULT_NAMES`]) of the constraint that produced it — the
+    /// "why" behind this car's throttle, for the introspection panel.
+    fn binding_reason(&self) -> (f64, usize) {
+        let opt = |x: f64| x.is_finite().then_some(x);
+        let ctx = LongContext {
+            driver: &self.driver,
+            speed: self.speed,
+            leader: opt(self.leader_gap).map(|gap| Obstacle { gap, speed: self.leader_speed }),
+            stop_line: opt(self.stop_line),
+            speed_target: opt(self.speed_target_dist)
+                .map(|distance| SpeedTarget { speed: self.speed_target_speed, distance }),
+            stop_sign: opt(self.stop_sign),
+            yield_line: opt(self.yield_line),
+            merge: opt(self.merge_gap).map(|gap| Obstacle { gap, speed: self.merge_speed }),
+            curve: opt(self.curve_dist).map(|distance| SpeedTarget { speed: self.curve_speed, distance }),
+        };
+        constraint::binding_reason(&ctx, constraint::DEFAULT)
     }
 
     /// The full per-vehicle acceleration: the binding fold plus the reproducible
@@ -1950,6 +1998,65 @@ impl NetWorld {
 
     pub fn vehicles(&self) -> &[NetVehicle] {
         &self.fleet.rows
+    }
+
+    /// Introspect one vehicle's current decision: what it perceives (leader gap,
+    /// stop line, yield, curve, …) and which constraint binds its throttle. A
+    /// read-only re-derivation using the same `gather_context` the step uses, so
+    /// the reported "why" matches the live behaviour. `None` if no such id.
+    pub fn explain(&self, id: u32) -> Option<DriverReport> {
+        let i = self.fleet.rows.iter().position(|v| v.id == id)?;
+        let veh = &self.fleet.rows[i];
+        let lane = *self.network.lane(veh.lane);
+        let link = *self.network.link(lane.link);
+        let driver = veh.driver.capped_to(lane.speed_limit);
+        let intended = self.intended_movement(veh);
+        let turn = match intended.map(|m| self.network.movement_turn(m)) {
+            Some(TurnType::Left) => "left",
+            Some(TurnType::Right) => "right",
+            Some(TurnType::Through) => "through",
+            None => "—",
+        };
+        let next_road = intended
+            .map(|m| self.network.lane(self.network.movement(m).to_lane).link)
+            .and_then(|l| self.network.link_names.get(l.idx()).filter(|s| !s.is_empty()).cloned())
+            .unwrap_or_default();
+
+        let mut r = DriverReport {
+            speed_mps: veh.speed,
+            desired_mps: driver.desired_speed,
+            speed_limit_mps: lane.speed_limit,
+            lane_index: lane.index_in_link,
+            lane_count: link.lane_count,
+            turn,
+            next_road,
+            changing_lanes: veh.lane_change.is_some(),
+            wait_secs: veh.wait_ticks() as f64 * self.cfg.dt,
+            ..Default::default()
+        };
+        if veh.is_wrecked() {
+            r.state = "crashed — clearing".into();
+            return Some(r);
+        }
+        if veh.is_crossing() {
+            r.state = "crossing intersection".into();
+            return Some(r);
+        }
+
+        let nb = self.neighbors();
+        let ctx = self.gather_context(i, &nb, intended);
+        let (accel, reason) = ctx.binding_reason();
+        r.accel = accel;
+        r.state = constraint::DEFAULT_NAMES.get(reason).copied().unwrap_or("driving").to_string();
+        let opt = |x: f64| x.is_finite().then_some(x);
+        r.leader_gap = opt(ctx.leader_gap);
+        r.leader_speed = r.leader_gap.map(|_| ctx.leader_speed);
+        r.stop_line = opt(ctx.stop_line);
+        r.stop_sign = opt(ctx.stop_sign);
+        r.yield_line = opt(ctx.yield_line);
+        r.curve_speed = opt(ctx.curve_dist).map(|_| ctx.curve_speed);
+        r.merge_gap = opt(ctx.merge_gap);
+        Some(r)
     }
 
     /// A crossing vehicle's arc-length into the node interior. `position` counts

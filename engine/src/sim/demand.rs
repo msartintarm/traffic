@@ -1629,7 +1629,8 @@ fn class_production(kind: RoadKind, t: DemandTuning) -> f64 {
         RoadKind::Local => 1.0,
         RoadKind::Collector => 0.7,
         RoadKind::Arterial => 0.25,
-        RoadKind::Ramp | RoadKind::Freeway => 0.0,
+        // A divided expressway has no mid-block driveways — trips don't originate on it.
+        RoadKind::Expressway | RoadKind::Ramp | RoadKind::Freeway => 0.0,
     }
 }
 
@@ -1649,7 +1650,8 @@ fn class_attraction(kind: RoadKind, t: DemandTuning) -> f64 {
         RoadKind::Local => 1.0,
         RoadKind::Collector => 0.9,
         RoadKind::Arterial => 0.5,
-        RoadKind::Ramp | RoadKind::Freeway => 0.0,
+        // No driveways/frontage on a divided expressway — trips don't terminate on it.
+        RoadKind::Expressway | RoadKind::Ramp | RoadKind::Freeway => 0.0,
     }
 }
 

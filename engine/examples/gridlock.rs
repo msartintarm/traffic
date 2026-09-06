@@ -92,24 +92,72 @@ fn main() {
         .map(|(&li, &(n, ss, cap))| (li, n as f64 / cap, n, if n > 0 { ss / n as f64 } else { 0.0 }))
         .collect();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+    // Downstream links per node, to trace spillback.
+    use engine::sim::network::LinkId;
+    let net = &world.network;
+    let mut out_of: Vec<Vec<u32>> = vec![Vec::new(); net.nodes.len()];
+    for li in 0..net.links.len() {
+        out_of[net.link(LinkId(li as u32)).from.idx()].push(li as u32);
+    }
+    let occ_of = |li: u32| per_link.get(&li).map(|&(n, _, cap)| n as f64 / cap).unwrap_or(0.0);
     println!("\nTop occupied links (occupancy = vehicles / jam-capacity):");
-    for (li, occ, n, mean) in ranked.iter().take(20) {
-        let name = world.network.link_names.get(*li as usize).map(|s| s.as_str()).unwrap_or("");
-        let refn = world.network.link_refs.get(*li as usize).map(|s| s.as_str()).unwrap_or("");
-        let kind = format!("{:?}", world.network.link(engine::sim::network::LinkId(*li)).kind);
+    for (li, occ, n, mean) in ranked.iter().take(14) {
+        let link = net.link(LinkId(*li));
+        let name = net.link_names.get(*li as usize).map(|s| s.as_str()).unwrap_or("");
+        let kind = format!("{:?}", link.kind);
+        let len = net.lane(link.lane_start).length;
+        let ctrl = format!("{:?}", net.node(link.to).control);
+        // Worst downstream link occupancy (is it blocked from draining?).
+        let down_occ = out_of[link.to.idx()].iter().map(|&d| occ_of(d)).fold(0.0, f64::max);
         println!(
-            "  occ={:>4.0}% n={:>3} mean={:>4.1}mph {:<9} {:<28} {}",
-            occ * 100.0,
-            n,
-            mean * 2.237,
-            kind,
+            "  occ={:>4.0}% n={:>3} mean={:>4.1}mph len={:>4.0}m lanes={} {:<10} down_occ={:>3.0}% ctrl={:<12} {}",
+            occ * 100.0, n, mean * 2.237, len, link.lane_count, kind, down_occ * 100.0, ctrl,
             if name.is_empty() { "(unnamed)" } else { name },
-            refn,
         );
     }
 
     let (fleet, mean, jam) = flow_stats(&world);
     println!("\nFINAL fleet={fleet} mean={:.1}mph jam={:.1}% asleep={}", mean * 2.237, jam * 100.0, world.asleep_count());
+
+    // Deadlock check: how long have stopped cars been stopped? A realistic queue
+    // clears within a cycle or two (< ~60 s); cars stuck for minutes are a lock.
+    let mut waits: Vec<f64> = world.vehicles().iter().map(|v| v.wait_ticks() as f64 * dt).collect();
+    waits.sort_by(f64::total_cmp);
+    let pct = |p: f64| waits.get(((waits.len() as f64 * p) as usize).min(waits.len().saturating_sub(1))).copied().unwrap_or(0.0);
+    let over = |s: f64| waits.iter().filter(|&&w| w > s).count();
+    println!(
+        "wait-time (s): p50={:.0} p95={:.0} max={:.0} · stuck>60s={} stuck>180s={}",
+        pct(0.5), pct(0.95), waits.last().copied().unwrap_or(0.0), over(60.0), over(180.0),
+    );
+    println!("trips: exited={} leaked={}", world.exited(), world.leaked());
+
+    // Localise the long-stuck cars (> 120 s stationary): which links hold them?
+    let mut stuck_by_link: HashMap<u32, u32> = HashMap::new();
+    for v in world.vehicles() {
+        if v.wait_ticks() as f64 * dt > 120.0 {
+            *stuck_by_link.entry(net.lane(v.lane).link.0).or_insert(0) += 1;
+        }
+    }
+    let mut sranked: Vec<(u32, u32)> = stuck_by_link.into_iter().collect();
+    sranked.sort_by(|a, b| b.1.cmp(&a.1));
+    println!("\nLinks holding the most >120s-stuck cars:");
+    for (li, c) in sranked.iter().take(12) {
+        let link = net.link(LinkId(*li));
+        let name = net.link_names.get(*li as usize).map(|s| s.as_str()).unwrap_or("");
+        let down_occ = out_of[link.to.idx()].iter().map(|&d| occ_of(d)).fold(0.0, f64::max);
+        let cyc = match net.node(link.to).control {
+            engine::sim::network::NodeControl::Signalized(pid) => {
+                let prog = &net.programs[pid.0 as usize];
+                format!("cycle={:.0}s phases={}", prog.cycle_length(), prog.phases.len())
+            }
+            other => format!("{other:?}"),
+        };
+        println!(
+            "  stuck={:>3} {:<10} len={:>4.0}m down_occ={:>3.0}% {:<24} {}",
+            c, format!("{:?}", link.kind), net.lane(link.lane_start).length, down_occ * 100.0, cyc,
+            if name.is_empty() { "(unnamed)" } else { name },
+        );
+    }
 }
 
 /// (fleet size, mean speed m/s, fraction with speed < 0.5 m/s).

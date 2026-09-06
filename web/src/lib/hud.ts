@@ -158,6 +158,46 @@ export function vehiclePanelText(name: string, stats: ArrayLike<number>, units: 
   return `Following ${name} (${klass}) — ${speed} ${UNIT_LABEL[units]}`;
 }
 
+// The driver-introspection panel: what the followed car perceives and the reason
+// its throttle is bound right now. `json` is `sim.selected_vehicle_report()` — a
+// small object built engine-side (SI units + labels); we format with the user's
+// units. Returns a multi-line string (the panel renders `white-space: pre-line`).
+type DriverReport = {
+  state: string; speed: number; desired: number; limit: number; accel: number;
+  leaderGap: number | null; leaderSpeed: number | null; stopLine: number | null;
+  stopSign: number | null; yield: number | null; curve: number | null; mergeGap: number | null;
+  lane: number; lanes: number; turn: string; next: string; changing: boolean; waitSecs: number;
+};
+
+export function vehicleReportText(name: string, stats: ArrayLike<number>, json: string, units: Units): string {
+  const head = vehiclePanelText(name, stats, units);
+  if (!json) return head;
+  let r: DriverReport;
+  try {
+    r = JSON.parse(json) as DriverReport;
+  } catch {
+    return head;
+  }
+  const u = UNIT_LABEL[units];
+  const sp = (mps: number | null) => (mps == null ? "—" : `${Math.round(mps * MPS_TO[units])} ${u}`);
+  const m = (v: number | null) => (v == null ? "—" : `${Math.round(v)} m`);
+  const lines = [
+    head,
+    `doing: ${r.state}${r.changing ? " · changing lanes" : ""}`,
+    `speed ${sp(r.speed)} → want ${sp(r.desired)} (limit ${sp(r.limit)}) · accel ${r.accel >= 0 ? "+" : ""}${r.accel.toFixed(1)} m/s²`,
+    `lane ${r.lane + 1}/${r.lanes} · next ${r.turn} → ${r.next || "—"}`,
+  ];
+  // Only surface the inputs that are actually active this instant.
+  if (r.leaderGap != null) lines.push(`car ahead: ${m(r.leaderGap)} gap @ ${sp(r.leaderSpeed)}`);
+  if (r.stopLine != null) lines.push(`stopping at line in ${m(r.stopLine)}`);
+  if (r.stopSign != null) lines.push(`stop sign in ${m(r.stopSign)}`);
+  if (r.yield != null) lines.push(`yielding — line in ${m(r.yield)}`);
+  if (r.curve != null) lines.push(`curve ahead: ${sp(r.curve)}`);
+  if (r.mergeGap != null) lines.push(`merge conflict: ${m(r.mergeGap)} gap`);
+  if (r.waitSecs >= 1) lines.push(`waited ${Math.round(r.waitSecs)} s`);
+  return lines.join("\n");
+}
+
 // The demand-slider label ("Start ≤ N mph") for a start-speed cap in m/s.
 export function startSpeedLabel(startSpeedMps: number, units: Units): string {
   return `Start ≤ ${Math.round(startSpeedMps * MPS_TO[units])} ${UNIT_LABEL[units]}`;

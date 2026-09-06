@@ -90,6 +90,33 @@ pub fn binding_acceleration(ctx: &LongContext, constraints: &[Constraint]) -> f6
     constraints.iter().map(|c| c(ctx)).fold(f64::INFINITY, f64::min)
 }
 
+/// Short human labels for [`DEFAULT`], index-aligned — what a vehicle is "doing"
+/// when that constraint is the binding one. For the driver-introspection panel.
+pub const DEFAULT_NAMES: &[&str] = &[
+    "cruising",
+    "following car ahead",
+    "stopping (signal/box)",
+    "slowing for road ahead",
+    "slowing for curve",
+    "stop sign",
+    "yielding to traffic",
+    "merging",
+];
+
+/// Like [`binding_acceleration`] but also returns the *index* of the binding
+/// constraint (the first one achieving the minimum), so a caller can report why
+/// a vehicle chose its acceleration.
+pub fn binding_reason(ctx: &LongContext, constraints: &[Constraint]) -> (f64, usize) {
+    let mut best = (f64::INFINITY, 0usize);
+    for (i, c) in constraints.iter().enumerate() {
+        let a = c(ctx);
+        if a < best.0 {
+            best = (a, i);
+        }
+    }
+    best
+}
+
 /// Free-road pursuit of the (already speed-limited) desired speed. Always binds,
 /// so the fold is never empty.
 pub fn desired_speed(ctx: &LongContext) -> f64 {
@@ -186,6 +213,24 @@ mod tests {
         let mut c = ctx(20.0);
         c.leader = Some(Obstacle { gap: 5.0, speed: 0.0 });
         assert!(car_following(&c) < desired_speed(&c));
+    }
+
+    #[test]
+    fn binding_reason_names_the_active_constraint() {
+        // Free road: index 0 (desired_speed / "cruising").
+        let (_, i) = binding_reason(&ctx(10.0), DEFAULT);
+        assert_eq!(DEFAULT_NAMES[i], "cruising");
+        // A close leader: index 1 (car_following) should now win.
+        let mut c = ctx(20.0);
+        c.leader = Some(Obstacle { gap: 4.0, speed: 0.0 });
+        let (a, i) = binding_reason(&c, DEFAULT);
+        assert_eq!(DEFAULT_NAMES[i], "following car ahead");
+        assert!((a - binding_acceleration(&c, DEFAULT)).abs() < 1e-9, "reason accel == fold accel");
+        // A red-signal stop line closer/harder than the leader takes over.
+        c.stop_line = Some(2.0);
+        let (_, i) = binding_reason(&c, DEFAULT);
+        assert_eq!(DEFAULT_NAMES[i], "stopping (signal/box)");
+        assert_eq!(DEFAULT_NAMES.len(), DEFAULT.len(), "labels stay index-aligned with constraints");
     }
 
     #[test]

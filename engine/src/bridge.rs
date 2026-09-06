@@ -60,6 +60,26 @@ fn now_ms() -> f64 {
     0.0
 }
 
+/// Hand-built JSON for a [`DriverReport`] — avoids pulling serde into the wasm
+/// bridge for one small object. Numbers are rounded for a stable readout; absent
+/// inputs serialise as `null`.
+fn driver_report_json(r: &crate::sim::net_world::DriverReport) -> String {
+    let n = |o: Option<f64>| o.map_or("null".to_string(), |v| format!("{v:.1}"));
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        concat!(
+            "{{\"state\":\"{}\",\"speed\":{:.1},\"desired\":{:.1},\"limit\":{:.1},\"accel\":{:.2},",
+            "\"leaderGap\":{},\"leaderSpeed\":{},\"stopLine\":{},\"stopSign\":{},\"yield\":{},",
+            "\"curve\":{},\"mergeGap\":{},\"lane\":{},\"lanes\":{},\"turn\":\"{}\",\"next\":\"{}\",",
+            "\"changing\":{},\"waitSecs\":{:.1}}}"
+        ),
+        esc(&r.state), r.speed_mps, r.desired_mps, r.speed_limit_mps, r.accel,
+        n(r.leader_gap), n(r.leader_speed), n(r.stop_line), n(r.stop_sign), n(r.yield_line),
+        n(r.curve_speed), n(r.merge_gap), r.lane_index, r.lane_count, r.turn, esc(&r.next_road),
+        r.changing_lanes, r.wait_secs,
+    )
+}
+
 /// Turn-signal blink phase: `true` during the lit half of a ~1.4 Hz cycle, off the
 /// other half. Driven off the wall clock so blinkers keep flashing while the sim is
 /// paused, and so timing is independent of frame rate.
@@ -179,6 +199,10 @@ pub struct Simulation {
     /// id so it survives fleet churn; the camera eases toward it each frame and
     /// the selection clears itself once the car reaches its destination.
     selected_vehicle: Option<u32>,
+    /// Throttle cache for the driver-introspection panel: rebuilding the report
+    /// rebuilds the fleet's neighbours, so recompute at most a few times a second
+    /// and hand back the cached JSON in between. `(id, wall-ms, json)`.
+    explain_cache: (i64, f64, String),
     /// The static world surface as one fill mesh, built lazily the first time the ASCII
     /// view is requested and reused every frame after — the network geometry never changes
     /// once assembled, so this avoids rebuilding the whole city's triangles per frame (and
@@ -256,6 +280,7 @@ impl Simulation {
             show_crashes: false,
             selected_junction: None,
             selected_vehicle: None,
+            explain_cache: (-1, f64::NEG_INFINITY, String::new()),
             ascii_fill: None,
         }
     }
@@ -1252,6 +1277,26 @@ impl Simulation {
         self.selected_vehicle = None;
     }
 
+    /// A JSON snapshot of the selected vehicle's current decision — perceived
+    /// inputs (leader gap, stop line, yield, curve, next road, turn) and the
+    /// binding reason for its throttle — for the driver-introspection panel.
+    /// Empty string when nothing is selected. Throttled internally (a rebuild
+    /// re-derives the fleet's neighbours) and served from cache in between.
+    pub fn selected_vehicle_report(&mut self) -> String {
+        let Some(id) = self.selected_vehicle else {
+            self.explain_cache = (-1, f64::NEG_INFINITY, String::new());
+            return String::new();
+        };
+        let now = now_ms();
+        let (cached_id, cached_ms, _) = self.explain_cache;
+        if cached_id == id as i64 && now - cached_ms < 150.0 {
+            return self.explain_cache.2.clone();
+        }
+        let json = self.world.explain(id).map(|r| driver_report_json(&r)).unwrap_or_default();
+        self.explain_cache = (id as i64, now, json.clone());
+        json
+    }
+
     /// Ease the camera toward the selected vehicle — call once per rendered frame
     /// with the real elapsed seconds. The exponential smoothing gives a soft
     /// chase; a pixel-space clamp keeps the car from trailing off screen when the
@@ -2010,6 +2055,7 @@ fn ascii_road_color(kind: RoadKind) -> [f32; 3] {
     match kind {
         RoadKind::Freeway => [0.98, 0.74, 0.26],
         RoadKind::Ramp => [0.82, 0.56, 0.30],
+        RoadKind::Expressway => [0.70, 0.80, 0.42],
         RoadKind::Arterial => [0.36, 0.76, 0.86],
         RoadKind::Collector => [0.44, 0.72, 0.48],
         RoadKind::Local => [0.42, 0.48, 0.60],

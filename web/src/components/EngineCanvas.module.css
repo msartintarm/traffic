@@ -271,6 +271,8 @@
   font-size: 0.72rem;
   font-variant-numeric: tabular-nums;
   max-width: calc(100% - 1.2rem);
+  white-space: pre-line;
+  line-height: 1.35;
   pointer-events: none;
 }
 

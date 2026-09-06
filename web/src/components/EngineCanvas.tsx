@@ -12,7 +12,7 @@ import {
   sliderToMpp,
   wheelZoomFactor,
 } from "../lib/camera";
-import { StatsSmoother, junctionPanelText, panelText, startSpeedLabel, vehiclePanelText } from "../lib/hud";
+import { StatsSmoother, junctionPanelText, panelText, startSpeedLabel, vehicleReportText } from "../lib/hud";
 import { type Control, type InitConfig, overlayFromSnapshot } from "../lib/protocol";
 import { createSession, type Session } from "../lib/session";
 import { SCENARIOS, scenarioName } from "../lib/maps";
@@ -447,7 +447,7 @@ export default function EngineCanvas() {
                   f.selected.kind === "junction"
                     ? junctionPanelText(f.selected.name, f.selected.control, f.selected.stats)
                     : f.selected.kind === "vehicle"
-                      ? vehiclePanelText(f.selected.name, f.selected.stats, unitsRef.current)
+                      ? vehicleReportText(f.selected.name, f.selected.stats, f.selected.report, unitsRef.current)
                       : panelText(f.selected.name, f.selected.stats, unitsRef.current);
                 panelRef.current.style.display = "block";
               } else {

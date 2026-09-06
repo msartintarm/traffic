@@ -28,6 +28,7 @@ export type Sim = {
   pick_vehicle?(wx: number, wy: number, radius: number): number;
   selected_vehicle_id?(): number;
   selected_vehicle_stats?(): Float32Array;
+  selected_vehicle_report?(): string;
   clear_selected_vehicle?(): void;
   follow_selected?(frameDtSecs: number): boolean;
   // Junction selection (optional so a stale wasm build degrades to link-only selection).

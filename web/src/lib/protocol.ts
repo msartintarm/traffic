@@ -175,7 +175,7 @@ export function overlayFromSnapshot(s: StatsSnapshot, opts: OverlayOpts, smoothe
 export type SelectedInfo =
   | { kind: "link"; name: string; stats: [number, number, number, number] }
   | { kind: "junction"; name: string; control: string; stats: [number, number, number, number] }
-  | { kind: "vehicle"; name: string; stats: [number, number] };
+  | { kind: "vehicle"; name: string; stats: [number, number]; report: string };
 
 // The one-shot boot config the worker needs to build the scene. Everything is plain data;
 // the OffscreenCanvas travels separately in the transfer list of the init message.

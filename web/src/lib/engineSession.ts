@@ -316,7 +316,12 @@ export async function startEngineSession(
     if (followingVehicle && sim.selected_vehicle_stats && sim.selected_vehicle_id) {
       const st = sim.selected_vehicle_stats();
       if (st.length >= 2) {
-        return { kind: "vehicle", name: `vehicle #${sim.selected_vehicle_id()}`, stats: [st[0], st[1]] };
+        return {
+          kind: "vehicle",
+          name: `vehicle #${sim.selected_vehicle_id()}`,
+          stats: [st[0], st[1]],
+          report: sim.selected_vehicle_report?.() ?? "",
+        };
       }
     }
     if (selectedJunction >= 0 && sim.junction_stats) {

@@ -96,10 +96,17 @@ pub struct Node {
 /// and are graded by function so demand and junction defaults can differ by type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoadKind {
-    /// Freeway/expressway mainline (`motorway`/`trunk`) — grade-separated, free-flow.
+    /// Freeway mainline (`motorway`) — grade-separated, free-flow, no at-grade crossings.
     Freeway,
-    /// Freeway on/off ramp or interchange connector (`motorway_link`/`trunk_link`).
+    /// Freeway on/off ramp or interchange connector (`motorway_link`).
     Ramp,
+    /// Divided expressway (`trunk`) — a high-capacity through-corridor that is
+    /// *at grade*: signalized where it crosses arterials, grade-separated only
+    /// where OSM models the crossing as a separate layered way. Emphatically NOT
+    /// the freeway system (US "expressways" like Lawrence/Central are `trunk`), so
+    /// its crossings must get the same signal/stop discipline as any arterial —
+    /// treating them as free-flow freeway nodes is what gridlocked MV/SV.
+    Expressway,
     /// Major surface arterial (`primary`/`secondary`) — high-capacity signalized
     /// street (e.g. El Camino Real / a main avenue), a through-corridor, not a
     /// typical trip endpoint.
@@ -117,8 +124,12 @@ impl RoadKind {
     /// slip lane of that class, not a grade-separated ramp.
     pub fn from_osm(class: &str) -> Self {
         match class {
-            "motorway" | "trunk" => RoadKind::Freeway,
-            "motorway_link" | "trunk_link" => RoadKind::Ramp,
+            "motorway" => RoadKind::Freeway,
+            "motorway_link" => RoadKind::Ramp,
+            // `trunk` is a US expressway (at-grade, signalized crossings), not a freeway.
+            "trunk" => RoadKind::Expressway,
+            // A trunk slip lane is an at-grade channelized connector, not a grade-separated ramp.
+            "trunk_link" => RoadKind::Arterial,
             "primary" | "primary_link" | "secondary" | "secondary_link" => RoadKind::Arterial,
             "tertiary" | "tertiary_link" => RoadKind::Collector,
             _ => RoadKind::Local,
@@ -139,7 +150,7 @@ impl RoadKind {
     /// A major road — the freeway system or an arterial. Its trips are through-
     /// movements; local trips start/end off it. (Collector/Local are "minor".)
     pub fn is_major(self) -> bool {
-        matches!(self, RoadKind::Freeway | RoadKind::Ramp | RoadKind::Arterial)
+        matches!(self, RoadKind::Freeway | RoadKind::Ramp | RoadKind::Expressway | RoadKind::Arterial)
     }
 
     /// At-grade right-of-way rank of the functional class (higher wins): the
@@ -150,7 +161,10 @@ impl RoadKind {
     /// yields to the street it meets.
     pub fn at_grade_rank(self) -> u64 {
         match self {
-            RoadKind::Freeway => 5,
+            RoadKind::Freeway => 6,
+            // An expressway outranks the arterials it crosses at grade (it is the
+            // major road at those junctions), below only the freeway system.
+            RoadKind::Expressway => 5,
             RoadKind::Arterial => 4,
             RoadKind::Collector => 3,
             RoadKind::Ramp => 2,
