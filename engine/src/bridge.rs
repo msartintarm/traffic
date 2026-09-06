@@ -1714,7 +1714,35 @@ impl Simulation {
             self.camera.viewport[0] * mpp * 0.5,
             self.camera.viewport[1] * mpp * 0.5,
         ];
-        geometry::occupancy_mesh(net, &counts, self.selected, view)
+        let mut mesh = geometry::occupancy_mesh(net, &counts, self.selected, view);
+        self.push_selection_halo(&mut mesh);
+        mesh
+    }
+
+    /// A pulsing cyan ring around the followed vehicle, riding the translucent
+    /// overlay tier of the density mesh (so it needs no separate pipeline). Drawn
+    /// beneath the car sprite, it reads as a soft halo hugging the selection.
+    fn push_selection_halo(&self, mesh: &mut StaticMesh) {
+        let Some(id) = self.selected_vehicle else { return };
+        let Some(center) = self.world.vehicles().iter().find(|v| v.id == id).map(|v| self.vehicle_draw_center(v)) else {
+            return;
+        };
+        const OVERLAY_LIGHT: f32 = 3.0; // fs_main's translucent tier
+        const STROKE_PX: f64 = 2.5; // on-screen ring thickness, held constant across zoom
+        const MIN_STROKE_M: f64 = 0.4; // …but never thinner than this in world metres
+        const MIN_OUTER_PX: f64 = 7.0; // keep a visible ring around a zoomed-out car-dot
+        let mpp = self.camera.meters_per_pixel;
+        let phase = (now_ms() / 1000.0 * std::f64::consts::TAU / 1.6).sin() * 0.5 + 0.5; // ~1.6 s cycle, 0..1
+        // Radius hugs the car (world metres) but never shrinks below a few screen
+        // pixels, so the ring stays a ring — not a dot — when zoomed way out.
+        let outer = (6.5 + 2.0 * phase).max(MIN_OUTER_PX * mpp);
+        // Stroke width fixed in screen pixels (mpp converts px→metres) so it reads
+        // the same at every zoom, floored to a world minimum so it can't thin to a
+        // sliver zoomed in, and capped so it never eats the ring's hole.
+        let stroke = (STROKE_PX * mpp).max(MIN_STROKE_M).min(outer * 0.6);
+        let inner = outer - stroke;
+        let c = [center[0] as f64, center[1] as f64];
+        mesh.push_halo_ring(c, inner, outer, geometry::HIGHLIGHT_COLOR, OVERLAY_LIGHT);
     }
 
     fn signal_instance_vec(&self) -> Vec<Instance> {

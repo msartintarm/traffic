@@ -246,6 +246,28 @@ impl StaticMesh {
         }
     }
 
+    /// An annulus (ring) centred at `center`, from `inner_r` to `outer_r` (world
+    /// metres), tagged with `light` so the fragment shader can pick its blend
+    /// tier (3.0 = the translucent overlay tier). Vertices carry the radius as
+    /// `offset`, so the shader's min-pixel expansion keeps the ring visible when
+    /// zoomed out. Used for the selected-vehicle halo.
+    pub fn push_halo_ring(&mut self, center: [f64; 2], inner_r: f64, outer_r: f64, color: [f32; 3], light: f32) {
+        const SIDES: u32 = 48;
+        let c = [center[0] as f32, center[1] as f32];
+        let base = self.vertices.len() as u32;
+        for k in 0..SIDES {
+            let a = std::f64::consts::TAU * k as f64 / SIDES as f64;
+            let (cos, sin) = (a.cos(), a.sin());
+            self.vertices.push(StaticVertex { center: c, offset: [(inner_r * cos) as f32, (inner_r * sin) as f32], color, light, edge: 0.0, hw: 0.0 });
+            self.vertices.push(StaticVertex { center: c, offset: [(outer_r * cos) as f32, (outer_r * sin) as f32], color, light, edge: 0.0, hw: 0.0 });
+        }
+        for k in 0..SIDES {
+            let (i0, o0) = (base + 2 * k, base + 2 * k + 1);
+            let (i1, o1) = (base + 2 * ((k + 1) % SIDES), base + 2 * ((k + 1) % SIDES) + 1);
+            self.indices.extend([i0, o0, o1, i0, o1, i1]);
+        }
+    }
+
     pub fn push_disc(&mut self, center: [f64; 2], radius: f64, color: [f32; 3]) {
         const SIDES: u32 = 12;
         let c = [center[0] as f32, center[1] as f32];
@@ -307,6 +329,24 @@ mod tests {
         assert_eq!(a.vertices.len(), 8);
         assert_eq!(a.indices.len(), 12);
         assert!(a.indices[6..].iter().all(|&i| i >= n));
+    }
+
+    #[test]
+    fn halo_ring_is_an_annulus_at_the_given_radii() {
+        let mut m = StaticMesh::default();
+        m.push_halo_ring([10.0, -5.0], 6.0, 8.0, [0.25, 0.85, 1.0], 3.0);
+        const SIDES: usize = 48;
+        assert_eq!(m.vertices.len(), SIDES * 2, "inner+outer ring vertices");
+        assert_eq!(m.indices.len(), SIDES * 6, "two triangles per segment");
+        // Every vertex shares the world centre; its offset length is one of the radii.
+        for v in &m.vertices {
+            assert!((v.center[0] - 10.0).abs() < 1e-4 && (v.center[1] + 5.0).abs() < 1e-4);
+            let r = (v.offset[0] * v.offset[0] + v.offset[1] * v.offset[1]).sqrt();
+            assert!((r - 6.0).abs() < 1e-3 || (r - 8.0).abs() < 1e-3, "radius {r} is inner or outer");
+            assert_eq!(v.light, 3.0, "rides the translucent overlay tier");
+        }
+        // Indices stay in range.
+        assert!(m.indices.iter().all(|&i| (i as usize) < m.vertices.len()));
     }
 
     #[test]
