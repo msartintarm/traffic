@@ -19,7 +19,7 @@ export type SimParams = {
   sharded: boolean;
   localRouting: boolean;
   splitJunctions: boolean;
-  prePopulate: boolean;
+  warmupMinutes: number;
   sleepScheduler: boolean;
   parThreshold: number;
   parallelRouting: boolean;
@@ -55,7 +55,7 @@ export const DEFAULTS: SimParams = {
   sharded: true,
   localRouting: true,
   splitJunctions: true,
-  prePopulate: false,
+  warmupMinutes: 0,
   sleepScheduler: true,
   parThreshold: 500,
   parallelRouting: true,
@@ -86,7 +86,7 @@ export const DEFAULTS: SimParams = {
 //  - "init": consumed while building InitConfig / picking the wasm (compute, gpu, split).
 //  - "control": applied via applyControl({type: controlType, value}) after boot.
 //  - "tuning": collected into sim.set_demand_tuning(...).
-//  - "boot": applied at boot through a bespoke path (localRouting/sharded/prePopulate,
+//  - "boot": applied at boot through a bespoke path (localRouting/sharded/warmupMinutes,
 //     which already had dedicated boot handling).
 export type Apply = "init" | "control" | "tuning" | "boot";
 
@@ -123,7 +123,7 @@ export const SCHEMA: Field[] = [
   { key: "sharded", kind: { t: "bool" }, group: "Execution", label: "Sharded parallelism", apply: "boot", control: "sharding", help: "Divide the map into regions carried by separate cores (SPMD). On by default." },
   { key: "localRouting", kind: { t: "bool" }, group: "Execution", label: "Local routing", apply: "boot", control: "localRouting", help: "Per-driver bounded-search routing (map-size-independent, measured faster than the flow-field). On by default." },
   { key: "splitJunctions", kind: { t: "bool" }, group: "Execution", label: "Align large junctions", apply: "init", help: "Split large divided-road junctions into aligned nodes so carriageways run straight through." },
-  { key: "prePopulate", kind: { t: "bool" }, group: "Execution", label: "Pre-populate traffic", apply: "boot", help: "Fast-forward up to an hour headlessly before the map appears, so roads start busy." },
+  { key: "warmupMinutes", kind: { t: "u16" }, group: "Execution", label: "Pre-populate (min)", apply: "boot", step: 5, uiMin: 0, uiMax: 120, help: "Fast-forward this many minutes of simulated travel headlessly before the map appears, so roads start busy. 0 = off." },
   { key: "sleepScheduler", kind: { t: "bool" }, group: "Execution", label: "Sleep scheduler", apply: "control", control: "sleepScheduler", help: "Skip queued/isolated cars' full per-tick work. On by default (stands down under parallel threads)." },
   { key: "parThreshold", kind: { t: "u16" }, group: "Execution", label: "Parallel threshold (cars)", apply: "control", control: "parThreshold", step: 100, uiMin: 0, uiMax: 20000, help: "Fleet size above which per-vehicle passes go parallel." },
   { key: "parallelRouting", kind: { t: "bool" }, group: "Execution", label: "Parallel routing", apply: "control", control: "parallelRouting" },
@@ -242,7 +242,7 @@ export function paramsFromUrl(search: string): SimParams {
   if (u.get("split") === "0") p.splitJunctions = false;
   if (u.get("localrouting") === "0") p.localRouting = false;
   if (u.get("shard") === "0") p.sharded = false;
-  if (u.get("warmup") === "1") p.prePopulate = true;
+  if (u.get("warmup") === "1") p.warmupMinutes = 60;
   return p;
 }
 
@@ -262,7 +262,7 @@ export function applyRuntimeParams(p: SimParams, apply: (c: ControlMsg) => void)
     } else if (f.apply === "boot") {
       if (f.key === "sharded") apply({ type: "sharding", value: p.sharded });
       else if (f.key === "localRouting") apply({ type: "localRouting", value: p.localRouting });
-      else if (f.key === "prePopulate" && p.prePopulate) apply({ type: "warmup", seconds: 3600 });
+      else if (f.key === "warmupMinutes" && p.warmupMinutes > 0) apply({ type: "warmup", seconds: p.warmupMinutes * 60 });
     }
   }
   apply({

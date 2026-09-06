@@ -132,8 +132,26 @@ pub struct StaticVertex {
     pub center: [f32; 2],
     pub offset: [f32; 2],
     pub color: [f32; 3],
+    /// Fragment-shader tag. 0 = flat static geometry; 1–5 are vehicle-lamp tiers
+    /// (see `scene.wgsl`). For a DASHED marking it instead carries
+    /// `DASH_LIGHT_BASE + arc-length` (world metres along the line), interpolated
+    /// across the ribbon so the shader paints the dash pattern itself — one quad
+    /// per whole divider instead of one per 6 m dash — with no extra vertex field.
     pub light: f32,
+    /// Road-fill only: signed lateral position (world metres) across the
+    /// carriageway — `-hw` at the median edge, `+hw` at the curb edge, interpolated
+    /// so the fragment paints the solid centre (median, yellow) and edge (curb,
+    /// white) lines itself. That removes the per-segment edge/centre ribbons — the
+    /// bulk of the marking mesh — at the cost of these two floats on every vertex.
+    pub edge: f32,
+    /// Road-fill only: the carriageway half-width (metres); `0` on all other
+    /// geometry, which the fragment reads as "no edge lines".
+    pub hw: f32,
 }
+
+/// A `light` at or above this marks a dashed marking; the excess is the arc-length
+/// (metres) along the line. Well clear of the 0–5 lamp/overlay tiers.
+pub(crate) const DASH_LIGHT_BASE: f32 = 100.0;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StaticMesh {
@@ -167,7 +185,48 @@ impl StaticMesh {
         let (af, bf) = ([a[0] as f32, a[1] as f32], [b[0] as f32, b[1] as f32]);
         let base = self.vertices.len() as u32;
         for (center, offset) in [(af, neg), (bf, neg), (bf, off), (af, off)] {
-            self.vertices.push(StaticVertex { center, offset, color, light });
+            self.vertices.push(StaticVertex { center, offset, color, light, edge: 0.0, hw: 0.0 });
+        }
+        self.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
+    /// A carriageway-fill ribbon that also carries the solid centre/edge line
+    /// markings, painted by the fragment shader from the signed lateral position
+    /// `edge` (∈ `[-half_w, +half_w]`): a yellow median line at `-half_w`, a white
+    /// curb line at `+half_w`. Replaces per-segment edge/centre marking ribbons —
+    /// the bulk of the marking mesh — with the road fill it already draws. The
+    /// `-half_w` side is the median (left of travel for right-hand traffic), the
+    /// `+half_w` side the curb, matching the perpendicular from [`unit_perp`].
+    pub fn push_road_fill(&mut self, a: [f64; 2], b: [f64; 2], half_w: f64, color: [f32; 3]) {
+        let n = unit_perp(a, b);
+        let off = [(n[0] * half_w) as f32, (n[1] * half_w) as f32];
+        let neg = [-off[0], -off[1]];
+        let (af, bf) = ([a[0] as f32, a[1] as f32], [b[0] as f32, b[1] as f32]);
+        let hw = half_w as f32;
+        let base = self.vertices.len() as u32;
+        // Order mirrors `push_ribbon`: the `neg` (−n) side is the median (`edge = -hw`).
+        for (center, offset, edge) in [(af, neg, -hw), (bf, neg, -hw), (bf, off, hw), (af, off, hw)] {
+            self.vertices.push(StaticVertex { center, offset, color, light: 0.0, edge, hw });
+        }
+        self.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
+    /// One ribbon quad along `a→b` whose dash pattern (3 m on / 3 m off) is painted
+    /// by the fragment shader from the interpolated arc-length carried in `light`
+    /// (offset by [`DASH_LIGHT_BASE`]). Replaces the old per-dash quads: a lane
+    /// divider is now a single quad, not `length/6` of them — and it reuses the
+    /// existing `light` field, so nothing grows. `a`-end vertices carry arc-length
+    /// 0, `b`-end vertices the full length.
+    pub fn push_dashed(&mut self, a: [f64; 2], b: [f64; 2], half_w: f64, color: [f32; 3]) {
+        let n = unit_perp(a, b);
+        let off = [(n[0] * half_w) as f32, (n[1] * half_w) as f32];
+        let neg = [-off[0], -off[1]];
+        let (af, bf) = ([a[0] as f32, a[1] as f32], [b[0] as f32, b[1] as f32]);
+        let len = ((b[0] - a[0]).hypot(b[1] - a[1])) as f32;
+        let base = self.vertices.len() as u32;
+        // Order mirrors `push_ribbon`: a, b, b, a — so a-end verts get arc-length 0.
+        for (center, offset, arc) in [(af, neg, 0.0), (bf, neg, len), (bf, off, len), (af, off, 0.0)] {
+            self.vertices.push(StaticVertex { center, offset, color, light: DASH_LIGHT_BASE + arc, edge: 0.0, hw: 0.0 });
         }
         self.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
     }
@@ -180,7 +239,7 @@ impl StaticMesh {
         }
         let base = self.vertices.len() as u32;
         for p in points {
-            self.vertices.push(StaticVertex { center: [p[0] as f32, p[1] as f32], offset: [0.0, 0.0], color, light: 0.0 });
+            self.vertices.push(StaticVertex { center: [p[0] as f32, p[1] as f32], offset: [0.0, 0.0], color, light: 0.0, edge: 0.0, hw: 0.0 });
         }
         for k in 1..points.len() as u32 - 1 {
             self.indices.extend([base, base + k, base + k + 1]);
@@ -191,7 +250,7 @@ impl StaticMesh {
         const SIDES: u32 = 12;
         let c = [center[0] as f32, center[1] as f32];
         let base = self.vertices.len() as u32;
-        self.vertices.push(StaticVertex { center: c, offset: [0.0, 0.0], color, light: 0.0 });
+        self.vertices.push(StaticVertex { center: c, offset: [0.0, 0.0], color, light: 0.0, edge: 0.0, hw: 0.0 });
         for k in 0..SIDES {
             let a = std::f64::consts::TAU * k as f64 / SIDES as f64;
             self.vertices.push(StaticVertex {
@@ -199,6 +258,8 @@ impl StaticMesh {
                 offset: [(radius * a.cos()) as f32, (radius * a.sin()) as f32],
                 color,
                 light: 0.0,
+                edge: 0.0,
+                hw: 0.0,
             });
         }
         for k in 0..SIDES {

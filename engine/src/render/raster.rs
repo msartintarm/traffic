@@ -53,17 +53,38 @@ impl Raster {
     /// Fill every mesh triangle in the colour carried by its vertices.
     pub fn fill_mesh(&mut self, mesh: &StaticMesh) {
         for tri in mesh.indices.chunks_exact(3) {
+            let sv = |i: u32| mesh.vertices[i as usize];
             let v = |i: u32| {
-                let sv = mesh.vertices[i as usize];
-                [(sv.center[0] + sv.offset[0]) as f64, (sv.center[1] + sv.offset[1]) as f64]
+                let s = sv(i);
+                [(s.center[0] + s.offset[0]) as f64, (s.center[1] + s.offset[1]) as f64]
             };
-            let c = mesh.vertices[tri[0] as usize].color;
+            let c = sv(tri[0]).color;
             let color = [(c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8];
-            self.fill_tri([v(tri[0]), v(tri[1]), v(tri[2])], color);
+            // A dashed ribbon encodes its per-vertex arc-length in `light`
+            // (DASH_LIGHT_BASE + metres); honour it per pixel so the software raster
+            // paints the same dash pattern the GPU shader does (a faithful golden
+            // reference now that a divider is one quad instead of many dashes).
+            let arc = |i: u32| (sv(i).light - super::DASH_LIGHT_BASE) as f64;
+            let dash = (sv(tri[0]).light >= super::DASH_LIGHT_BASE).then(|| [arc(tri[0]), arc(tri[1]), arc(tri[2])]);
+            // Road fill (hw > 0): the fragment paints solid median/curb lines from
+            // the signed lateral coordinate `edge`, mirroring the GPU shader so the
+            // golden reference stays faithful. Only once zoomed in past the marking
+            // cutoff (0.7 m/px), matching the shader gate — the raster's m/px is its
+            // world span over its pixel width.
+            let mpp = (self.max[0] - self.min[0]) / self.w as f64;
+            let hw = sv(tri[0]).hw as f64;
+            let road = (hw > 0.0 && mpp <= 0.7).then(|| ([sv(tri[0]).edge as f64, sv(tri[1]).edge as f64, sv(tri[2]).edge as f64], hw));
+            self.fill_tri([v(tri[0]), v(tri[1]), v(tri[2])], color, dash, road);
         }
     }
 
-    fn fill_tri(&mut self, t: [[f64; 2]; 3], color: [u8; 3]) {
+    fn fill_tri(&mut self, t: [[f64; 2]; 3], color: [u8; 3], dash: Option<[f64; 3]>, road: Option<([f64; 3], f64)>) {
+        // Metres from a carriageway edge within which the solid line paints, and the
+        // line colours (matching `scene.wgsl` / the geometry constants).
+        const LINE_HW: f64 = 0.2;
+        let u8c = |c: [f32; 3]| [(c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8];
+        let center = u8c(super::geometry::CENTER_LINE_COLOR);
+        let edge_col = u8c(super::geometry::EDGE_LINE_COLOR);
         let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
         for p in t {
             for k in 0..2 {
@@ -80,12 +101,42 @@ impl Raster {
         let r1 = to_row(lo[1]).clamp(0, self.h as isize - 1);
         for row in r0..=r1 {
             for col in c0..=c1 {
-                if point_in_tri(t, self.pixel_center(col as usize, row as usize)) {
-                    self.px[row as usize * self.w + col as usize] = color;
+                let p = self.pixel_center(col as usize, row as usize);
+                if !point_in_tri(t, p) {
+                    continue;
                 }
+                if let Some(d) = dash {
+                    let b = barycentric(t, p);
+                    let arc = b[0] * d[0] + b[1] * d[1] + b[2] * d[2];
+                    // 3 m painted, 3 m gap (a 6 m cycle) — the shader's DASH pattern.
+                    if (arc / 6.0).rem_euclid(1.0) * 6.0 >= 3.0 {
+                        continue;
+                    }
+                }
+                let mut px = color;
+                if let Some((e, hw)) = road {
+                    let b = barycentric(t, p);
+                    let lat = b[0] * e[0] + b[1] * e[1] + b[2] * e[2];
+                    if hw - lat.abs() < LINE_HW {
+                        px = if lat < 0.0 { center } else { edge_col };
+                    }
+                }
+                self.px[row as usize * self.w + col as usize] = px;
             }
         }
     }
+}
+
+/// Barycentric weights of `p` in triangle `t` (weights of t0, t1, t2), for
+/// interpolating a per-vertex attribute across the face.
+fn barycentric(t: [[f64; 2]; 3], p: [f64; 2]) -> [f64; 3] {
+    let edge = |a: [f64; 2], b: [f64; 2]| (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+    let (s0, s1, s2) = (edge(t[0], t[1]), edge(t[1], t[2]), edge(t[2], t[0]));
+    let sum = s0 + s1 + s2;
+    if sum.abs() < 1e-12 {
+        return [1.0, 0.0, 0.0];
+    }
+    [s1 / sum, s2 / sum, s0 / sum]
 }
 
 // --- realism metrics: how closely the render matches a real intersection ------
@@ -707,6 +758,126 @@ mod golden {
     fn real_map() -> Option<Network> {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/public/map.json");
         Some(crate::sim::map::OsmMap::from_json(&std::fs::read_to_string(path).ok()?).ok()?.build())
+    }
+
+    /// The solid centre (median, yellow) and edge (curb, white) lines are painted by
+    /// the road-fill fragment from its signed lateral coordinate — not baked as
+    /// separate ribbons. A straight carriageway must show a yellow line at its median
+    /// edge, a white line at its curb edge, and plain asphalt between. (TDD gate for
+    /// the shader-drawn solid lines; the raster mirrors `scene.wgsl`.)
+    #[test]
+    fn road_fill_paints_median_and_curb_lines() {
+        use crate::render::geometry::{CENTER_LINE_COLOR, EDGE_LINE_COLOR, ROAD_COLOR};
+        let mut mesh = StaticMesh::default();
+        // Straight carriageway, half-width 5 m, 40 m long along +x at y = 0.
+        mesh.push_road_fill([0.0, 0.0], [40.0, 0.0], 5.0, ROAD_COLOR);
+        let mut r = Raster::new([-2.0, -7.0], [42.0, 7.0], 440, 140, BG); // 10 px/m
+        r.fill_mesh(&mesh);
+        let u8c = |c: [f32; 3]| [(c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8];
+        let px = |x: f64, y: f64| {
+            let (col, row) = r.world_to_px([x, y]);
+            r.px[row as usize * r.w + col as usize]
+        };
+        // unit_perp points -y, so the median edge (`edge = -hw`) is the +y side, the
+        // curb edge the -y side.
+        assert_eq!(px(20.0, 0.0), u8c(ROAD_COLOR), "plain asphalt mid-carriageway");
+        assert_eq!(px(20.0, 4.9), u8c(CENTER_LINE_COLOR), "yellow median line at the median edge");
+        assert_eq!(px(20.0, -4.9), u8c(EDGE_LINE_COLOR), "white curb line at the curb edge");
+    }
+
+    /// The road-fill lines are gated by zoom (like the marking mesh): painted when
+    /// zoomed in, hidden when zoomed out so they don't clutter the overview.
+    #[test]
+    fn road_lines_gated_by_zoom() {
+        use crate::render::geometry::{CENTER_LINE_COLOR, EDGE_LINE_COLOR, ROAD_COLOR};
+        let mut mesh = StaticMesh::default();
+        mesh.push_road_fill([0.0, 0.0], [40.0, 0.0], 5.0, ROAD_COLOR);
+        let u8c = |c: [f32; 3]| [(c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8];
+        let (center, edge) = (u8c(CENTER_LINE_COLOR), u8c(EDGE_LINE_COLOR));
+        let line_px = |r: &Raster| r.px.iter().filter(|&&p| p == center || p == edge).count();
+        // Zoomed in (~0.1 m/px): lines painted.
+        let mut zin = Raster::new([-2.0, -7.0], [42.0, 7.0], 440, 140, BG);
+        zin.fill_mesh(&mesh);
+        assert!(line_px(&zin) > 0, "lines show when zoomed in");
+        // Zoomed out (~5 m/px, above the 0.7 cutoff): no lines, just asphalt.
+        let mut zout = Raster::new([-100.0, -100.0], [140.0, 100.0], 48, 40, BG);
+        zout.fill_mesh(&mesh);
+        assert_eq!(line_px(&zout), 0, "no lines when zoomed out");
+    }
+
+    /// Ranks a map's junctions by rendering difficulty (most member nodes, then
+    /// widest extent, then most arms) — the sprawling multi-node crossings the
+    /// decomposition handles, the ones most likely to regress. Mirrors
+    /// `diag_city_views`' ranking so the golden set is a stable, complexity-ordered
+    /// sample.
+    fn complex_junctions(net: &Network, take: usize) -> Vec<usize> {
+        let extent = |ji: usize| {
+            let j = &net.junctions[ji];
+            j.nodes
+                .iter()
+                .map(|&nd| {
+                    let p = net.node(nd).position;
+                    ((p[0] - j.center[0]).hypot(p[1] - j.center[1]) * 10.0) as u64
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        let mut rank: Vec<usize> = (0..net.junctions.len()).collect();
+        rank.sort_by_key(|&ji| {
+            let j = &net.junctions[ji];
+            std::cmp::Reverse((j.nodes.len(), extent(ji), j.mouths.len(), ji))
+        });
+        rank.truncate(take);
+        rank
+    }
+
+    /// Screenshot regression for manually-identified complex intersections on the
+    /// real scraped maps: the most complex junctions on Millbrae and (when present)
+    /// SF are rendered car-free and pixel-diffed against committed goldens, so any
+    /// change to road/marking rendering — like moving the solid lines onto the fill
+    /// — is caught. First run writes each golden for review; a mismatch writes
+    /// `<name>.actual.png` beside it and fails.
+    #[test]
+    fn complex_real_junctions_match_golden_screenshots() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/render/fixtures");
+        std::fs::create_dir_all(dir).unwrap();
+        const SIZE: usize = 768;
+        for map in ["map", "sf"] {
+            let path = format!("{}/../web/public/{map}.json", env!("CARGO_MANIFEST_DIR"));
+            let Ok(text) = std::fs::read_to_string(&path) else { continue }; // absent in a bare checkout
+            let net = crate::sim::map::OsmMap::from_json(&text).expect("map json").build();
+            for (rank, &ji) in complex_junctions(&net, 3).iter().enumerate() {
+                let j = &net.junctions[ji];
+                let half = j
+                    .nodes
+                    .iter()
+                    .map(|&nd| {
+                        let p = net.node(nd).position;
+                        (p[0] - j.center[0]).hypot(p[1] - j.center[1])
+                    })
+                    .fold(0.0, f64::max)
+                    + 45.0;
+                let mut r = Raster::centered(j.center, half, SIZE, BG);
+                draw_world(&net, &[], &mut r);
+                let rgb = r.rgb();
+                let png = encode(SIZE, SIZE, &rgb);
+                let golden_path = format!("{dir}/complex_{map}_{rank}.png");
+                match std::fs::read(&golden_path) {
+                    Ok(golden) => {
+                        let (_, _, gpx) = decode(&golden);
+                        let diff = rgb.iter().zip(&gpx).filter(|(a, b)| a != b).count();
+                        if diff > 0 {
+                            std::fs::write(format!("{dir}/complex_{map}_{rank}.actual.png"), &png).unwrap();
+                            panic!("complex_{map}_{rank} render changed ({diff} byte diffs); wrote .actual.png — review, then update the golden if intended");
+                        }
+                    }
+                    Err(_) => {
+                        std::fs::write(&golden_path, &png).unwrap();
+                        println!("wrote initial golden complex_{map}_{rank}.png — review it and commit");
+                    }
+                }
+            }
+        }
     }
 
     fn crossing_track(net: &Network, mid: MovementId, step: f64) -> Vec<([f64; 2], u32, bool)> {

@@ -10,7 +10,8 @@ fn main() {
     let net = map.build();
     let t = std::time::Instant::now();
     let g = geometry::world_geometry(&net);
-    let vb = |m: &engine::render::StaticMesh| m.vertices.len() * 32 + m.indices.len() * 4;
+    let vsize = std::mem::size_of::<engine::render::StaticVertex>();
+    let vb = |m: &engine::render::StaticMesh| m.vertices.len() * vsize + m.indices.len() * 4;
     println!("bake: {:?}", t.elapsed());
     println!(
         "world: {} verts, {} idx ({} MB)   marking: {} verts, {} idx ({} MB)   dir: {} u32",

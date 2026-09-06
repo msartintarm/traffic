@@ -1857,8 +1857,8 @@ impl Simulation {
 /// high-water. `StaticVertex` is `#[repr(C)]` of exactly 8 `f32` with no padding, so its
 /// buffer *is* a valid `[f32; 8·len]` with `8·cap` capacity and identical alignment.
 fn flatten_static_vertices(mut v: Vec<StaticVertex>) -> Vec<f32> {
-    const _: () = assert!(std::mem::size_of::<StaticVertex>() == 8 * std::mem::size_of::<f32>());
-    let (ptr, len, cap) = (v.as_mut_ptr() as *mut f32, v.len() * 8, v.capacity() * 8);
+    const _: () = assert!(std::mem::size_of::<StaticVertex>() == 10 * std::mem::size_of::<f32>());
+    let (ptr, len, cap) = (v.as_mut_ptr() as *mut f32, v.len() * 10, v.capacity() * 10);
     std::mem::forget(v);
     // SAFETY: layout-compatible per the doc comment; the original allocation size
     // (cap · size_of::<StaticVertex>()) equals 8·cap · size_of::<f32>() with the same 4-byte

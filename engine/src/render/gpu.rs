@@ -22,8 +22,8 @@ const MARKING_MAX_MPP: f32 = 0.7;
 
 const VERTEX_ATTRS: [wgpu::VertexAttribute; 3] =
     wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x3, 2 => Float32];
-const STATIC_ATTRS: [wgpu::VertexAttribute; 4] =
-    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x3, 3 => Float32];
+const STATIC_ATTRS: [wgpu::VertexAttribute; 6] =
+    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x3, 3 => Float32, 4 => Float32, 5 => Float32];
 const INSTANCE_ATTRS: [wgpu::VertexAttribute; 9] = wgpu::vertex_attr_array![
     3 => Float32x2, 4 => Float32x2, 5 => Float32x2, 6 => Float32x2, 7 => Float32x3, 8 => Float32, 9 => Float32, 10 => Float32, 11 => Float32
 ];

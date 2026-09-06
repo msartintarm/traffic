@@ -310,36 +310,27 @@ pub fn world_fill_colored(net: &Network, color_of: impl Fn(RoadKind) -> [f32; 3]
     out
 }
 
-/// One link's carriageway fill ribbons, appended to `mesh`.
+/// One link's carriageway fill ribbons, appended to `mesh`. The ribbon carries its
+/// signed lateral coordinate so the shader paints the solid centre (median) and
+/// edge (curb) lines directly on the fill — no separate marking ribbons.
 fn link_fill(net: &Network, i: usize, mesh: &mut StaticMesh) {
     let half = net.links[i].lane_count as f64 * LANE_WIDTH / 2.0;
     for seg in net.polylines[i].windows(2) {
         let (a, b) = offset_right(seg[0], seg[1], half);
-        mesh.push_ribbon(a, b, half, ROAD_COLOR, 0.0);
+        mesh.push_road_fill(a, b, half, ROAD_COLOR);
     }
 }
 
-/// One link's lane markings (dashed dividers + solid edge/centre lines),
-/// appended to `mesh` — the per-link half of [`marking_mesh`], bucketed by band.
+/// One link's lane markings — the DASHED same-direction lane dividers. The solid
+/// centre (median, yellow) and edge (curb, white) lines are no longer baked here:
+/// they are painted by the fragment shader from the carriageway fill's lateral
+/// coordinate (see [`StaticMesh::push_road_fill`]), which removed the per-segment
+/// edge/centre ribbons that were the bulk of the marking mesh.
 fn link_markings(net: &Network, id: LinkId, mesh: &mut StaticMesh) {
     let mut dividers = Vec::new();
     net.link_dividers(id, &mut dividers);
     for d in dividers {
-        dashed_line(mesh, [d[0], d[1]], [d[2], d[3]], 3.0, 3.0, 0.15, LANE_LINE_COLOR);
-    }
-    let mut strips = Vec::new();
-    net.link_strips(id, &mut strips);
-    for s in strips {
-        let (a, b, half) = ([s[0], s[1]], [s[2], s[3]], s[4] / 2.0);
-        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-        let len = dx.hypot(dy).max(1e-9);
-        let n = [dy / len, -dx / len];
-        // Inner edge (side -1) borders opposing traffic → yellow centre line;
-        // outer edge (side +1) is the road edge.
-        for (side, color) in [(-1.0, CENTER_LINE_COLOR), (1.0, EDGE_LINE_COLOR)] {
-            let off = [n[0] * half * side, n[1] * half * side];
-            mesh.push_ribbon([a[0] + off[0], a[1] + off[1]], [b[0] + off[0], b[1] + off[1]], 0.1, color, 0.0);
-        }
+        dashed_line(mesh, [d[0], d[1]], [d[2], d[3]], 0.15, LANE_LINE_COLOR);
     }
 }
 
@@ -901,9 +892,9 @@ fn fill_fan(mesh: &mut StaticMesh, center: [f64; 2], ring: &[[f64; 2]], color: [
         return;
     }
     let base = mesh.vertices.len() as u32;
-    mesh.vertices.push(StaticVertex { center: [center[0] as f32, center[1] as f32], offset: [0.0, 0.0], color, light: 0.0 });
+    mesh.vertices.push(StaticVertex { center: [center[0] as f32, center[1] as f32], offset: [0.0, 0.0], color, light: 0.0, edge: 0.0, hw: 0.0 });
     for p in ring {
-        mesh.vertices.push(StaticVertex { center: [p[0] as f32, p[1] as f32], offset: [0.0, 0.0], color, light: 0.0 });
+        mesh.vertices.push(StaticVertex { center: [p[0] as f32, p[1] as f32], offset: [0.0, 0.0], color, light: 0.0, edge: 0.0, hw: 0.0 });
     }
     let k = ring.len() as u32;
     for j in 0..k {
@@ -1365,19 +1356,15 @@ pub fn turn_arc(entry: [f64; 2], node: [f64; 2], exit: [f64; 2], samples: usize)
     (0..=samples).map(|i| bezier(entry, node, exit, i as f64 / samples as f64)).collect()
 }
 
-fn dashed_line(mesh: &mut StaticMesh, a: [f64; 2], b: [f64; 2], dash: f64, gap: f64, width: f64, color: [f32; 3]) {
-    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-    let len = dx.hypot(dy);
-    if len < 1e-6 {
+/// One dashed line `a→b`. The dash pattern (3 m on / 3 m off — the cycle the
+/// shader assumes) is painted per-fragment from the interpolated arc-length, so
+/// this emits a SINGLE ribbon rather than a quad per dash (the marking mesh's
+/// dominant cost on a big map).
+fn dashed_line(mesh: &mut StaticMesh, a: [f64; 2], b: [f64; 2], width: f64, color: [f32; 3]) {
+    if (b[0] - a[0]).hypot(b[1] - a[1]) < 1e-6 {
         return;
     }
-    let (ux, uy) = (dx / len, dy / len);
-    let mut s = 0.0;
-    while s < len {
-        let e = (s + dash).min(len);
-        mesh.push_ribbon([a[0] + ux * s, a[1] + uy * s], [a[0] + ux * e, a[1] + uy * e], width / 2.0, color, 0.0);
-        s += dash + gap;
-    }
+    mesh.push_dashed(a, b, width / 2.0, color);
 }
 
 #[cfg(test)]
