@@ -58,6 +58,7 @@ export type Control =
   | { type: "panBy"; dx: number; dy: number }
   | { type: "resize"; w: number; h: number }
   | { type: "select"; wx: number; wy: number; radius: number }
+  | { type: "releaseFollow" }
   | { type: "hover"; wx: number; wy: number; x: number; y: number }
   | { type: "play" }
   | { type: "pause" }
@@ -81,7 +82,7 @@ export const CONTROL_TYPES: ReadonlySet<ControlType> = new Set([
   "parThreshold", "parallelRouting", "cacheSort", "stopCostRouting", "laneEvalStagger", "arterialRouting", "targetedRouting", "localitySort", "sharding", "asyncRouting", "followerLod", "localRouting", "shardStats", "warmup",
   "showCrashes", "clearCrashes", "entrySpeedCap", "congestionEngage", "congestionEnabled",
   "demandSources", "fit", "metersPerPixel", "zoomAt", "panBy", "resize", "select",
-  "hover", "play", "pause", "frameBudget", "ascii", "transit", "demandTuning",
+  "releaseFollow", "hover", "play", "pause", "frameBudget", "ascii", "transit", "demandTuning",
 ] satisfies ControlType[]);
 
 export function isControl(msg: unknown): msg is Control {
@@ -173,7 +174,8 @@ export function overlayFromSnapshot(s: StatsSnapshot, opts: OverlayOpts, smoothe
 // `[queued, crossing, maxWaitSecs, throughputVph]` plus its control regime.
 export type SelectedInfo =
   | { kind: "link"; name: string; stats: [number, number, number, number] }
-  | { kind: "junction"; name: string; control: string; stats: [number, number, number, number] };
+  | { kind: "junction"; name: string; control: string; stats: [number, number, number, number] }
+  | { kind: "vehicle"; name: string; stats: [number, number] };
 
 // The one-shot boot config the worker needs to build the scene. Everything is plain data;
 // the OffscreenCanvas travels separately in the transfer list of the init message.

@@ -59,6 +59,26 @@ impl Camera {
         self.center[1] += before[1] - after[1];
     }
 
+    /// Ease the centre toward a world `target` for a follow camera: a frame-rate
+    /// independent exponential approach (time constant `tau` seconds), then a
+    /// hard clamp so the target never trails farther than `max_offset_px` screen
+    /// pixels from the centre — the car stays on screen however fast it moves.
+    pub fn ease_toward(&mut self, target: [f64; 2], frame_dt: f64, tau: f64, max_offset_px: f64) {
+        let k = 1.0 - (-frame_dt.max(0.0) / tau.max(1e-6)).exp();
+        let mut c = [
+            self.center[0] + (target[0] - self.center[0]) * k,
+            self.center[1] + (target[1] - self.center[1]) * k,
+        ];
+        let max_off = max_offset_px * self.meters_per_pixel;
+        let (dx, dy) = (target[0] - c[0], target[1] - c[1]);
+        let d = dx.hypot(dy);
+        if d > max_off {
+            let s = (d - max_off) / d;
+            c = [c[0] + dx * s, c[1] + dy * s];
+        }
+        self.center = c;
+    }
+
     /// Visible world rectangle `[min_x, min_y, max_x, max_y]` for culling.
     pub fn visible_world_rect(&self) -> [f64; 4] {
         let hw = self.viewport[0] / 2.0 * self.meters_per_pixel;
@@ -129,6 +149,37 @@ mod tests {
         c.meters_per_pixel *= 2.0;
         let w1 = c.visible_world_rect();
         assert!((w1[2] - w1[0]) > (w0[2] - w0[0]));
+    }
+
+    #[test]
+    fn ease_toward_converges_on_a_still_target() {
+        let mut c = cam();
+        let target = [400.0, -200.0];
+        for _ in 0..600 {
+            c.ease_toward(target, 1.0 / 60.0, 0.18, 90.0);
+        }
+        assert!((c.center[0] - target[0]).abs() < 1e-3 && (c.center[1] - target[1]).abs() < 1e-3);
+    }
+
+    #[test]
+    fn ease_toward_moves_partway_in_one_frame() {
+        // A single frame should close some of the gap but not all of it (the
+        // smoothing) when the target sits within the pixel clamp.
+        let mut c = Camera::new([0.0, 0.0], 0.5, [800.0, 600.0]);
+        let target = [10.0, 0.0]; // 20 px away, inside the 90 px window
+        c.ease_toward(target, 1.0 / 60.0, 0.18, 90.0);
+        assert!(c.center[0] > 0.0 && c.center[0] < 10.0, "eased partway, got {}", c.center[0]);
+    }
+
+    #[test]
+    fn ease_toward_clamps_a_fast_target_within_the_pixel_window() {
+        // A far jump (target way outside the window) is clamped so the target is
+        // at most max_offset_px * mpp from the centre — the car can't run off.
+        let mut c = Camera::new([0.0, 0.0], 2.0, [800.0, 600.0]);
+        let target = [100_000.0, 0.0];
+        c.ease_toward(target, 1.0 / 60.0, 0.18, 90.0);
+        let off = (target[0] - c.center[0]).hypot(target[1] - c.center[1]);
+        assert!(off <= 90.0 * 2.0 + 1e-6, "target within the clamp window, off={off}");
     }
 
     #[test]

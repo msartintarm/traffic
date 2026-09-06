@@ -175,6 +175,10 @@ pub struct Simulation {
     show_crashes: bool,
     /// The junction the user selected (stats panel + footprint highlight).
     selected_junction: Option<usize>,
+    /// The vehicle the follow-camera is tracking, keyed by its (globally unique)
+    /// id so it survives fleet churn; the camera eases toward it each frame and
+    /// the selection clears itself once the car reaches its destination.
+    selected_vehicle: Option<u32>,
     /// The static world surface as one fill mesh, built lazily the first time the ASCII
     /// view is requested and reused every frame after — the network geometry never changes
     /// once assembled, so this avoids rebuilding the whole city's triangles per frame (and
@@ -251,6 +255,7 @@ impl Simulation {
             frame_budget: true,
             show_crashes: false,
             selected_junction: None,
+            selected_vehicle: None,
             ascii_fill: None,
         }
     }
@@ -616,12 +621,15 @@ impl Simulation {
 
     /// Reset to a whole-network fit for the current viewport.
     pub fn fit(&mut self) {
+        self.selected_vehicle = None; // a full-map fit ends any follow
         self.camera = Camera::fit_bounds(self.world.network.bounds(), self.camera.viewport, 24.0);
         self.touch_camera();
     }
 
-    /// Pan by a drag delta in canvas pixels.
+    /// Pan by a drag delta in canvas pixels. A manual pan releases the follow
+    /// camera — otherwise the per-frame recenter would fight the drag.
     pub fn pan_pixels(&mut self, dx: f32, dy: f32) {
+        self.selected_vehicle = None;
         self.camera.pan_pixels(dx as f64, dy as f64);
         self.touch_camera();
     }
@@ -1197,6 +1205,71 @@ impl Simulation {
             (index >= 0 && (index as usize) < self.world.network.junctions.len()).then_some(index as usize);
     }
 
+    /// Select the vehicle nearest a world point within `radius` world metres for
+    /// the follow camera. Returns the picked id (or -1 when none was close
+    /// enough); a hit replaces any prior selection, a miss leaves it untouched
+    /// (so a click that lands on a road, not a car, doesn't drop the follow).
+    pub fn pick_vehicle(&mut self, wx: f32, wy: f32, radius: f32) -> i32 {
+        let r2 = radius * radius;
+        let mut best: Option<(f32, u32)> = None;
+        for v in self.world.vehicles() {
+            let [x, y] = self.vehicle_draw_center(v);
+            let d2 = (x - wx) * (x - wx) + (y - wy) * (y - wy);
+            if d2 <= r2 && best.is_none_or(|(bd, _)| d2 < bd) {
+                best = Some((d2, v.id));
+            }
+        }
+        match best {
+            Some((_, id)) => {
+                self.selected_vehicle = Some(id);
+                id as i32
+            }
+            None => -1,
+        }
+    }
+
+    /// The followed vehicle's id, or -1 when none is selected (or it despawned).
+    pub fn selected_vehicle_id(&self) -> i32 {
+        self.selected_vehicle.map_or(-1, |id| id as i32)
+    }
+
+    /// Live readout for the followed vehicle: `[speed_mps, class_id]` (class 0
+    /// car / 1 truck / 2 bus), or empty when none is selected (or it despawned).
+    pub fn selected_vehicle_stats(&self) -> Vec<f32> {
+        let Some(id) = self.selected_vehicle else { return Vec::new() };
+        self.world.vehicles().iter().find(|v| v.id == id).map_or(Vec::new(), |v| {
+            let class_id = match VehicleClass::from_length(v.driver.vehicle_length) {
+                VehicleClass::Car => 0.0,
+                VehicleClass::Truck => 1.0,
+                VehicleClass::Bus => 2.0,
+            };
+            vec![v.speed as f32, class_id]
+        })
+    }
+
+    /// Stop following (a click on empty road, or the UI's "release" affordance).
+    pub fn clear_selected_vehicle(&mut self) {
+        self.selected_vehicle = None;
+    }
+
+    /// Ease the camera toward the selected vehicle — call once per rendered frame
+    /// with the real elapsed seconds. The exponential smoothing gives a soft
+    /// chase; a pixel-space clamp keeps the car from trailing off screen when the
+    /// sim runs fast. Returns false (and clears the selection) once the car has
+    /// reached its destination and left the fleet.
+    pub fn follow_selected(&mut self, frame_dt: f32) -> bool {
+        let Some(id) = self.selected_vehicle else { return false };
+        let Some(target) = self.world.vehicles().iter().find(|v| v.id == id).map(|v| self.vehicle_draw_center(v)) else {
+            self.selected_vehicle = None;
+            return false;
+        };
+        const TAU: f64 = 0.18; // soft chase
+        const MAX_OFFSET_PX: f64 = 90.0; // never let the car leave this central window
+        self.camera.ease_toward([target[0] as f64, target[1] as f64], frame_dt as f64, TAU, MAX_OFFSET_PX);
+        self.touch_camera();
+        true
+    }
+
     /// The crossing's display name: its two busiest distinct street names.
     pub fn junction_label(&self, index: u32) -> String {
         let Some(j) = self.world.network.junctions.get(index as usize) else { return String::new() };
@@ -1703,6 +1776,27 @@ impl Simulation {
 
     fn snapshot_crossing(&self) -> IntMap<bool> {
         self.world.vehicles().iter().map(|v| (v.id, v.is_crossing())).collect()
+    }
+
+    /// The interpolated centre-of-body position the sprite is drawn at this frame
+    /// — the same Bézier-through-turn interpolation `vehicle_instances` uses, so
+    /// the follow camera keeps the selected car dead-centre rather than trailing
+    /// its committed (per-tick) pose.
+    fn vehicle_draw_center(&self, v: &crate::sim::net_world::NetVehicle) -> [f32; 2] {
+        let alpha = self.clock.alpha() as f32;
+        let c = self.world.vehicle_world_pose(v);
+        let half = 0.5 * v.driver.vehicle_length as f32;
+        let ch = c[2] as f32;
+        let (cx, cy) = (c[0] as f32 - half * ch.cos(), c[1] as f32 - half * ch.sin());
+        match self.prev.get(&v.id) {
+            Some(&[rpx, rpy, ph, _ps]) => {
+                let (px, py) = (rpx - half * ph.cos(), rpy - half * ph.sin());
+                let [kx, ky] = self.control_point(v.id, v.lane.0, [px, py], [cx, cy]);
+                let (u, m, a2) = ((1.0 - alpha) * (1.0 - alpha), 2.0 * (1.0 - alpha) * alpha, alpha * alpha);
+                [u * px + m * kx + a2 * cx, u * py + m * ky + a2 * cy]
+            }
+            None => [cx, cy],
+        }
     }
 
     fn control_point(&self, v_id: u32, cur_lane: u32, prev: [f32; 2], cur: [f32; 2]) -> [f32; 2] {

@@ -24,6 +24,12 @@ export type Sim = {
   signal_instances(): Uint8Array;
   signal_instance_count(): number;
   crash_instances(): Uint8Array;
+  // Vehicle follow-camera (optional so a stale wasm build degrades to no-follow).
+  pick_vehicle?(wx: number, wy: number, radius: number): number;
+  selected_vehicle_id?(): number;
+  selected_vehicle_stats?(): Float32Array;
+  clear_selected_vehicle?(): void;
+  follow_selected?(frameDtSecs: number): boolean;
   // Junction selection (optional so a stale wasm build degrades to link-only selection).
   junction_hit?(wx: number, wy: number): number;
   set_selected_junction?(index: number): void;

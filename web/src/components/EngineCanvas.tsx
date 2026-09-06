@@ -12,7 +12,7 @@ import {
   sliderToMpp,
   wheelZoomFactor,
 } from "../lib/camera";
-import { StatsSmoother, junctionPanelText, panelText, startSpeedLabel } from "../lib/hud";
+import { StatsSmoother, junctionPanelText, panelText, startSpeedLabel, vehiclePanelText } from "../lib/hud";
 import { type Control, type InitConfig, overlayFromSnapshot } from "../lib/protocol";
 import { createSession, type Session } from "../lib/session";
 import { SCENARIOS, scenarioName } from "../lib/maps";
@@ -272,6 +272,11 @@ export default function EngineCanvas() {
     const onUp = () => {
       pointer.pressed = false;
     };
+    // Escape releases a follow-camera; a manual pan (below) does too, so the user
+    // can always break free of a tracked car.
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") apply({ type: "releaseFollow" });
+    };
 
     // Touch: one finger pans (a tap selects); two fingers pinch-zoom toward the
     // midpoint and pan by the midpoint's movement.
@@ -352,6 +357,7 @@ export default function EngineCanvas() {
     canvas.addEventListener("touchcancel", onTouchEnd);
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
+    window.addEventListener("keydown", onKeyDown);
     window.addEventListener("resize", resizeCanvas);
     document.addEventListener("fullscreenchange", onFsChange);
     document.addEventListener("webkitfullscreenchange", onFsChange);
@@ -440,7 +446,9 @@ export default function EngineCanvas() {
                 panelRef.current.textContent =
                   f.selected.kind === "junction"
                     ? junctionPanelText(f.selected.name, f.selected.control, f.selected.stats)
-                    : panelText(f.selected.name, f.selected.stats, unitsRef.current);
+                    : f.selected.kind === "vehicle"
+                      ? vehiclePanelText(f.selected.name, f.selected.stats, unitsRef.current)
+                      : panelText(f.selected.name, f.selected.stats, unitsRef.current);
                 panelRef.current.style.display = "block";
               } else {
                 panelRef.current.style.display = "none";
@@ -480,6 +488,7 @@ export default function EngineCanvas() {
       canvas.removeEventListener("touchcancel", onTouchEnd);
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("resize", resizeCanvas);
       document.removeEventListener("fullscreenchange", onFsChange);
       document.removeEventListener("webkitfullscreenchange", onFsChange);

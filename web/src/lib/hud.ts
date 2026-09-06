@@ -150,6 +150,14 @@ export function junctionPanelText(name: string, control: string, stats: ArrayLik
   );
 }
 
+// The followed-vehicle panel: which vehicle the camera is tracking and its live
+// speed. `stats` mirrors `sim.selected_vehicle_stats()`: [speedMps, classId].
+export function vehiclePanelText(name: string, stats: ArrayLike<number>, units: Units): string {
+  const klass = ["car", "truck", "bus"][stats[1] | 0] ?? "vehicle";
+  const speed = Math.round(stats[0] * MPS_TO[units]);
+  return `Following ${name} (${klass}) — ${speed} ${UNIT_LABEL[units]}`;
+}
+
 // The demand-slider label ("Start ≤ N mph") for a start-speed cap in m/s.
 export function startSpeedLabel(startSpeedMps: number, units: Units): string {
   return `Start ≤ ${Math.round(startSpeedMps * MPS_TO[units])} ${UNIT_LABEL[units]}`;

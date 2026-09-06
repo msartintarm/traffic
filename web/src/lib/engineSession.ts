@@ -156,6 +156,7 @@ export async function startEngineSession(
   let gpuRouting = false;
   let selectedIndex = -1;
   let selectedJunction = -1;
+  let followingVehicle = false; // the camera is chasing a clicked car
   let width = config.width;
   let height = config.height;
   let fitMpp = 1;
@@ -312,6 +313,12 @@ export async function startEngineSession(
   };
 
   const selectedInfo = (): SelectedInfo | null => {
+    if (followingVehicle && sim.selected_vehicle_stats && sim.selected_vehicle_id) {
+      const st = sim.selected_vehicle_stats();
+      if (st.length >= 2) {
+        return { kind: "vehicle", name: `vehicle #${sim.selected_vehicle_id()}`, stats: [st[0], st[1]] };
+      }
+    }
     if (selectedJunction >= 0 && sim.junction_stats) {
       const st = sim.junction_stats(selectedJunction);
       return {
@@ -351,6 +358,8 @@ export async function startEngineSession(
     } else if (warmupTimer === null && sim.pump_warmup) {
       pumpWarmup(); // self-heal: never let an in-flight warmup sit undriven
     }
+    // Ease the camera toward the followed car (returns false once it despawns).
+    if (followingVehicle) followingVehicle = sim.follow_selected?.(dt) ?? false;
     const t1 = config.debug ? performance.now() : 0;
     // ASCII view: the engine rasterises the same geometry to text; the pixel render is
     // skipped (the overlay covers the canvas) so it costs nothing while the toggle is on.
@@ -450,12 +459,30 @@ export async function startEngineSession(
         );
         break;
       case "select": {
-        // A click inside a junction footprint selects the intersection; anywhere
-        // else selects the nearest road segment.
+        // A click on a car follows it; otherwise a click inside a junction
+        // footprint selects the intersection, and anywhere else the nearest road
+        // segment. Following supersedes both (and clears them), and a click that
+        // lands on neither a car nor a junction/road releases any active follow.
+        const carId = sim.pick_vehicle ? sim.pick_vehicle(c.wx, c.wy, c.radius) : -1;
+        if (carId >= 0) {
+          followingVehicle = true;
+          selectedJunction = -1;
+          selectedIndex = -1;
+          sim.set_selected_link(-1);
+          sim.set_selected_junction?.(-1);
+          break;
+        }
+        followingVehicle = false;
+        sim.clear_selected_vehicle?.();
         selectedJunction = sim.junction_hit ? sim.junction_hit(c.wx, c.wy) : -1;
         selectedIndex = selectedJunction >= 0 ? -1 : nearestLink(roads, c.wx, c.wy, c.radius);
         sim.set_selected_link(selectedIndex);
         sim.set_selected_junction?.(selectedJunction);
+        break;
+      }
+      case "releaseFollow": {
+        followingVehicle = false;
+        sim.clear_selected_vehicle?.();
         break;
       }
       case "hover": {
