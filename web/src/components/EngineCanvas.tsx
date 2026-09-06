@@ -16,6 +16,18 @@ import { StatsSmoother, junctionPanelText, panelText, startSpeedLabel } from "..
 import { type Control, type InitConfig, overlayFromSnapshot } from "../lib/protocol";
 import { createSession, type Session } from "../lib/session";
 import { SCENARIOS, scenarioName } from "../lib/maps";
+import {
+  type Compute,
+  type Field as ParamField,
+  type SimParams,
+  DEFAULTS as PARAM_DEFAULTS,
+  SCHEMA as PARAM_SCHEMA,
+  applyRuntimeParams,
+  encodeParams,
+  fieldRange,
+  isDefault as paramsAreDefault,
+  paramsFromUrl,
+} from "../lib/simParams";
 import styles from "./EngineCanvas.module.css";
 
 /** A show/hide panel: an emoji (optionally labelled) header that toggles a vertically
@@ -139,6 +151,29 @@ export default function EngineCanvas() {
   const [followerLod, setFollowerLod] = useState(false); // front-of-lane LOD toggle; measured ~0% runtime benefit on SF, so off by default (deadlock now fixed, so safe if wanted)
   const [localRouting, setLocalRouting] = useState(true); // per-driver bounded-search routing, default on (map-size-independent, measured faster than the field)
   const [shardStats, setShardStats] = useState(false); // per-thread work rows in the diagnostics overlay
+  // Mirror the boot config (from `?c=`) into the in-play menu so its toggles match
+  // what actually launched — otherwise the menu would show its hardcoded defaults.
+  const syncMenuFromParams = (p: SimParams) => {
+    setRushHour(p.rushHour);
+    setDayCompression(p.dayCompression);
+    setRampMetering(p.rampMetering);
+    setTransit(p.transit);
+    setParThreshold(p.parThreshold);
+    setParallelRouting(p.parallelRouting);
+    setDemandRate(p.demandRate);
+    setCongestionEngage(p.congestionEngage);
+    setSleepScheduler(p.sleepScheduler);
+    setCacheSort(p.cacheSort);
+    setStopCostRouting(p.stopCostRouting);
+    setLaneEvalStagger(p.laneEvalStagger);
+    setArterialRouting(p.arterialRouting);
+    setTargetedRouting(p.targetedRouting);
+    setLocalitySort(p.localitySort);
+    setSharding(p.sharded);
+    setAsyncRouting(p.asyncRouting);
+    setFollowerLod(p.followerLod);
+    setLocalRouting(p.localRouting);
+  };
   const [startSpeedMps, setStartSpeedMps] = useState(36); // ≥ every road limit ⇒ "enter at limit"
   const [units, setUnits] = useState<"mi" | "km">("mi");
   const unitsRef = useRef<"mi" | "km">("mi"); // read inside the per-frame HUD update (avoids stale closure)
@@ -328,12 +363,18 @@ export default function EngineCanvas() {
       bootedRef.current = true;
       const params = new URLSearchParams(window.location.search);
       const scenarioKey = params.get("scenario") ?? "millbrae";
+      // All boot levers come from the compact `?c=` config blob (or the legacy
+      // readable params, for old links) — one source of truth shared with the
+      // splash "Params" menu. See `lib/simParams`.
+      const p = paramsFromUrl(window.location.search);
       // The compute backend dictates which wasm module the worker loads (CPU-threads is a
-      // separate atomics-enabled artifact), chosen at page load via `?compute=`.
-      const compute = params.get("compute") ?? "threads";
+      // separate atomics-enabled artifact).
+      const compute = p.compute;
       setAccelBackend(compute);
-      const gpu = new URLSearchParams(window.location.search).get("gpu") !== "0";
-      const splitJunctions = params.get("split") !== "0"; // on by default; opt out with ?split=0
+      const gpu = p.gpuRouting;
+      const splitJunctions = p.splitJunctions;
+      // Mirror the boot config into the in-play menu's state so its toggles match.
+      syncMenuFromParams(p);
       (async () => {
         // Threads need cross-origin isolation (COOP/COEP via the shim SW, which reloads once).
         // Establish it here, before the worker boots and checks `crossOriginIsolated`.
@@ -347,7 +388,7 @@ export default function EngineCanvas() {
           basePath: basePath(),
           width: w,
           height: h,
-          congestionEngage,
+          congestionEngage: p.congestionEngage,
           zoomRange: ZOOM_RANGE,
           debug: params.get("debug") === "1",
         };
@@ -358,24 +399,13 @@ export default function EngineCanvas() {
             fitMppRef.current = r.fitMpp;
             setCongestionEnabled(r.congestionEnabled);
             setReady(true);
-            // Sharded (SPMD) execution is the default; `?shard=0` (settable
-            // from the splash) keeps the classic fork-join engine.
-            const params = new URL(window.location.href).searchParams;
-            const shard = params.get("shard") !== "0";
-            setSharding(shard);
-            if (shard) sessionRef.current?.applyControl({ type: "sharding", value: true });
-            sessionRef.current?.applyControl({ type: "asyncRouting", value: true });
-            // Local routing is the boot default (set in the engine before the
-            // router install, so no flow-field is built). Only opt OUT to the
-            // global field router here; the default needs no control message.
-            if (params.get("localrouting") === "0") {
-              sessionRef.current?.applyControl({ type: "localRouting", value: false });
-              setLocalRouting(false);
-            }
-            // `?warmup=1` (settable from the splash) pre-populates on load.
-            if (params.get("warmup") === "1") {
-              sessionRef.current?.applyControl({ type: "warmup", seconds: 3600 });
-            }
+            // Apply every boot lever from the config: runtime controls, the boot
+            // toggles (sharding / local routing / pre-populate), and the demand-
+            // generation tuning. Applying at default is a no-op in the engine, so
+            // this drives the whole config in one pass. (`local routing` is also the
+            // engine boot default, set before the router install so no flow-field is
+            // built; re-asserting it here is harmless.)
+            applyRuntimeParams(p, (c) => sessionRef.current?.applyControl(c as Control));
           },
           onFrame: (f) => {
             fitMppRef.current = f.fitMpp;
@@ -1118,23 +1148,87 @@ export default function EngineCanvas() {
  * cross-origin isolation on mount so the one-time COOP/COEP service-worker reload
  * happens *here*, before any map loads — then a card's navigation boots the scene
  * already-isolated, and the threaded wasm loads with no further reload. */
+/** One editor row for a lever, rendered by its schema kind. */
+function ParamRow({ field, params, set }: { field: ParamField; params: SimParams; set: (k: keyof SimParams, v: SimParams[keyof SimParams]) => void }) {
+  const v = params[field.key];
+  const label = (
+    <span style={{ flex: 1 }} title={field.help}>
+      {field.label}
+    </span>
+  );
+  if (field.kind.t === "bool") {
+    return (
+      <label className={styles.paramRow} title={field.help}>
+        {label}
+        <input type="checkbox" checked={v as boolean} onChange={(e) => set(field.key, e.target.checked)} />
+      </label>
+    );
+  }
+  if (field.kind.t === "enum") {
+    return (
+      <label className={styles.paramRow} title={field.help}>
+        {label}
+        <select value={v as string} onChange={(e) => set(field.key, e.target.value as Compute)}>
+          {field.kind.values.map((o) => (
+            <option key={o} value={o}>
+              {o}
+            </option>
+          ))}
+        </select>
+      </label>
+    );
+  }
+  const { min, max } = fieldRange(field);
+  const step = field.step ?? 1;
+  return (
+    <label className={styles.paramRow} title={field.help}>
+      {label}
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={v as number}
+        onChange={(e) => set(field.key, Number(e.target.value))}
+        style={{ flex: 1 }}
+      />
+      <span style={{ width: "3.5em", textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
+        {step < 1 ? (v as number).toFixed(2) : Math.round(v as number)}
+      </span>
+    </label>
+  );
+}
+
+const PARAM_GROUPS = ["Execution", "Routing", "Behavior", "Demand generation"] as const;
+
+/** A collapsible group of lever rows; the title keeps the `paramGroupTitle` font. */
+function ParamGroupSection({ title, fields, params, set }: { title: string; fields: ParamField[]; params: SimParams; set: (k: keyof SimParams, v: SimParams[keyof SimParams]) => void }) {
+  const [open, setOpen] = useState(true);
+  return (
+    <div className={styles.paramGroup}>
+      <button className={styles.paramGroupTitle} onClick={() => setOpen((v) => !v)} aria-expanded={open}>
+        <span>{title}</span>
+        <span>{open ? "▾" : "▸"}</span>
+      </button>
+      {open && fields.map((f) => <ParamRow key={f.key} field={f} params={params} set={set} />)}
+    </div>
+  );
+}
+
 function SplashScreen() {
-  const [splitJunctions, setSplitJunctions] = useState(true);
-  const [prePopulate, setPrePopulate] = useState(false);
-  const [sharded, setSharded] = useState(true);
+  const [params, setParams] = useState<SimParams>({ ...PARAM_DEFAULTS });
   useEffect(() => {
     void ensureCrossOriginIsolation();
   }, []);
+  const set = (k: keyof SimParams, v: SimParams[keyof SimParams]) => setParams((p) => ({ ...p, [k]: v }));
   const pick = (key: string) => {
     const url = new URL(window.location.href);
     url.searchParams.set("scenario", key);
-    // Junction alignment is the default; opt out with `?split=0`. Chosen before the map loads.
-    if (splitJunctions) url.searchParams.delete("split");
-    else url.searchParams.set("split", "0");
-    if (prePopulate) url.searchParams.set("warmup", "1");
-    else url.searchParams.delete("warmup");
-    if (sharded) url.searchParams.delete("shard");
-    else url.searchParams.set("shard", "0");
+    // Only carry a config blob when it differs from defaults, so a stock launch is
+    // just `?scenario=…`. Legacy readable params are cleared to avoid ambiguity.
+    for (const k of ["split", "warmup", "shard", "gpu", "compute", "localrouting"]) url.searchParams.delete(k);
+    if (paramsAreDefault(params)) url.searchParams.delete("c");
+    else url.searchParams.set("c", encodeParams(params));
     window.location.href = url.toString();
   };
   return (
@@ -1142,30 +1236,16 @@ function SplashScreen() {
       <div className={styles.splashInner}>
         <h1 className={styles.splashTitle}>Traffic</h1>
         <p className={styles.splashSubtitle}>Pick a map to simulate</p>
-        <label
-          className={styles.splashSubtitle}
-          style={{ display: "flex", alignItems: "center", gap: "0.5em", cursor: "pointer", marginBottom: "0.5em" }}
-          title="Split large divided-road junctions (e.g. Geary Blvd / Webster St) into separate, aligned nodes so the carriageways run straight through instead of fanning out. On by default; uncheck to see the original merged geometry."
-        >
-          <input type="checkbox" checked={splitJunctions} onChange={(e) => setSplitJunctions(e.target.checked)} />
-          Align large junctions
-        </label>
-        <label
-          className={styles.splashSubtitle}
-          style={{ display: "flex", alignItems: "center", gap: "0.5em", cursor: "pointer", marginBottom: "0.5em" }}
-          title="Fast-forward up to an hour of simulated travel headlessly before the map appears, so roads start realistically busy instead of empty. Runs in the background at full speed; progress shows on the loading screen."
-        >
-          <input type="checkbox" checked={prePopulate} onChange={(e) => setPrePopulate(e.target.checked)} />
-          Pre-populate traffic
-        </label>
-        <label
-          className={styles.splashSubtitle}
-          style={{ display: "flex", alignItems: "center", gap: "0.5em", cursor: "pointer", marginBottom: "0.5em" }}
-          title="Divide the map into regions that separate CPU cores carry through the simulation step (SPMD execution). On by default; uncheck to run the classic single-region engine. Also toggleable live under Performance."
-        >
-          <input type="checkbox" checked={sharded} onChange={(e) => setSharded(e.target.checked)} />
-          Sharded parallelism
-        </label>
+        <Collapsible icon="⚙️" label="Params" title="Simulation configuration" defaultOpen={false} className={styles.splashParams}>
+          <div className={styles.paramsHint}>
+            <button className={styles.paramReset} onClick={() => setParams({ ...PARAM_DEFAULTS })} disabled={paramsAreDefault(params)}>
+              Reset
+            </button>
+          </div>
+          {PARAM_GROUPS.map((g) => (
+            <ParamGroupSection key={g} title={g} fields={PARAM_SCHEMA.filter((f) => f.group === g)} params={params} set={set} />
+          ))}
+        </Collapsible>
         <div className={styles.splashGrid}>
           {SCENARIOS.map((s) => (
             <button key={s.key} className={styles.splashCard} onClick={() => pick(s.key)}>

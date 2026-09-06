@@ -439,6 +439,16 @@ export async function startEngineSession(
       case "frameBudget": sim.set_frame_budget(c.value); break;
       case "ascii": asciiMode = c.value; break;
       case "transit": sim.set_transit_enabled?.(c.value); break;
+      case "demandTuning":
+        sim.set_demand_tuning?.(
+          c.roadFunctionWeighting,
+          c.gravityBeta,
+          c.internalBeta,
+          c.onRampShare,
+          c.corridorThroughShare,
+          c.corridorAccessShare,
+        );
+        break;
       case "select": {
         // A click inside a junction footprint selects the intersection; anywhere
         // else selects the nearest road segment.

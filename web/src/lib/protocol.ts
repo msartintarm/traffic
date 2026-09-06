@@ -63,7 +63,16 @@ export type Control =
   | { type: "pause" }
   | { type: "frameBudget"; value: boolean }
   | { type: "ascii"; value: boolean }
-  | { type: "transit"; value: boolean };
+  | { type: "transit"; value: boolean }
+  | {
+      type: "demandTuning";
+      roadFunctionWeighting: boolean;
+      gravityBeta: number;
+      internalBeta: number;
+      onRampShare: number;
+      corridorThroughShare: number;
+      corridorAccessShare: number;
+    };
 
 export type ControlType = Control["type"];
 
@@ -72,7 +81,7 @@ export const CONTROL_TYPES: ReadonlySet<ControlType> = new Set([
   "parThreshold", "parallelRouting", "cacheSort", "stopCostRouting", "laneEvalStagger", "arterialRouting", "targetedRouting", "localitySort", "sharding", "asyncRouting", "followerLod", "localRouting", "shardStats", "warmup",
   "showCrashes", "clearCrashes", "entrySpeedCap", "congestionEngage", "congestionEnabled",
   "demandSources", "fit", "metersPerPixel", "zoomAt", "panBy", "resize", "select",
-  "hover", "play", "pause", "frameBudget", "ascii", "transit",
+  "hover", "play", "pause", "frameBudget", "ascii", "transit", "demandTuning",
 ] satisfies ControlType[]);
 
 export function isControl(msg: unknown): msg is Control {

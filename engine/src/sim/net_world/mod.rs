@@ -8970,7 +8970,14 @@ mod tests {
             boundary::interior_links(&net).iter().filter(|&&l| boundary::is_highway_link(&net, l)).map(|l| l.0).collect();
         let mut same_hw = 0;
         for p in &pairs {
-            assert!(entries.contains(&p.origin.0), "trip {p:?} must enter at a freeway gateway (from outside)");
+            // A freeway trip either enters from outside at a highway gateway (through/
+            // interchange traffic) or starts on a surface street and takes an on-ramp
+            // onto the mainline (on-ramp loading) — never mid-freeway either way.
+            assert!(
+                entries.contains(&p.origin.0) || surface_int.contains(&p.origin.0),
+                "trip {p:?} enters at a freeway gateway or loads from a surface street",
+            );
+            assert!(!mid_freeway.contains(&p.origin.0), "no origin on a mid-freeway segment: {p:?}");
             assert!(!mid_freeway.contains(&p.dest.0), "no destination on a mid-freeway segment: {p:?}");
             assert!(hw_exit.contains(&p.dest.0) || surface_int.contains(&p.dest.0), "dest is a highway exit or surface street: {p:?}");
             let (ro, rd) = (net.link_ref(p.origin), net.link_ref(p.dest));

@@ -107,6 +107,15 @@ export type Sim = {
   // Train carriages for the 2D fallback: [x, y, heading, length, width] per carriage.
   train_poses?(): Float32Array;
   set_rush_hour(enabled: boolean): void;
+  // Topology-grounded OD-generation levers; optional so a stale wasm build degrades.
+  set_demand_tuning?(
+    roadFunctionWeighting: boolean,
+    gravityBeta: number,
+    internalBeta: number,
+    onRampShare: number,
+    corridorThroughShare: number,
+    corridorAccessShare: number,
+  ): void;
   // Day-clock speed (day-seconds per sim second); optional so a stale wasm build degrades.
   set_day_compression?(x: number): void;
   day_compression?(): number;

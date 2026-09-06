@@ -19,7 +19,7 @@ use crate::sim::clock::SimClock;
 use crate::sim::flowfield;
 use crate::sim::flowfield_gpu::{GpuFlowField, PendingFlag, PendingReadback};
 use crate::sim::config::{SimConfig, VehicleClass};
-use crate::sim::demand::{self, DemandGenerator, DemandSources};
+use crate::sim::demand::{self, DemandGenerator, DemandSources, DemandTuning};
 use crate::sim::congestion::CongestionConfig;
 use crate::sim::map;
 use crate::sim::net_world::{AccelBackend, NetWorld};
@@ -283,6 +283,32 @@ impl Simulation {
     /// spawns only; live and non-destructive like the other demand toggles.
     pub fn set_rush_hour(&mut self, enabled: bool) {
         self.apply_demand_sources(DemandSources { rush_hour: enabled, ..self.demand_sources });
+    }
+
+    /// Shape the topology-grounded OD generation (the demand levers): road-function
+    /// origin/destination weighting, per-purpose distance decay, freeway on-ramp
+    /// loading, and counted-corridor through/access split. Rebuilds demand live
+    /// (non-destructive) like the other demand toggles; a no-op when unchanged.
+    /// Set at boot from the URL config; defaults reproduce the shipped calibration.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_demand_tuning(
+        &mut self,
+        road_function_weighting: bool,
+        gravity_beta: f64,
+        internal_beta: f64,
+        on_ramp_share: f64,
+        corridor_through_share: f64,
+        corridor_access_share: f64,
+    ) {
+        let tuning = DemandTuning {
+            road_function_weighting,
+            gravity_beta,
+            internal_beta,
+            on_ramp_share,
+            corridor_through_share,
+            corridor_access_share,
+        };
+        self.apply_demand_sources(DemandSources { tuning, ..self.demand_sources });
     }
 
     /// Load real commute OD flows (`tools/lodes/fetch_lodes.py` output): measured

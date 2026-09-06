@@ -32,8 +32,8 @@ test("isControl accepts every declared control and rejects the rest", () => {
 });
 
 test("CONTROL_TYPES is the complete control set", () => {
-  assert.equal(CONTROL_TYPES.size, 38);
-  for (const t of ["speed", "fit", "resize", "select", "demandSources", "hover", "play", "pause", "frameBudget", "parallelRouting", "cacheSort", "stopCostRouting", "laneEvalStagger", "arterialRouting", "targetedRouting", "localitySort", "sharding", "asyncRouting", "followerLod", "localRouting", "shardStats", "warmup", "showCrashes", "clearCrashes", "ascii", "transit"]) {
+  assert.equal(CONTROL_TYPES.size, 39);
+  for (const t of ["speed", "fit", "resize", "select", "demandSources", "hover", "play", "pause", "frameBudget", "parallelRouting", "cacheSort", "stopCostRouting", "laneEvalStagger", "arterialRouting", "targetedRouting", "localitySort", "sharding", "asyncRouting", "followerLod", "localRouting", "shardStats", "warmup", "showCrashes", "clearCrashes", "ascii", "transit", "demandTuning"]) {
     assert.equal(CONTROL_TYPES.has(t as Control["type"]), true);
   }
 });

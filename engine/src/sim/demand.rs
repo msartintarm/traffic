@@ -13,7 +13,7 @@ use super::boundary;
 use super::config::VehicleClass;
 use super::hash::IntMap;
 use super::net_world::{NetWorld, ScheduledStop};
-use super::network::{LinkId, Network};
+use super::network::{LinkId, Network, RoadKind};
 use super::rng::{self, Stream};
 use super::rush_hour::{self, SurfaceClass};
 
@@ -112,7 +112,7 @@ impl CommuteOd {
 /// they compose. Freeway traffic enters at highway gateways bound for the far end of
 /// its highway (or another highway exit, or a surface street it leaves the freeway
 /// for); surface traffic is the local/arterial boundary mix.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DemandSources {
     pub highway: bool,
     pub surface: bool,
@@ -120,15 +120,59 @@ pub struct DemandSources {
     /// real per-lane PeMS volumes and surface streets by the arterial diurnal shape,
     /// so the network builds and fades the way a real peak commute does.
     pub rush_hour: bool,
+    /// How the topology-grounded OD generation is shaped (road-function weighting,
+    /// distance decay, on-ramp/corridor shares). Rides in `DemandSources` so the
+    /// public `od_pairs*` entry points carry it without a signature change.
+    pub tuning: DemandTuning,
 }
 
 impl DemandSources {
     pub const fn new(highway: bool, surface: bool) -> Self {
-        Self { highway, surface, rush_hour: false }
+        Self { highway, surface, rush_hour: false, tuning: DemandTuning::DEFAULT }
     }
 
     pub const fn with_rush_hour(highway: bool, surface: bool, rush_hour: bool) -> Self {
-        Self { highway, surface, rush_hour }
+        Self { highway, surface, rush_hour, tuning: DemandTuning::DEFAULT }
+    }
+}
+
+/// Tunable knobs for the topology-grounded OD generation — the UI-exposed demand
+/// levers. Defaults reproduce the shipped calibration exactly; each field is a
+/// single meaningful lever (the per-`RoadKind` class coefficients stay calibrated
+/// constants, gated on/off by `road_function_weighting`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DemandTuning {
+    /// L1: weight origins/destinations by road function (Local produces, Arterial is
+    /// a through-corridor). When false the class terms are neutral 1.0 (the pre-lever
+    /// uniform-origin / capacity-only-attraction behavior).
+    pub road_function_weighting: bool,
+    /// L3: distance-decay β for commute/through trips (lower = longer trips).
+    pub gravity_beta: f64,
+    /// L3: distance-decay β for internal/local errands (higher = they stay local).
+    pub internal_beta: f64,
+    /// L2: share of freeway demand that loads at interior on-ramps (vs edge gateways).
+    pub on_ramp_share: f64,
+    /// L4: share of a counted corridor's inflow that rides it end to end (the rest is
+    /// mid-corridor egress/access at cross-streets).
+    pub corridor_through_share: f64,
+    /// L4: per-cross-street mid-corridor access share.
+    pub corridor_access_share: f64,
+}
+
+impl DemandTuning {
+    pub const DEFAULT: Self = Self {
+        road_function_weighting: true,
+        gravity_beta: GRAVITY_BETA,
+        internal_beta: 1.8,
+        on_ramp_share: 0.25,
+        corridor_through_share: 0.6,
+        corridor_access_share: 0.15,
+    };
+}
+
+impl Default for DemandTuning {
+    fn default() -> Self {
+        Self::DEFAULT
     }
 }
 
@@ -165,11 +209,11 @@ pub fn od_pairs_with_commute(
     let with_commute = sources.surface && commute.is_some_and(|od| !od.flows.is_empty());
     let mut pairs = Vec::new();
     if sources.highway {
-        highway_od_pairs(net, seed, per, &mut pairs);
+        highway_od_pairs(net, seed, per, sources.tuning, &mut pairs);
     }
     let surface_start = pairs.len();
     if sources.surface {
-        surface_od_pairs(net, seed, per, &mut pairs);
+        surface_od_pairs(net, seed, per, sources.tuning, &mut pairs);
     }
     if pairs.is_empty() && !with_commute {
         pairs = boundary_od_pairs(net, seed, target);
@@ -180,7 +224,7 @@ pub fn od_pairs_with_commute(
     if with_commute {
         let sampled: f64 = pairs[surface_start..].iter().map(|p| p.rate_per_sec).sum();
         let n0 = pairs.len();
-        commute_od_pairs(net, commute.unwrap(), seed, per / 2, &mut pairs);
+        commute_od_pairs(net, commute.unwrap(), seed, per / 2, sources.tuning, &mut pairs);
         let measured: f64 = pairs[n0..].iter().map(|p| p.rate_per_sec).sum();
         if measured > 0.0 && sampled > 0.0 {
             let keep = (1.0 - measured / sampled).max(0.3);
@@ -207,8 +251,10 @@ struct CellAnchors {
     anchors: Vec<Vec<LinkId>>,
 }
 
-/// Candidate anchor links kept per cell.
-const ANCHOR_CANDIDATES: usize = 4;
+/// Candidate anchor links kept per cell. A few more than the minimum so commute
+/// trips spread across a cell's streets (class-weighted in `routable_pair`) instead
+/// of all piling onto the single nearest link.
+const ANCHOR_CANDIDATES: usize = 8;
 
 impl CellAnchors {
     fn new(net: &Network, od: &CommuteOd) -> Self {
@@ -247,16 +293,36 @@ impl CellAnchors {
         self.anchors.get(cell as usize).map_or(&[], Vec::as_slice)
     }
 
-    /// First candidate pair `from → to` with a route between them.
-    fn routable_pair(&self, reach: &Reachability, from: u32, to: u32) -> Option<(LinkId, LinkId)> {
+    /// A routable candidate pair `from → to`, chosen (seeded) by road function so a
+    /// commute leg starts on the origin cell's local/collector streets (production)
+    /// and ends on the destination cell's endpoint-suitable streets (attraction) —
+    /// and spreads across the cell's candidates instead of always taking the single
+    /// nearest link. The origin/dest roles hold for both legs: the AM leg's origin
+    /// is home, the PM leg's origin is work; each leg's start is production-weighted
+    /// and its end attraction-weighted. Falls back to the first routable pair if the
+    /// class weights sum to zero.
+    fn routable_pair(&self, net: &Network, reach: &Reachability, from: u32, to: u32, seed: u64, salt: u32, tune: DemandTuning) -> Option<(LinkId, LinkId)> {
+        let mut cum: Vec<f64> = Vec::new();
+        let mut pairs: Vec<(LinkId, LinkId)> = Vec::new();
+        let mut total = 0.0;
         for &f in self.candidates(from) {
             for &t in self.candidates(to) {
                 if f != t && reach.reachable(f, t) {
-                    return Some((f, t));
+                    let w = class_production(net.link(f).kind, tune) * class_attraction(net.link(t).kind, tune);
+                    total += w;
+                    cum.push(total);
+                    pairs.push((f, t));
                 }
             }
         }
-        None
+        if pairs.is_empty() {
+            return None;
+        }
+        if total <= 0.0 {
+            return Some(pairs[0]);
+        }
+        let r = rng::uniform01(seed, salt, from as u64, Stream::RouteChoice) * total;
+        Some(pairs[cum.partition_point(|&c| c < r).min(pairs.len() - 1)])
     }
 }
 
@@ -265,7 +331,7 @@ impl CellAnchors {
 /// — the AM arrival surge) and its evening reverse ([`SurfaceClass::Outbound`]).
 /// Rates size the sampled set to carry the box's real total commuter volume:
 /// Σ jobs trips per day each way, so the measured magnitude survives sampling.
-pub fn commute_od_pairs(net: &Network, od: &CommuteOd, seed: u64, target: usize, out: &mut Vec<OdPair>) {
+pub fn commute_od_pairs(net: &Network, od: &CommuteOd, seed: u64, target: usize, t: DemandTuning, out: &mut Vec<OdPair>) {
     if od.flows.is_empty() || target == 0 {
         return;
     }
@@ -285,8 +351,12 @@ pub fn commute_od_pairs(net: &Network, od: &CommuteOd, seed: u64, target: usize,
         let (h, w, _) = od.flows[cum.partition_point(|&c| c < r).min(od.flows.len() - 1)];
         attempt += 1;
         // Anchor the trip and its reverse independently — the return leg may need
-        // the opposite carriageway.
-        if let (Some(am), Some(pm)) = (anchors.routable_pair(&reach, h, w), anchors.routable_pair(&reach, w, h)) {
+        // the opposite carriageway. Each leg is class-weighted (production origin,
+        // attraction dest) and seeded off the attempt so trips spread across a
+        // cell's streets.
+        let am = anchors.routable_pair(net, &reach, h, w, seed, 71 ^ (attempt as u32).wrapping_mul(2), t);
+        let pm = anchors.routable_pair(net, &reach, w, h, seed, 72 ^ (attempt as u32).wrapping_mul(2).wrapping_add(1), t);
+        if let (Some(am), Some(pm)) = (am, pm) {
             ends.push((am, pm));
         }
     }
@@ -1165,11 +1235,11 @@ pub fn boundary_od_pairs(net: &Network, seed: u64, target: usize) -> Vec<OdPair>
             continue;
         }
         let want = ((target as f64 * share).round() as usize).max(1);
-        sample_pairs(net, &reach, seed, cat as u32, origins, dests, want, *class, &mut pairs);
+        sample_pairs(net, &reach, seed, cat as u32, origins, dests, want, *class, DemandTuning::DEFAULT, &mut pairs);
     }
     if pairs.is_empty() {
         let all: Vec<LinkId> = (0..net.links.len() as u32).map(LinkId).collect();
-        sample_pairs(net, &reach, seed, 99, &all, &all, target, SurfaceClass::Through, &mut pairs);
+        sample_pairs(net, &reach, seed, 99, &all, &all, target, SurfaceClass::Through, DemandTuning::DEFAULT, &mut pairs);
     }
     pairs
 }
@@ -1179,7 +1249,7 @@ pub fn boundary_od_pairs(net: &Network, seed: u64, target: usize) -> Vec<OdPair>
 /// another highway exit (an interchange), or a surface street it leaves the freeway
 /// for. Never a mid-freeway segment. Same-highway matching uses the OSM route `ref`;
 /// a map without refs or freeway gateways contributes nothing (the caller falls back).
-pub fn highway_od_pairs(net: &Network, seed: u64, target: usize, out: &mut Vec<OdPair>) {
+pub fn highway_od_pairs(net: &Network, seed: u64, target: usize, t: DemandTuning, out: &mut Vec<OdPair>) {
     let reach = Reachability::new(net);
     let hw_in = boundary::highway_entry_links(net);
     if hw_in.is_empty() {
@@ -1218,9 +1288,15 @@ pub fn highway_od_pairs(net: &Network, seed: u64, target: usize, out: &mut Vec<O
         })
         .collect();
 
+    // Reserve a share of freeway demand for on-ramp loading (city → freeway →
+    // off-map) so the mainline is fed at the interchanges, not only at the two
+    // map-edge gateways; the rest is gateway-origin through/interchange traffic.
+    let onramp_target = (target as f64 * t.on_ramp_share).round() as usize;
+    let gateway_target = target.saturating_sub(onramp_target);
+
     let mut found = 0usize;
     let mut attempt = 0u64;
-    while found < target && attempt < target as u64 * 40 + 400 {
+    while found < gateway_target && attempt < gateway_target as u64 * 40 + 400 {
         let (e, same, other) = &pools[(rng::hash(seed, 60, attempt, Stream::RouteChoice) as usize) % pools.len()];
         let r = rng::uniform01(seed, e.0, attempt, Stream::RouteChoice);
         // Weighted by category, cascading when a pool is empty so the majority still
@@ -1232,13 +1308,13 @@ pub fn highway_od_pairs(net: &Network, seed: u64, target: usize, out: &mut Vec<O
         let dest = if r < 0.85 {
             pick(same, seed, attempt)
                 .or_else(|| pick(other, seed, attempt))
-                .or_else(|| pick_routable(net, &reach, *e, &surface, seed, attempt))
+                .or_else(|| pick_routable(net, &reach, *e, &surface, seed, attempt, SurfaceClass::Through, t))
         } else if r < 0.93 {
             pick(other, seed, attempt)
                 .or_else(|| pick(same, seed, attempt))
-                .or_else(|| pick_routable(net, &reach, *e, &surface, seed, attempt))
+                .or_else(|| pick_routable(net, &reach, *e, &surface, seed, attempt, SurfaceClass::Through, t))
         } else {
-            pick_routable(net, &reach, *e, &surface, seed, attempt)
+            pick_routable(net, &reach, *e, &surface, seed, attempt, SurfaceClass::Through, t)
                 .or_else(|| pick(same, seed, attempt))
                 .or_else(|| pick(other, seed, attempt))
         };
@@ -1250,21 +1326,65 @@ pub fn highway_od_pairs(net: &Network, seed: u64, target: usize, out: &mut Vec<O
             }
         }
     }
+
+    // On-ramp loading: local trips that get on the freeway and ride it out of the
+    // map. Origin on a surface street (production-weighted — where drivers actually
+    // start), destination a highway-exit gateway reachable ONLY through an on-ramp,
+    // so the router sends them local → on-ramp → mainline → off the map. This feeds
+    // the freeway at every interchange the map contains, not just the two edge
+    // gateways — a freeway loaded by the city it runs through. It fires only where
+    // the map has on-ramps (a surface→freeway route exists); otherwise it finds
+    // nothing and the freeway stays gateway-fed. Destinations are drawn uniformly
+    // among reachable highway exits (the freeway-zeroing `gravity_pick` endpoint
+    // term doesn't apply — a highway gateway is a legitimate trip end).
+    if onramp_target > 0 && !surface.is_empty() && !hw_out.is_empty() {
+        let mut ocum = Vec::with_capacity(surface.len());
+        let mut ototal = 0.0;
+        for &o in &surface {
+            ototal += net.link_res_weight(o) * class_production(net.link(o).kind, t);
+            ocum.push(ototal);
+        }
+        let mut found_on = 0usize;
+        let mut attempt_on = 0u64;
+        while ototal > 0.0 && found_on < onramp_target && attempt_on < onramp_target as u64 * 40 + 400 {
+            let r = rng::uniform01(seed, 63, attempt_on, Stream::RouteChoice) * ototal;
+            let o = surface[ocum.partition_point(|&c| c < r).min(surface.len() - 1)];
+            let mut dest = None;
+            for k in 0..8u64 {
+                let cand = hw_out[(rng::hash(seed, 64, attempt_on.wrapping_mul(8).wrapping_add(k), Stream::RouteChoice) as usize) % hw_out.len()];
+                if cand != o && reach.reachable(o, cand) {
+                    dest = Some(cand);
+                    break;
+                }
+            }
+            attempt_on += 1;
+            if let Some(d) = dest {
+                out.push(OdPair { origin: o, dest: d, rate_per_sec: capacity_rate(net, o), class: SurfaceClass::Outbound, anchored: false });
+                found_on += 1;
+            }
+        }
+    }
 }
 
 /// Surface (local/arterial) traffic: the boundary mix over non-freeway gateways and
 /// interior streets — through the city, inbound, outbound, and internal trips.
-pub fn surface_od_pairs(net: &Network, seed: u64, target: usize, out: &mut Vec<OdPair>) {
+pub fn surface_od_pairs(net: &Network, seed: u64, target: usize, t: DemandTuning, out: &mut Vec<OdPair>) {
     let reach = Reachability::new(net);
     let entries = boundary::surface_entry_links(net);
     let exits = boundary::surface_exit_links(net);
     let interior = boundary::surface_interior_links(net);
     // Observed corridors first: a counted state route (El Camino's CA-82) mostly
     // *carries its measured volume through* — the count at every screenline is
-    // dominated by traffic riding the corridor, not by trips scattering off it.
-    // Each counted, named gateway gets an anchored through stream to the far end
-    // of the same-named road at ~65% of its calibrated inflow; the sampled
-    // categories below split the remainder (see `calibrate_origin_inflow`).
+    // dominated by traffic riding the corridor, not by trips scattering off it. Each
+    // counted, named gateway anchors a through stream to the far end of the same-
+    // named road, PLUS mid-corridor access streams at its cross-streets, so the
+    // corridor loads and unloads along its length (a longitudinal volume profile)
+    // instead of one flat end-to-end OD. The entry's total anchored inflow is
+    // preserved (through-share + egress-shares ≈ the old 0.9), so screenline volume
+    // is not inflated; the access streams add realistic local mid-corridor traffic.
+    let corridor_through_share = t.corridor_through_share;
+    let corridor_access_share = t.corridor_access_share;
+    const MAX_CORRIDOR_ACCESS: usize = 2;
     for &e in &entries {
         if net.link_aadt(e) <= 0.0 {
             continue;
@@ -1282,14 +1402,43 @@ pub fn surface_od_pairs(net: &Network, seed: u64, target: usize, out: &mut Vec<O
                 let db = link_centroid(net, b);
                 (da[0] - ep[0]).hypot(da[1] - ep[1]).total_cmp(&(db[0] - ep[0]).hypot(db[1] - ep[1]))
             });
-        if let Some(&d) = far {
-            out.push(OdPair {
-                origin: e,
-                dest: d,
-                rate_per_sec: 0.9 * capacity_rate(net, e),
-                class: SurfaceClass::Through,
-                anchored: true,
-            });
+        let Some(&d) = far else { continue };
+        let rate = capacity_rate(net, e);
+        out.push(OdPair {
+            origin: e,
+            dest: d,
+            rate_per_sec: corridor_through_share * rate,
+            class: SurfaceClass::Through,
+            anchored: true,
+        });
+        // Same-named interior links between the entry and the far exit — the
+        // corridor's mid-block cross-streets — become intermediate trip ends,
+        // spread along its length by distance from the entry.
+        let mut mids: Vec<LinkId> = interior
+            .iter()
+            .copied()
+            .filter(|&m| {
+                m != e && m != d && net.link_names[m.idx()] == name && reach.reachable(e, m) && reach.reachable(m, d)
+            })
+            .collect();
+        if mids.is_empty() {
+            continue;
+        }
+        mids.sort_by(|&a, &b| {
+            let ca = link_centroid(net, a);
+            let cb = link_centroid(net, b);
+            (ca[0] - ep[0]).hypot(ca[1] - ep[1]).total_cmp(&(cb[0] - ep[0]).hypot(cb[1] - ep[1]))
+        });
+        let n = mids.len();
+        let k = MAX_CORRIDOR_ACCESS.min(n);
+        for j in 0..k {
+            let m = mids[(((j + 1) * n) / (k + 1)).min(n - 1)];
+            // Egress: through-riders peeling off at this cross-street (shares the
+            // entry origin, so it counts against the entry's preserved inflow).
+            out.push(OdPair { origin: e, dest: m, rate_per_sec: corridor_access_share * rate, class: SurfaceClass::Through, anchored: true });
+            // Access: local traffic joining the corridor here, bound for its far end
+            // (new mid-corridor volume — the corridor filling as it runs).
+            out.push(OdPair { origin: m, dest: d, rate_per_sec: corridor_access_share * capacity_rate(net, m), class: SurfaceClass::Through, anchored: true });
         }
     }
     let categories: [(&[LinkId], &[LinkId], f64, SurfaceClass); 4] = [
@@ -1303,7 +1452,7 @@ pub fn surface_od_pairs(net: &Network, seed: u64, target: usize, out: &mut Vec<O
             continue;
         }
         let want = ((target as f64 * share).round() as usize).max(1);
-        sample_pairs(net, &reach, seed, 80 + cat as u32, origins, dests, want, *class, out);
+        sample_pairs(net, &reach, seed, 80 + cat as u32, origins, dests, want, *class, t, out);
     }
 }
 
@@ -1330,11 +1479,25 @@ fn link_centroid(net: &Network, link: LinkId) -> [f64; 2] {
     [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5]
 }
 
+/// Distance-decay exponent β by trip purpose. Commute/through trips barely
+/// distance-minimize within a metro box (LODES max-likelihood fit β≈0.7); local
+/// errand/shopping trips (`Internal`) decay far faster (~1.8, the NHTS shopping
+/// range) so they stay in the neighborhood instead of scattering across the map.
+/// Through trips are the longest (cross-map), so they decay least. This is the
+/// per-class β the global-`GRAVITY_BETA` comment flagged as a future refinement.
+fn class_beta(class: SurfaceClass, t: DemandTuning) -> f64 {
+    match class {
+        SurfaceClass::Internal => t.internal_beta,
+        SurfaceClass::Inbound | SurfaceClass::Outbound | SurfaceClass::Through => t.gravity_beta,
+    }
+}
+
 /// Gravity draw from `pool`: destination `d` is chosen with probability ∝
-/// `link_capacity(d) / dist(o, d)^β` — the classic gravity model, so trips prefer
-/// bigger (higher-capacity, AADT-correlated) roads and nearer ones over a uniform
-/// scatter. `None` only for an empty pool.
-fn gravity_pick(net: &Network, o: LinkId, pool: &[LinkId], seed: u64, salt: u32, attempt: u64) -> Option<LinkId> {
+/// `link_capacity(d) × class_attraction(d) / dist(o, d)^β` — the classic gravity
+/// model with a road-function endpoint term, so trips prefer bigger, nearer, and
+/// endpoint-suitable roads over a uniform scatter. `β` is the trip purpose's
+/// distance decay ([`class_beta`]). `None` only for an empty pool.
+fn gravity_pick(net: &Network, o: LinkId, pool: &[LinkId], seed: u64, salt: u32, attempt: u64, beta: f64, t: DemandTuning) -> Option<LinkId> {
     if pool.is_empty() {
         return None;
     }
@@ -1344,9 +1507,14 @@ fn gravity_pick(net: &Network, o: LinkId, pool: &[LinkId], seed: u64, salt: u32,
     for &d in pool {
         let dp = link_centroid(net, d);
         let dist = (op[0] - dp[0]).hypot(op[1] - dp[1]).max(GRAVITY_MIN_DIST);
-        // Land-use attraction (shops/jobs around the destination) scales the
-        // road-size term; neutral 1.0 on maps without the scraper's land-use pass.
-        total += link_capacity(net, d) * net.link_attr_weight(d) / dist.powf(GRAVITY_BETA);
+        // Attraction = road-size × land-use × road-FUNCTION endpoint-suitability, all
+        // over distance^β. The class term (`class_attraction`) demotes big through-
+        // arterials as trip *endpoints* and promotes the local/collector network, so
+        // destinations spread onto the streets where trips actually end rather than
+        // piling onto the highest-capacity corridors. Land-use is neutral 1.0 without
+        // the scraper's pass; the class term shapes the draw from topology alone.
+        total += link_capacity(net, d) * net.link_attr_weight(d) * class_attraction(net.link(d).kind, t)
+            / dist.powf(beta);
         cum.push(total);
     }
     if total <= 0.0 {
@@ -1356,10 +1524,11 @@ fn gravity_pick(net: &Network, o: LinkId, pool: &[LinkId], seed: u64, salt: u32,
     Some(pool[cum.partition_point(|&c| c < r).min(pool.len() - 1)])
 }
 
-/// Gravity-weighted pick from `pool` that is routable from `e` (a few candidate tries).
-fn pick_routable(net: &Network, reach: &Reachability, e: LinkId, pool: &[LinkId], seed: u64, attempt: u64) -> Option<LinkId> {
+/// Gravity-weighted pick from `pool` that is routable from `e` (a few candidate
+/// tries), for trips of purpose `class` (sets the distance decay).
+fn pick_routable(net: &Network, reach: &Reachability, e: LinkId, pool: &[LinkId], seed: u64, attempt: u64, class: SurfaceClass, t: DemandTuning) -> Option<LinkId> {
     for k in 0..8u64 {
-        let d = gravity_pick(net, e, pool, seed, 62, attempt.wrapping_mul(8).wrapping_add(k))?;
+        let d = gravity_pick(net, e, pool, seed, 62, attempt.wrapping_mul(8).wrapping_add(k), class_beta(class, t), t)?;
         if d != e && reach.reachable(e, d) {
             return Some(d);
         }
@@ -1402,23 +1571,36 @@ fn sample_pairs(
     dests: &[LinkId],
     want: usize,
     class: SurfaceClass,
+    t: DemandTuning,
     out: &mut Vec<OdPair>,
 ) {
-    // Origins draw by land-use production weight — trips start where people live
-    // (uniform on maps without land-use data, every weight 1.0).
+    // Origins draw by land-use production weight × road-function production — trips
+    // start where people live (residential/local streets), scaled by land use where
+    // the scraper supplied it. On a map without land-use data the class term alone
+    // still biases origins onto the local/collector network instead of uniformly.
     let mut ocum = Vec::with_capacity(origins.len());
     let mut ototal = 0.0;
     for &o in origins {
-        ototal += net.link_res_weight(o);
+        ototal += net.link_res_weight(o) * class_production(net.link(o).kind, t);
         ocum.push(ototal);
+    }
+    // Degenerate pool (e.g. all-arterial origins zeroed by class): fall back to
+    // uniform so the category still produces its trips.
+    if ototal <= 0.0 {
+        ototal = origins.len() as f64;
+        ocum.clear();
+        for i in 0..origins.len() {
+            ocum.push((i + 1) as f64);
+        }
     }
     let mut found = 0;
     let mut attempt = 0u64;
     while found < want && attempt < want as u64 * 40 + 200 {
         let r = rng::uniform01(seed, salt * 2, attempt, Stream::RouteChoice) * ototal;
         let o = origins[ocum.partition_point(|&c| c < r).min(origins.len() - 1)];
-        // Destination by gravity (bigger/nearer roads win), not a uniform scatter.
-        let d = gravity_pick(net, o, dests, seed, salt * 2 + 1, attempt);
+        // Destination by gravity (bigger/nearer/endpoint-suitable roads win), not a
+        // uniform scatter; distance decay is set by the trip purpose (`class_beta`).
+        let d = gravity_pick(net, o, dests, seed, salt * 2 + 1, attempt, class_beta(class, t), t);
         attempt += 1;
         if let Some(d) = d {
             // `o != d` reachable ⟺ a route of ≥ 2 links exists, so this matches the old
@@ -1428,6 +1610,46 @@ fn sample_pairs(
                 found += 1;
             }
         }
+    }
+}
+
+/// Trip-PRODUCTION multiplier by road function. Trips overwhelmingly begin on the
+/// local/collector network — homes, driveways, parking — and only rarely off an
+/// arterial's frontage; you never start a trip mid-freeway or on a ramp. This
+/// multiplies the land-use production weight, so a map WITHOUT the scraper's
+/// land-use pass (every `link_res_weight` == 1.0) still originates traffic from the
+/// street network's *function* rather than uniformly over every interior link.
+/// Grounded in `RoadKind`'s own doc: Local = "where trips actually start and end",
+/// Arterial = "a through-corridor, not a typical trip endpoint".
+fn class_production(kind: RoadKind, t: DemandTuning) -> f64 {
+    if !t.road_function_weighting {
+        return 1.0;
+    }
+    match kind {
+        RoadKind::Local => 1.0,
+        RoadKind::Collector => 0.7,
+        RoadKind::Arterial => 0.25,
+        RoadKind::Ramp | RoadKind::Freeway => 0.0,
+    }
+}
+
+/// Trip-ATTRACTION (endpoint-suitability) multiplier by road function. Trips END on
+/// the local/collector network and along commercial arterial frontage — not as
+/// through-movements on the highest-capacity corridors, and never on a freeway or
+/// ramp. Demotes the raw-capacity bias in [`gravity_pick`] that otherwise piles
+/// destinations onto the biggest through-arterials (whose measured volume is carried
+/// by the anchored through-streams, not by trips terminating there).
+fn class_attraction(kind: RoadKind, t: DemandTuning) -> f64 {
+    if !t.road_function_weighting {
+        // Neutral for surface pools (which exclude freeways/ramps anyway); the
+        // capacity term alone drives attraction, the pre-lever behavior.
+        return 1.0;
+    }
+    match kind {
+        RoadKind::Local => 1.0,
+        RoadKind::Collector => 0.9,
+        RoadKind::Arterial => 0.5,
+        RoadKind::Ramp | RoadKind::Freeway => 0.0,
     }
 }
 
@@ -1722,7 +1944,7 @@ mod tests {
         assert!(surface.contains(&3) && !surface.contains(&1), "link 1 is mid-freeway, not a surface dest");
 
         let mut pairs = Vec::new();
-        highway_od_pairs(&net, 7, 200, &mut pairs);
+        highway_od_pairs(&net, 7, 200, DemandTuning::DEFAULT, &mut pairs);
         assert!(!pairs.is_empty(), "yields freeway demand");
         let mut same = 0;
         for p in &pairs {
@@ -1785,21 +2007,29 @@ mod tests {
         };
 
         let mut pairs = Vec::new();
-        highway_od_pairs(&net, 11, 300, &mut pairs);
+        highway_od_pairs(&net, 11, 300, DemandTuning::DEFAULT, &mut pairs);
         assert!(!pairs.is_empty(), "yields freeway demand");
 
+        // Two origin classes now: gateway through/interchange traffic (freeway
+        // carriageway origin) and on-ramp loading (a surface street origin routing
+        // onto the freeway). The U-turn invariant concerns freeway-to-freeway
+        // through-traffic, so it is checked only for gateway-origin pairs.
         let mut through = 0;
+        let mut gateway_origin = 0;
         for p in &pairs {
-            assert!(entries.contains(&p.origin), "every trip enters at a freeway carriageway");
-            if exits.contains(&p.dest.0) {
-                let (e, x) = (dir(p.origin), dir(p.dest));
-                assert!(
-                    e[0] * x[0] + e[1] * x[1] > 0.0,
-                    "U-turn: entered heading {e:?} but exits heading {x:?} on the same freeway",
-                );
-                through += 1;
+            if entries.contains(&p.origin) {
+                gateway_origin += 1;
+                if exits.contains(&p.dest.0) {
+                    let (e, x) = (dir(p.origin), dir(p.dest));
+                    assert!(
+                        e[0] * x[0] + e[1] * x[1] > 0.0,
+                        "U-turn: entered heading {e:?} but exits heading {x:?} on the same freeway",
+                    );
+                    through += 1;
+                }
             }
         }
+        assert!(gateway_origin > 0, "gateway freeway traffic still runs");
         assert!(through > 0, "same-carriageway through-traffic still runs");
     }
 
@@ -1811,7 +2041,7 @@ mod tests {
         let net = freeway_corridor_with_ref();
         let world = NetWorld::new(net, SimConfig::default_config());
         let mut pairs = Vec::new();
-        highway_od_pairs(&world.network, 7, 60, &mut pairs);
+        highway_od_pairs(&world.network, 7, 60, DemandTuning::DEFAULT, &mut pairs);
         let mut gen = DemandGenerator::new(&world, &pairs, 7);
 
         gen.set_rush_hour(&world.network, true);
@@ -1850,7 +2080,7 @@ mod tests {
         let net = freeway_corridor_with_ref();
         let world = NetWorld::new(net, SimConfig::default_config());
         let mut pairs = Vec::new();
-        highway_od_pairs(&world.network, 7, 60, &mut pairs);
+        highway_od_pairs(&world.network, 7, 60, DemandTuning::DEFAULT, &mut pairs);
         let mut gen = DemandGenerator::new(&world, &pairs, 7);
         gen.set_rush_hour(&world.network, true);
         let stream = gen
@@ -1929,7 +2159,7 @@ mod tests {
         let origin = (0..net.links.len() as u32).map(LinkId).find(|&l| net.node(net.link(l).from).position[0] < -100.0).unwrap();
         let (arterial, local) = (by(3, true).unwrap(), by(1, false).unwrap());
         let pool = vec![arterial, local];
-        let big = (0..2000u64).filter(|&a| gravity_pick(&net, origin, &pool, 7, 5, a) == Some(arterial)).count();
+        let big = (0..2000u64).filter(|&a| gravity_pick(&net, origin, &pool, 7, 5, a, GRAVITY_BETA, DemandTuning::DEFAULT) == Some(arterial)).count();
         assert!(big > 1600, "gravity strongly favours the higher-capacity arterial: {big}/2000");
     }
 
@@ -1976,7 +2206,7 @@ mod tests {
     fn boundary_categories_carry_their_diurnal_class() {
         let net = line().build();
         let mut pairs = Vec::new();
-        surface_od_pairs(&net, 3, 40, &mut pairs);
+        surface_od_pairs(&net, 3, 40, DemandTuning::DEFAULT, &mut pairs);
         assert!(!pairs.is_empty());
         let (entry, exit) = (LinkId(0), LinkId(4));
         for p in &pairs {
@@ -2170,20 +2400,24 @@ mod tests {
         let net = twoway_line().build();
         let od = commute_fixture();
         let mut pairs = Vec::new();
-        commute_od_pairs(&net, &od, 7, 4, &mut pairs);
+        commute_od_pairs(&net, &od, 7, 4, DemandTuning::DEFAULT, &mut pairs);
         assert_eq!(pairs.len(), 4, "each sampled flow yields an AM and a PM stream");
 
         let x = |l: LinkId| link_centroid(&net, l)[0];
         let mut inbound_rate = 0.0;
         for p in &pairs {
             assert!(p.anchored, "commute streams are pinned to measured geography");
+            // Anchors now spread across each cell's candidate streets (class-
+            // weighted) rather than pinning to the single nearest link, so the
+            // invariant is the trip *direction* (home is west, work is east), not a
+            // strict midpoint threshold.
             match p.class {
                 SurfaceClass::Inbound => {
-                    assert!(x(p.origin) < 500.0 && x(p.dest) > 700.0, "AM runs home→work");
+                    assert!(x(p.origin) <= x(p.dest), "AM runs home(west)→work(east): {} → {}", x(p.origin), x(p.dest));
                     inbound_rate += p.rate_per_sec;
                 }
                 SurfaceClass::Outbound => {
-                    assert!(x(p.origin) > 700.0 && x(p.dest) < 500.0, "PM runs work→home");
+                    assert!(x(p.origin) >= x(p.dest), "PM runs work(east)→home(west): {} → {}", x(p.origin), x(p.dest));
                 }
                 c => panic!("commute stream carries a commute shape, got {c:?}"),
             }
@@ -2260,7 +2494,7 @@ mod tests {
         let net = spec.build();
         let reach = Reachability::new(&net);
         let mut pairs = Vec::new();
-        sample_pairs(&net, &reach, 7, 40, &[LinkId(0), LinkId(1)], &[LinkId(2), LinkId(3)], 300, SurfaceClass::Through, &mut pairs);
+        sample_pairs(&net, &reach, 7, 40, &[LinkId(0), LinkId(1)], &[LinkId(2), LinkId(3)], 300, SurfaceClass::Through, DemandTuning::DEFAULT, &mut pairs);
         let n = pairs.len();
         assert!(n >= 250, "sampling fills the request: {n}");
         let res_origins = pairs.iter().filter(|p| p.origin == LinkId(0)).count();
