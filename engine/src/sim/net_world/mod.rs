@@ -2772,15 +2772,21 @@ impl NetWorld {
     /// signalized node, the phase greening that approach's movements.
     fn build_rail_preempts(network: &Network) -> Vec<(u32, usize, NodeId)> {
         let mut out = Vec::new();
+        // Links grouped by their `from` node, so each rail crossing scans only its
+        // own outgoing links. The naive form was O(rail_crossings × all_links) — a
+        // latent quadratic that only fires on a rail-heavy map (a Caltrain/light-rail
+        // corridor with many at-grade crossings), where it dominated the map build
+        // (~99 s on Mountain View + Sunnyvale). This index makes it O(links).
+        let mut links_from: Vec<Vec<u32>> = vec![Vec::new(); network.nodes.len()];
+        for li in 0..network.links.len() {
+            links_from[network.link(LinkId(li as u32)).from.idx()].push(li as u32);
+        }
         for r in 0..network.nodes.len() {
             if !network.nodes[r].rail_crossing {
                 continue;
             }
-            for li in 0..network.links.len() {
-                let l = network.link(LinkId(li as u32));
-                if l.from != NodeId(r as u32) {
-                    continue;
-                }
+            for &li in &links_from[r] {
+                let l = network.link(LinkId(li));
                 let lane = network.lane(l.lane_start);
                 if lane.length > 120.0 {
                     continue; // not adjacent — the queue can't back onto the tracks

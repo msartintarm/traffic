@@ -34,61 +34,76 @@ impl<T> Default for GroupMap<T> {
 
 impl<T> GroupMap<T> {
     /// Switch to a direct-indexed bucket array sized for keys in `0..cap`
-    /// (idempotent-safe to call once at construction). Every key ever pushed
-    /// must be `< cap`.
+    /// (idempotent-safe to call once at construction). Keys `< cap` use the array;
+    /// keys `>= cap` (e.g. the `u32::MAX` "no corridor" sentinel a lane in a cycle
+    /// / unreachable component carries) fall back to the hash map, so the dense
+    /// store is never a *narrower* key domain than the hash map it replaced.
     pub(super) fn reserve_dense(&mut self, cap: usize) {
         self.dense = (0..cap).map(|_| Vec::new()).collect();
     }
 
+    /// Whether `key` is served by the direct-indexed array (dense mode and in
+    /// range); otherwise it lives in the hash map.
     #[inline]
-    fn is_dense(&self) -> bool {
-        !self.dense.is_empty()
+    fn dense_key(&self, key: u32) -> bool {
+        (key as usize) < self.dense.len()
+    }
+
+    /// The bucket for `key`, from whichever store owns it.
+    #[inline]
+    fn bucket_mut(&mut self, key: u32) -> &mut Vec<T> {
+        if self.dense_key(key) {
+            &mut self.dense[key as usize]
+        } else {
+            self.map.entry(key).or_default()
+        }
     }
 
     /// Reset for a new tick: clear last tick's groups, keep their capacity.
     pub(super) fn begin_tick(&mut self) {
-        if self.is_dense() {
-            for &k in &self.touched {
+        for k in self.touched.drain(..) {
+            if (k as usize) < self.dense.len() {
                 self.dense[k as usize].clear();
-            }
-            self.touched.clear();
-        } else {
-            for k in self.touched.drain(..) {
-                if let Some(v) = self.map.get_mut(&k) {
-                    v.clear();
-                }
+            } else if let Some(v) = self.map.get_mut(&k) {
+                v.clear();
             }
         }
     }
 
     /// This tick's non-empty groups, keyed.
     pub(super) fn iter(&self) -> impl Iterator<Item = (u32, &Vec<T>)> {
-        let dense = self.is_dense();
-        self.touched.iter().filter_map(move |&k| {
-            let g = if dense { &self.dense[k as usize] } else { self.map.get(&k)? };
-            Some((k, g))
-        })
+        self.touched.iter().filter_map(move |&k| Some((k, self.group_by_key(k)?)))
+    }
+
+    fn group_by_key(&self, key: u32) -> Option<&Vec<T>> {
+        if self.dense_key(key) {
+            Some(&self.dense[key as usize])
+        } else {
+            self.map.get(&key)
+        }
     }
 
     pub(super) fn push(&mut self, key: u32, value: T) {
-        let group = if self.is_dense() {
-            &mut self.dense[key as usize]
+        // Inlined (not via `bucket_mut`) so the bucket borrow (`self.dense`/`self.map`)
+        // and `self.touched` are seen as disjoint fields.
+        if (key as usize) < self.dense.len() {
+            let g = &mut self.dense[key as usize];
+            if g.is_empty() {
+                self.touched.push(key);
+            }
+            g.push(value);
         } else {
-            self.map.entry(key).or_default()
-        };
-        if group.is_empty() {
-            self.touched.push(key);
+            let g = self.map.entry(key).or_default();
+            if g.is_empty() {
+                self.touched.push(key);
+            }
+            g.push(value);
         }
-        group.push(value);
     }
 
     /// The group under `key` this tick, if any member was pushed.
     pub(super) fn get(&self, key: &u32) -> Option<&Vec<T>> {
-        if self.is_dense() {
-            self.dense.get(*key as usize).filter(|v| !v.is_empty())
-        } else {
-            self.map.get(key).filter(|v| !v.is_empty())
-        }
+        self.group_by_key(*key).filter(|v| !v.is_empty())
     }
 
     /// Number of non-empty groups this tick.
@@ -98,21 +113,40 @@ impl<T> GroupMap<T> {
 
     /// The `i`-th touched group (arbitrary but stable within a tick).
     pub(super) fn group_at(&self, i: usize) -> &Vec<T> {
-        let k = self.touched[i];
-        if self.is_dense() {
-            &self.dense[k as usize]
-        } else {
-            &self.map[&k]
-        }
+        self.group_by_key(self.touched[i]).expect("touched key has a group")
     }
 
     pub(super) fn group_mut_at(&mut self, i: usize) -> (u32, &mut Vec<T>) {
         let k = self.touched[i];
-        let g = if self.is_dense() {
-            &mut self.dense[k as usize]
-        } else {
-            self.map.get_mut(&k).unwrap()
-        };
-        (k, g)
+        (k, self.bucket_mut(k))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dense_groupmap_handles_out_of_range_keys() {
+        // A dense-backed map must still accept keys >= cap (e.g. the u32::MAX
+        // "no corridor" sentinel) via the hash-map fallback — not index-panic.
+        let mut g: GroupMap<usize> = GroupMap::default();
+        g.reserve_dense(4);
+        g.begin_tick();
+        g.push(1, 10); // in the dense array
+        g.push(u32::MAX, 20); // out of range -> hash map
+        g.push(1, 11);
+        g.push(u32::MAX, 21);
+        assert_eq!(g.get(&1), Some(&vec![10, 11]));
+        assert_eq!(g.get(&u32::MAX), Some(&vec![20, 21]));
+        assert_eq!(g.len(), 2, "two touched groups across both stores");
+        let mut seen: Vec<(u32, usize)> = g.iter().map(|(k, v)| (k, v.len())).collect();
+        seen.sort();
+        assert_eq!(seen, vec![(1, 2), (u32::MAX, 2)]);
+        // A second tick clears both stores' touched buckets.
+        g.begin_tick();
+        assert_eq!(g.get(&1), None);
+        assert_eq!(g.get(&u32::MAX), None);
+        assert_eq!(g.len(), 0);
     }
 }

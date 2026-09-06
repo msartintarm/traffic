@@ -386,6 +386,12 @@ pub struct Network {
     /// so every render backend sees it through the one `&Network`. Empty on
     /// hand-built maps; trains themselves live in the world's timetable.
     pub rail: super::rail::RailNetwork,
+    /// Lazily-built uniform grid over surface-link segments, so `nearest_surface_link`
+    /// is a small-neighbourhood scan rather than a walk of every road segment — the
+    /// difference between a sub-second boot and a minute-long one when a transit-dense
+    /// map resolves thousands of stop/trace points. Built on first query from the
+    /// then-final geometry.
+    surface_index: std::sync::OnceLock<SurfaceIndex>,
 }
 
 fn movement_pair_key(a: MovementId, b: MovementId) -> u64 {
@@ -616,6 +622,102 @@ fn point_along(poly: &[[f64; 2]], s: f64) -> ([f64; 2], [f64; 2]) {
     (poly[n - 1], unit(sub(poly[n - 1], poly[n - 2])))
 }
 
+/// One surface-link polyline segment, pre-decomposed for point projection.
+#[derive(Clone, Debug, Default)]
+struct SurfaceSeg {
+    link: u32,
+    a: [f64; 2],
+    seg: [f64; 2],
+    len2: f64,
+    arc: f64,
+}
+
+/// Uniform grid over surface-link segments for fast nearest-point queries.
+/// `CELL` exceeds every caller's snap threshold (≤30 m), so a query need only
+/// inspect the 3×3 block of cells around the point: any segment within the
+/// threshold is registered in one of those cells.
+#[derive(Clone, Debug, Default)]
+struct SurfaceIndex {
+    min: [f64; 2],
+    cols: i64,
+    rows: i64,
+    grid: Vec<Vec<u32>>,
+    segs: Vec<SurfaceSeg>,
+}
+
+impl SurfaceIndex {
+    const CELL: f64 = 40.0;
+
+    fn build(net: &Network) -> Self {
+        let mut segs: Vec<SurfaceSeg> = Vec::new();
+        let (mut minx, mut miny, mut maxx, mut maxy) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for li in 0..net.links.len() {
+            if matches!(net.links[li].kind, RoadKind::Freeway | RoadKind::Ramp) {
+                continue;
+            }
+            let mut arc = 0.0;
+            for w in net.polylines[li].windows(2) {
+                let seg = [w[1][0] - w[0][0], w[1][1] - w[0][1]];
+                let len2 = (seg[0] * seg[0] + seg[1] * seg[1]).max(1e-9);
+                segs.push(SurfaceSeg { link: li as u32, a: w[0], seg, len2, arc });
+                arc += len2.sqrt();
+                for pt in [w[0], w[1]] {
+                    minx = minx.min(pt[0]);
+                    miny = miny.min(pt[1]);
+                    maxx = maxx.max(pt[0]);
+                    maxy = maxy.max(pt[1]);
+                }
+            }
+        }
+        if segs.is_empty() {
+            return Self::default();
+        }
+        let cols = (((maxx - minx) / Self::CELL).floor() as i64 + 1).max(1);
+        let rows = (((maxy - miny) / Self::CELL).floor() as i64 + 1).max(1);
+        let mut grid: Vec<Vec<u32>> = vec![Vec::new(); (cols * rows) as usize];
+        let cell_of = |x: f64, y: f64| (((x - minx) / Self::CELL).floor() as i64, ((y - miny) / Self::CELL).floor() as i64);
+        for (si, s) in segs.iter().enumerate() {
+            let b = [s.a[0] + s.seg[0], s.a[1] + s.seg[1]];
+            let (c0x, c0y) = cell_of(s.a[0].min(b[0]), s.a[1].min(b[1]));
+            let (c1x, c1y) = cell_of(s.a[0].max(b[0]), s.a[1].max(b[1]));
+            for cy in c0y..=c1y {
+                for cx in c0x..=c1x {
+                    if cx >= 0 && cy >= 0 && cx < cols && cy < rows {
+                        grid[(cy * cols + cx) as usize].push(si as u32);
+                    }
+                }
+            }
+        }
+        Self { min: [minx, miny], cols, rows, grid, segs }
+    }
+
+    fn nearest(&self, p: [f64; 2]) -> Option<(LinkId, f64, f64)> {
+        if self.segs.is_empty() {
+            return None;
+        }
+        let cx = ((p[0] - self.min[0]) / Self::CELL).floor() as i64;
+        let cy = ((p[1] - self.min[1]) / Self::CELL).floor() as i64;
+        let mut best: Option<(f64, LinkId, f64)> = None;
+        for gy in (cy - 1)..=(cy + 1) {
+            for gx in (cx - 1)..=(cx + 1) {
+                if gx < 0 || gy < 0 || gx >= self.cols || gy >= self.rows {
+                    continue;
+                }
+                for &si in &self.grid[(gy * self.cols + gx) as usize] {
+                    let s = &self.segs[si as usize];
+                    let t = (((p[0] - s.a[0]) * s.seg[0] + (p[1] - s.a[1]) * s.seg[1]) / s.len2).clamp(0.0, 1.0);
+                    let q = [s.a[0] + s.seg[0] * t, s.a[1] + s.seg[1] * t];
+                    let d = (q[0] - p[0]).hypot(q[1] - p[1]);
+                    if best.is_none_or(|(bd, ..)| d < bd) {
+                        best = Some((d, LinkId(s.link), s.arc + s.len2.sqrt() * t));
+                    }
+                }
+            }
+        }
+        best.map(|(d, l, a)| (l, a, d))
+    }
+}
+
 impl Network {
     pub fn node(&self, id: NodeId) -> &Node {
         &self.nodes[id.idx()]
@@ -687,25 +789,7 @@ impl Network {
     /// polyline and the projection distance — the resolver behind bus stops
     /// and route traces.
     pub fn nearest_surface_link(&self, p: [f64; 2]) -> Option<(LinkId, f64, f64)> {
-        let mut best: Option<(f64, LinkId, f64)> = None;
-        for li in 0..self.links.len() {
-            if matches!(self.links[li].kind, RoadKind::Freeway | RoadKind::Ramp) {
-                continue;
-            }
-            let mut arc = 0.0;
-            for w in self.polylines[li].windows(2) {
-                let seg = [w[1][0] - w[0][0], w[1][1] - w[0][1]];
-                let len2 = (seg[0] * seg[0] + seg[1] * seg[1]).max(1e-9);
-                let t = (((p[0] - w[0][0]) * seg[0] + (p[1] - w[0][1]) * seg[1]) / len2).clamp(0.0, 1.0);
-                let q = [w[0][0] + seg[0] * t, w[0][1] + seg[1] * t];
-                let d = (q[0] - p[0]).hypot(q[1] - p[1]);
-                if best.is_none_or(|(bd, ..)| d < bd) {
-                    best = Some((d, LinkId(li as u32), arc + len2.sqrt() * t));
-                }
-                arc += len2.sqrt();
-            }
-        }
-        best.map(|(d, l, a)| (l, a, d))
+        self.surface_index.get_or_init(|| SurfaceIndex::build(self)).nearest(p)
     }
 
     /// Resolve scraped bus-stop points onto surface links: each stop lands on
@@ -1978,6 +2062,57 @@ mod tests {
             (lo[0] - 1.0..=hi[0] + 1.0).contains(&j.center[0]) && (lo[1] - 1.0..=hi[1] + 1.0).contains(&j.center[1]),
             "the crossing centre sits inside its footprint",
         );
+    }
+
+    #[test]
+    fn surface_index_matches_brute_force_nearest() {
+        // The spatial grid must return exactly what a full segment scan would for
+        // any point within the callers' snap threshold — anything farther is
+        // rejected by the caller regardless, so only near matches need agree.
+        let net = map::arterial_intersection();
+        let brute = |p: [f64; 2]| -> Option<(LinkId, f64, f64)> {
+            let mut best: Option<(f64, LinkId, f64)> = None;
+            for li in 0..net.links.len() {
+                if matches!(net.links[li].kind, RoadKind::Freeway | RoadKind::Ramp) {
+                    continue;
+                }
+                let mut arc = 0.0;
+                for w in net.polylines[li].windows(2) {
+                    let seg = [w[1][0] - w[0][0], w[1][1] - w[0][1]];
+                    let len2 = (seg[0] * seg[0] + seg[1] * seg[1]).max(1e-9);
+                    let t = (((p[0] - w[0][0]) * seg[0] + (p[1] - w[0][1]) * seg[1]) / len2).clamp(0.0, 1.0);
+                    let q = [w[0][0] + seg[0] * t, w[0][1] + seg[1] * t];
+                    let d = (q[0] - p[0]).hypot(q[1] - p[1]);
+                    if best.is_none_or(|(bd, ..)| d < bd) {
+                        best = Some((d, LinkId(li as u32), arc + len2.sqrt() * t));
+                    }
+                    arc += len2.sqrt();
+                }
+            }
+            best.map(|(d, l, a)| (l, a, d))
+        };
+        let b = net.bounds();
+        let mut checked = 0;
+        for i in 0..40 {
+            for j in 0..40 {
+                let p = [
+                    b[0] + (b[2] - b[0]) * i as f64 / 39.0,
+                    b[1] + (b[3] - b[1]) * j as f64 / 39.0,
+                ];
+                let (Some(exp), Some(got)) = (brute(p), net.nearest_surface_link(p)) else { continue };
+                if exp.2 > 30.0 {
+                    continue; // beyond every caller's threshold; the grid may skip it
+                }
+                // The invariant is the minimum distance, not the identity: coincident
+                // links at a crossing are genuine ties either order may resolve.
+                assert!((exp.2 - got.2).abs() < 1e-6, "same min distance at {p:?}: brute {} grid {}", exp.2, got.2);
+                if exp.0 == got.0 {
+                    assert!((exp.1 - got.1).abs() < 1e-6, "same arc on the same link at {p:?}");
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "the sweep exercised at least some near matches");
     }
 
     #[test]

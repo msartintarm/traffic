@@ -153,7 +153,7 @@ fn all_way_stops_serve_their_corridors_without_gridlock() {
 /// to parse; Columbus is covered by its `#[ignore]`d build test's budget.
 #[test]
 fn shipped_commute_od_artifacts_load_against_their_maps() {
-    use engine::sim::demand::{commute_od_pairs, CommuteOd};
+    use engine::sim::demand::{commute_od_pairs, CommuteOd, DemandTuning};
     for (map, needs_pairs) in [("map", true), ("sancarlos", true), ("sf", true), ("peninsula", false)] {
         let Some(net) = map_from(&format!("{map}.json")) else { continue };
         let od_path = format!("{}/../web/public/{map}.lodes.json", env!("CARGO_MANIFEST_DIR"));
@@ -161,7 +161,7 @@ fn shipped_commute_od_artifacts_load_against_their_maps() {
             .unwrap_or_else(|_| panic!("{map}.json has no commute-OD sibling {od_path} — run tools/lodes/fetch_lodes.py --map"));
         let od = CommuteOd::from_json(&od_text).unwrap_or_else(|e| panic!("{map}.lodes.json: {e}"));
         let mut pairs = Vec::new();
-        commute_od_pairs(&net, &od, 7, 32, &mut pairs);
+        commute_od_pairs(&net, &od, 7, 32, DemandTuning::DEFAULT, &mut pairs);
         if needs_pairs {
             assert!(!pairs.is_empty(), "{map}: measured flows anchor to the map");
             assert!(pairs.iter().all(|p| p.anchored), "{map}: commute streams are anchored");
