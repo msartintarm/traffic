@@ -57,12 +57,18 @@ pub(super) struct Sharding {
     /// Home shard per lane — the shard of its link's *downstream* node: owns
     /// the cars currently on it (their boundary interaction happens there).
     pub(super) lane_home: Vec<u32>,
+    /// Indivisible-unit (junction cluster / lone node) id per node. Kept so the
+    /// partition can be re-balanced by a fresh per-unit weight without recomputing
+    /// clusters. See [`rebalance`](Self::rebalance).
+    pub(super) unit_of: Vec<u32>,
+    /// Number of distinct units.
+    pub(super) units: usize,
 }
 
 impl Sharding {
     /// Deterministic partition: each junction cluster (or lone node) is one
-    /// indivisible unit; units, in stable order, are placed greedily onto the
-    /// least-loaded shard (by node count).
+    /// indivisible unit. Built balanced by node count; the runtime re-balances it
+    /// by live car load (see [`rebalance`](Self::rebalance)).
     pub(super) fn build(net: &Network, target: usize) -> Self {
         let n = net.nodes.len();
         // Unit id per node: its junction cluster index, or a fresh unit for a
@@ -80,31 +86,46 @@ impl Sharding {
                 next += 1;
             }
         }
-        // Unit sizes, then greedy balance in unit order (stable, deterministic).
-        let mut size = vec![0u32; next as usize];
+        let units = next as usize;
+        // Seed weight: node count per unit (a car-free network still balances).
+        let mut size = vec![0.0f64; units];
         for &u in &unit_of {
-            size[u as usize] += 1;
+            size[u as usize] += 1.0;
         }
         let count = Self::clamp_count(target);
-        let mut load = vec![0u32; count];
-        let mut shard_of_unit = vec![0u32; next as usize];
-        for u in 0..next as usize {
-            let s = (0..count).min_by_key(|&s| load[s]).unwrap();
+        let mut s = Self { count, lane_entry: vec![0; net.lanes.len()], lane_home: vec![0; net.lanes.len()], unit_of, units };
+        s.assign(net, &size);
+        s
+    }
+
+    /// Re-partition the units onto shards by `unit_weight` (e.g. live car counts),
+    /// keeping cluster atomicity. The SPMD span is a barrier — it waits on the
+    /// slowest shard — so balancing the *work* (cars), not the node count, is what
+    /// lifts parallel efficiency once traffic concentrates. Cheap: O(units + lanes),
+    /// deterministic (greedy least-loaded in unit order).
+    pub(super) fn rebalance(&mut self, net: &Network, unit_weight: &[f64]) {
+        self.assign(net, unit_weight);
+    }
+
+    /// Greedy least-loaded assignment of units → shards by `weight`, then the
+    /// per-lane entry/home shard tables that follow from it.
+    fn assign(&mut self, net: &Network, weight: &[f64]) {
+        let mut load = vec![0.0f64; self.count];
+        let mut shard_of_unit = vec![0u32; self.units];
+        for u in 0..self.units {
+            let s = (0..self.count).min_by(|&a, &b| load[a].total_cmp(&load[b])).unwrap();
             shard_of_unit[u] = s as u32;
-            load[s] += size[u];
+            load[s] += weight[u];
         }
-        let node_shard: Vec<u32> = unit_of.iter().map(|&u| shard_of_unit[u as usize]).collect();
-        let mut lane_entry = vec![0u32; net.lanes.len()];
-        let mut lane_home = vec![0u32; net.lanes.len()];
+        let node_shard: Vec<u32> = self.unit_of.iter().map(|&u| shard_of_unit[u as usize]).collect();
         for li in 0..net.links.len() {
             let l = net.links[li];
             for k in 0..l.lane_count {
                 let lane = (l.lane_start.0 + k) as usize;
-                lane_entry[lane] = node_shard[l.from.idx()];
-                lane_home[lane] = node_shard[l.to.idx()];
+                self.lane_entry[lane] = node_shard[l.from.idx()];
+                self.lane_home[lane] = node_shard[l.to.idx()];
             }
         }
-        Self { count, lane_entry, lane_home }
     }
 
     /// The SPMD span barriers `count` tasks that must all be running at once,

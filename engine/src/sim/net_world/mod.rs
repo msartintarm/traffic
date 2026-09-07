@@ -442,6 +442,11 @@ fn threads_available() -> bool {
 /// serial even on the `Threads` backend below it. Adjustable at runtime.
 pub const DEFAULT_PAR_THRESHOLD: usize = 500;
 
+/// How often (ticks) the sharded backend re-balances its partition by live car
+/// load. Frequent enough to track the commute's shifting hotspots, rare enough
+/// that the O(units+lanes) rebuild is negligible.
+const SHARD_REBALANCE_TICKS: u64 = 64;
+
 /// Cap on retained crash-site positions (for the overlay). A long run can accumulate many
 /// wrecks; keep the most recent so the overlay stays bounded in memory and upload size.
 pub const MAX_CRASH_SITES: usize = 8192;
@@ -1176,7 +1181,7 @@ impl NetWorld {
         Self {
             network, cfg, fleet: Fleet::default(), time: 0.0, tick: 0, exited: 0, leaked: 0, crashed: 0, divergences: 0,
             control_aware_routing: true, lane_eval_stagger: true, arterial_routing: false,
-            targeted_routing: true, dest_entries: HashMap::new(), locality_sort: false,
+            targeted_routing: true, dest_entries: HashMap::new(), locality_sort: true,
             nb_pool, lc_groups, corridor_groups, crash_groups: GroupMap::default(),
             kinematics_enabled: true, defer_kinematics: false, sharding: None, region_isolation: false, follower_lod: false, shard_accel: false, async_routing: false, router_generation: 0, route_async_cycles: 0,
             approach_ctx: IntMap::default(), standing_pose: IntMap::default(), shard_stats: Vec::new(),
@@ -1472,6 +1477,25 @@ impl NetWorld {
 
     pub fn set_sharding(&mut self, count: usize) {
         self.sharding = (count > 1).then(|| Sharding::build(&self.network, count));
+    }
+
+    /// Re-partition the shards by each unit's live car count, so the SPMD barrier
+    /// waits on a balanced work split rather than one node-heavy-but-empty region.
+    /// A `+1` floor keeps empty units placeable (a shard should still own quiet
+    /// nodes so a car entering them has an owner). Cheap; runs a few times a minute.
+    fn rebalance_shards(&mut self) {
+        let Some(mut sh) = self.sharding.take() else { return };
+        // Weight units by live car load (the `1.0` floor keeps quiet units
+        // placeable). This tightens the car balance markedly (measured 1.44→1.22×
+        // on the loaded map); the residual resolve-*time* skew (~1.43×) is a floor
+        // set by indivisible heavy junction clusters, not the assignment.
+        let mut weight = vec![1.0f64; sh.units];
+        for v in &self.fleet.rows {
+            let home = self.network.link(self.network.lane(v.lane).link).to;
+            weight[sh.unit_of[home.idx()] as usize] += 1.0;
+        }
+        sh.rebalance(&self.network, &weight);
+        self.sharding = Some(sh);
     }
 
     /// Toggle the periodic fleet locality reorder (see the field docs).
@@ -3522,6 +3546,12 @@ impl NetWorld {
         if self.locality_sort && self.tick % 16 == 0 {
             self.locality_reorder();
         }
+        // Re-balance the shards by live car load every so often: the partition is
+        // seeded by node count, but traffic concentrates, so a downtown shard
+        // would otherwise carry ~2× the cars and stall the SPMD barrier.
+        if self.tick > 0 && self.tick % SHARD_REBALANCE_TICKS == 0 {
+            self.rebalance_shards();
+        }
         self.refresh_routes();
         prof.lap(0);
         self.advance_signals(dt);
@@ -5023,10 +5053,11 @@ impl NetWorld {
         let mut hit: Vec<Option<(CrashKind, f32)>> = vec![None; taken.len()];
         let on_road = |i: usize| matches!(fates[i], Fate::Alive | Fate::Entered(_));
 
-        // Deliberately serial (like the integrate arm): the per-follower verdict
-        // is a handful of reads — fanning it out was measured slower (crashes
-        // lap 1.9 → 3.4 ms; re-confirmed chunky at 11k, 2.3 → 5.3 ms) than just
-        // walking the array. See the phase-fusion note in the parallelism roadmap.
+        // Serial: the per-follower verdict is a few memory-bound reads, and fanning
+        // it out was *measured slower* here (rear map_collect: 1.8 → 2.7 ms) —
+        // dispatch/steal traffic outweighs the tiny per-item work. The sharded
+        // path (`detect_crashes_sharded`) is the parallel win, via ownership
+        // partition + cache-contiguous per-shard walks, not a blind fan-out.
         let rear: Vec<Option<f32>> = (0..taken.len()).map(|i| self.rear_end_verdict(i, taken, fates, nb)).collect();
         for (i, closing) in rear.into_iter().enumerate() {
             let Some(closing) = closing else { continue };
