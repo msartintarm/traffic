@@ -142,6 +142,14 @@ pub struct NetWorld {
     /// Spatial shards for the boundary-resolution phase (None = classic serial
     /// path, bit-identical to the unsharded engine). See [`shards::Sharding`].
     sharding: Option<Sharding>,
+    /// Auto-manage `sharding` by fleet size: the sharded SPMD span only beats the
+    /// classic path once there's enough per-shard work to amortize its barrier
+    /// (measured net-negative ~13k, net-positive ~26k). On, it engages sharding
+    /// above [`SHARD_AUTO_ON`] and drops it below [`SHARD_AUTO_OFF`] (hysteresis).
+    /// A manual [`set_sharding`](Self::set_sharding) turns it off — that caller
+    /// wants an exact count. Small-fleet sims (every test) never cross the
+    /// threshold, so they stay on the classic path regardless.
+    auto_shard: bool,
     /// Option C dry-run: run the SPMD span on per-region row copies (see
     /// `ShardView::Regions`). Validation mode — costs two row copies per tick.
     region_isolation: bool,
@@ -446,6 +454,17 @@ pub const DEFAULT_PAR_THRESHOLD: usize = 500;
 /// load. Frequent enough to track the commute's shifting hotspots, rare enough
 /// that the O(units+lanes) rebuild is negligible.
 const SHARD_REBALANCE_TICKS: u64 = 64;
+
+/// Fleet size at/above which auto-sharding engages, and below which it drops
+/// (hysteresis). The sharded SPMD span only out-runs the classic path once the
+/// per-shard work amortizes its barrier — measured net-negative at ~13k,
+/// net-positive at ~26k, so the ON gate sits comfortably above the crossover.
+const SHARD_AUTO_ON: usize = 18_000;
+const SHARD_AUTO_OFF: usize = 13_000;
+/// Shard-count target when auto-engaging (clamped to the thread pool by
+/// `Sharding::build`). 8 was the balance/efficiency sweet spot in the sweep
+/// (72% vs 60% at 32); more shards split the load finer but skew worse.
+const SHARD_AUTO_COUNT: usize = 8;
 
 /// Cap on retained crash-site positions (for the overlay). A long run can accumulate many
 /// wrecks; keep the most recent so the overlay stays bounded in memory and upload size.
@@ -1183,7 +1202,7 @@ impl NetWorld {
             control_aware_routing: true, lane_eval_stagger: true, arterial_routing: false,
             targeted_routing: true, dest_entries: HashMap::new(), locality_sort: true,
             nb_pool, lc_groups, corridor_groups, crash_groups: GroupMap::default(),
-            kinematics_enabled: true, defer_kinematics: false, sharding: None, region_isolation: false, follower_lod: false, shard_accel: false, async_routing: false, router_generation: 0, route_async_cycles: 0,
+            kinematics_enabled: true, defer_kinematics: false, sharding: None, auto_shard: true, region_isolation: false, follower_lod: false, shard_accel: false, async_routing: false, router_generation: 0, route_async_cycles: 0,
             approach_ctx: IntMap::default(), standing_pose: IntMap::default(), shard_stats: Vec::new(),
             #[cfg(feature = "parallel")]
             route_pred: None,
@@ -1476,7 +1495,27 @@ impl NetWorld {
     }
 
     pub fn set_sharding(&mut self, count: usize) {
+        self.auto_shard = false; // explicit count — stop auto-managing it
         self.sharding = (count > 1).then(|| Sharding::build(&self.network, count));
+    }
+
+    /// Toggle fleet-size-driven auto-sharding (on by default; see `auto_shard`).
+    pub fn set_auto_shard(&mut self, on: bool) {
+        self.auto_shard = on;
+        if !on {
+            self.sharding = None;
+        }
+    }
+
+    /// Engage/drop sharding by live fleet size (hysteresis). Building is O(nodes+
+    /// lanes), so it only fires on the up/down crossing, not every tick.
+    fn manage_auto_sharding(&mut self) {
+        let n = self.fleet.rows.len();
+        if self.sharding.is_none() && n >= SHARD_AUTO_ON {
+            self.sharding = Some(Sharding::build(&self.network, SHARD_AUTO_COUNT));
+        } else if self.sharding.is_some() && n < SHARD_AUTO_OFF {
+            self.sharding = None;
+        }
     }
 
     /// Re-partition the shards by each unit's live car count, so the SPMD barrier
@@ -2420,6 +2459,11 @@ impl NetWorld {
         // Flat sort keys (contiguous, cache-friendly) precomputed once when the cache-sort
         // option is on; empty when off, so the helpers read each vehicle row instead.
         let (pos, cpos) = (self.position_keys(), self.corridor_keys());
+        // Per-group sorts, kept serial. Fanning them out was *measured slower* at
+        // 25k on Columbus (neighbors 3.8 → 7.5 ms): the groups are small, so the
+        // fan-out is thousands of tiny memory-bound sorts whose dispatch and
+        // cache-line contention on `leader_of` dwarf the work — the same wall the
+        // crash fan-out hit. accel is the only coarse-enough phase that scales.
         // The leader chain runs along the whole corridor (grade-separated 1:1 through-lanes
         // coalesced), so `leader_of` never loses the car ahead at a segment boundary.
         for gi in 0..nb.by_corridor.len() {
@@ -3545,6 +3589,10 @@ impl NetWorld {
         let mut prof = Prof::new();
         if self.locality_sort && self.tick % 16 == 0 {
             self.locality_reorder();
+        }
+        // Engage/drop sharding by fleet size (net-positive only at scale).
+        if self.auto_shard {
+            self.manage_auto_sharding();
         }
         // Re-balance the shards by live car load every so often: the partition is
         // seeded by node count, but traffic concentrates, so a downtown shard

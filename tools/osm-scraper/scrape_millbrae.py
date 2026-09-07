@@ -70,26 +70,51 @@ DEFAULT_SPEED_MPH = {
 SIMPLIFY_TOL_M = 0.5
 
 
-def overpass_query(bbox, classes=None):
+def overpass_query(bbox, classes=None, area=None):
     s, w, n, e = bbox
     # Restricting to specific highway classes server-side keeps a large-area scrape
     # (e.g. the whole peninsula's freeways) a small download instead of every street.
-    if classes:
-        selector = f'way["highway"~"^({"|".join(sorted(classes))})$"]({s},{w},{n},{e});'
-    else:
-        selector = f'way["highway"]({s},{w},{n},{e});'
+    cls = f'"highway"~"^({"|".join(sorted(classes))})$"' if classes else '"highway"'
+    if area:
+        # Clip to an admin boundary (e.g. a whole county). `way(area)` keeps ways
+        # with any node inside, so boundary-crossing blocks aren't chopped mid-span.
+        # A county's worth of streets is a big response — give the server room.
+        name, level = area
+        return f"""
+    [out:json][timeout:600];
+    area["name"="{name}"]["admin_level"="{level}"]->.a;
+    (
+      way(area.a)[{cls}];
+    );
+    (._;>;);
+    out body;
+    """
     return f"""
     [out:json][timeout:90];
     (
-      {selector}
+      way[{cls}]({s},{w},{n},{e});
     );
     (._;>;);
     out body;
     """
 
 
-def fetch(bbox, classes=None, attempts=6):
-    return fetch_query(overpass_query(bbox, classes), attempts)
+def resolve_area(name, level):
+    """The bounding box of an admin boundary (for the local projection + the
+    supplementary rail/bus/restriction queries, which stay bbox-based). The road
+    scrape itself clips to the area, not this box."""
+    els = fetch_query(f'[out:json][timeout:120]; rel["name"="{name}"]["admin_level"="{level}"]; out bb;').get("elements", [])
+    rels = [e for e in els if e.get("type") == "relation" and "bounds" in e]
+    if not rels:
+        raise SystemExit(f"no admin boundary named '{name}' at admin_level {level}")
+    if len(rels) > 1:
+        print(f"warning: {len(rels)} boundaries match '{name}' @ level {level}; using the first")
+    b = rels[0]["bounds"]
+    return (b["minlat"], b["minlon"], b["maxlat"], b["maxlon"])
+
+
+def fetch(bbox, classes=None, area=None, attempts=6):
+    return fetch_query(overpass_query(bbox, classes, area), attempts)
 
 
 def fetch_query(query, attempts=6):
@@ -104,7 +129,7 @@ def fetch_query(query, attempts=6):
         url = OVERPASS_URLS[attempt % len(OVERPASS_URLS)]
         try:
             req = urllib.request.Request(url, data=body, headers=headers)
-            return json.loads(urllib.request.urlopen(req, timeout=180).read())
+            return json.loads(urllib.request.urlopen(req, timeout=600).read())
         except urllib.error.HTTPError as err:
             last = err
             if err.code not in RETRYABLE_STATUS:
@@ -797,6 +822,12 @@ def main():
     ap.add_argument("--bbox", nargs=4, type=float, metavar=("S", "W", "N", "E"))
     ap.add_argument("--bbox-file", dest="bbox_file")
     ap.add_argument(
+        "--area",
+        help="clip roads to this OSM admin boundary (e.g. 'San Mateo County') instead of a bbox; "
+        "projection + rail/bus use the boundary's bounding box",
+    )
+    ap.add_argument("--admin-level", default="6", help="admin_level of --area (county = 6, city = 8)")
+    ap.add_argument(
         "--highways-only", action="store_true",
         help="keep only freeways and their ramps/exits (motorway/trunk + _link)",
     )
@@ -806,7 +837,8 @@ def main():
     )
     args = ap.parse_args()
 
-    bbox = resolve_bbox(args)
+    area = (args.area, args.admin_level) if args.area else None
+    bbox = resolve_area(args.area, args.admin_level) if area else resolve_bbox(args)
     classes = FREEWAY if args.highways_only else None
     landuse = None
     if args.landuse:
@@ -821,7 +853,7 @@ def main():
         ).get("elements", [])
         if el["type"] == "relation"
     ]
-    graph = build(fetch(bbox, classes), bbox, args.place, classes or DRIVABLE, landuse, turn_rels)
+    graph = build(fetch(bbox, classes, area), bbox, args.place, classes or DRIVABLE, landuse, turn_rels)
     if not args.highways_only:
         # Curbside bus stops: the engine dwells buses at these service positions.
         lat0, lon0 = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
