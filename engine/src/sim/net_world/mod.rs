@@ -105,6 +105,7 @@ pub struct DriverReport {
     pub wait_secs: f64,
 }
 
+
 pub struct NetWorld {
     pub network: Network,
     cfg: SimConfig,
@@ -133,6 +134,11 @@ pub struct NetWorld {
     lc_groups: GroupMap,
     corridor_groups: GroupMap,
     crash_groups: GroupMap,
+    /// Reused demanded-lane set for signal actuation (see [`junction::LaneSet`]).
+    lane_demand: junction::LaneSet,
+    /// Per-node "any outgoing link" bit — the leak-vs-arrived test in
+    /// `resolve_boundary` was an O(all links) scan per dead-end car.
+    node_has_outgoing: Vec<bool>,
     /// Periodically permute the fleet into (lane, position) order so the per-car
     /// passes' neighbor reads walk adjacent memory instead of pointer-chasing a
     /// shuffled ~250-byte-row array — the memory-bound closures are why the
@@ -353,6 +359,10 @@ const REROUTE_INTERVAL_SECS: f64 = 3.0;
 /// behind a leader — it could still enter the box this decision.
 const COMMIT_LEAD_SECS: f64 = 1.0;
 const COMMIT_MIN_M: f64 = 8.0;
+/// Approach-table horizon: a car whose stop-line eta exceeds this can never
+/// fall inside any caller's critical gap (see `build_step_caches`), so no
+/// [`ApproachRow`] is built for it.
+const APPROACH_ETA_CAP: f64 = 45.0;
 
 pub const STEP_PHASES: usize = 7;
 pub const PHASE_NAMES: [&str; STEP_PHASES] =
@@ -1183,6 +1193,10 @@ impl NetWorld {
             stops_by_link.entry(link.0).or_default().push((i as u32, arc));
         }
         let link_entries = vec![0u32; network.links.len()];
+        let mut node_has_outgoing = vec![false; network.nodes.len()];
+        for l in &network.links {
+            node_has_outgoing[l.from.idx()] = true;
+        }
         let junctions = Junctions::build(&network);
         let congestion = CongestionLod::new(network.links.len());
         // Direct-indexed grouping for the full-fleet per-tick maps (keys are dense
@@ -1202,6 +1216,7 @@ impl NetWorld {
             control_aware_routing: true, lane_eval_stagger: true, arterial_routing: false,
             targeted_routing: true, dest_entries: HashMap::new(), locality_sort: true,
             nb_pool, lc_groups, corridor_groups, crash_groups: GroupMap::default(),
+            lane_demand: junction::LaneSet::default(), node_has_outgoing,
             kinematics_enabled: true, defer_kinematics: false, sharding: None, auto_shard: true, region_isolation: false, follower_lod: false, shard_accel: false, async_routing: false, router_generation: 0, route_async_cycles: 0,
             approach_ctx: IntMap::default(), standing_pose: IntMap::default(), shard_stats: Vec::new(),
             #[cfg(feature = "parallel")]
@@ -1870,6 +1885,84 @@ impl NetWorld {
 
     /// Spawn at the start of `entry_link` bound for `dest`, routed live by the
     /// world's flow-field. Refused if every entry lane is still occupied.
+    /// Build an [`EntryOccupancy`] snapshot over every lane of `links` in one
+    /// fleet pass — see the struct docs for why.
+    pub fn entry_occupancy(&self, links: impl IntoIterator<Item = LinkId>) -> EntryOccupancy {
+        let mut marked = vec![false; self.network.lanes.len()];
+        for link in links {
+            let l = self.network.link(link);
+            for k in 0..l.lane_count {
+                marked[(l.lane_start.0 + k) as usize] = true;
+            }
+        }
+        let mut lanes: IntMap<LaneTail> = IntMap::default();
+        for v in &self.fleet.rows {
+            if !marked[v.lane.0 as usize] {
+                continue;
+            }
+            let rear = v.position - v.driver.vehicle_length;
+            let t = lanes.entry(v.lane.0).or_insert(LaneTail {
+                rear_all: f64::INFINITY,
+                rear_free: f64::INFINITY,
+                tail_speed: 0.0,
+            });
+            t.rear_all = t.rear_all.min(rear);
+            if v.crossing.is_none() && rear < t.rear_free {
+                t.rear_free = rear;
+                t.tail_speed = v.speed;
+            }
+        }
+        EntryOccupancy { marked, lanes }
+    }
+
+    /// [`spawn_to`] against an [`EntryOccupancy`] snapshot instead of per-attempt
+    /// fleet scans; keeps the snapshot exact by recording the spawned car.
+    pub fn spawn_to_occ(
+        &mut self,
+        occ: &mut EntryOccupancy,
+        id: u32,
+        entry_link: LinkId,
+        dest: LinkId,
+        speed: f64,
+        driver: DriverConfig,
+    ) -> bool {
+        let admit_gap = driver.min_gap + speed * driver.time_headway;
+        let Some(lane) = self.entry_lane_toward_occ(Some(occ), entry_link, admit_gap, id, Some(dest)) else {
+            return false;
+        };
+        let gates = self.dest_entries.entry(dest.0).or_default();
+        if !gates.contains(&entry_link.0) {
+            gates.push(entry_link.0);
+        }
+        let speed = match occ.lanes.get(&lane.0) {
+            None => speed,
+            Some(t) if t.rear_free.is_infinite() => speed,
+            Some(t) => {
+                let gap = (t.rear_free - driver.min_gap).max(0.0);
+                speed.min((t.tail_speed * t.tail_speed + 2.0 * driver.comfort_decel * gap).sqrt())
+            }
+        };
+        self.link_entries[entry_link.idx()] += 1;
+        let kin = Self::spawn_kin(&self.network, lane, 0.0, &driver);
+        let rear = -driver.vehicle_length;
+        let t = occ.lanes.entry(lane.0).or_insert(LaneTail {
+            rear_all: f64::INFINITY,
+            rear_free: f64::INFINITY,
+            tail_speed: 0.0,
+        });
+        t.rear_all = t.rear_all.min(rear);
+        if rear < t.rear_free {
+            t.rear_free = rear;
+            t.tail_speed = speed;
+        }
+        self.fleet.push(NetVehicle {
+            id, lane, position: 0.0, speed, kin, steer: 0.0, driver, route: Vec::new(), route_idx: 0, dest: Some(dest),
+            stopped_at: None, wait_ticks: 0, crossing: None, lane_change: None, wreck: None, slept: false, next_link: None,
+        });
+        self.init_local_next_link();
+        true
+    }
+
     pub fn spawn_to(&mut self, id: u32, entry_link: LinkId, dest: LinkId, speed: f64, driver: DriverConfig) -> bool {
         // Admit only with the following distance the entry speed needs (min gap + one
         // headway), not just a bumper length. A freeway car entering at 29 m/s a couple
@@ -1929,14 +2022,32 @@ impl NetWorld {
     /// enters a continuing lane, instead of random lanes forcing a full-width
     /// weave inside the map (which broke the US-101 gateway down to ⅓ capacity).
     fn entry_lane_toward(&self, link: LinkId, clearance: f64, id: u32, dest: Option<LinkId>) -> Option<LaneId> {
+        self.entry_lane_toward_occ(None, link, clearance, id, dest)
+    }
+
+    /// [`entry_lane_toward`], with the entrance check answered by an
+    /// [`EntryOccupancy`] snapshot when one is supplied (the demand burst path)
+    /// instead of a per-attempt fleet scan.
+    fn entry_lane_toward_occ(
+        &self,
+        occ: Option<&EntryOccupancy>,
+        link: LinkId,
+        clearance: f64,
+        id: u32,
+        dest: Option<LinkId>,
+    ) -> Option<LaneId> {
         let l = self.network.link(link);
         let n = l.lane_count;
+        let clear = |lane: LaneId| match occ {
+            Some(o) => {
+                debug_assert!(o.marked[lane.0 as usize], "occupancy snapshot must cover the entry link");
+                o.lanes.get(&lane.0).is_none_or(|t| t.rear_all > clearance)
+            }
+            None => self.entrance_clear(lane, clearance),
+        };
         let candidates = (0..n)
             .map(|k| LaneId(l.lane_start.0 + (id.wrapping_add(k)) % n))
-            .filter(|&lane| {
-                (!self.network.lane_is_hov(lane) || hov_eligible(self.cfg.seed, id))
-                    && self.entrance_clear(lane, clearance)
-            });
+            .filter(|&lane| (!self.network.lane_is_hov(lane) || hov_eligible(self.cfg.seed, id)) && clear(lane));
         if let Some(d) = dest.filter(|_| self.routing_installed()) {
             let score = |lane: LaneId| -> u64 {
                 self.network
@@ -2450,20 +2561,22 @@ impl NetWorld {
                     }
                     nb.crossing_mvs.push(key, m);
                 }
-                nb.by_lane.push(v.lane.0, i);
+                    nb.by_lane.push(v.lane.0, i);
                 continue;
             }
             nb.by_lane.push(v.lane.0, i);
             nb.approaching.push(self.approach_key_of[v.lane.0 as usize], i);
         }
-        // Flat sort keys (contiguous, cache-friendly) precomputed once when the cache-sort
-        // option is on; empty when off, so the helpers read each vehicle row instead.
+        // Flat sort keys (contiguous, cache-friendly) precomputed once: each group
+        // comparison reads an 8-byte key instead of chasing a ~230-byte row.
         let (pos, cpos) = (self.position_keys(), self.corridor_keys());
-        // Per-group sorts, kept serial. Fanning them out was *measured slower* at
-        // 25k on Columbus (neighbors 3.8 → 7.5 ms): the groups are small, so the
-        // fan-out is thousands of tiny memory-bound sorts whose dispatch and
-        // cache-line contention on `leader_of` dwarf the work — the same wall the
-        // crash fan-out hit. accel is the only coarse-enough phase that scales.
+        // Per-group sorts, kept serial — measured repeatedly, including against a
+        // single global parallel key sort (2026-09): in-lane order is invariant
+        // (no overtaking within a lane) and the fleet is locality-ordered, so the
+        // groups arrive nearly sorted and pdqsort's sorted-run best case makes
+        // these near-O(members). Both the tiny-sort fan-out AND the fleet-wide
+        // packed-key par_sort lost to it (the global sort re-orders from scratch
+        // and its memory traffic beat the win, serial and threaded alike).
         // The leader chain runs along the whole corridor (grade-separated 1:1 through-lanes
         // coalesced), so `leader_of` never loses the car ahead at a segment boundary.
         for gi in 0..nb.by_corridor.len() {
@@ -2607,8 +2720,29 @@ impl NetWorld {
         for (j, o) in self.fleet.rows.iter().enumerate() {
             by_corridor.push(self.corridor_of[o.lane.0 as usize], j);
         }
+        let decided: Vec<(usize, LaneId)> = decided.into_iter().flatten().collect();
+        // Sort only the corridors this tick's candidates target, so the slot
+        // check can window a binary search instead of scanning the whole
+        // corridor per candidate (O(moved × corridor occupancy) — quadratic on
+        // a jammed arterial). Sorting happens before any apply, so the order is
+        // committed-state truth; a car a later apply moves *out* of its
+        // corridor is skipped by the check's corridor re-validation, and moves
+        // *into* a corridor are covered by the `moved` re-check list.
+        {
+            let mut sorted: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for &(_, target) in &decided {
+                let c = self.corridor_of[target.0 as usize];
+                if sorted.insert(c) {
+                    if let Some(g) = by_corridor.get_mut(&c) {
+                        g.sort_by(|&a, &b| {
+                            self.corridor_pos(&self.fleet.rows[a]).total_cmp(&self.corridor_pos(&self.fleet.rows[b]))
+                        });
+                    }
+                }
+            }
+        }
         let mut moved: Vec<usize> = Vec::new();
-        for (i, target) in decided.into_iter().flatten() {
+        for (i, target) in decided {
             // Preserve arc-length along the link across the change. Lanes normally
             // share a start offset (a no-op remap), but a turn-*pocket* lane begins
             // partway down the link, so a car can only move into it once it is
@@ -2878,6 +3012,13 @@ impl NetWorld {
         // corridor, different lane), not just the cars physically on the target lane — else it
         // cuts in a few metres ahead of a fast car on the previous link and slams it.
         const HEADWAY: f64 = 0.5;
+        // No car can violate the slot from beyond these corridor distances: the
+        // requirement grows with the *other* car's speed squared, bounded here
+        // by a 60 m/s hard cap (well above any sampled desired speed) plus the
+        // longest vehicle body. Lets the check window a binary search on the
+        // pre-sorted corridor instead of walking a multi-kilometre group.
+        const V_HARD: f64 = 60.0;
+        const MAX_BODY: f64 = 25.0;
         let target_corridor = self.corridor_of[target.0 as usize];
         let my_cpos = self.corridor_offset[target.0 as usize] + pos;
         let clear_of = |j: usize| -> bool {
@@ -2897,8 +3038,39 @@ impl NetWorld {
                 my_cpos - len - o_cpos > 0.5 + o.speed * HEADWAY + closing
             }
         };
-        by_corridor.get(&target_corridor).is_none_or(|g| g.iter().all(|&j| clear_of(j)))
-            && moved.iter().all(|&j| clear_of(j))
+        // The corridor group was pre-sorted by corridor position for every
+        // targeted corridor (see the apply pass). Cars a later apply moved out
+        // of the corridor fail the corridor re-validation and are skipped
+        // without consulting their (now foreign-frame) position, so the
+        // monotone window-break below only ever reads in-corridor positions.
+        let ahead_window = 0.5 + speed * HEADWAY + speed * speed / (2.0 * MAX_BRAKE_DECEL) + MAX_BODY;
+        let behind_window = 0.5 + V_HARD * HEADWAY + V_HARD * V_HARD / (2.0 * MAX_BRAKE_DECEL) + len;
+        if let Some(g) = by_corridor.get(&target_corridor) {
+            let split = g.partition_point(|&j| self.corridor_pos(&self.fleet.rows[j]) < my_cpos);
+            for &j in &g[split..] {
+                if self.corridor_of[self.fleet.rows[j].lane.0 as usize] != target_corridor {
+                    continue;
+                }
+                if self.corridor_pos(&self.fleet.rows[j]) - my_cpos > ahead_window {
+                    break;
+                }
+                if !clear_of(j) {
+                    return false;
+                }
+            }
+            for &j in g[..split].iter().rev() {
+                if self.corridor_of[self.fleet.rows[j].lane.0 as usize] != target_corridor {
+                    continue;
+                }
+                if my_cpos - self.corridor_pos(&self.fleet.rows[j]) > behind_window {
+                    break;
+                }
+                if !clear_of(j) {
+                    return false;
+                }
+            }
+        }
+        moved.iter().all(|&j| clear_of(j))
     }
 
     /// Current colour of a movement under the actuated signal runtime
@@ -2912,6 +3084,11 @@ impl NetWorld {
     }
 
     /// Colour of every signal group, indexed by group id — for rendering.
+    /// Colour of one signal group — O(1) (see [`SignalController::state_of_group`]).
+    pub fn signal_group_state(&self, gi: usize) -> SignalState {
+        self.signals.state_of_group(&self.network, gi)
+    }
+
     pub fn signal_states(&self) -> Vec<SignalState> {
         self.signals.states(&self.network)
     }
@@ -2922,7 +3099,8 @@ impl NetWorld {
         // Per-lane detection, like a real stop-line loop: a car calls only the
         // groups its *lane* feeds, so a through queue can't call the adjacent
         // bay's protected-left phase.
-        let mut demand: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut demand = std::mem::take(&mut self.lane_demand);
+        demand.reset(self.network.lanes.len());
         for v in &self.fleet.rows {
             let lane = self.network.lane(v.lane);
             if lane.length - v.position < junction::DETECT {
@@ -2938,6 +3116,7 @@ impl NetWorld {
             }
         }
         self.signals.advance(&self.network, &demand, dt, &forced);
+        self.lane_demand = demand;
         self.advance_meters(dt);
         self.advance_bus_stops(dt);
     }
@@ -3362,32 +3541,63 @@ impl NetWorld {
     /// conflicting mover). Both are pure functions of committed state, built
     /// serially before the parallel passes — read-only sharing, no contention,
     /// coherent by construction (they live one tick).
+    /// Rows are built only for cars the sole consumer
+    /// (`conflicting_priority_traffic_scaled`) can act on: it unconditionally
+    /// skips rows with `speed < 0.5`, and discards rows whose eta exceeds the
+    /// caller's critical gap — bounded well under [`APPROACH_ETA_CAP`] (HCM
+    /// behavioural gaps top out ~10 s; the physics floor is the caller's own
+    /// clearance time). Gating here collapses the per-tick build *and* the
+    /// per-front-car scans from O(whole approach queue) to O(near-line movers),
+    /// which is what kept junction decisions superlinear as queues deepened.
     fn build_step_caches(&mut self, nb: &Neighbors) {
         let mut ctx = std::mem::take(&mut self.approach_ctx);
         ctx.clear();
-        for (key, members) in nb.approaching.iter() {
-            let rows: Vec<ApproachRow> = members
-                .iter()
-                .map(|&j| {
-                    let o = &self.fleet.rows[j];
-                    let o_lane = *self.network.lane(o.lane);
-                    let mid = self.intended_movement(o);
-                    ApproachRow {
-                        idx: j as u32,
-                        link: o_lane.link,
-                        key: self.priority_key(o_lane.link),
-                        dir: self.network.arrival_dir(o_lane.link),
-                        turn: mid.map_or(TurnType::Through, |m| self.network.movement_turn(m)),
-                        mid,
-                        eta: (o_lane.length - o.position) / o.speed.max(0.1),
-                        speed: o.speed,
-                    }
-                })
+        let qualify = |j: usize| {
+            let v = &self.fleet.rows[j];
+            v.speed >= 0.5 && (self.network.lane(v.lane).length - v.position) < v.speed * APPROACH_ETA_CAP
+        };
+        #[cfg(feature = "parallel")]
+        if matches!(self.active_backend(), AccelBackend::Threads) && self.fleet.rows.len() >= self.par_threshold {
+            use rayon::prelude::*;
+            let groups: Vec<(u32, &Vec<usize>)> = nb.approaching.iter().collect();
+            let built: Vec<(u32, Vec<ApproachRow>)> = groups
+                .par_iter()
+                .with_min_len(16)
+                .map(|&(key, members)| (key, members.iter().filter(|&&j| qualify(j)).map(|&j| self.approach_row(j)).collect()))
                 .collect();
+            for (key, rows) in built {
+                ctx.insert(key, rows);
+            }
+            self.approach_ctx = ctx;
+            self.build_standing_poses(nb);
+            return;
+        }
+        for (key, members) in nb.approaching.iter() {
+            let rows: Vec<ApproachRow> = members.iter().filter(|&&j| qualify(j)).map(|&j| self.approach_row(j)).collect();
             ctx.insert(key, rows);
         }
         self.approach_ctx = ctx;
+        self.build_standing_poses(nb);
+    }
 
+    /// One approaching car's right-of-way facts (see [`build_step_caches`]).
+    fn approach_row(&self, j: usize) -> ApproachRow {
+        let o = &self.fleet.rows[j];
+        let o_lane = *self.network.lane(o.lane);
+        let mid = self.intended_movement(o);
+        ApproachRow {
+            idx: j as u32,
+            link: o_lane.link,
+            key: self.priority_key(o_lane.link),
+            dir: self.network.arrival_dir(o_lane.link),
+            turn: mid.map_or(TurnType::Through, |m| self.network.movement_turn(m)),
+            mid,
+            eta: (o_lane.length - o.position) / o.speed.max(0.1),
+            speed: o.speed,
+        }
+    }
+
+    fn build_standing_poses(&mut self, _nb: &Neighbors) {
         let mut poses = std::mem::take(&mut self.standing_pose);
         poses.clear();
         for (i, v) in self.fleet.rows.iter().enumerate() {
@@ -3429,14 +3639,17 @@ impl NetWorld {
         // Recompute routing only when the cost landscape actually moves. The fields from
         // `install_router` are optimal for free-flow; while traffic stays light or static the
         // congestion fingerprint doesn't change, so we skip the O(links) rebuild entirely —
-        // this is why a near-empty city map costs almost nothing.
-        let fp = self.congestion_fingerprint();
+        // this is why a near-empty city map costs almost nothing. The fingerprint itself is
+        // O(cars), so it is only taken when its result could start a cycle: interval elapsed
+        // and no recompute in flight — not every tick.
         let interval_ticks = (REROUTE_INTERVAL_SECS / self.cfg.dt).max(1.0) as u64;
         // Start a new reroute cycle only when congestion has moved, none is in flight, and the
         // interval has elapsed since the last — so constantly-churning traffic can't chain
         // back-to-back whole-map rebuilds.
         let pending = self.router.as_ref().is_some_and(|r| r.recompute_pending());
-        if fp != self.route_fingerprint && !pending && self.tick.saturating_sub(self.route_cycle_tick) >= interval_ticks {
+        let due = !pending && self.tick.saturating_sub(self.route_cycle_tick) >= interval_ticks;
+        let fp = if due { self.congestion_fingerprint() } else { self.route_fingerprint };
+        if due && fp != self.route_fingerprint {
             self.route_fingerprint = fp;
             self.route_cycle_tick = self.tick;
             let costs = self.live_link_costs();
@@ -3496,9 +3709,13 @@ impl NetWorld {
         if self.route_job.is_some() {
             return;
         }
-        let fp = self.congestion_fingerprint();
+        // The O(cars) fingerprint is only worth taking once a new cycle could start.
         let interval_ticks = (REROUTE_INTERVAL_SECS / self.cfg.dt).max(1.0) as u64;
-        if fp == self.route_fingerprint || self.tick.saturating_sub(self.route_cycle_tick) < interval_ticks {
+        if self.tick.saturating_sub(self.route_cycle_tick) < interval_ticks {
+            return;
+        }
+        let fp = self.congestion_fingerprint();
+        if fp == self.route_fingerprint {
             return;
         }
         self.route_fingerprint = fp;
@@ -3615,10 +3832,26 @@ impl NetWorld {
         // (so the borrow checker sees it as a local) and returned at the end.
         let nb = {
             let mut nb = std::mem::take(&mut self.nb_pool);
+            #[cfg(not(target_arch = "wasm32"))]
+            let t0 = std::time::Instant::now();
             self.rebuild_neighbors(&mut nb);
+            #[cfg(not(target_arch = "wasm32"))]
+            if std::env::var_os("NB_PROF").is_some() {
+                let t1 = std::time::Instant::now();
+                self.build_step_caches(&nb);
+                eprintln!(
+                    "NB tick={} rebuild={:.0}us caches={:.0}us",
+                    self.tick,
+                    (t1 - t0).as_secs_f64() * 1e6,
+                    t1.elapsed().as_secs_f64() * 1e6,
+                );
+            } else {
+                self.build_step_caches(&nb);
+            }
+            #[cfg(target_arch = "wasm32")]
+            self.build_step_caches(&nb);
             nb
         };
-        self.build_step_caches(&nb);
         prof.lap(3);
 
         let mut cross_by_mv: IntMap<Vec<usize>> = IntMap::default();
@@ -4097,7 +4330,7 @@ impl NetWorld {
             // No movement resolved. Legitimate when the car has arrived (no next
             // hop) or run off a genuine dead end; a leak if it still had somewhere
             // to go — which `intended_movement`'s fallback prevents.
-            None if self.still_has_a_route(veh, lane.link) && self.network.links.iter().any(|l| l.from == node) => Fate::Leaked,
+            None if self.still_has_a_route(veh, lane.link) && self.node_has_outgoing[node.idx()] => Fate::Leaked,
             None => Fate::Exited,
         }
     }
@@ -5066,8 +5299,7 @@ impl NetWorld {
         }
         // Two in-node crossers share the scalar coordinate only on the *same*
         // interior path; on movements fanning out from one lane the arcs diverge
-        // in the world, so an arc "overlap" there is not a touch (their genuine
-        // collisions are the body-overlap detector's concern).
+        // in the world, so an arc "overlap" there is not a touch.
         if let (Some(cf), Some(cl)) = (f.crossing, l.crossing) {
             if cf.movement != cl.movement {
                 return None;
@@ -5077,11 +5309,9 @@ impl NetWorld {
             let closing = (f.speed - l.speed).abs() as f32;
             if std::env::var_os("CRASH_DEBUG").is_some() {
                 eprintln!(
-                    "RE tick={} gap={:.2} f=(id{} lane{} pos{:.1} v{:.1} cross{} fate{:?}) l=(id{} lane{} pos{:.1} v{:.1} cross{} wreck{})",
-                    self.tick,
-                    self.corridor_gap(f, l),
-                    f.id, f.lane.0, f.position, f.speed, f.crossing.is_some(), matches!(fates[i], Fate::Entered(_)),
-                    l.id, l.lane.0, l.position, l.speed, l.crossing.is_some(), l.wreck.is_some(),
+                    "RE tick={} gap={:.2} f=(id{} lane{} pos{:.1} v{:.1}) l=(id{} lane{} pos{:.1} v{:.1})",
+                    self.tick, self.corridor_gap(f, l),
+                    f.id, f.lane.0, f.position, f.speed, l.id, l.lane.0, l.position, l.speed,
                 );
             }
             return Some(closing);
@@ -5102,10 +5332,9 @@ impl NetWorld {
         let on_road = |i: usize| matches!(fates[i], Fate::Alive | Fate::Entered(_));
 
         // Serial: the per-follower verdict is a few memory-bound reads, and fanning
-        // it out was *measured slower* here (rear map_collect: 1.8 → 2.7 ms) —
-        // dispatch/steal traffic outweighs the tiny per-item work. The sharded
-        // path (`detect_crashes_sharded`) is the parallel win, via ownership
-        // partition + cache-contiguous per-shard walks, not a blind fan-out.
+        // it out was *measured slower* here (rear map_collect: 1.8 → 2.7 ms); a
+        // compact SoA snapshot didn't help either (locality already caches the
+        // leader access). The sharded path is the parallel win.
         let rear: Vec<Option<f32>> = (0..taken.len()).map(|i| self.rear_end_verdict(i, taken, fates, nb)).collect();
         for (i, closing) in rear.into_iter().enumerate() {
             let Some(closing) = closing else { continue };
@@ -6000,6 +6229,29 @@ impl NetWorld {
             self.step();
         }
     }
+}
+
+/// Per-entry-lane occupancy for a burst of spawn attempts (one demand step):
+/// the admission checks (`entrance_clear`, `safe_entry_speed`) are full-fleet
+/// scans, and the demand loop was running dozens of them per tick — the
+/// dominant county-scale demand-generation cost. Built in one fleet pass over
+/// the gateway lanes and updated on each spawn, so a burst of attempts sees
+/// exactly what the per-attempt scans saw.
+pub struct EntryOccupancy {
+    /// Lanes the snapshot covers (every lane of the links it was built over).
+    marked: Vec<bool>,
+    /// lane → tail facts; a covered lane absent here holds no cars.
+    lanes: IntMap<LaneTail>,
+}
+
+#[derive(Clone, Copy)]
+struct LaneTail {
+    /// Min rear bumper over every car on the lane (the entrance-clear bound).
+    rear_all: f64,
+    /// Min rear bumper over non-crossing cars — the tail a spawner settles behind.
+    rear_free: f64,
+    /// That tail car's speed.
+    tail_speed: f64,
 }
 
 #[derive(Default)]

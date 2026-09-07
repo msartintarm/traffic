@@ -38,19 +38,22 @@ pub struct CongestionLod {
     mode: Vec<Mode>,
     /// Consecutive ticks the link has held past the threshold that would flip it.
     dwell: Vec<u32>,
+    queue_count: u32,
 }
 
 impl CongestionLod {
     pub fn new(link_count: usize) -> Self {
-        Self { mode: vec![Mode::Full; link_count], dwell: vec![0; link_count] }
+        Self { mode: vec![Mode::Full; link_count], dwell: vec![0; link_count], queue_count: 0 }
     }
 
     pub fn is_queue(&self, link: usize) -> bool {
         self.mode[link] == Mode::Queue
     }
 
+    /// Live queue-mode link count, maintained on flips — the UI reads this
+    /// every frame, and a recount was an O(links) sweep each time.
     pub fn active_count(&self) -> u32 {
-        self.mode.iter().filter(|&&m| m == Mode::Queue).count() as u32
+        self.queue_count
     }
 
     /// All links revert to full detail — used when the LOD is switched off.
@@ -59,6 +62,7 @@ impl CongestionLod {
             *m = Mode::Full;
             *d = 0;
         }
+        self.queue_count = 0;
     }
 
     /// Flip links between full and queue detail under `cfg`, given each link's live
@@ -75,6 +79,10 @@ impl CongestionLod {
                 if self.dwell[i] >= cfg.dwell_ticks {
                     self.mode[i] = target;
                     self.dwell[i] = 0;
+                    match target {
+                        Mode::Queue => self.queue_count += 1,
+                        Mode::Full => self.queue_count -= 1,
+                    }
                 }
             } else {
                 self.dwell[i] = 0;

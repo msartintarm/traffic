@@ -8,6 +8,15 @@ use crate::sim::hash::IntMap;
 /// Pose map keyed by (sparse) vehicle id, hashed cheaply for the per-frame rebuild.
 type PoseMap = IntMap<[f32; 4]>;
 
+/// One frame's built instance buffers (see `Simulation::frame_cache`).
+#[derive(Default)]
+struct FrameCache {
+    serial: u64,
+    trains: Option<Vec<Instance>>,
+    signal: Option<Vec<Instance>>,
+    crash: Option<Vec<Instance>>,
+}
+
 use wasm_bindgen::prelude::*;
 
 use crate::render::camera::Camera;
@@ -140,6 +149,20 @@ pub struct Simulation {
     prev_crossing: IntMap<bool>,
     /// The link the user has selected (clicked), highlighted in the density pass.
     selected: Option<usize>,
+    /// Per-frame memo for the instance buffers: the renderer fetches each
+    /// buffer's bytes and count as *separate* calls, which used to rebuild the
+    /// whole vec twice per frame (and scan the timetable four times). The
+    /// serial bumps in `advance`, which the draw loop calls before any export.
+    frame_serial: u64,
+    frame_cache: std::cell::RefCell<FrameCache>,
+    /// Last known fleet index of the followed vehicle (see `followed_vehicle`).
+    veh_idx_hint: std::cell::Cell<u32>,
+    /// 100 ms caches for the per-frame selection stat panels: `(index, at_ms, stats)`.
+    junction_stats_cache: std::cell::RefCell<(u32, f64, Vec<f32>)>,
+    link_stats_cache: std::cell::RefCell<(u32, f64, Vec<f32>)>,
+    /// Reused per-link occupancy bins for the density mesh (was a fresh
+    /// O(links) zeroed alloc every frame).
+    density_counts: Vec<u32>,
     /// Baked static-world render payload, built once and *handed off*: each
     /// export moves its buffer out to JS, so after `set_world_mesh` has pulled
     /// all five arrays the wasm side retains none of it (Columbus's meshes are
@@ -273,6 +296,10 @@ impl Simulation {
             warmup: None,
             metering_enabled: true, transit_lines: Vec::new(), transit_json: None, transit_enabled: true, camera,
             prev: PoseMap::default(), prev_lane: IntMap::default(), prev_crossing: IntMap::default(), selected: None, render_bake: None, density_index_cache: Vec::new(), signal_heads,
+            frame_serial: 0, frame_cache: std::cell::RefCell::new(FrameCache::default()), density_counts: Vec::new(),
+            veh_idx_hint: std::cell::Cell::new(u32::MAX),
+            junction_stats_cache: std::cell::RefCell::new((u32::MAX, f64::NEG_INFINITY, Vec::new())),
+            link_stats_cache: std::cell::RefCell::new((u32::MAX, f64::NEG_INFINITY, Vec::new())),
             gpu: None, gpu_pending: None, gpu_relax: None, gpu_generation: 0, gpu_cost: Vec::new(), gpu_last: 0.0, gpu_fingerprint: 0,
             effective_speed: 0.0, throttled: false, last_advance_ms: 0.0, last_camera_ms: 0.0,
             speed_sim_accum: 0.0, speed_wall_accum: 0.0, speed_dropped: false,
@@ -810,6 +837,7 @@ impl Simulation {
     }
 
     pub fn advance(&mut self, real_elapsed_secs: f64) -> u32 {
+        self.frame_serial = self.frame_serial.wrapping_add(1);
         if self.advance_warmup() {
             // Pre-populating: every frame goes to headless catch-up; the clock
             // isn't advanced, so no backlog accumulates behind the warmup.
@@ -1260,9 +1288,25 @@ impl Simulation {
 
     /// Live readout for the followed vehicle: `[speed_mps, class_id]` (class 0
     /// car / 1 truck / 2 bus), or empty when none is selected (or it despawned).
+    /// The followed vehicle's row, found via a last-index hint: its fleet index
+    /// only moves on compaction, so the per-frame lookups are O(1) between
+    /// compactions instead of an O(fleet) scan each.
+    fn followed_vehicle(&self, id: u32) -> Option<&crate::sim::net_world::NetVehicle> {
+        let vs = self.world.vehicles();
+        let hint = self.veh_idx_hint.get() as usize;
+        if let Some(v) = vs.get(hint) {
+            if v.id == id {
+                return Some(v);
+            }
+        }
+        let i = vs.iter().position(|v| v.id == id)?;
+        self.veh_idx_hint.set(i as u32);
+        vs.get(i)
+    }
+
     pub fn selected_vehicle_stats(&self) -> Vec<f32> {
         let Some(id) = self.selected_vehicle else { return Vec::new() };
-        self.world.vehicles().iter().find(|v| v.id == id).map_or(Vec::new(), |v| {
+        self.followed_vehicle(id).map_or(Vec::new(), |v| {
             let class_id = match VehicleClass::from_length(v.driver.vehicle_length) {
                 VehicleClass::Car => 0.0,
                 VehicleClass::Truck => 1.0,
@@ -1304,7 +1348,7 @@ impl Simulation {
     /// reached its destination and left the fleet.
     pub fn follow_selected(&mut self, frame_dt: f32) -> bool {
         let Some(id) = self.selected_vehicle else { return false };
-        let Some(target) = self.world.vehicles().iter().find(|v| v.id == id).map(|v| self.vehicle_draw_center(v)) else {
+        let Some(target) = self.followed_vehicle(id).map(|v| self.vehicle_draw_center(v)) else {
             self.selected_vehicle = None;
             return false;
         };
@@ -1353,6 +1397,20 @@ impl Simulation {
     /// Live junction stats: `[queued_on_approaches, crossing_inside,
     /// longest_current_wait_secs, throughput_vph]`.
     pub fn junction_stats(&self, index: u32) -> Vec<f32> {
+        // Fleet + link-flow sweeps per call; a live panel polls this every
+        // frame, so serve a ~100 ms cache (the `explain` throttle discipline).
+        {
+            let (ci, at, ref v) = *self.junction_stats_cache.borrow();
+            if ci == index && now_ms() - at < 100.0 {
+                return v.clone();
+            }
+        }
+        let out = self.junction_stats_uncached(index);
+        *self.junction_stats_cache.borrow_mut() = (index, now_ms(), out.clone());
+        out
+    }
+
+    fn junction_stats_uncached(&self, index: u32) -> Vec<f32> {
         let Some(j) = self.world.network.junctions.get(index as usize) else { return vec![0.0; 4] };
         let net = &self.world.network;
         let approach: std::collections::HashSet<u32> = j.approaches.iter().map(|l| l.0).collect();
@@ -1386,8 +1444,16 @@ impl Simulation {
         if i >= self.world.network.links.len() {
             return vec![0.0; 4];
         }
+        {
+            let (ci, at, ref v) = *self.link_stats_cache.borrow();
+            if ci == index && now_ms() - at < 100.0 {
+                return v.clone();
+            }
+        }
         let (count, mean, occ) = self.world.link_stats(LinkId(index));
-        vec![count as f32, mean as f32, self.world.link_flows()[i] as f32, occ as f32]
+        let out = vec![count as f32, mean as f32, self.world.link_flows()[i] as f32, occ as f32];
+        *self.link_stats_cache.borrow_mut() = (index, now_ms(), out.clone());
+        out
     }
 
     /// `[x, y, heading, brake, blinker, length, width, class]` per vehicle:
@@ -1571,6 +1637,28 @@ impl Simulation {
         self.clock.alpha() as f32
     }
 
+    /// Drop stale per-frame buffers, then lazily build the requested one. Build
+    /// closures must not touch `frame_cache` themselves.
+    fn frame_cached(
+        &self,
+        slot: fn(&FrameCache) -> &Option<Vec<Instance>>,
+        slot_mut: fn(&mut FrameCache) -> &mut Option<Vec<Instance>>,
+        build: impl FnOnce(&Self) -> Vec<Instance>,
+    ) -> std::cell::Ref<'_, Vec<Instance>> {
+        if self.frame_cache.borrow().serial != self.frame_serial {
+            *self.frame_cache.borrow_mut() = FrameCache { serial: self.frame_serial, ..FrameCache::default() };
+        }
+        if slot(&self.frame_cache.borrow()).is_none() {
+            let built = build(self);
+            *slot_mut(&mut self.frame_cache.borrow_mut()) = Some(built);
+        }
+        std::cell::Ref::map(self.frame_cache.borrow(), |fc| slot(fc).as_ref().expect("just built"))
+    }
+
+    fn trains_cached(&self) -> std::cell::Ref<'_, Vec<Instance>> {
+        self.frame_cached(|fc| &fc.trains, |fc| &mut fc.trains, Self::train_instance_vec)
+    }
+
     /// Raw `Instance` bytes for the instanced draw: current + previous pose (the
     /// shader interpolates by `alpha`), class size/colour, and brake intensity.
     pub fn render_instances(&self) -> Vec<u8> {
@@ -1607,12 +1695,12 @@ impl Simulation {
             })
             .collect();
         let mut instances = instances;
-        instances.extend(self.train_instance_vec());
+        instances.extend(self.trains_cached().iter().copied());
         bytemuck::cast_slice(&instances).to_vec()
     }
 
     pub fn render_instance_count(&self) -> u32 {
-        (self.world.vehicles().len() + self.train_instance_vec().len()) as u32
+        (self.world.vehicles().len() + self.trains_cached().len()) as u32
     }
 
     /// Active trains as carriage-chain instances riding the same instanced draw
@@ -1665,7 +1753,7 @@ impl Simulation {
     pub fn train_poses(&self) -> Vec<f32> {
         let alpha = self.clock.alpha() as f32;
         let mut out = Vec::new();
-        for i in self.train_instance_vec() {
+        for &i in self.trains_cached().iter() {
             let x = i.prev_pos[0] + (i.pos[0] - i.prev_pos[0]) * alpha;
             let y = i.prev_pos[1] + (i.pos[1] - i.prev_pos[1]) * alpha;
             let h = i.prev_heading + shortest_angle(i.prev_heading, i.heading) * alpha;
@@ -1677,21 +1765,23 @@ impl Simulation {
     /// Signal heads — plus the selected junction's footprint highlight — as raw
     /// `Instance` bytes for the emissive draw.
     pub fn signal_instances(&self) -> Vec<u8> {
-        bytemuck::cast_slice(&self.signal_instance_vec()).to_vec()
+        let v = self.frame_cached(|fc| &fc.signal, |fc| &mut fc.signal, Self::signal_instance_vec);
+        bytemuck::cast_slice(&v).to_vec()
     }
 
     pub fn signal_instance_count(&self) -> u32 {
-        self.signal_instance_vec().len() as u32
+        self.frame_cached(|fc| &fc.signal, |fc| &mut fc.signal, Self::signal_instance_vec).len() as u32
     }
 
     /// Crash-site markers as raw `Instance` bytes (empty when the overlay is off). Drawn at
     /// every zoom, so each marker is sized in world metres to hold a constant on-screen size.
     pub fn crash_instances(&self) -> Vec<u8> {
-        bytemuck::cast_slice(&self.crash_instance_vec()).to_vec()
+        let v = self.frame_cached(|fc| &fc.crash, |fc| &mut fc.crash, Self::crash_instance_vec);
+        bytemuck::cast_slice(&v).to_vec()
     }
 
     pub fn crash_instance_count(&self) -> u32 {
-        self.crash_instance_vec().len() as u32
+        self.frame_cached(|fc| &fc.crash, |fc| &mut fc.crash, Self::crash_instance_vec).len() as u32
     }
 
     /// Toggle the crash-location overlay. Independent of the sim; purely a display option.
@@ -1746,9 +1836,11 @@ impl Simulation {
         std::mem::take(&mut self.density_index_cache)
     }
 
-    fn density_mesh(&self) -> StaticMesh {
+    fn density_mesh(&mut self) -> StaticMesh {
         let net = &self.world.network;
-        let mut counts = vec![0u32; net.links.len()];
+        let mut counts = std::mem::take(&mut self.density_counts);
+        counts.clear();
+        counts.resize(net.links.len(), 0);
         for v in self.world.vehicles() {
             counts[net.lane(v.lane).link.idx()] += 1;
         }
@@ -1760,6 +1852,7 @@ impl Simulation {
             self.camera.viewport[1] * mpp * 0.5,
         ];
         let mut mesh = geometry::occupancy_mesh(net, &counts, self.selected, view);
+        self.density_counts = counts;
         self.push_selection_halo(&mut mesh);
         mesh
     }
@@ -1822,12 +1915,16 @@ impl Simulation {
         let c = self.camera.center;
         let hx = self.camera.viewport[0] * mpp * 0.5 + SIGNAL_CULL_MARGIN_M;
         let hy = self.camera.viewport[1] * mpp * 0.5 + SIGNAL_CULL_MARGIN_M;
-        let states = self.world.signal_states();
+        // Group colour is queried per *visible* head (O(1) each) — building the
+        // all-groups state vector first cost O(every signal in the county) per
+        // frame before the viewport cull could discard any of it.
         out.extend(
             self.signal_heads
                 .iter()
                 .filter(|&&(_, pos, _, _)| (pos[0] as f64 - c[0]).abs() <= hx && (pos[1] as f64 - c[1]).abs() <= hy)
-                .flat_map(|&(gi, pos, heading, is_left)| signal_head_instances(pos, heading, states[gi], is_left)),
+                .flat_map(|&(gi, pos, heading, is_left)| {
+                    signal_head_instances(pos, heading, self.world.signal_group_state(gi), is_left)
+                }),
         );
         out
     }

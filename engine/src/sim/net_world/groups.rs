@@ -106,6 +106,16 @@ impl<T> GroupMap<T> {
         self.group_by_key(*key).filter(|v| !v.is_empty())
     }
 
+    /// Mutable access to the group under `key`, if any member was pushed.
+    pub(super) fn get_mut(&mut self, key: &u32) -> Option<&mut Vec<T>> {
+        let g = self.bucket_mut(*key);
+        if g.is_empty() {
+            None
+        } else {
+            Some(g)
+        }
+    }
+
     /// Number of non-empty groups this tick.
     pub(super) fn len(&self) -> usize {
         self.touched.len()

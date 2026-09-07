@@ -6,8 +6,6 @@
 //! It stays data-oriented: CSR (`offsets` + concatenated ids) over the existing
 //! `Vec`s, no per-object ownership, so the GPU-friendly SoA layout is preserved.
 
-use std::collections::HashSet;
-
 use super::network::{LaneId, MovementId, Network, NodeControl, NodeId, ProgramId};
 use super::signal::{SignalProgram, SignalState, DEFAULT_ALL_RED};
 
@@ -27,6 +25,57 @@ fn all_red_of(program: &SignalProgram, phase: usize) -> f64 {
         ar
     } else {
         DEFAULT_ALL_RED
+    }
+}
+
+/// Reusable flat set of demanded lane ids: unhashed insert/contains over a
+/// lane-indexed bit array, cleared via the touched list so a steady-state tick
+/// allocates nothing. Replaces a per-tick `HashSet` whose O(cars) hashed
+/// inserts were a flat tax at county fleet sizes.
+#[derive(Default)]
+pub struct LaneSet {
+    bits: Vec<bool>,
+    touched: Vec<u32>,
+}
+
+impl LaneSet {
+    /// Empty the set and (idempotently) size the bit array for lane ids `0..cap`.
+    pub fn reset(&mut self, cap: usize) {
+        for &l in &self.touched {
+            self.bits[l as usize] = false;
+        }
+        self.touched.clear();
+        if self.bits.len() < cap {
+            self.bits.resize(cap, false);
+        }
+    }
+
+    #[inline]
+    pub fn insert(&mut self, lane: u32) {
+        let b = &mut self.bits[lane as usize];
+        if !*b {
+            *b = true;
+            self.touched.push(lane);
+        }
+    }
+
+    #[inline]
+    pub fn contains(&self, lane: u32) -> bool {
+        self.bits.get(lane as usize).copied().unwrap_or(false)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        self.touched.iter().copied()
+    }
+
+    /// A fresh set over lane ids `0..cap` containing `lanes`.
+    pub fn of(cap: usize, lanes: impl IntoIterator<Item = u32>) -> Self {
+        let mut s = Self::default();
+        s.reset(cap);
+        for l in lanes {
+            s.insert(l);
+        }
+        s
     }
 }
 
@@ -61,10 +110,15 @@ impl SignalRuntime {
 /// vehicle world only has to supply which links currently have waiting demand.
 pub struct SignalController {
     signals: Vec<SignalRuntime>,
-    /// Reverse of `approaches`: each feeder lane → the programs it can call, so
-    /// `advance` builds the active set from the (small) demand set in O(demand)
-    /// and skips resting programs instead of scanning all of them.
-    lane_programs: std::collections::HashMap<u32, Vec<usize>>,
+    /// Reverse of `approaches` in CSR form (`lane_prog_off[lane]..` slices
+    /// `lane_prog`): each feeder lane → the programs it can call, so `advance`
+    /// builds the active set from the (small) demand set in O(demand) and skips
+    /// resting programs instead of scanning all of them. Lane-indexed, so the
+    /// hot lookup is two array reads, no hashing.
+    lane_prog_off: Vec<u32>,
+    lane_prog: Vec<u32>,
+    /// Scratch for `advance`'s active-program set, reused across ticks.
+    active: Vec<bool>,
     /// Approach *lanes* per program, per group bit — the from-lanes of each
     /// group's movements. Lane-grained like a real stop-line detector, so a
     /// through queue never calls the adjacent bay's protected-left phase.
@@ -122,7 +176,22 @@ impl SignalController {
                 }
             }
         }
-        Self { signals, approaches, time: 0.0, lane_programs }
+        let mut lane_prog_off = vec![0u32; net.lanes.len() + 1];
+        for (&l, pids) in &lane_programs {
+            lane_prog_off[l as usize + 1] = pids.len() as u32;
+        }
+        for i in 0..net.lanes.len() {
+            lane_prog_off[i + 1] += lane_prog_off[i];
+        }
+        let mut lane_prog = vec![0u32; lane_prog_off[net.lanes.len()] as usize];
+        for (&l, pids) in &lane_programs {
+            let start = lane_prog_off[l as usize] as usize;
+            for (k, &pid) in pids.iter().enumerate() {
+                lane_prog[start + k] = pid as u32;
+            }
+        }
+        let active = vec![false; net.programs.len()];
+        Self { signals, approaches, time: 0.0, lane_prog_off, lane_prog, active }
     }
 
     fn group_state(&self, net: &Network, program: ProgramId, bit: u8) -> SignalState {
@@ -139,6 +208,13 @@ impl SignalController {
                 self.group_state(net, group.program, group.bit)
             }
         }
+    }
+
+    /// Colour of one signal group — O(1), so a viewport-culled render pass can
+    /// query only the visible heads instead of building the all-groups vector.
+    pub fn state_of_group(&self, net: &Network, gid: usize) -> SignalState {
+        let g = net.groups[gid];
+        self.group_state(net, g.program, g.bit)
     }
 
     /// Colour of every signal group, indexed by group id — for rendering.
@@ -172,7 +248,7 @@ impl SignalController {
     pub fn advance(
         &mut self,
         net: &Network,
-        demand: &HashSet<u32>,
+        demand: &LaneSet,
         dt: f64,
         forced: &std::collections::HashMap<usize, usize>,
     ) {
@@ -185,15 +261,17 @@ impl SignalController {
         // its expensive per-approach demand checks are pointless — advance its
         // timer and move on. Cuts the per-tick signal work to O(demanded
         // programs) + a cheap O(programs) skip scan.
-        let mut active: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        for &lane in demand {
-            if let Some(pids) = self.lane_programs.get(&lane) {
-                active.extend(pids.iter().copied());
+        let mut active = std::mem::take(&mut self.active);
+        active.iter_mut().for_each(|b| *b = false);
+        for lane in demand.iter() {
+            let (s, e) = (self.lane_prog_off[lane as usize], self.lane_prog_off[lane as usize + 1]);
+            for &pid in &self.lane_prog[s as usize..e as usize] {
+                active[pid as usize] = true;
             }
         }
         for pid in 0..self.signals.len() {
             let rt0 = self.signals[pid];
-            if !active.contains(&pid)
+            if !active[pid]
                 && !rt0.yellow
                 && rt0.all_red <= 0.0
                 && !forced.contains_key(&pid)
@@ -212,12 +290,12 @@ impl SignalController {
             };
             let phase_demand = |mask: u64| {
                 self.approaches[pid].iter().enumerate().any(|(bit, links)| {
-                    mask & (1u64 << bit) != 0 && links.iter().any(|l| demand.contains(&l.0))
+                    mask & (1u64 << bit) != 0 && links.iter().any(|l| demand.contains(l.0))
                 })
             };
             let bit_has_demand = |served: bool| {
                 self.approaches[pid].iter().enumerate().any(|(bit, links)| {
-                    (green_mask & (1u64 << bit) != 0) == served && links.iter().any(|l| demand.contains(&l.0))
+                    (green_mask & (1u64 << bit) != 0) == served && links.iter().any(|l| demand.contains(l.0))
                 })
             };
             // Semi-actuated coordination: the progression phase is guaranteed its
@@ -311,6 +389,7 @@ impl SignalController {
             }
             self.signals[pid] = rt;
         }
+        self.active = active;
     }
 }
 
@@ -405,8 +484,8 @@ mod tests {
         // sit on one phase — it cycles, so more than one green pattern appears.
         let net = arterial_intersection();
         let mut ctrl = SignalController::build(&net);
-        let demand: HashSet<u32> = (0..net.lanes.len() as u32).collect();
-        let mut patterns: HashSet<Vec<bool>> = HashSet::new();
+        let demand = LaneSet::of(net.lanes.len(), 0..net.lanes.len() as u32);
+        let mut patterns: std::collections::HashSet<Vec<bool>> = std::collections::HashSet::new();
         for _ in 0..2000 {
             ctrl.advance(&net, &demand, 0.2, &Default::default());
             patterns.insert(ctrl.states(&net).iter().map(|s| *s == SignalState::Green).collect());

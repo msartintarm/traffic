@@ -6,8 +6,9 @@
 //! of a per-vehicle path search.
 //!
 //! Fields are rebuilt from live per-link travel times, so in-flight vehicles pick
-//! fresh next-hops as jams form. Computed by [`flowfield`] (Bellman–Ford Jacobi);
-//! `flowfield_gpu` runs the same relaxation on a GPU device.
+//! fresh next-hops as jams form. Computed by [`flowfield`] (reverse heap
+//! Dijkstra on the CPU); `flowfield_gpu` solves the same fields with
+//! Bellman–Ford Jacobi relaxation on a GPU device.
 
 use std::collections::HashMap;
 

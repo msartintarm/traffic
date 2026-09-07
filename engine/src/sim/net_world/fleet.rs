@@ -191,22 +191,33 @@ impl NetWorld {
     pub(super) fn locality_reorder(&mut self) {
         let n = self.fleet.rows.len();
         let shard_of = |lane: LaneId| self.sharding.as_ref().map_or(0, |sh| sh.home_of(lane));
+        // Flat (shard, lane, position) keys computed once — the comparator used
+        // to chase two ~230-byte rows and re-derive the shard per comparison.
+        // Positions are non-negative, so their raw bits order like the floats.
+        let keys: Vec<u128> = self
+            .fleet
+            .rows
+            .iter()
+            .map(|v| {
+                ((shard_of(v.lane) as u128) << 96) | ((v.lane.0 as u128) << 64) | v.position.to_bits() as u128
+            })
+            .collect();
         let mut order: Vec<u32> = (0..n as u32).collect();
-        order.sort_by(|&a, &b| {
-            let (va, vb) = (&self.fleet.rows[a as usize], &self.fleet.rows[b as usize]);
-            (shard_of(va.lane), va.lane.0, va.position)
-                .partial_cmp(&(shard_of(vb.lane), vb.lane.0, vb.position))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let rows = std::mem::take(&mut self.fleet.rows);
-        let hist = std::mem::take(&mut self.fleet.hist);
-        let hist_len = std::mem::take(&mut self.fleet.hist_len);
-        let mut rows: Vec<Option<NetVehicle>> = rows.into_iter().map(Some).collect();
-        let mut hist: Vec<Option<History>> = hist.into_iter().map(Some).collect();
-        for &i in &order {
-            self.fleet.rows.push(rows[i as usize].take().unwrap());
-            self.fleet.hist.push(hist[i as usize].take().unwrap());
-            self.fleet.hist_len.push(hist_len[i as usize]);
+        order.sort_by_key(|&i| keys[i as usize]);
+        // Apply the permutation with in-place cycle swaps across the three
+        // columns — no `Option`-boxed temporary copies of the fat rows.
+        let mut dest = vec![0u32; n];
+        for (d, &s) in order.iter().enumerate() {
+            dest[s as usize] = d as u32;
+        }
+        for i in 0..n {
+            while dest[i] as usize != i {
+                let j = dest[i] as usize;
+                self.fleet.rows.swap(i, j);
+                self.fleet.hist.swap(i, j);
+                self.fleet.hist_len.swap(i, j);
+                dest.swap(i, j);
+            }
         }
     }
 }

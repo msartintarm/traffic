@@ -3989,7 +3989,6 @@ mod tests {
     fn actuated_controller_honors_coordination_offsets_at_runtime() {
         use super::super::junction::SignalController;
         use super::super::signal::SignalState;
-        use std::collections::HashSet;
 
         let net = coordinated_corridor_net();
         let coordinated = net.programs.iter().filter(|p| p.coordinated).count();
@@ -4024,7 +4023,7 @@ mod tests {
         let cycle = net.programs[up.2].cycle_length();
         let steps = 2 * (cycle / 0.1).ceil() as usize + 4;
         let mut ctrl = SignalController::build(&net);
-        let demand: HashSet<u32> = (0..net.lanes.len() as u32).collect();
+        let demand = super::super::junction::LaneSet::of(net.lanes.len(), 0..net.lanes.len() as u32);
         let mut clock = 0.0;
         // One warm-up cycle so the seeded runtime settles onto the schedule.
         while clock < cycle {
@@ -4063,7 +4062,6 @@ mod tests {
         // must. (With per-link detectors, any through queue rang the left bell.)
         use super::super::junction::SignalController;
         use super::super::signal::SignalState;
-        use std::collections::HashSet;
         let net = coordinated_corridor_net();
         let left = (0..net.movements.len() as u32)
             .find_map(|m| {
@@ -4081,9 +4079,8 @@ mod tests {
 
         // Every through lane of the same link occupied — but not the left's lane.
         let link = net.lane(left_lane).link;
-        let through_lanes: HashSet<u32> =
-            net.lanes_of(link).filter(|&l| l != left_lane).map(|l| l.0).collect();
-        let run = |demand: &HashSet<u32>| -> bool {
+        let through_lanes: Vec<u32> = net.lanes_of(link).filter(|&l| l != left_lane).map(|l| l.0).collect();
+        let run = |demand: &super::super::junction::LaneSet| -> bool {
             let mut ctrl = SignalController::build(&net);
             let mut left_green = false;
             for _ in 0..steps {
@@ -4093,10 +4090,16 @@ mod tests {
             }
             left_green
         };
-        assert!(!run(&through_lanes), "a through queue alone never opens the protected-left window");
-        let mut with_bay = through_lanes.clone();
-        with_bay.insert(left_lane.0);
-        assert!(run(&with_bay), "a car in the bay calls and receives its protected window");
+        let lanes = net.lanes.len();
+        assert!(
+            !run(&super::super::junction::LaneSet::of(lanes, through_lanes.iter().copied())),
+            "a through queue alone never opens the protected-left window"
+        );
+        let with_bay = through_lanes.iter().copied().chain([left_lane.0]);
+        assert!(
+            run(&super::super::junction::LaneSet::of(lanes, with_bay)),
+            "a car in the bay calls and receives its protected window"
+        );
     }
 
     #[test]
@@ -4107,14 +4110,13 @@ mod tests {
         // served within a cycle.
         use super::super::junction::SignalController;
         use super::super::signal::SignalState;
-        use std::collections::HashSet;
         let net = coordinated_corridor_net();
         let (pid, _bit, mid) = corridor_through(&net);
         let cycle = net.programs[pid].cycle_length();
         let mut ctrl = SignalController::build(&net);
         // Demand only in the through movement's own lane: detection is per-lane,
         // so this places no call for any protected-left phase.
-        let main: HashSet<u32> = HashSet::from([net.movement(mid).from_lane.0]);
+        let main = super::super::junction::LaneSet::of(net.lanes.len(), [net.movement(mid).from_lane.0]);
         let mut clock = 0.0;
         // Warm-up cycle, then measure green share over two cycles.
         while clock < cycle {

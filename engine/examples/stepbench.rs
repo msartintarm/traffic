@@ -47,6 +47,13 @@ fn main() {
     world.install_router(&gen.destinations());
 
     let dt = SimConfig::default_config().dt;
+    println!(
+        "network: {} nodes {} links {} lanes   od pairs: {}",
+        world.network.nodes.len(),
+        world.network.links.len(),
+        world.network.lanes.len(),
+        pairs.len(),
+    );
     print!("loading fleet");
     let mut warm = 0u32;
     while world.vehicles().len() < target_fleet && warm < 40_000 {
@@ -78,6 +85,7 @@ fn main() {
     const SETTLE: usize = 20;
     const MEASURE: usize = 120;
     let mut total_us = vec![0u128; configs.len()];
+    let mut gen_us = vec![0u128; configs.len()];
     let mut total_asleep = vec![0usize; configs.len()];
     let mut samples = vec![0u32; configs.len()];
     let mut phases = vec![[0.0f64; STEP_PHASES]; configs.len()];
@@ -93,7 +101,9 @@ fn main() {
             }
             prof_take();
             for _ in 0..MEASURE {
+                let tg = Instant::now();
                 gen.step(&mut world, dt);
+                gen_us[ci] += tg.elapsed().as_micros();
                 let t0 = Instant::now();
                 world.step();
                 total_us[ci] += t0.elapsed().as_micros();
@@ -109,8 +119,9 @@ fn main() {
     println!("fleet at end: {}", world.vehicles().len());
     for (ci, &(name, ..)) in configs.iter().enumerate() {
         println!(
-            "{name}  mean step {:>7.0} us   asleep {:>5}",
+            "{name}  mean step {:>7.0} us   gen {:>6.0} us   asleep {:>5}",
             total_us[ci] as f64 / samples[ci] as f64,
+            gen_us[ci] as f64 / samples[ci] as f64,
             total_asleep[ci] / samples[ci] as usize,
         );
         let per: Vec<String> = (0..STEP_PHASES)

@@ -3,10 +3,11 @@
 //! Instead of a per-vehicle Dijkstra, we precompute, for a destination, a
 //! shortest-path *tree*: `next_hop[link]` = the outgoing link to take from each
 //! link to reach the destination fastest. A vehicle then routes by an O(1)
-//! lookup per intersection — what scales to 1M+. The tree is computed by
-//! **parallel Bellman–Ford** (Jacobi relaxation: read committed distances, write
-//! new ones), which maps directly onto a GPU compute kernel (see `flowfield.wgsl`
-//! / `flowfield_gpu.rs`); this is the CPU reference the GPU is validated against.
+//! lookup per intersection — what scales to 1M+. The CPU tree solve is a
+//! **reverse Dijkstra with a binary heap** (O(E log V), resumable/budgeted via
+//! [`PartialField`]); only the GPU kernel (`flowfield_batch.wgsl` /
+//! `flowfield_gpu.rs`) uses Bellman–Ford Jacobi relaxation, and this module is
+//! the reference it is validated against.
 //!
 //! Edge weights are `cost[link]` = the traversal cost (ms) of *entering* a link,
 //! so feeding live travel times makes routing congestion-reactive for free.

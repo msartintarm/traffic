@@ -14,6 +14,7 @@ export const REAL_MAPS: Record<string, { file: string; name: string }> = {
   lacrosse: { file: "lacrosse.json", name: "La Crosse, WI" },
   mvsv: { file: "mvsv.json", name: "Mountain View + Sunnyvale, CA" },
   sanmateo: { file: "sanmateo.json", name: "San Mateo County, CA" },
+  santaclara: { file: "santaclara.json", name: "Santa Clara County, CA" },
 };
 
 // The display name for a scenario key (real map or test scene), falling back to the key.
@@ -33,6 +34,7 @@ export const SCENARIOS: { key: string; name: string; kind: "Real map" | "Test" }
   { key: "lacrosse", name: "La Crosse, WI", kind: "Real map" },
   { key: "mvsv", name: "Mountain View + Sunnyvale, CA", kind: "Real map" },
   { key: "sanmateo", name: "San Mateo County, CA", kind: "Real map" },
+  { key: "santaclara", name: "Santa Clara County, CA", kind: "Real map" },
   { key: "arterial", name: "Arterial junction", kind: "Test" },
   { key: "corridor", name: "Signal corridor", kind: "Test" },
   { key: "gridlock", name: "Gridlock", kind: "Test" },

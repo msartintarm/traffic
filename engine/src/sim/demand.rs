@@ -33,6 +33,16 @@ impl<'a> Reachability<'a> {
         Self { net, from: RefCell::new(IntMap::default()) }
     }
 
+    /// Resume with a memo carried over from an earlier instance, so periodic
+    /// callers (origin churn) don't re-BFS the whole graph every epoch.
+    fn with_cache(net: &'a Network, cache: IntMap<Rc<Vec<bool>>>) -> Self {
+        Self { net, from: RefCell::new(cache) }
+    }
+
+    fn into_cache(self) -> IntMap<Rc<Vec<bool>>> {
+        self.from.into_inner()
+    }
+
     fn reachable(&self, from: LinkId, to: LinkId) -> bool {
         if from == to {
             return true;
@@ -562,6 +572,8 @@ pub struct DemandGenerator {
     sim_secs: f64,
     /// Last churn window acted on, so each window swaps at most once.
     churn_epoch: u64,
+    /// Persistent per-origin reachability memo for churn (see [`Reachability`]).
+    reach_cache: IntMap<Rc<Vec<bool>>>,
     /// Per-gateway (origin link) backlog of fired-but-not-yet-admitted trips
     /// `(stream, id)`. When demand outruns what the entrance can accept, trips wait
     /// here instead of being dropped, and are released FIFO as lanes clear — a real
@@ -704,7 +716,7 @@ impl DemandGenerator {
             pairs, transit: Vec::new(), seed, tick: 0, next_id: 0, spawned: 0, dropped: 0,
             rate_scale: 1.0, entry_speed_cap: f64::INFINITY, rush_clock: None, day_frozen: false,
             day_compression: DEFAULT_DAY_COMPRESSION,
-            day: 0, sim_secs: 0.0, churn_epoch: 0,
+            day: 0, sim_secs: 0.0, churn_epoch: 0, reach_cache: IntMap::default(),
             queues: std::collections::BTreeMap::new(),
             calibrator: None,
         }
@@ -1023,7 +1035,15 @@ impl DemandGenerator {
 
     pub fn step(&mut self, world: &mut NetWorld, dt: f64) {
         self.update_calibration(world);
-        let costs = world.live_link_costs();
+        // Live link costs feed only the no-field routing fallback in `launch`;
+        // with a router installed they are never read, so the O(links) build is
+        // deferred until a launch actually needs it (at county scale the eager
+        // build was several ms per tick, all discarded).
+        let mut costs: Option<Vec<u64>> = None;
+        // One gateway-occupancy snapshot for this tick's whole burst of spawn
+        // attempts, in place of per-attempt full-fleet admission scans.
+        let mut occ = world
+            .entry_occupancy(self.pairs.iter().map(|s| s.origin).chain(self.queues.keys().map(|&o| LinkId(o))));
         let day = self.rush_clock;
         let weekend = self.weekend();
         let daily = if day.is_some() { daily_factor(self.seed, self.day) } else { 1.0 };
@@ -1033,7 +1053,7 @@ impl DemandGenerator {
         let origins: Vec<u32> = self.queues.keys().copied().collect();
         for o in origins {
             while let Some(&(stream, id)) = self.queues[&o].front() {
-                if self.launch(world, &costs, stream, id) {
+                if self.launch(world, &mut occ, &mut costs, stream, id) {
                     self.queues.get_mut(&o).unwrap().pop_front();
                     self.spawned += 1;
                 } else {
@@ -1066,7 +1086,7 @@ impl DemandGenerator {
             let (origin, surface) = (s.origin, s.surface);
             let id = self.next_id;
             self.next_id += 1;
-            if self.launch(world, &costs, i, id) {
+            if self.launch(world, &mut occ, &mut costs, i, id) {
                 self.spawned += 1;
             } else {
                 let q = self.queues.entry(origin.0).or_default();
@@ -1149,7 +1169,10 @@ impl DemandGenerator {
         if self.pairs.is_empty() {
             return;
         }
-        let reach = Reachability::new(net);
+        // The BFS memo persists across epochs (churn only swaps existing
+        // origins, so the origin set — and the cache — stays bounded); a cold
+        // rebuild here was up to ~16 whole-graph BFS every churn period.
+        let reach = Reachability::with_cache(net, std::mem::take(&mut self.reach_cache));
         let idle = |gen: &Self, s: &OdStream| {
             s.surface && !s.anchored && gen.queues.get(&s.origin.0).map_or(true, |q| q.is_empty())
         };
@@ -1173,8 +1196,10 @@ impl DemandGenerator {
             let (bo, br) = (sb.origin, sb.base_rate);
             (self.pairs[a].origin, self.pairs[a].base_rate) = (bo, br);
             (self.pairs[b].origin, self.pairs[b].base_rate) = (ao, ar);
+            self.reach_cache = reach.into_cache();
             return;
         }
+        self.reach_cache = reach.into_cache();
     }
 
     /// Attempt to admit trip `id` of stream `stream` at its origin: destination-routed
@@ -1182,17 +1207,27 @@ impl DemandGenerator {
     /// cost-routed link path. `false` if the entrance is occupied (try again later) or
     /// no route exists. Driver and entry speed are derived from `id`, so a queued trip
     /// keeps its identity across the wait.
-    fn launch(&self, world: &mut NetWorld, costs: &[u64], stream: usize, id: u32) -> bool {
+    fn launch(
+        &self,
+        world: &mut NetWorld,
+        occ: &mut super::net_world::EntryOccupancy,
+        costs: &mut Option<Vec<u64>>,
+        stream: usize,
+        id: u32,
+    ) -> bool {
         let (origin, dest) = (self.pairs[stream].origin, self.pairs[stream].dest);
         let highway = !self.pairs[stream].surface;
         let driver = class_of(self.seed, id, highway, self.rush_clock).driver().sample(self.seed, id);
         let speed = self.launch_speed(&world.network, stream, origin, &driver);
         if world.router_knows(dest) {
-            world.spawn_to(id, origin, dest, speed, driver)
-        } else if let Some(route) = world.network.route_links_with_costs(origin, dest, costs) {
-            world.spawn_routed(id, route, speed, driver)
+            world.spawn_to_occ(occ, id, origin, dest, speed, driver)
         } else {
-            false
+            let costs = costs.get_or_insert_with(|| world.live_link_costs());
+            if let Some(route) = world.network.route_links_with_costs(origin, dest, costs) {
+                world.spawn_routed(id, route, speed, driver)
+            } else {
+                false
+            }
         }
     }
 
