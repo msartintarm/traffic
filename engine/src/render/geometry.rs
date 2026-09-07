@@ -8,6 +8,9 @@ use crate::sim::network::{Junction, LaneId, LinkId, MovementId, Network, NodeCon
 use super::{mass, StaticMesh, StaticVertex};
 
 pub const ROAD_COLOR: [f32; 3] = [0.16, 0.18, 0.21];
+/// Darker than both the road and the background — an elevated link's casing/drop
+/// shadow, so an overpass reads as floating over the road it crosses.
+pub const CASING_COLOR: [f32; 3] = [0.05, 0.06, 0.08];
 // The junction is the same asphalt as the carriageways, so it reads as one
 // continuous surface (no lighter disc) when zoomed in.
 // Kept dimmer than the vehicle body colour so cars read clearly against them.
@@ -40,7 +43,14 @@ pub fn world_bands(net: &Network) -> Vec<RenderBand> {
     let mut bands: BTreeMap<(i32, u64), RenderBand> = BTreeMap::new();
     for i in 0..net.links.len() {
         let l = net.link(LinkId(i as u32));
-        let band = bands.entry((l.layer, l.kind.at_grade_rank())).or_default();
+        let band = bands.entry((net.render_layer_of(i), l.kind.at_grade_rank())).or_default();
+        // An elevated link (above grade) gets a dark casing under its fill so it
+        // reads as passing *over* the road it crosses — a crisp edge plus a drop
+        // shadow onto the lower band (option B). At-grade links skip it, keeping
+        // their look and the mesh unchanged.
+        if net.render_layer_of(i) > 0 {
+            link_casing(net, i, &mut band.fill);
+        }
         link_fill(net, i, &mut band.fill);
         if !interior[i] {
             link_markings(net, LinkId(i as u32), &mut band.marking);
@@ -290,7 +300,7 @@ pub fn world_fill_colored(net: &Network, color_of: impl Fn(RoadKind) -> [f32; 3]
     }
     for i in 0..net.links.len() {
         let l = net.link(LinkId(i as u32));
-        let band = bands.entry((l.layer, l.kind.at_grade_rank())).or_default();
+        let band = bands.entry((net.render_layer_of(i), l.kind.at_grade_rank())).or_default();
         let start = band.vertices.len();
         link_fill(net, i, band);
         let color = color_of(l.kind);
@@ -318,6 +328,21 @@ fn link_fill(net: &Network, i: usize, mesh: &mut StaticMesh) {
     for seg in net.polylines[i].windows(2) {
         let (a, b) = offset_right(seg[0], seg[1], half);
         mesh.push_road_fill(a, b, half, ROAD_COLOR);
+    }
+}
+
+/// A dark casing ribbon a little wider than the carriageway, drawn *under* an
+/// elevated link's fill (same band, so it sits above whatever the link crosses).
+/// The margin peeks out beyond the fill as a crisp edge + shadow, so an overpass
+/// visibly floats over the road below it. `light = 0` → opaque flat fill.
+fn link_casing(net: &Network, i: usize, mesh: &mut StaticMesh) {
+    const MARGIN: f64 = 1.6; // metres of shadow beyond each edge
+    let half = net.links[i].lane_count as f64 * LANE_WIDTH / 2.0;
+    for seg in net.polylines[i].windows(2) {
+        // Same carriageway centre as `link_fill`, a wider ribbon: it peeks out
+        // `MARGIN` past both edges as the casing/shadow.
+        let (a, b) = offset_right(seg[0], seg[1], half);
+        mesh.push_ribbon(a, b, half + MARGIN, CASING_COLOR, 0.0);
     }
 }
 

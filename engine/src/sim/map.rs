@@ -861,7 +861,7 @@ impl OsmMap {
         enforce_mouth_ordering(&mut net);
         net.build_interiors();
 
-        let plans = relocate_signals_to_junctions(&net, &self.nodes);
+        let mut plans = relocate_signals_to_junctions(&net, &self.nodes);
         // Fixed (non-signal) controls now; the signal programs are built after the
         // junctions and cross-node conflicts exist, so each multi-node junction is
         // timed as one coordinated signal rather than several independent ones.
@@ -948,8 +948,20 @@ impl OsmMap {
         };
         net.build_cross_junction_conflicts();
         net.build_conflict_index();
+        // Real traffic engineering signalizes crossings of two major roads; OSM
+        // frequently omits the `traffic_signals` tag on them, leaving an at-grade
+        // major×major crossing uncontrolled. Modelled uncontrolled, both major
+        // streams gap-accept against each other and starve under heavy flow — a
+        // false gridlock. Promote those (only) to a default-timed signal here,
+        // where the conflict index exists to identify a genuine crossing.
+        promote_major_crossings(&net, &mut plans);
         coordinate_junction_signals(&mut net, &plans);
         coordinate_green_waves(&mut net);
+        // Render-only grade layering: infer overpass/underpass occlusion for
+        // crossings OSM left untagged, so a road passing over another is drawn on
+        // top of it. Purely visual (see `Network::render_layer`); after all
+        // geometry is final.
+        net.build_render_layers();
         net
     }
 }
@@ -1324,6 +1336,46 @@ fn assign_signal_program(
         }
     }
     NodeControl::Signalized(program)
+}
+
+/// Signalize uncontrolled junctions where two *different* major roads (expressway
+/// or arterial) actually cross — a conflict between streams whose approaches are
+/// both major and on distinct streets. Such a crossing left uncontrolled starves
+/// (each major stream perpetually gap-accepting against the other); real ones are
+/// signalized. Conservative by construction: a major road meeting a minor one (one
+/// major approach) keeps its priority/gap-acceptance, an already-controlled
+/// junction (signal/stop/yield) is untouched, and a mere merge/continuation (no
+/// cross-conflict) is skipped. Writes a default-timed plan the signal builder then
+/// programs and coordinates like any other.
+fn promote_major_crossings(net: &Network, plans: &mut [Option<SignalPlan>]) {
+    const GREEN: f64 = 20.0;
+    const YELLOW: f64 = 3.5;
+    let mut mvs_by_node: Vec<Vec<MovementId>> = vec![Vec::new(); net.nodes.len()];
+    for (m, mv) in net.movements.iter().enumerate() {
+        mvs_by_node[mv.node.idx()].push(MovementId(m as u32));
+    }
+    let is_major = |mid: MovementId| {
+        matches!(net.link(net.lane(net.movement(mid).from_lane).link).kind, RoadKind::Expressway | RoadKind::Arterial)
+    };
+    let approach = |mid: MovementId| net.lane(net.movement(mid).from_lane).link;
+    for ji in 0..net.junctions.len() {
+        let members = &net.junctions[ji].nodes;
+        if members.iter().any(|&n| {
+            plans[n.idx()].is_some() || matches!(net.nodes[n.idx()].control, NodeControl::Stop | NodeControl::Yield)
+        }) {
+            continue; // already controlled — leave it
+        }
+        let mvs: Vec<MovementId> = members.iter().flat_map(|&n| mvs_by_node[n.idx()].iter().copied()).collect();
+        let major_crossing = mvs.iter().enumerate().any(|(i, &a)| {
+            is_major(a)
+                && mvs[i + 1..].iter().any(|&b| {
+                    is_major(b) && approach(a) != approach(b) && net.movements_conflict(a, b)
+                })
+        });
+        if major_crossing {
+            plans[members[0].idx()] = Some(SignalPlan { green_secs: GREEN, yellow_secs: YELLOW, offset: 0.0 });
+        }
+    }
 }
 
 /// Give each multi-node junction a single coordinated signal spanning all its member

@@ -400,6 +400,14 @@ pub struct Network {
     /// so every render backend sees it through the one `&Network`. Empty on
     /// hand-built maps; trains themselves live in the world's timetable.
     pub rail: super::rail::RailNetwork,
+    /// Render-only grade layer per link (index-aligned with `links`): the OSM
+    /// `layer`, then bumped by [`build_render_layers`](Self::build_render_layers)
+    /// so a *geometrically* grade-separated crossing that OSM left untagged still
+    /// occludes correctly — the "over" road lands in a higher painter's band than
+    /// the road it passes over. Distinct from `Link::layer` (which also gates
+    /// junction/seam geometry); this one only orders the render bands. Empty until
+    /// built; renderers fall back to `Link::layer` then.
+    pub render_layer: Vec<i32>,
     /// Lazily-built uniform grid over surface-link segments, so `nearest_surface_link`
     /// is a small-neighbourhood scan rather than a walk of every road segment — the
     /// difference between a sub-second boot and a minute-long one when a transit-dense
@@ -634,6 +642,16 @@ fn point_along(poly: &[[f64; 2]], s: f64) -> ([f64; 2], [f64; 2]) {
     }
     let n = poly.len();
     (poly[n - 1], unit(sub(poly[n - 1], poly[n - 2])))
+}
+
+/// Whether segments `p1p2` and `p3p4` cross in their interiors (a proper
+/// intersection — shared endpoints or T-touches don't count). Used to detect a
+/// grade separation: two centrelines that genuinely cross but share no node.
+fn segments_properly_cross(p1: [f64; 2], p2: [f64; 2], p3: [f64; 2], p4: [f64; 2]) -> bool {
+    let orient = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    let (d1, d2) = (orient(p3, p4, p1), orient(p3, p4, p2));
+    let (d3, d4) = (orient(p1, p2, p3), orient(p1, p2, p4));
+    d1 != 0.0 && d2 != 0.0 && d3 != 0.0 && d4 != 0.0 && (d1 > 0.0) != (d2 > 0.0) && (d3 > 0.0) != (d4 > 0.0)
 }
 
 /// One surface-link polyline segment, pre-decomposed for point projection.
@@ -2041,6 +2059,92 @@ impl Network {
         r
     }
 
+    /// Render grade layer for link `i`: the inferred value once built, else the
+    /// raw OSM `layer` (hand-built networks that never call the inference).
+    pub fn render_layer_of(&self, i: usize) -> i32 {
+        self.render_layer.get(i).copied().unwrap_or_else(|| self.links[i].layer)
+    }
+
+    /// Infer render grade layers so untagged overpasses occlude correctly. Two
+    /// links whose centrelines actually cross (segments intersect in their
+    /// interiors) yet share no node are grade-separated — OSM just omitted the
+    /// `layer`/`bridge` tag. If both sit at the same render layer they collapse
+    /// into one painter's band and neither occludes the other, so lift the "over"
+    /// road (higher road class, then more lanes, then lower id — deterministic)
+    /// one layer above the road it crosses. A coarse segment grid keeps this near
+    /// O(segments) rather than O(links²).
+    pub fn build_render_layers(&mut self) {
+        use std::collections::{HashMap, HashSet};
+        const CELL: f64 = 30.0;
+        // Flatten every link's centreline into segments, bucketed by grid cell.
+        let mut segs: Vec<(u32, [f64; 2], [f64; 2])> = Vec::new();
+        for (i, poly) in self.polylines.iter().enumerate() {
+            for w in poly.windows(2) {
+                segs.push((i as u32, w[0], w[1]));
+            }
+        }
+        let cell = |p: [f64; 2]| ((p[0] / CELL).floor() as i64, (p[1] / CELL).floor() as i64);
+        let mut grid: HashMap<(i64, i64), Vec<u32>> = HashMap::new();
+        for (si, &(_, a, b)) in segs.iter().enumerate() {
+            let (c0, c1) = (cell([a[0].min(b[0]), a[1].min(b[1])]), cell([a[0].max(b[0]), a[1].max(b[1])]));
+            for cx in c0.0..=c1.0 {
+                for cy in c0.1..=c1.1 {
+                    grid.entry((cx, cy)).or_default().push(si as u32);
+                }
+            }
+        }
+        // Two links "meet at grade" if they share an endpoint node, or if their
+        // endpoints belong to the same junction cluster — a split intersection
+        // whose through-links cross *inside* the box without sharing a raw node.
+        // Either way it's an at-grade crossing, never an overpass.
+        let meet_at_grade = |i: usize, j: usize| {
+            let (a, b) = (self.links[i], self.links[j]);
+            if a.from == b.from || a.from == b.to || a.to == b.from || a.to == b.to {
+                return true;
+            }
+            let ja = [self.node_junction(a.from), self.node_junction(a.to)];
+            let jb = [self.node_junction(b.from), self.node_junction(b.to)];
+            ja.iter().flatten().any(|x| jb.iter().flatten().any(|y| x == y))
+        };
+        // Collect the link pairs that genuinely cross (dedup across shared cells).
+        let mut crossings: HashSet<(u32, u32)> = HashSet::new();
+        for bucket in grid.values() {
+            for (x, &sa) in bucket.iter().enumerate() {
+                for &sb in &bucket[x + 1..] {
+                    let (la, pa0, pa1) = segs[sa as usize];
+                    let (lb, pb0, pb1) = segs[sb as usize];
+                    if la == lb {
+                        continue;
+                    }
+                    let (lo, hi) = (la.min(lb), la.max(lb));
+                    if crossings.contains(&(lo, hi)) || meet_at_grade(lo as usize, hi as usize) {
+                        continue;
+                    }
+                    if segments_properly_cross(pa0, pa1, pb0, pb1) {
+                        crossings.insert((lo, hi));
+                    }
+                }
+            }
+        }
+        // Lift the over-road of each equal-layer crossing. Deterministic order.
+        let mut layer: Vec<i32> = self.links.iter().map(|l| l.layer).collect();
+        let mut pairs: Vec<(u32, u32)> = crossings.into_iter().collect();
+        pairs.sort_unstable();
+        for (a, b) in pairs {
+            let (a, b) = (a as usize, b as usize);
+            if layer[a] != layer[b] {
+                continue; // already grade-distinct — a tagged bridge/tunnel
+            }
+            let (la, lb) = (self.links[a], self.links[b]);
+            // Over = higher class, then more lanes, then lower id (a→b tie-break).
+            let a_over = (la.kind.at_grade_rank(), la.lane_count, u32::MAX - a as u32)
+                >= (lb.kind.at_grade_rank(), lb.lane_count, u32::MAX - b as u32);
+            let (over, under) = if a_over { (a, b) } else { (b, a) };
+            layer[over] = layer[over].max(layer[under] + 1);
+        }
+        self.render_layer = layer;
+    }
+
     /// One O(#groups) pass evaluating every signal group at `sim_time`; vehicles
     /// then read the returned array in O(1). This is the per-tick scale story.
     pub fn signal_states(&self, sim_time: f64) -> Vec<SignalState> {
@@ -2076,6 +2180,58 @@ mod tests {
             (lo[0] - 1.0..=hi[0] + 1.0).contains(&j.center[0]) && (lo[1] - 1.0..=hi[1] + 1.0).contains(&j.center[1]),
             "the crossing centre sits inside its footprint",
         );
+    }
+
+    fn crossing_net(layer_a: i32, layer_b: i32, kind_b: RoadKind, share: bool) -> Network {
+        let node = |x: f64, y: f64| Node { position: [x, y], control: NodeControl::Uncontrolled, rail_crossing: false };
+        let link = |from: u32, to: u32, ls: u32, layer: i32, kind: RoadKind| Link {
+            from: NodeId(from),
+            to: NodeId(to),
+            lane_start: LaneId(ls),
+            lane_count: 2,
+            layer,
+            kind,
+            motorway: false,
+        };
+        let mut net = Network::default();
+        // Horizontal link A→B and a second link crossing it vertically. When `share`
+        // they meet at a shared node (a T), else they cross with no shared node.
+        net.nodes = vec![node(-10.0, 0.0), node(10.0, 0.0), node(0.0, -10.0), node(0.0, 10.0)];
+        net.links = vec![
+            link(0, 1, 0, layer_a, RoadKind::Arterial),
+            if share { link(1, 3, 1, layer_b, kind_b) } else { link(2, 3, 1, layer_b, kind_b) },
+        ];
+        net.polylines = vec![
+            vec![[-10.0, 0.0], [10.0, 0.0]],
+            if share { vec![[10.0, 0.0], [0.0, 10.0]] } else { vec![[0.0, -10.0], [0.0, 10.0]] },
+        ];
+        net.build_render_layers();
+        net
+    }
+
+    #[test]
+    fn untagged_crossing_lifts_the_higher_class_over_the_other() {
+        // Two same-layer links that genuinely cross (no shared node): the higher
+        // class (Arterial > Collector) is lifted one render layer above.
+        let net = crossing_net(0, 0, RoadKind::Collector, false);
+        assert_eq!(net.render_layer_of(0), 1, "arterial rides over");
+        assert_eq!(net.render_layer_of(1), 0, "collector stays below");
+    }
+
+    #[test]
+    fn crossing_that_shares_a_node_is_a_junction_not_a_grade_separation() {
+        // Meeting at a shared node is an at-grade junction — never lifted.
+        let net = crossing_net(0, 0, RoadKind::Collector, true);
+        assert_eq!(net.render_layer_of(0), 0);
+        assert_eq!(net.render_layer_of(1), 0);
+    }
+
+    #[test]
+    fn already_grade_distinct_crossing_is_left_alone() {
+        // A tagged bridge (already a layer apart) keeps its layers untouched.
+        let net = crossing_net(0, 1, RoadKind::Arterial, false);
+        assert_eq!(net.render_layer_of(0), 0);
+        assert_eq!(net.render_layer_of(1), 1);
     }
 
     #[test]
