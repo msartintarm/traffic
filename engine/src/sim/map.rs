@@ -162,11 +162,17 @@ impl ImportedMap {
     /// duplicate links (a segment lying on the boundary in both extracts)
     /// collapse by their (from, to) pair, first occurrence winning.
     pub fn merge(parts: Vec<(ImportedMap, [f64; 2])>) -> ImportedMap {
+        // A merged region is memory-bound end to end (network, lane bounds,
+        // render mesh all scale with bend points), so link polylines are
+        // thinned to this tolerance — invisible at any zoom the region is
+        // viewed at.
+        const GEOMETRY_TOL_M: f64 = 2.0;
         let frame = parts[0].1;
         let mut out = ImportedMap::default();
         let mut seen_nodes: HashSet<i64> = HashSet::new();
         let mut seen_links: HashSet<(i64, i64)> = HashSet::new();
         for (part, origin) in parts {
+            let pos: HashMap<i64, [f64; 2]> = part.map.nodes.iter().map(|n| (n.osm_id, [n.x, n.y])).collect();
             for mut n in part.map.nodes {
                 if !seen_nodes.insert(n.osm_id) {
                     continue;
@@ -177,6 +183,9 @@ impl ImportedMap {
             for mut l in part.map.links {
                 if !seen_links.insert((l.from_osm, l.to_osm)) {
                     continue;
+                }
+                if let (Some(&a), Some(&b)) = (pos.get(&l.from_osm), pos.get(&l.to_osm)) {
+                    l.geometry = thin_polyline(a, l.geometry, b, GEOMETRY_TOL_M);
                 }
                 for g in &mut l.geometry {
                     *g = reframe(g[0], g[1], origin, frame);
@@ -232,6 +241,41 @@ mod merge_tests {
         let route = net.route_links(LinkId(0), LinkId(2));
         assert!(route.is_some(), "routes cross the county stitch");
     }
+}
+
+/// Douglas–Peucker over a link's interior bend points, anchored at its node
+/// endpoints so bends near a junction are judged against the true chord.
+fn thin_polyline(from: [f64; 2], bends: Vec<[f64; 2]>, to: [f64; 2], tol: f64) -> Vec<[f64; 2]> {
+    if bends.len() < 2 {
+        return bends;
+    }
+    let mut line = Vec::with_capacity(bends.len() + 2);
+    line.push(from);
+    line.extend(bends);
+    line.push(to);
+    let mut keep = vec![false; line.len()];
+    keep[0] = true;
+    *keep.last_mut().unwrap() = true;
+    let mut stack = vec![(0usize, line.len() - 1)];
+    while let Some((i, j)) = stack.pop() {
+        let [ax, ay] = line[i];
+        let [bx, by] = line[j];
+        let (dx, dy) = (bx - ax, by - ay);
+        let len = dx.hypot(dy).max(1e-9);
+        let (mut far, mut fd) = (0usize, tol);
+        for k in i + 1..j {
+            let d = ((line[k][0] - ax) * dy - (line[k][1] - ay) * dx).abs() / len;
+            if d > fd {
+                (far, fd) = (k, d);
+            }
+        }
+        if far > 0 {
+            keep[far] = true;
+            stack.push((i, far));
+            stack.push((far, j));
+        }
+    }
+    (1..line.len() - 1).filter(|&k| keep[k]).map(|k| line[k]).collect()
 }
 
 /// A point in one scraper extract's local frame, re-projected into another's

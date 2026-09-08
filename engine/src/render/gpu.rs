@@ -138,8 +138,16 @@ async fn from_surface(
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("traffic"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_webgl2_defaults()
-                    .using_resolution(adapter.limits()),
+                required_limits: {
+                    // A merged-region world mesh runs to hundreds of MB; the
+                    // downlevel default caps buffers at 256 MiB, which fails
+                    // the static-mesh upload. Ask for whatever this adapter
+                    // actually allows.
+                    let mut limits =
+                        wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits());
+                    limits.max_buffer_size = adapter.limits().max_buffer_size;
+                    limits
+                },
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
             })
@@ -398,9 +406,26 @@ impl Renderer {
     /// Upload the baked static geometry once. Roads+junctions (`world_*`) draw at
     /// every zoom; markings (`mark_*`) only when zoomed in. Both are flat
     /// `StaticVertex` arrays (center.xy, offset.xy, color.rgb, light).
-    pub fn set_world_mesh(&mut self, world_v: Vec<f32>, world_i: Vec<u32>, mark_v: Vec<f32>, mark_i: Vec<u32>, bands: Vec<u32>) {
+    pub fn set_world_mesh(
+        &mut self,
+        world_v: Vec<f32>,
+        world_i: Vec<u32>,
+        mark_v: Vec<f32>,
+        mark_i: Vec<u32>,
+        bands: Vec<u32>,
+    ) -> Result<(), JsValue> {
+        // A merged-region mesh can exceed what this adapter allows per buffer;
+        // creating it anyway panics uncatchably in wasm, so refuse here and let
+        // the caller fall back to the 2D scene renderer.
+        let need = (world_v.len().max(mark_v.len()) * 4) as u64;
+        let cap = self.device.limits().max_buffer_size;
+        if need > cap {
+            return Err(JsValue::from_str(&format!("world mesh {need} B exceeds adapter buffer cap {cap} B")));
+        }
         self.world = Some(self.upload_mesh("world", &world_v, &world_i));
-        self.markings = Some(self.upload_mesh("markings", &mark_v, &mark_i));
+        // Merged regions ship no lane paint (see `world_bands`); skip the
+        // zero-size upload and the draw skips the pass.
+        self.markings = (!mark_v.is_empty()).then(|| self.upload_mesh("markings", &mark_v, &mark_i));
         // Tiled band directory (or the legacy flat ranges — both parse). Fall
         // back to one whole-buffer band if the caller supplied none.
         self.bands = parse_world_directory(&bands);
@@ -413,6 +438,7 @@ impl Renderer {
             }];
         }
         self.cached_vp = None;
+        Ok(())
     }
 
     fn upload_mesh(&self, label: &str, vertices: &[f32], indices: &[u32]) -> (wgpu::Buffer, wgpu::Buffer, u32) {

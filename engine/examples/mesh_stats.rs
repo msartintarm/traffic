@@ -4,10 +4,17 @@ use engine::render::geometry;
 use engine::sim::map::OsmMap;
 
 fn main() {
+    // Comma-separated paths merge into one network (the combined-scenario path).
     let path = std::env::args().nth(1).expect("map path");
-    let raw = std::fs::read_to_string(&path).expect("read map");
-    let map = OsmMap::from_json(&raw).expect("parse map");
-    let net = map.build();
+    let parts: Vec<_> = path
+        .split(',')
+        .map(|p| {
+            let raw = std::fs::read_to_string(p).expect("read map");
+            let origin = engine::sim::map::json_origin(&raw).expect("meta.origin");
+            (OsmMap::from_json(&raw).expect("parse map"), origin)
+        })
+        .collect();
+    let net = engine::sim::map::ImportedMap::merge(parts).build();
     let t = std::time::Instant::now();
     let g = geometry::world_geometry(&net);
     let vsize = std::mem::size_of::<engine::render::StaticVertex>();

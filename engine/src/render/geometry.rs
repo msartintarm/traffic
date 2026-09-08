@@ -39,6 +39,11 @@ pub struct RenderBand {
 /// raster order is exactly the browser's.
 pub fn world_bands(net: &Network) -> Vec<RenderBand> {
     use std::collections::BTreeMap;
+    // Lane paint is forgone past this size: a merged-region marking mesh runs
+    // hundreds of MB against wasm's 4 GiB ceiling. Rail steel stays — it is
+    // structural, not paint, and a rounding error by comparison.
+    const MARKINGS_MAX_LINKS: usize = 250_000;
+    let markings = net.links.len() <= MARKINGS_MAX_LINKS;
     let interior = interior_links(net);
     let mut bands: BTreeMap<(i32, u64), RenderBand> = BTreeMap::new();
     for i in 0..net.links.len() {
@@ -52,13 +57,15 @@ pub fn world_bands(net: &Network) -> Vec<RenderBand> {
             link_casing(net, i, &mut band.fill);
         }
         link_fill(net, i, &mut band.fill);
-        if !interior[i] {
+        if markings && !interior[i] {
             link_markings(net, LinkId(i as u32), &mut band.marking);
         }
     }
     let jband = bands.entry((0, JUNCTION_PRIORITY)).or_default();
     jband.fill.extend(&junction_mesh(net));
-    jband.marking.extend(&junction_markings(net));
+    if markings {
+        jband.marking.extend(&junction_markings(net));
+    }
     for (key, rail) in rail_band_geometry(net) {
         let band = bands.entry(key).or_default();
         band.fill.extend(&rail.fill);
@@ -153,7 +160,22 @@ pub fn world_geometry(net: &Network) -> WorldGeometry {
             dir.extend(t.bbox.iter().map(|f| f.to_bits()));
         }
     };
-    for band in &bands {
+    // Aggregates are pre-sized (growth-doubling a ~700 MB Vec keeps old+new
+    // alive through each realloc — the difference between fitting under
+    // wasm's memory ceiling and not, on a merged region) and bands are
+    // consumed as they're absorbed.
+    let (mut wv, mut wi, mut mv, mut mi_n) = (0, 0, 0, 0);
+    for b in &bands {
+        wv += b.fill.vertices.len();
+        wi += b.fill.indices.len();
+        mv += b.marking.vertices.len();
+        mi_n += b.marking.indices.len();
+    }
+    world.vertices.reserve_exact(wv);
+    world.indices.reserve_exact(wi);
+    marking.vertices.reserve_exact(mv);
+    marking.indices.reserve_exact(mi_n);
+    for band in bands {
         let (fi, ftiles) = tile_indices(&band.fill, WORLD_TILE_M);
         let (mi, mtiles) = tile_indices(&band.marking, WORLD_TILE_M);
         // max_mpp is reserved (always 0 = draw at every zoom): class-based LOD
