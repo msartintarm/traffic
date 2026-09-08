@@ -46,16 +46,25 @@ struct Scratch {
 /// (dest,from)→next; bounded by traffic in practice, this only guards a runaway).
 const MEMO_CAP: usize = 1 << 20;
 
-/// Per-thread next-hop cache, tagged with the router generation it was filled
-/// under so a congestion refresh invalidates it wholesale.
+/// Cached hops expire in rotating cohorts as the congestion generation
+/// advances (each bump expires exactly the one cohort matching its index).
+/// A generation bump used to flush every thread's whole memo at once, so one
+/// quarter-band crossing anywhere re-ran thousands of ALT searches on the next
+/// tick — a visible hitch every reroute interval at county scale. With
+/// cohorts, each bump re-searches 1/`MEMO_SPREAD` of the cache: unchanged
+/// regions re-derive the same hop, and a new jam reaches every driver within
+/// `MEMO_SPREAD` reroute intervals — staggered discovery, the way real
+/// drivers learn of a backup.
+const MEMO_SPREAD: u64 = 4;
+
 struct Memo {
-    generation: u64,
-    map: std::collections::HashMap<u64, u32, std::hash::BuildHasherDefault<super::hash::FxHasher>>,
+    /// `(dest, from)` key → (hop, generation at compute); `u32::MAX` = no hop.
+    map: std::collections::HashMap<u64, (u32, u64), std::hash::BuildHasherDefault<super::hash::FxHasher>>,
 }
 
 thread_local! {
     static MEMO: std::cell::RefCell<Memo> =
-        std::cell::RefCell::new(Memo { generation: u64::MAX, map: std::collections::HashMap::default() });
+        std::cell::RefCell::new(Memo { map: std::collections::HashMap::default() });
     static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch {
         g: super::hash::IntMap::default(),
         first: super::hash::IntMap::default(),
@@ -137,22 +146,34 @@ impl LocalRouter {
     }
 
     /// Refresh congestion penalties from per-link vehicle counts (`counts`: link
-    /// id → vehicles; occupied links only). O(occupied) reset+set — no map sweep —
-    /// and the generation bump re-plans cached hops around new jams. Call on the
-    /// reroute interval; quarter-jam bands make penalties change rarely, so the
-    /// memo stays hot between refreshes.
+    /// id → vehicles; occupied links only). O(occupied) reset+set — no map sweep.
+    /// The generation (which rotates the memo's expiry cohorts — see
+    /// [`MEMO_SPREAD`]) bumps only when the banded penalty set actually moved,
+    /// so a quiet map keeps every cached route indefinitely.
     pub fn update_congestion(&mut self, counts: &super::hash::IntMap<u32>) {
+        let mut old: Vec<(u32, u32)> =
+            self.jammed.iter().map(|&l| (l, self.penalty[l as usize])).filter(|&(_, p)| p != 0).collect();
+        let mut next: Vec<(u32, u32)> = counts
+            .iter()
+            .filter_map(|(&link, &c)| {
+                let l = link as usize;
+                let band = ((c as f64 / self.jam[l]).min(3.0) * 4.0) as u32; // quarter-jam bands
+                let pen = ((self.cost[l] as u64 * band as u64) / 3).min(u32::MAX as u64) as u32;
+                (band > 0 && pen > 0).then_some((link, pen))
+            })
+            .collect();
+        old.sort_unstable();
+        next.sort_unstable();
+        if old == next {
+            return; // same jams, same prices — cached routes all still hold
+        }
         for &l in &self.jammed {
             self.penalty[l as usize] = 0;
         }
         self.jammed.clear();
-        for (&link, &c) in counts {
-            let l = link as usize;
-            let band = ((c as f64 / self.jam[l]).min(3.0) * 4.0) as u32; // quarter-jam bands
-            if band > 0 {
-                self.penalty[l] = ((self.cost[l] as u64 * band as u64) / 3).min(u32::MAX as u64) as u32;
-                self.jammed.push(link);
-            }
+        for &(link, pen) in &next {
+            self.penalty[link as usize] = pen;
+            self.jammed.push(link);
         }
         self.generation = self.generation.wrapping_add(1);
     }
@@ -178,18 +199,26 @@ impl LocalRouter {
         let key = ((dest.0 as u64) << 32) | from.0 as u64;
         MEMO.with(|c| {
             let mut m = c.borrow_mut();
-            if m.generation != self.generation {
-                m.map.clear();
-                m.generation = self.generation;
-            }
-            if let Some(&v) = m.map.get(&key) {
-                return (v != u32::MAX).then(|| LinkId(v));
+            if let Some(&(v, g)) = m.map.get(&key) {
+                // The entry expires at the first generation bump whose index
+                // lands on this key's rotating cohort — exactly one cohort per
+                // bump, so each bump re-searches 1/MEMO_SPREAD of the cache.
+                let cohort = key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 62; // 0..MEMO_SPREAD-1
+                let until_expiry = 1 + (cohort.wrapping_sub(g).wrapping_sub(1) % MEMO_SPREAD);
+                if self.generation.wrapping_sub(g) < until_expiry {
+                    return (v != u32::MAX).then(|| LinkId(v));
+                }
             }
             let ans = self.next_hop_search(dest, from);
             if m.map.len() >= MEMO_CAP {
-                m.map.clear();
+                // Evict only pairs no query has refreshed for several
+                // generations (exited cars, recycled destinations) — a blanket
+                // clear would recreate the very re-search burst the cohorts
+                // exist to prevent.
+                let gen = self.generation;
+                m.map.retain(|_, &mut (_, g)| gen.wrapping_sub(g) <= MEMO_SPREAD);
             }
-            m.map.insert(key, ans.map_or(u32::MAX, |l| l.0));
+            m.map.insert(key, (ans.map_or(u32::MAX, |l| l.0), self.generation));
             ans
         })
     }

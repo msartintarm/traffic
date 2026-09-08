@@ -93,3 +93,7 @@ required-features = ["import"]
 [[example]]
 name = "junction_probe"
 required-features = ["import"]
+
+[[example]]
+name = "hitch_probe"
+required-features = ["import"]
