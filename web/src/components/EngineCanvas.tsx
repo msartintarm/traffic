@@ -15,7 +15,16 @@ import {
 import { StatsSmoother, junctionPanelText, panelText, startSpeedLabel, vehicleReportText } from "../lib/hud";
 import { type Control, type InitConfig, overlayFromSnapshot } from "../lib/protocol";
 import { createSession, type Session } from "../lib/session";
-import { SCENARIOS, scenarioName } from "../lib/maps";
+import { COUNTY_MAPS, REAL_MAPS, SCENARIOS, scenarioName } from "../lib/maps";
+import { fetchCountyOutline, fetchMapMeta } from "../lib/loadMap";
+import {
+  countyRect,
+  outlinePath,
+  outlineToWorld,
+  rectToCss,
+  worldToCssMatrix,
+  type CountyRect,
+} from "../lib/countyOverlay";
 import {
   type Compute,
   type Field as ParamField,
@@ -113,6 +122,15 @@ export default function EngineCanvas() {
   const loadingCountsRef = useRef<{ done: number; total: number; unit: string } | null>(null);
   const loadingDetailRef = useRef<HTMLSpanElement>(null);
   const loadingSmootherRef = useRef(new StatsSmoother());
+  // County-jump overlay: on a county map, the sibling counties' extents in this
+  // map's world frame, tracked with the camera and clickable to travel there.
+  const [countyRects, setCountyRects] = useState<CountyRect[]>([]);
+  // The CURRENT county's own silhouette, used as an SVG mask so a neighbour's
+  // shape never covers this map's roads — the two coverages read as mutually
+  // exclusive along the county line.
+  const [countyClip, setCountyClip] = useState<[number, number][] | null>(null);
+  const [pendingJump, setPendingJump] = useState<CountyRect | null>(null);
+  const countyLayerRef = useRef<HTMLDivElement>(null);
   const tipRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const asciiRef = useRef<HTMLPreElement>(null); // the ASCII "terminal" overlay (shown when asciiMode is on)
@@ -205,6 +223,82 @@ export default function EngineCanvas() {
       document.body.style.overflow = prev;
     };
   }, [pseudoFs]);
+
+  // On a county-level map, fetch the sibling counties' map headers (a few
+  // hundred bytes each — see fetchMapMeta) and place their scrape extents in
+  // this map's frame. Placement is derived entirely from the map files' own
+  // meta, so no coordinates live in the app.
+  useEffect(() => {
+    if (!ready || !REAL_MAPS[scenario]?.county) return;
+    let dead = false;
+    (async () => {
+      const cur = await fetchMapMeta(`${basePath()}/${REAL_MAPS[scenario].file}`);
+      if (!cur || dead) return;
+      const mine = await fetchCountyOutline(
+        `${basePath()}/${REAL_MAPS[scenario].file.replace(/\.json$/, ".outline.json")}`,
+      );
+      if (dead) return;
+      setCountyClip(mine ? outlineToWorld(mine, cur.origin) : null);
+      const rects: CountyRect[] = [];
+      for (const key of COUNTY_MAPS) {
+        if (key === scenario) continue;
+        const file = REAL_MAPS[key].file;
+        const m = await fetchMapMeta(`${basePath()}/${file}`);
+        if (!m) continue;
+        const r = countyRect(key, REAL_MAPS[key].name, m, cur.origin);
+        // Silhouette sidecar (the county's road-network footprint) when it
+        // exists; the bbox rectangle is the fallback shape.
+        const o = await fetchCountyOutline(`${basePath()}/${file.replace(/\.json$/, ".outline.json")}`);
+        if (o) r.outline = outlineToWorld(o, cur.origin);
+        rects.push(r);
+      }
+      if (!dead) setCountyRects(rects);
+    })();
+    return () => {
+      dead = true;
+    };
+  }, [ready, scenario]);
+
+  // Track the camera each frame so the county regions pan/zoom like map
+  // features, not screen chrome; off-screen counties hide entirely.
+  useEffect(() => {
+    if (countyRects.length === 0) return;
+    let raf = 0;
+    const tick = () => {
+      const cam = cameraRef.current;
+      const canvas = canvasRef.current;
+      const layer = countyLayerRef.current;
+      if (cam && canvas && layer) {
+        const box = canvas.getBoundingClientRect();
+        const m = worldToCssMatrix(cam, box.width, box.height);
+        for (const r of countyRects) {
+          const region = layer.querySelector<HTMLElement>(`[data-county-region="${r.key}"]`);
+          const chip = layer.querySelector<HTMLElement>(`[data-county-chip="${r.key}"]`);
+          const shape = layer.querySelector<SVGGElement>(`[data-county-shape="${r.key}"]`);
+          if (!chip) continue;
+          const css = rectToCss(r, cam, box.width, box.height);
+          for (const el of [region, chip, shape?.ownerSVGElement ?? null]) {
+            if (el) el.style.display = css ? "block" : "none";
+          }
+          if (!css) continue;
+          if (shape) {
+            // The silhouette lives in world coordinates; one affine transform
+            // per frame pans/zooms it with the map.
+            shape.ownerSVGElement?.setAttribute("viewBox", `0 0 ${box.width} ${box.height}`);
+            shape.setAttribute("transform", `matrix(${m.a} 0 0 ${m.d} ${m.e} ${m.f})`);
+          } else if (region) {
+            region.style.transform = `translate(${css.left}px, ${css.top}px)`;
+            region.style.width = `${css.width}px`;
+            region.style.height = `${css.height}px`;
+          }
+          chip.style.transform = `translate(${css.chipX}px, ${css.chipY}px) translate(-50%, -50%)`;
+        }
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [countyRects]);
 
   // While loading, glide the stage's item counter through the same EMA+deadband
   // the live HUD uses, so bursty worker progress reads as steady motion.
@@ -577,6 +671,90 @@ export default function EngineCanvas() {
         <pre ref={asciiRef} className={styles.asciiGrid} />
       </div>
 
+      {/* Neighbouring counties, drawn at their true positions and tracked with
+          the camera; the region outline ignores the pointer (pan/zoom pass
+          through) — only the labelled chip is clickable. */}
+      {ready && countyRects.length > 0 && (
+        <div ref={countyLayerRef} className={styles.countyLayer}>
+          {countyRects.map((r) => (
+            <div key={r.key}>
+              {r.outline ? (
+                <svg className={styles.countySvg} aria-hidden="true">
+                  {countyClip && (
+                    <defs>
+                      {/* This map's own footprint, cut out of the neighbour's
+                          shape (mask content shares the <g>'s world frame): a
+                          county never overlays the roads being simulated. */}
+                      <mask
+                        id={`county-cut-${scenario}-${r.key}`}
+                        maskUnits="userSpaceOnUse"
+                        x={r.x0 - 10000}
+                        y={r.y0 - 10000}
+                        width={r.x1 - r.x0 + 20000}
+                        height={r.y1 - r.y0 + 20000}
+                      >
+                        <rect
+                          x={r.x0 - 10000}
+                          y={r.y0 - 10000}
+                          width={r.x1 - r.x0 + 20000}
+                          height={r.y1 - r.y0 + 20000}
+                          fill="#fff"
+                        />
+                        <path d={outlinePath(countyClip)} fill="#000" />
+                      </mask>
+                    </defs>
+                  )}
+                  <g data-county-shape={r.key}>
+                    <path
+                      className={styles.countyShape}
+                      d={outlinePath(r.outline)}
+                      vectorEffect="non-scaling-stroke"
+                      mask={countyClip ? `url(#county-cut-${scenario}-${r.key})` : undefined}
+                    />
+                  </g>
+                </svg>
+              ) : (
+                <div className={styles.countyRegion} data-county-region={r.key} />
+              )}
+              <button
+                type="button"
+                className={styles.countyChip}
+                data-county-chip={r.key}
+                onClick={() => setPendingJump(r)}
+              >
+                {r.name} →
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      {pendingJump && (
+        <div className={styles.countyConfirm} role="dialog" aria-modal="true" onClick={() => setPendingJump(null)}>
+          <div className={styles.countyConfirmPanel} onClick={(e) => e.stopPropagation()}>
+            <div className={styles.countyConfirmTitle}>Drive over to {pendingJump.name}?</div>
+            <div className={styles.countyConfirmBody}>
+              This simulation stays behind while {pendingJump.name} loads fresh.
+            </div>
+            <div className={styles.countyConfirmActions}>
+              <button type="button" className={styles.button} onClick={() => setPendingJump(null)}>
+                Stay here
+              </button>
+              <button
+                type="button"
+                className={`${styles.button} ${styles.countyGo}`}
+                onClick={() => {
+                  const url = new URL(window.location.href);
+                  url.searchParams.set("scenario", pendingJump.key);
+                  window.location.href = url.toString();
+                }}
+              >
+                Let's go
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {!ready && !error && (
         <div className={styles.loading} role="status" aria-live="polite">
           <div className={styles.loadingInner}>
@@ -659,14 +837,11 @@ export default function EngineCanvas() {
                 window.location.href = url.toString();
               }}
             >
-              <option value="millbrae">Millbrae (real map)</option>
-              <option value="sancarlos">San Carlos (real map)</option>
-              <option value="sf">San Francisco (real map)</option>
-              <option value="peninsula">Bay Area Peninsula (real map)</option>
-              <option value="columbus">Columbus, OH (real map)</option>
-              <option value="arterial">Test: arterial junction</option>
-              <option value="corridor">Test: signal corridor</option>
-              <option value="gridlock">Test: gridlock (fast jam)</option>
+              {SCENARIOS.map((s) => (
+                <option key={s.key} value={s.key}>
+                  {s.kind === "Test" ? `Test: ${s.name}` : `${s.name} (real map)`}
+                </option>
+              ))}
             </select>
             <label className={styles.zoomLabel} title="Freeway through-traffic: enters at a highway gateway, bound for the far end of the same highway, another highway exit, or a surface street.">
               <input

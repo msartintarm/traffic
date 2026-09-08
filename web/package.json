@@ -6,10 +6,11 @@
     "wasm:build": "node scripts/build-wasm.mjs single",
     "wasm:build:threads": "node scripts/build-wasm.mjs threads",
     "wasm:build:all": "npm run wasm:build && (npm run wasm:build:threads || echo 'threads build unavailable (needs nightly + build-std); single-threaded only')",
-    "predev": "npm run wasm:build:all",
+    "outlines": "node scripts/build-outlines.mjs",
+    "predev": "npm run outlines && npm run wasm:build:all",
     "dev": "next dev -p 3000",
     "dev:threads": "npm run wasm:build:threads && npm run dev",
-    "prebuild": "npm run wasm:build:all",
+    "prebuild": "npm run outlines && npm run wasm:build:all",
     "build": "next build",
     "start": "next start",
     "test": "node --test src/lib/*.test.ts"
