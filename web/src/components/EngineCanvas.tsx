@@ -123,6 +123,9 @@ export default function EngineCanvas() {
   const loadingCountsRef = useRef<{ done: number; total: number; unit: string } | null>(null);
   const loadingDetailRef = useRef<HTMLSpanElement>(null);
   const loadingSmootherRef = useRef(new StatsSmoother());
+  // When the current stage started — the elapsed heartbeat that keeps a long
+  // uncounted stage (a county-scale build step) from reading as a hang.
+  const loadingStageAtRef = useRef({ stage: "", at: 0 });
   // County-jump overlay: on a county map, the sibling counties' extents in this
   // map's world frame, tracked with the camera and clickable to travel there.
   const [countyRects, setCountyRects] = useState<CountyRect[]>([]);
@@ -314,9 +317,16 @@ export default function EngineCanvas() {
     const tick = () => {
       const c = loadingCountsRef.current;
       const el = loadingDetailRef.current;
-      if (el && c) {
-        const shown = loadingSmootherRef.current.count(`load:${c.unit}`, c.done, 0.15);
-        el.textContent = `${shown.toLocaleString()} of ${c.total.toLocaleString()} ${c.unit}`;
+      if (el) {
+        if (c) {
+          const shown = loadingSmootherRef.current.count(`load:${c.unit}`, c.done, 0.15);
+          el.textContent = `${shown.toLocaleString()} of ${c.total.toLocaleString()} ${c.unit}`;
+        } else {
+          // No counter for this stage: tick its elapsed seconds instead, so
+          // even the longest silent step visibly moves.
+          const secs = (performance.now() - loadingStageAtRef.current.at) / 1000;
+          el.textContent = secs >= 3 ? `${Math.floor(secs)} s` : "";
+        }
       }
       raf = requestAnimationFrame(tick);
     };
@@ -582,7 +592,9 @@ export default function EngineCanvas() {
             setLoadingFraction(fraction);
             setLoadingStage(stage);
             loadingCountsRef.current = counts ?? null;
-            if (!counts && loadingDetailRef.current) loadingDetailRef.current.textContent = "";
+            if (stage !== loadingStageAtRef.current.stage) {
+              loadingStageAtRef.current = { stage, at: performance.now() };
+            }
           },
           onHover: (name, x, y) => {
             const tip = tipRef.current;

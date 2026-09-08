@@ -152,21 +152,25 @@ async function loadEngine(config: InitConfig): Promise<{ mod: EngineModule; thre
 // human label, count unit, and a duration weight apportioning the loading bar's
 // 0.60→0.72 span. Stages a configuration skips (e.g. `fields` under the default
 // local router) are simply jumped over; the bar is clamped monotonic.
+// Weights are measured stage shares of a large-map build (recalibrate from
+// the console `map build:` timing line).
 const BUILD_STAGES: { key: string; label: string; unit?: string; weight: number }[] = [
   { key: "parse", label: "Parsing map…", weight: 3 },
   { key: "simplify", label: "Simplifying geometry…", weight: 2 },
-  { key: "links", label: "Building roads…", unit: "roads", weight: 4 },
-  { key: "movements", label: "Wiring turn movements…", unit: "roads", weight: 3 },
-  { key: "lane-bounds", label: "Aligning lane geometry…", weight: 1 },
-  { key: "interiors", label: "Shaping intersections…", weight: 1 },
-  { key: "junctions", label: "Clustering junctions…", weight: 2 },
-  { key: "conflicts", label: "Crossing conflict points…", weight: 1 },
-  { key: "signals", label: "Timing signals…", weight: 1 },
-  { key: "rail", label: "Laying rail…", weight: 1 },
+  { key: "links", label: "Building roads…", unit: "roads", weight: 8 },
+  { key: "movements", label: "Wiring turn movements…", unit: "roads", weight: 9 },
+  { key: "lane-bounds", label: "Aligning lane geometry…", weight: 4 },
+  { key: "interiors", label: "Shaping intersections…", weight: 6 },
+  { key: "junctions", label: "Clustering junctions…", weight: 9 },
+  { key: "conflicts", label: "Crossing conflict points…", weight: 3 },
+  { key: "signals", label: "Timing signals…", weight: 10 },
+  { key: "green-waves", label: "Coordinating green waves…", weight: 6 },
+  { key: "layers", label: "Layering bridges and tunnels…", weight: 4 },
+  { key: "rail", label: "Laying rail…", weight: 2 },
   { key: "world", label: "Preparing the world…", weight: 2 },
-  { key: "demand", label: "Sampling travel demand…", weight: 2 },
-  { key: "landmarks", label: "Computing route landmarks…", unit: "landmarks", weight: 6 },
-  { key: "fields", label: "Solving routing fields…", weight: 6 },
+  { key: "demand", label: "Sampling travel demand…", weight: 9 },
+  { key: "landmarks", label: "Computing route landmarks…", unit: "landmarks", weight: 7 },
+  { key: "fields", label: "Solving routing fields…", weight: 7 },
   { key: "signal-heads", label: "Placing signal heads…", weight: 1 },
 ];
 

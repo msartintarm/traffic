@@ -1127,11 +1127,13 @@ impl OsmMap {
         cb("signals", 0, 0);
         promote_major_crossings(&net, &mut plans);
         coordinate_junction_signals(&mut net, &plans);
+        cb("green-waves", 0, 0);
         coordinate_green_waves(&mut net);
         // Render-only grade layering: infer overpass/underpass occlusion for
         // crossings OSM left untagged, so a road passing over another is drawn on
         // top of it. Purely visual (see `Network::render_layer`); after all
         // geometry is final.
+        cb("layers", 0, 0);
         net.build_render_layers();
         net
     }
