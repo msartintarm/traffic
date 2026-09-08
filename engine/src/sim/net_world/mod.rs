@@ -136,6 +136,8 @@ pub struct NetWorld {
     crash_groups: GroupMap,
     /// Reused demanded-lane set for signal actuation (see [`junction::LaneSet`]).
     lane_demand: junction::LaneSet,
+    /// Scratch neighbor index for `explain` (capacity reuse only).
+    explain_nb: Neighbors,
     /// Per-node "any outgoing link" bit — the leak-vs-arrived test in
     /// `resolve_boundary` was an O(all links) scan per dead-end car.
     node_has_outgoing: Vec<bool>,
@@ -1216,7 +1218,7 @@ impl NetWorld {
             control_aware_routing: true, lane_eval_stagger: true, arterial_routing: false,
             targeted_routing: true, dest_entries: HashMap::new(), locality_sort: true,
             nb_pool, lc_groups, corridor_groups, crash_groups: GroupMap::default(),
-            lane_demand: junction::LaneSet::default(), node_has_outgoing,
+            lane_demand: junction::LaneSet::default(), node_has_outgoing, explain_nb: Neighbors::default(),
             kinematics_enabled: true, defer_kinematics: false, sharding: None, auto_shard: true, region_isolation: false, follower_lod: false, shard_accel: false, async_routing: false, router_generation: 0, route_async_cycles: 0,
             approach_ctx: IntMap::default(), standing_pose: IntMap::default(), shard_stats: Vec::new(),
             #[cfg(feature = "parallel")]
@@ -1411,16 +1413,23 @@ impl NetWorld {
     /// Install a flow-field router covering `dests`; vehicles spawned via
     /// [`NetWorld::spawn_to`] then route by the field and reroute live.
     pub fn install_router(&mut self, dests: &[LinkId]) {
+        self.install_router_with_progress(dests, &mut |_, _, _| {})
+    }
+
+    /// [`install_router`] with live stage reporting (per landmark in local mode;
+    /// one boundary for a field install — its solve is already frame-spread).
+    pub fn install_router_with_progress(&mut self, dests: &[LinkId], cb: &mut dyn FnMut(&str, u32, u32)) {
         if self.local_routing {
             // Local routing needs no per-destination field — build the ALT
             // landmark index once (O(K·links)) and route every driver from it.
             if self.local_router.is_none() {
-                self.local_router = Some(LocalRouter::build(&self.network));
+                self.local_router = Some(LocalRouter::build_with_progress(&self.network, cb));
             }
             self.router = None;
             self.router_generation = self.router_generation.wrapping_add(1);
             return;
         }
+        cb("fields", 0, 0);
         let costs = self.live_link_costs();
         let trunk = self.arterial_routing.then(|| {
             self.network.links.iter().map(|l| !matches!(l.kind, crate::sim::network::RoadKind::Local)).collect()
@@ -1605,26 +1614,6 @@ impl NetWorld {
     /// How many links are currently running the cheap queue model.
     pub fn congestion_active_links(&self) -> u32 {
         self.congestion.active_count()
-    }
-
-    /// Per-link occupancy ratio (rolling car count ÷ jam capacity), the signal the
-    /// congestion LOD thresholds on.
-    fn link_occupancy(&self) -> Vec<f64> {
-        let n = self.network.links.len();
-        let mut count = vec![0u32; n];
-        for v in &self.fleet.rows {
-            if v.crossing.is_none() {
-                count[self.network.lane(v.lane).link.idx()] += 1;
-            }
-        }
-        (0..n)
-            .map(|i| {
-                let l = self.network.link(LinkId(i as u32));
-                let lane = self.network.lane(l.lane_start);
-                let jam = (lane.length / 7.0 * l.lane_count as f64).max(1.0);
-                (count[i] as f64 / jam).min(1.0)
-            })
-            .collect()
     }
 
     /// A cheap accel context for a queued follower: leader car-following (at the true
@@ -2144,6 +2133,11 @@ impl NetWorld {
     /// Per-link travel time (ms) inflated by current occupancy — the live edge
     /// weights that make routing congestion-reactive. A jammed link costs several
     /// times its free-flow time, so routes computed with these steer around it.
+    /// Occupancy is quantized to the same quarter-jam bands the reroute
+    /// fingerprint triggers on: costs are stable under per-car jitter and only
+    /// move when a link genuinely changes congestion regime — which keeps the
+    /// cycle-to-cycle cost diff to the actual band-crossers, the set the
+    /// incremental field repair patches.
     pub fn live_link_costs(&self) -> Vec<u64> {
         let mut count = vec![0u32; self.network.links.len()];
         for v in &self.fleet.rows {
@@ -2154,7 +2148,7 @@ impl NetWorld {
                 let link = self.network.link(LinkId(i));
                 let lane = self.network.lane(link.lane_start);
                 let jam = (lane.length / 7.0 * link.lane_count as f64).max(1.0);
-                let ratio = (count[i as usize] as f64 / jam).min(3.0);
+                let ratio = ((count[i as usize] as f64 / jam).min(3.0) * 4.0).floor() / 4.0;
                 let base = self.network.link_travel_time_ms(LinkId(i)) as f64;
                 let ctrl = if self.control_aware_routing {
                     match self.network.node(link.to).control {
@@ -2178,7 +2172,7 @@ impl NetWorld {
     /// stop line, yield, curve, …) and which constraint binds its throttle. A
     /// read-only re-derivation using the same `gather_context` the step uses, so
     /// the reported "why" matches the live behaviour. `None` if no such id.
-    pub fn explain(&self, id: u32) -> Option<DriverReport> {
+    pub fn explain(&mut self, id: u32) -> Option<DriverReport> {
         let i = self.fleet.rows.iter().position(|v| v.id == id)?;
         let veh = &self.fleet.rows[i];
         let lane = *self.network.lane(veh.lane);
@@ -2217,8 +2211,12 @@ impl NetWorld {
             return Some(r);
         }
 
-        let nb = self.neighbors();
+        // Reuse a persistent index (capacity survives across calls) — a fresh
+        // `neighbors()` allocated fleet-sized group storage per introspection.
+        let mut nb = std::mem::take(&mut self.explain_nb);
+        self.rebuild_neighbors(&mut nb);
         let ctx = self.gather_context(i, &nb, intended);
+        self.explain_nb = nb;
         let (accel, reason) = ctx.binding_reason();
         r.accel = accel;
         r.state = constraint::DEFAULT_NAMES.get(reason).copied().unwrap_or("driving").to_string();
@@ -3822,9 +3820,26 @@ impl NetWorld {
         self.advance_signals(dt);
         prof.lap(1);
         if self.congestion_cfg.enabled {
-            let occ = self.link_occupancy();
+            // Sparse LOD update: O(cars + latent links), not O(all links) —
+            // occupancy is priced lazily per hot link.
+            let mut counts: IntMap<u32> = IntMap::default();
+            for v in &self.fleet.rows {
+                if v.crossing.is_none() {
+                    *counts.entry(self.network.lane(v.lane).link.0).or_default() += 1;
+                }
+            }
             let cfg = self.congestion_cfg;
-            self.congestion.update_modes(&occ, &cfg);
+            let net = &self.network;
+            self.congestion.update_modes_sparse(
+                counts.keys().copied(),
+                |i| {
+                    let l = net.link(LinkId(i as u32));
+                    let lane = net.lane(l.lane_start);
+                    let jam = (lane.length / 7.0 * l.lane_count as f64).max(1.0);
+                    (counts.get(&(i as u32)).copied().unwrap_or(0) as f64 / jam).min(1.0)
+                },
+                &cfg,
+            );
         }
         self.lane_changes();
         prof.lap(2);
@@ -5433,53 +5448,74 @@ impl NetWorld {
         let mut out = Vec::new();
         // One pose per crosser, not per pair: k poses instead of k² at a busy box.
         let poses: Vec<[f64; 3]> = group.iter().map(|&i| self.vehicle_arc_pose(&taken[i])).collect();
-        for a in 0..group.len() {
-                for b in a + 1..group.len() {
-                    let (i, j) = (group[a], group[b]);
-                    let (vi, vj) = (&taken[i], &taken[j]);
-                    if vi.wreck.is_some() && vj.wreck.is_some() {
-                        continue;
-                    }
-                    let (idi, idj) = (vi.crossing.unwrap().movement, vj.crossing.unwrap().movement);
-                    // Only conflict-graph pairs can collide: the interior Béziers are
-                    // schematic, so non-conflicting paths (opposing lefts, shallow
-                    // near-parallel passes) may legitimately graze in the compressed
-                    // box the way real offset paths don't — that's geometry, not a
-                    // collision. Same-approach fan-outs and same-exit zippers are
-                    // excluded by the same rule (the builder never pairs them).
-                    if !self.network.movements_conflict(idi, idj) {
-                        continue;
-                    }
-                    // Any genuine body contact between conflicting paths is a
-                    // crash — the paths themselves are laterally honest now
-                    // (left turns bow to their own side, so counterpart lefts
-                    // pass offset instead of sharing one corridor).
-                    // Judged in the sim's arc frame, the same frame the conflict
-                    // points and box scheduling live in — two bodies genuinely
-                    // meeting on their paths. The kinematic pose is the *drawn*
-                    // frame; its bounded tracking deviations (corner off-tracking,
-                    // recovery at the few degenerate mouths) would read as
-                    // phantom junction crashes the dynamics never produced.
-                    let (pi, pj) = (poses[a], poses[b]);
-                    let width = |v: &NetVehicle| VehicleClass::from_length(v.driver.vehicle_length).width();
-                    if body_overlap(pi, vi.driver.vehicle_length, width(vi), pj, vj.driver.vehicle_length, width(vj)) {
-                        let closing = (vi.speed.max(vj.speed)) as f32;
-                        if std::env::var_os("CRASH_DEBUG").is_some() {
-                            let mv = |mid: MovementId| {
-                                (self.network.movement_turn(mid), self.movement_state(mid))
-                            };
-                            eprintln!(
-                                "JX tick={} node={} i=(id{} mid{} {:?} v{:.1} arc{:.1}/{:.0} len{:.0}) j=(id{} mid{} {:?} v{:.1} arc{:.1}/{:.0} len{:.0})",
-                                self.tick,
-                                self.network.movement(idi).node.0,
-                                vi.id, idi.0, mv(idi), vi.speed, self.crossing_arc(vi), self.network.interior(idi).len, vi.driver.vehicle_length,
-                                vj.id, idj.0, mv(idj), vj.speed, self.crossing_arc(vj), self.network.interior(idj).len, vj.driver.vehicle_length,
-                            );
-                        }
-                        out.push((i, closing));
-                        out.push((j, closing));
-                    }
+        // Broad phase: two bodies can only touch within the sum of their
+        // half-diagonals, so an x-sorted sweep bounded by the largest diagonal
+        // replaces the all-pairs scan (quadratic in simultaneous crossers at a
+        // big merged cluster).
+        let diag = |i: usize| {
+            let v = &taken[group[i]];
+            let w = VehicleClass::from_length(v.driver.vehicle_length).width();
+            v.driver.vehicle_length.hypot(w)
+        };
+        let reach = (0..group.len()).map(diag).fold(0.0f64, f64::max);
+        let mut order: Vec<u32> = (0..group.len() as u32).collect();
+        order.sort_unstable_by(|&x, &y| poses[x as usize][0].total_cmp(&poses[y as usize][0]));
+        let mut cand: Vec<(usize, usize)> = Vec::new();
+        for s in 0..order.len() {
+            let (a, pa) = (order[s] as usize, poses[order[s] as usize]);
+            for &b in &order[s + 1..] {
+                let (b, pb) = (b as usize, poses[b as usize]);
+                if pb[0] - pa[0] > reach {
+                    break;
                 }
+                if (pa[0] - pb[0]).hypot(pa[1] - pb[1]) <= 0.5 * (diag(a) + diag(b)) {
+                    cand.push((a, b));
+                }
+            }
+        }
+        for (a, b) in cand {
+            let (i, j) = (group[a], group[b]);
+            let (vi, vj) = (&taken[i], &taken[j]);
+            if vi.wreck.is_some() && vj.wreck.is_some() {
+                continue;
+            }
+            let (idi, idj) = (vi.crossing.unwrap().movement, vj.crossing.unwrap().movement);
+            // Only conflict-graph pairs can collide: the interior Béziers are
+            // schematic, so non-conflicting paths (opposing lefts, shallow
+            // near-parallel passes) may legitimately graze in the compressed
+            // box the way real offset paths don't — that's geometry, not a
+            // collision. Same-approach fan-outs and same-exit zippers are
+            // excluded by the same rule (the builder never pairs them).
+            if !self.network.movements_conflict(idi, idj) {
+                continue;
+            }
+            // Any genuine body contact between conflicting paths is a
+            // crash — the paths themselves are laterally honest now
+            // (left turns bow to their own side, so counterpart lefts
+            // pass offset instead of sharing one corridor).
+            // Judged in the sim's arc frame, the same frame the conflict
+            // points and box scheduling live in — two bodies genuinely
+            // meeting on their paths. The kinematic pose is the *drawn*
+            // frame; its bounded tracking deviations (corner off-tracking,
+            // recovery at the few degenerate mouths) would read as
+            // phantom junction crashes the dynamics never produced.
+            let (pi, pj) = (poses[a], poses[b]);
+            let width = |v: &NetVehicle| VehicleClass::from_length(v.driver.vehicle_length).width();
+            if body_overlap(pi, vi.driver.vehicle_length, width(vi), pj, vj.driver.vehicle_length, width(vj)) {
+                let closing = (vi.speed.max(vj.speed)) as f32;
+                if std::env::var_os("CRASH_DEBUG").is_some() {
+                    let mv = |mid: MovementId| (self.network.movement_turn(mid), self.movement_state(mid));
+                    eprintln!(
+                        "JX tick={} node={} i=(id{} mid{} {:?} v{:.1} arc{:.1}/{:.0} len{:.0}) j=(id{} mid{} {:?} v{:.1} arc{:.1}/{:.0} len{:.0})",
+                        self.tick,
+                        self.network.movement(idi).node.0,
+                        vi.id, idi.0, mv(idi), vi.speed, self.crossing_arc(vi), self.network.interior(idi).len, vi.driver.vehicle_length,
+                        vj.id, idj.0, mv(idj), vj.speed, self.crossing_arc(vj), self.network.interior(idj).len, vj.driver.vehicle_length,
+                    );
+                }
+                out.push((i, closing));
+                out.push((j, closing));
+            }
         }
         out
     }

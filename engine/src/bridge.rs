@@ -8,6 +8,31 @@ use crate::sim::hash::IntMap;
 /// Pose map keyed by (sparse) vehicle id, hashed cheaply for the per-frame rebuild.
 type PoseMap = IntMap<[f32; 4]>;
 
+/// Hover hit-test grid pitch: junction footprints are tens of metres, so each
+/// spans a handful of cells and a lookup tests a few candidates.
+const JUNCTION_CELL_M: f64 = 128.0;
+
+/// Every junction index (ascending) bucketed into each grid cell its footprint's
+/// bounding box overlaps.
+fn junction_grid(net: &crate::sim::network::Network) -> std::collections::HashMap<(i64, i64), Vec<u32>> {
+    let mut grid: std::collections::HashMap<(i64, i64), Vec<u32>> = std::collections::HashMap::new();
+    for (i, j) in net.junctions.iter().enumerate() {
+        let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+        for p in &j.footprint {
+            for k in 0..2 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        for cx in (lo[0] / JUNCTION_CELL_M).floor() as i64..=(hi[0] / JUNCTION_CELL_M).floor() as i64 {
+            for cy in (lo[1] / JUNCTION_CELL_M).floor() as i64..=(hi[1] / JUNCTION_CELL_M).floor() as i64 {
+                grid.entry((cx, cy)).or_default().push(i as u32);
+            }
+        }
+    }
+    grid
+}
+
 /// One frame's built instance buffers (see `Simulation::frame_cache`).
 #[derive(Default)]
 struct FrameCache {
@@ -157,6 +182,8 @@ pub struct Simulation {
     frame_cache: std::cell::RefCell<FrameCache>,
     /// Last known fleet index of the followed vehicle (see `followed_vehicle`).
     veh_idx_hint: std::cell::Cell<u32>,
+    /// Hover hit-test cells (see [`junction_grid`]).
+    junction_grid: std::collections::HashMap<(i64, i64), Vec<u32>>,
     /// 100 ms caches for the per-frame selection stat panels: `(index, at_ms, stats)`.
     junction_stats_cache: std::cell::RefCell<(u32, f64, Vec<f32>)>,
     link_stats_cache: std::cell::RefCell<(u32, f64, Vec<f32>)>,
@@ -255,28 +282,54 @@ impl Simulation {
 
     /// Load a network scraped by `tools/osm-scraper` (its JSON schema) and drive
     /// origin–destination demand across it. Requires the `import` feature.
+    /// `progress`, when given, is called with `(stage, done, total)` at the
+    /// build's internal boundaries — the whole call blocks its thread, so this
+    /// is how a worker keeps the loading screen honest through a county-sized
+    /// build (`total == 0` marks an indeterminate boundary).
     #[cfg(feature = "import")]
-    pub fn from_map_json(json: &str, seed: u32, split_junctions: bool) -> Result<Simulation, JsValue> {
-        let map = map::OsmMap::from_json_opts(json, split_junctions).map_err(|e| JsValue::from_str(&e))?;
-        let mut net = map.build();
+    pub fn from_map_json(
+        json: &str,
+        seed: u32,
+        split_junctions: bool,
+        progress: Option<js_sys::Function>,
+    ) -> Result<Simulation, JsValue> {
+        let mut report = |stage: &str, done: u32, total: u32| {
+            if let Some(f) = &progress {
+                let _ = f.call3(
+                    &JsValue::NULL,
+                    &JsValue::from_str(stage),
+                    &JsValue::from_f64(done as f64),
+                    &JsValue::from_f64(total as f64),
+                );
+            }
+        };
+        let map = map::OsmMap::from_json_opts_with_progress(json, split_junctions, &mut report)
+            .map_err(|e| JsValue::from_str(&e))?;
+        let mut net = map.build_with_progress(&mut report);
+        report("rail", 0, 0);
         net.rail = crate::sim::rail::RailNetwork::from_map_json(json);
         net.attach_bus_stops(&map::bus_stops_from_json(json));
         let lines: Vec<demand::TransitLine> = map::bus_routes_from_json(json)
             .into_iter()
             .filter_map(|(name, pts)| net.resolve_route_chain(&pts).map(|route| demand::TransitLine::new(name, route)))
             .collect();
-        let mut sim = Self::assemble(net, seed);
+        let mut sim = Self::assemble_with_progress(net, seed, &mut report);
         sim.transit_lines = lines;
         sim.demand.set_transit_lines(sim.transit_lines.clone());
         Ok(sim)
     }
 
     fn assemble(network: Network, seed: u32) -> Simulation {
+        Self::assemble_with_progress(network, seed, &mut |_, _, _| {})
+    }
+
+    fn assemble_with_progress(network: Network, seed: u32, report: &mut dyn FnMut(&str, u32, u32)) -> Simulation {
         // Browser default: the active-set scheduler on (a clean serial/GPU win, and it
         // auto-stands-down under actively-parallel threads). The pure engine default stays
         // off so native tests and A/B baselines are unaffected. Toggle live via the UI.
         let cfg = SimConfig { seed: seed as u64, sleep_scheduler: true, ..SimConfig::default_config() };
         let camera = Camera::fit_bounds(network.bounds(), [900.0, 600.0], 24.0);
+        report("world", 0, 0);
         let mut world = NetWorld::new(network, cfg);
         // Browser default: per-driver local routing (map-size-independent, and
         // measured faster than the flow-field). Set BEFORE the install so only the
@@ -285,11 +338,14 @@ impl Simulation {
         world.set_local_routing(true);
         let demand_sources = DemandSources::new(true, true); // freeway + surface by default
         let (demand_rate, entry_speed_cap) = (1.0, f64::INFINITY);
+        report("demand", 0, 0);
         let demand = build_demand(&world, cfg.seed, demand_sources, demand_rate, entry_speed_cap, None);
-        world.install_router(&demand.destinations());
+        world.install_router_with_progress(&demand.destinations(), report);
         let mut clock = SimClock::new(&cfg);
         clock.play();
+        report("signal-heads", 0, 0);
         let signal_heads = geometry::signal_head_placements(&world.network);
+        let junction_grid = junction_grid(&world.network);
         Simulation {
             world, clock, seed: cfg.seed, demand, demand_sources, commute: None, demand_rate, entry_speed_cap,
             day_compression: demand::DEFAULT_DAY_COMPRESSION, wreck_clear_day_minutes: None,
@@ -298,6 +354,7 @@ impl Simulation {
             prev: PoseMap::default(), prev_lane: IntMap::default(), prev_crossing: IntMap::default(), selected: None, render_bake: None, density_index_cache: Vec::new(), signal_heads,
             frame_serial: 0, frame_cache: std::cell::RefCell::new(FrameCache::default()), density_counts: Vec::new(),
             veh_idx_hint: std::cell::Cell::new(u32::MAX),
+            junction_grid,
             junction_stats_cache: std::cell::RefCell::new((u32::MAX, f64::NEG_INFINITY, Vec::new())),
             link_stats_cache: std::cell::RefCell::new((u32::MAX, f64::NEG_INFINITY, Vec::new())),
             gpu: None, gpu_pending: None, gpu_relax: None, gpu_generation: 0, gpu_cost: Vec::new(), gpu_last: 0.0, gpu_fingerprint: 0,
@@ -1244,12 +1301,19 @@ impl Simulation {
             }
             true
         };
-        self.world
-            .network
-            .junctions
-            .iter()
-            .position(|j| inside(&j.footprint))
-            .map_or(-1, |i| i as i32)
+        // Cell lookup instead of a linear scan over every junction per hover.
+        // Cells hold ascending indices, so the first hit is the same junction
+        // the full scan's `position` returned.
+        let cell = (
+            (wx / JUNCTION_CELL_M).floor() as i64,
+            (wy / JUNCTION_CELL_M).floor() as i64,
+        );
+        self.junction_grid
+            .get(&cell)
+            .into_iter()
+            .flatten()
+            .find(|&&ji| inside(&self.world.network.junctions[ji as usize].footprint))
+            .map_or(-1, |&ji| ji as i32)
     }
 
     /// Select a junction for the stats panel and footprint highlight (negative clears).

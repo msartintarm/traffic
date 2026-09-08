@@ -205,8 +205,12 @@ export type FromWorker =
   | { type: "ready"; backend: string; mapLabel: string; gpuRouting: boolean; fitMpp: number; congestionEnabled: boolean }
   | { type: "frame"; snapshot: StatsSnapshot; selected: SelectedInfo | null; fitMpp: number; ascii?: string | null }
   | { type: "hover"; name: string | null; x: number; y: number }
-  | { type: "progress"; fraction: number; stage: string }
+  | { type: "progress"; fraction: number; stage: string; counts?: BuildCounts }
   | { type: "fatal"; message: string };
+
+// Live item counts for a boot stage ("42,850 of 123,726 roads"), displayed with
+// the same EMA-glide the HUD's counters use.
+export type BuildCounts = { done: number; total: number; unit: string };
 
 // The units carried alongside the overlay for the selected-link panel and slider label.
 export type { Units };

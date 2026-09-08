@@ -42,7 +42,7 @@ function workerSession(canvas: HTMLCanvasElement, config: InitConfig, cb: Sessio
       case "ready": cb.onReady(m); break;
       case "frame": cb.onFrame(m); break;
       case "hover": cb.onHover(m.name, m.x, m.y); break;
-      case "progress": cb.onProgress(m.fraction, m.stage); break;
+      case "progress": cb.onProgress(m.fraction, m.stage, m.counts); break;
       case "fatal": cb.onFatal(m.message); break;
     }
   };

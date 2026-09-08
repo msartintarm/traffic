@@ -25,7 +25,7 @@ ctx.onmessage = async (e: MessageEvent) => {
         onReady: (r) => post({ type: "ready", ...r }),
         onFrame: (f) => post({ type: "frame", ...f }),
         onHover: (name, x, y) => post({ type: "hover", name, x, y }),
-        onProgress: (fraction, stage) => post({ type: "progress", fraction, stage }),
+        onProgress: (fraction, stage, counts) => post({ type: "progress", fraction, stage, counts }),
         onFatal: (message) => post({ type: "fatal", message }),
       });
       for (const c of pending.splice(0)) session.applyControl(c);

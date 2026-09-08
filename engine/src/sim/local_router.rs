@@ -98,6 +98,13 @@ const SEARCH_CAP: usize = 64;
 
 impl LocalRouter {
     pub fn build(net: &Network) -> Self {
+        Self::build_with_progress(net, &mut |_, _, _| {})
+    }
+
+    /// [`build`] reporting each landmark's whole-graph Dijkstra as it lands —
+    /// the longest stretch of a big-map load, and the one that reads as "stuck"
+    /// without a counter.
+    pub fn build_with_progress(net: &Network, cb: &mut dyn FnMut(&str, u32, u32)) -> Self {
         let n = net.links.len();
         let adj = super::flowfield::adjacency(net);
         let cost: Vec<u32> = (0..n as u32).map(|i| net.link_travel_time_ms(LinkId(i)) as u32).collect();
@@ -111,9 +118,14 @@ impl LocalRouter {
         let pred = super::flowfield::reverse(&adj);
         let landmarks = pick_landmarks(&pos, LANDMARKS);
         // dist(link → landmark) for each landmark = reverse-Dijkstra toward it.
+        let cost64 = to_u64(&cost);
         let dist: Vec<Vec<u32>> = landmarks
             .iter()
-            .map(|&lm| super::flowfield::distances_to_with(&pred, LinkId(lm), &to_u64(&cost)).iter().map(clamp_u32).collect())
+            .enumerate()
+            .map(|(k, &lm)| {
+                cb("landmarks", k as u32, landmarks.len() as u32);
+                super::flowfield::distances_to_with(&pred, LinkId(lm), &cost64).iter().map(clamp_u32).collect()
+            })
             .collect();
         let jam: Vec<f64> = (0..n as u32)
             .map(|i| {

@@ -503,6 +503,16 @@
   letter-spacing: 0.04em;
 }
 
+/* Live item counter under the stage ("42,850 of 123,726 roads"), tabular so
+   the gliding digits don't jitter the layout. */
+.loadingDetail {
+  min-height: 1em;
+  font-size: 0.66rem;
+  color: #64748b;
+  letter-spacing: 0.04em;
+  font-variant-numeric: tabular-nums;
+}
+
 @keyframes loadingFadeIn {
   from {
     opacity: 0;

@@ -39,11 +39,21 @@ pub struct CongestionLod {
     /// Consecutive ticks the link has held past the threshold that would flip it.
     dwell: Vec<u32>,
     queue_count: u32,
+    /// Links that can change state this tick — occupied, in queue mode, or
+    /// mid-dwell — so the sparse sweep is O(hot) instead of O(all links).
+    hot: Vec<u32>,
+    in_hot: Vec<bool>,
 }
 
 impl CongestionLod {
     pub fn new(link_count: usize) -> Self {
-        Self { mode: vec![Mode::Full; link_count], dwell: vec![0; link_count], queue_count: 0 }
+        Self {
+            mode: vec![Mode::Full; link_count],
+            dwell: vec![0; link_count],
+            queue_count: 0,
+            hot: Vec::new(),
+            in_hot: vec![false; link_count],
+        }
     }
 
     pub fn is_queue(&self, link: usize) -> bool {
@@ -70,23 +80,65 @@ impl CongestionLod {
     /// flips, and the engage/release gap keeps it from oscillating.
     pub fn update_modes(&mut self, occ: &[f64], cfg: &CongestionConfig) {
         for i in 0..self.mode.len() {
-            let (past, target) = match self.mode[i] {
-                Mode::Full => (occ[i] >= cfg.engage_occ, Mode::Queue),
-                Mode::Queue => (occ[i] <= cfg.release_occ, Mode::Full),
-            };
-            if past {
-                self.dwell[i] += 1;
-                if self.dwell[i] >= cfg.dwell_ticks {
-                    self.mode[i] = target;
-                    self.dwell[i] = 0;
-                    match target {
-                        Mode::Queue => self.queue_count += 1,
-                        Mode::Full => self.queue_count -= 1,
-                    }
-                }
-            } else {
-                self.dwell[i] = 0;
+            self.step_link(i, occ[i], cfg);
+        }
+        // A dense sweep leaves nothing latent, so the sparse hot set restarts empty.
+        for &l in &self.hot {
+            self.in_hot[l as usize] = false;
+        }
+        self.hot.clear();
+    }
+
+    /// [`update_modes`], but sweeping only the links whose state can move this
+    /// tick: the currently `occupied` ones plus every link still in queue mode
+    /// or mid-dwell from earlier ticks. Identical outcomes to the dense sweep —
+    /// an unoccupied full-detail link with zero dwell is a strict no-op there.
+    pub fn update_modes_sparse(
+        &mut self,
+        occupied: impl Iterator<Item = u32>,
+        occ_of: impl Fn(usize) -> f64,
+        cfg: &CongestionConfig,
+    ) {
+        for l in occupied {
+            if !self.in_hot[l as usize] {
+                self.in_hot[l as usize] = true;
+                self.hot.push(l);
             }
+        }
+        let mut w = 0;
+        for r in 0..self.hot.len() {
+            let l = self.hot[r] as usize;
+            self.step_link(l, occ_of(l), cfg);
+            // Retain while anything latent remains (a queued link must keep
+            // dwelling toward release even after its cars leave; a mid-dwell
+            // link must be swept once more so an absence resets its dwell).
+            if self.mode[l] == Mode::Queue || self.dwell[l] > 0 {
+                self.hot[w] = l as u32;
+                w += 1;
+            } else {
+                self.in_hot[l] = false;
+            }
+        }
+        self.hot.truncate(w);
+    }
+
+    fn step_link(&mut self, i: usize, occ: f64, cfg: &CongestionConfig) {
+        let (past, target) = match self.mode[i] {
+            Mode::Full => (occ >= cfg.engage_occ, Mode::Queue),
+            Mode::Queue => (occ <= cfg.release_occ, Mode::Full),
+        };
+        if past {
+            self.dwell[i] += 1;
+            if self.dwell[i] >= cfg.dwell_ticks {
+                self.mode[i] = target;
+                self.dwell[i] = 0;
+                match target {
+                    Mode::Queue => self.queue_count += 1,
+                    Mode::Full => self.queue_count -= 1,
+                }
+            }
+        } else {
+            self.dwell[i] = 0;
         }
     }
 }

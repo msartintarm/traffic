@@ -23,13 +23,18 @@ pub struct FieldRouter {
     pred: Vec<Vec<u32>>,
     dests: Vec<LinkId>,
     slot: HashMap<u32, usize>,
-    /// `next_hop[slot][from_link]` toward `dests[slot]` (`None` = unreachable).
-    next_hop: Vec<Vec<Option<LinkId>>>,
-    /// `dist[slot][from_link]` = travel cost from `from_link` to `dests[slot]`,
-    /// kept alongside the next-hop field so a car that can't reach its routed lane
-    /// can fall back onto the *forward-most* movement it can take (nearest to the
-    /// destination) instead of an arbitrary one. `u64::MAX` = unreachable.
-    dist: Vec<Vec<u64>>,
+    /// `next_hop[slot * links + from_link]` toward `dests[slot]` (`u32::MAX` =
+    /// unreachable). One contiguous stripe per slot: half the bytes of the old
+    /// `Vec<Vec<Option<LinkId>>>` and no per-slot pointer chase.
+    next_hop: Vec<u32>,
+    /// `dist[slot * links + from_link]` = travel cost from `from_link` to
+    /// `dests[slot]`, kept alongside the next-hop field so a car that can't
+    /// reach its routed lane can fall back onto the *forward-most* movement it
+    /// can take (nearest to the destination). `u64::MAX` = unreachable.
+    dist: Vec<u64>,
+    /// Slots that have been published at least once; an unfilled slot's rows are
+    /// all sentinels (the old empty-Vec state).
+    filled: Vec<bool>,
     /// Next slot a recompute cycle starts from, so successive cycles round-robin the fields.
     cursor: usize,
     /// An in-flight budgeted recompute: refresh every field once against a cost snapshot, one
@@ -49,6 +54,15 @@ pub struct FieldRouter {
     /// Cycles since each destination field was last solved — dirty-gated slots
     /// age until [`AGE_FORCE`] forces a full refresh, bounding staleness.
     age: Vec<u32>,
+    /// The cost snapshot every `consistent` slot's field is an exact whole-graph
+    /// fixpoint of — the base the incremental repair diffs against. Empty until
+    /// the first full alignment; unused in trunk mode (masked fields are never
+    /// whole-graph fixpoints).
+    repair_base: Vec<u64>,
+    /// Slots whose live field is a fixpoint of `repair_base`, and so eligible
+    /// for [`flowfield::repair_field`]. A merge-publish or an externally-fed
+    /// distance batch clears the flag; a full aligned publish or a repair sets it.
+    consistent: Vec<bool>,
     /// `(solved, skipped)` of the last targeted cycle, for probes and tests.
     last_cycle: (usize, usize),
 }
@@ -88,6 +102,9 @@ struct Recompute {
     /// The batch of in-flight fields `(slot, targeted?, resumable Dijkstra, subgraph mask)`,
     /// each advanced per tick — concurrently across cores when `width > 1`.
     batch: Vec<(usize, bool, flowfield::PartialField, Option<Vec<bool>>)>,
+    /// Whether this cycle's cost snapshot equals `repair_base`, so a full
+    /// publish leaves its slot repair-eligible.
+    aligned: bool,
 }
 
 impl FieldRouter {
@@ -110,12 +127,16 @@ impl FieldRouter {
                 unique.len() - 1
             });
         }
-        let next_hop = vec![Vec::new(); unique.len()];
-        let dist = vec![Vec::new(); unique.len()];
+        let links = adj.len();
+        let next_hop = vec![u32::MAX; unique.len() * links];
+        let dist = vec![u64::MAX; unique.len() * links];
+        let filled = vec![false; unique.len()];
+        let consistent = vec![false; unique.len()];
         let mut router = Self {
-            adj, pred, dests: unique, slot, next_hop, dist, cursor: 0, rc: None,
+            adj, pred, dests: unique, slot, next_hop, dist, filled, cursor: 0, rc: None,
             trunk, ascent_next: Vec::new(), ascent_dist: Vec::new(),
             age: Vec::new(), last_cycle: (0, 0),
+            repair_base: Vec::new(), consistent,
         };
         router.age = vec![0; router.dests.len()];
         router.recompute(cost);
@@ -159,11 +180,14 @@ impl FieldRouter {
     /// distances straight to the destination. Outside it the previous field is
     /// kept whole, an internally consistent older tree. The two can meet only
     /// stale→fresh, never alternate, so the merged field cannot cycle.
-    fn publish_merged(&mut self, slot: usize, dist: Vec<u64>, settled: Vec<bool>, cost: &[u64]) {
-        if self.next_hop[slot].len() != dist.len() {
-            return self.publish(slot, dist, cost); // no previous field to merge over
+    fn publish_merged(&mut self, slot: usize, dist: Vec<u64>, settled: Vec<bool>, cost: &[u64], aligned: bool) {
+        if !self.filled[slot] {
+            return self.publish(slot, dist, cost, aligned); // no previous field to merge over
         }
-        let (hops, live) = (&mut self.next_hop[slot], &mut self.dist[slot]);
+        // A merged field is a fresh/stale patchwork, not a whole-graph fixpoint.
+        self.consistent[slot] = false;
+        let n = self.adj.len();
+        let (hops, live) = (&mut self.next_hop[slot * n..(slot + 1) * n], &mut self.dist[slot * n..(slot + 1) * n]);
         for a in 0..dist.len() {
             if !settled[a] {
                 continue;
@@ -174,18 +198,21 @@ impl FieldRouter {
                 .copied()
                 .filter(|&b| settled[b as usize] && dist[b as usize] != u64::MAX)
                 .min_by_key(|&b| cost[b as usize].saturating_add(dist[b as usize]))
-                .map(LinkId);
+                .unwrap_or(u32::MAX);
         }
     }
 
-    /// Publish a finished field into the live buffers.
-    fn publish(&mut self, slot: usize, dist: Vec<u64>, cost: &[u64]) {
-        let next = flowfield::next_hops(&self.adj, &dist, cost);
+    /// Publish a finished field into the live buffers. `aligned` = the solve's
+    /// cost snapshot equals `repair_base`, so the slot becomes repair-eligible.
+    fn publish(&mut self, slot: usize, dist: Vec<u64>, cost: &[u64], aligned: bool) {
         if slot < self.dests.len() {
-            self.next_hop[slot] = next;
-            self.dist[slot] = dist;
+            let n = self.adj.len();
+            flowfield::next_hops_into(&self.adj, &dist, cost, &mut self.next_hop[slot * n..(slot + 1) * n]);
+            self.dist[slot * n..(slot + 1) * n].copy_from_slice(&dist);
+            self.filled[slot] = true;
+            self.consistent[slot] = aligned && self.trunk.is_none();
         } else {
-            self.ascent_next = next;
+            self.ascent_next = flowfield::next_hops(&self.adj, &dist, cost);
             self.ascent_dist = dist;
         }
     }
@@ -212,12 +239,30 @@ impl FieldRouter {
         let base = self.cursor;
         self.cursor = (self.cursor + 1) % total; // rotate the start so freshness spreads over cycles
         let plan: Vec<(usize, Option<Vec<u32>>)> = (0..total).map(|i| ((base + i) % total, None)).collect();
+        self.align_base(&cost);
         self.begin_plan(cost, width, plan);
+    }
+
+    /// Move `repair_base` to this cycle's snapshot: slots that stay fixpoints of
+    /// the old base lose repair eligibility until their next aligned full solve
+    /// (or repair). Callers that already realigned every consistent slot keep
+    /// the flags themselves.
+    fn align_base(&mut self, cost: &[u64]) {
+        if self.trunk.is_some() {
+            return;
+        }
+        self.consistent.fill(false);
+        self.repair_base = cost.to_vec();
     }
 
     /// [`begin_recompute`] restricted to what will actually be read: `targets`
     /// maps a destination link to the links that will query its field this
-    /// cycle (cars bound for it + its spawn gateways). Per destination:
+    /// cycle (cars bound for it + its spawn gateways).
+    ///
+    /// When few costs moved since the repair base (≤2% of links), every
+    /// repair-eligible field is instead patched in place to the exact new
+    /// fixpoint ([`flowfield::repair_field`]) — fresher than the dirty-sampled
+    /// machinery below at a fraction of the work. Otherwise, per destination:
     /// - **clean & young** (its current paths still price within tolerance of
     ///   the field's own distance claims): skipped entirely;
     /// - **dirty**: a targeted solve, early-terminated once every target is
@@ -231,26 +276,59 @@ impl FieldRouter {
         if self.dests.is_empty() {
             return;
         }
+        // Repair setup: with a small cost diff since the base, a slot the lazy
+        // machinery below decides to SOLVE can instead be patched in place to
+        // the exact new fixpoint (work ∝ affected region, capped — an
+        // over-budget repair rolls back and takes the budgeted solve). The
+        // clean-skip laziness is untouched: repair replaces solves, not skips.
+        let n = self.adj.len();
+        let changed: Option<Vec<u32>> = (self.trunk.is_none() && self.repair_base.len() == n)
+            .then(|| (0..n as u32).filter(|&l| cost[l as usize] != self.repair_base[l as usize]).collect());
+        let repair_diff = changed.as_ref().filter(|c| c.len() * 50 <= n);
         let mut plan: Vec<(usize, Option<Vec<u32>>)> = Vec::new();
         let (mut solved, mut skipped) = (0usize, 0usize);
+        let mut repaired = vec![false; self.dests.len()];
         for s in 0..self.dests.len() {
             let t = targets.get(&self.dests[s].0).map(Vec::as_slice).unwrap_or(&[]);
-            if self.age[s] >= AGE_FORCE {
+            let force = self.age[s] >= AGE_FORCE && !t.is_empty();
+            if !force && (t.is_empty() || !self.dirty(s, t, &cost)) {
+                // A dest with no querying links skips even past AGE_FORCE — nothing
+                // reads its field, and the accumulated age forces a full refresh
+                // the moment a car for it appears.
+                self.age[s] = self.age[s].saturating_add(1);
+                skipped += 1;
+                continue;
+            }
+            if let Some(diff) = repair_diff {
+                if self.consistent[s] && self.filled[s] && self.repair_slot(s, &cost, diff) {
+                    repaired[s] = true;
+                    self.age[s] = 0;
+                    solved += 1;
+                    continue;
+                }
+            }
+            if force {
                 // Full refresh. Ages count cycles since the last *full* solve —
                 // a targeted solve leaves the unqueried region stale, so it must
                 // not reset the clock (a busy field would otherwise never
                 // refresh its far side at all).
                 plan.push((s, None));
                 self.age[s] = 0;
-                solved += 1;
-            } else if t.is_empty() || !self.dirty(s, t, &cost) {
-                self.age[s] += 1;
-                skipped += 1;
             } else {
                 plan.push((s, Some(t.to_vec())));
                 self.age[s] += 1;
-                solved += 1;
             }
+            solved += 1;
+        }
+        // Advance the repair base to this snapshot. Repaired slots are exact
+        // fixpoints of it; anything else only stays eligible if nothing moved.
+        if let Some(ch) = &changed {
+            if !ch.is_empty() {
+                for s in 0..self.dests.len() {
+                    self.consistent[s] &= repaired[s];
+                }
+            }
+            self.repair_base = cost.to_vec();
         }
         self.last_cycle = (solved, skipped);
         if plan.is_empty() {
@@ -273,10 +351,11 @@ impl FieldRouter {
     /// materially changed — solve; otherwise the field is still telling the
     /// truth and can skip the cycle.
     fn dirty(&self, slot: usize, targets: &[u32], cost: &[u64]) -> bool {
-        let (hops, dist) = (&self.next_hop[slot], &self.dist[slot]);
-        if hops.is_empty() {
+        if !self.filled[slot] {
             return true;
         }
+        let n = self.adj.len();
+        let (hops, dist) = (&self.next_hop[slot * n..(slot + 1) * n], &self.dist[slot * n..(slot + 1) * n]);
         let dest = self.dests[slot].0;
         for &t in targets.iter().take(DIRTY_SAMPLES) {
             let claimed = dist[t as usize];
@@ -288,9 +367,12 @@ impl FieldRouter {
                 if cur == dest {
                     break true;
                 }
-                let Some(next) = hops[cur as usize] else { break false };
-                acc = acc.saturating_add(cost[next.idx()]);
-                cur = next.0;
+                let next = hops[cur as usize];
+                if next == u32::MAX {
+                    break false;
+                }
+                acc = acc.saturating_add(cost[next as usize]);
+                cur = next;
                 steps += 1;
                 if steps > 600 {
                     break false;
@@ -303,13 +385,49 @@ impl FieldRouter {
         false
     }
 
+    /// Patch one slot's field to the exact fixpoint of `cost` (whose diff from
+    /// the repair base is `changed`), refreshing the hops whose inputs moved.
+    /// `false` = the affected region blew the work budget and the field was
+    /// rolled back untouched — the caller schedules an ordinary solve.
+    fn repair_slot(&mut self, s: usize, cost: &[u64], changed: &[u32]) -> bool {
+        let n = self.adj.len();
+        let drow = &mut self.dist[s * n..(s + 1) * n];
+        let Some(moved) =
+            flowfield::repair_field(&self.adj, &self.pred, self.dests[s], cost, changed, drow, n / 4)
+        else {
+            return false;
+        };
+        // Re-choose hops wherever an input moved: predecessors of any link with
+        // a changed distance or changed cost.
+        let mut touched: Vec<u32> =
+            moved.iter().chain(changed).flat_map(|&l| self.pred[l as usize].iter().copied()).collect();
+        touched.sort_unstable();
+        touched.dedup();
+        let drow = &self.dist[s * n..(s + 1) * n];
+        for &p in &touched {
+            self.next_hop[s * n + p as usize] = self.adj[p as usize]
+                .iter()
+                .copied()
+                .filter(|&b| drow[b as usize] != u64::MAX)
+                .min_by_key(|&b| cost[b as usize].saturating_add(drow[b as usize]))
+                .unwrap_or(u32::MAX);
+        }
+        true
+    }
+
     fn begin_plan(&mut self, cost: Vec<u64>, width: usize, plan: Vec<(usize, Option<Vec<u32>>)>) {
         let total = plan.len();
         let width = width.clamp(1, total);
-        let mut rc = Recompute { cost, width, plan, started: 0, published: 0, total, batch: Vec::with_capacity(width) };
+        // Aligned when this snapshot IS the repair base (every caller that sets
+        // the base does so just before planning), so full publishes leave their
+        // slots repair-eligible.
+        let aligned = self.trunk.is_none() && self.repair_base == cost;
+        let mut rc =
+            Recompute { cost, width, plan, started: 0, published: 0, total, batch: Vec::with_capacity(width), aligned };
         self.fill_batch(&mut rc);
         self.rc = Some(rc);
     }
+
 
     /// `(solved, skipped)` destination counts of the most recent targeted cycle.
     pub fn last_cycle_stats(&self) -> (usize, usize) {
@@ -362,9 +480,9 @@ impl FieldRouter {
                 let (slot, targeted, mut pf, _) = rc.batch.swap_remove(i);
                 let (dist, settled) = pf.take_parts();
                 if targeted {
-                    self.publish_merged(slot, dist, settled, &rc.cost);
+                    self.publish_merged(slot, dist, settled, &rc.cost, rc.aligned);
                 } else {
-                    self.publish(slot, dist, &rc.cost);
+                    self.publish(slot, dist, &rc.cost, rc.aligned);
                 }
                 rc.published += 1;
             }
@@ -411,8 +529,11 @@ impl FieldRouter {
         };
         #[cfg(not(feature = "parallel"))]
         let dists: Vec<_> = (0..total).map(field).collect();
+        if self.trunk.is_none() {
+            self.repair_base = cost.to_vec();
+        }
         for (s, dist) in dists.into_iter().enumerate() {
-            self.publish(s, dist, cost);
+            self.publish(s, dist, cost, true);
         }
     }
 
@@ -437,26 +558,35 @@ impl FieldRouter {
         // destinations changed (the router was reinstalled) after it was dispatched.
         // Applying it would index past the fields or bind distances to the wrong
         // destinations, so drop it wholesale; the next dispatch matches the new set.
-        if dist_per_slot.len() != self.next_hop.len() {
+        if dist_per_slot.len() != self.dests.len() {
             return;
         }
         // Rebuild every destination's next-hop field from the GPU-computed distances.
         // O(dests × links), so on a city map parallelize it across cores (with the
         // `parallel` feature / browser thread pool) to keep it off the frame's critical
-        // path when a readback lands.
+        // path when a readback lands — each slot's stripe of the flat tables is an
+        // independent chunk.
+        let n = self.adj.len();
         let adj = &self.adj;
-        let field = |dist: &Vec<u64>| (flowfield::next_hops(adj, dist, cost), dist.clone());
-        #[cfg(feature = "parallel")]
-        let fields: Vec<_> = {
-            use rayon::prelude::*;
-            dist_per_slot.par_iter().map(field).collect()
+        let fill = |((hops, live), dist): ((&mut [u32], &mut [u64]), &Vec<u64>)| {
+            flowfield::next_hops_into(adj, dist, cost, hops);
+            live.copy_from_slice(dist);
         };
-        #[cfg(not(feature = "parallel"))]
-        let fields: Vec<_> = dist_per_slot.iter().map(field).collect();
-        for (s, (next_hop, dist)) in fields.into_iter().enumerate() {
-            self.next_hop[s] = next_hop;
-            self.dist[s] = dist;
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            self.next_hop
+                .par_chunks_mut(n)
+                .zip(self.dist.par_chunks_mut(n))
+                .zip(dist_per_slot.par_iter())
+                .for_each(fill);
         }
+        #[cfg(not(feature = "parallel"))]
+        self.next_hop.chunks_mut(n).zip(self.dist.chunks_mut(n)).zip(dist_per_slot).for_each(fill);
+        self.filled.fill(true);
+        // Externally-computed distances (the GPU's are u32-quantized) are not
+        // guaranteed to be exact u64 fixpoints — never a repair base.
+        self.consistent.fill(false);
     }
 
     /// The next link to take from `from` toward `dest`: `None` if `from` already
@@ -467,9 +597,9 @@ impl FieldRouter {
             return None;
         }
         let &s = self.slot.get(&dest.0)?;
-        let hop = self.next_hop[s].get(from.idx()).copied().flatten();
-        if hop.is_some() {
-            return hop;
+        let hop = self.next_hop.get(s * self.adj.len() + from.idx()).copied().unwrap_or(u32::MAX);
+        if hop != u32::MAX {
+            return Some(LinkId(hop));
         }
         // Trunk mode: a link outside this destination's field isn't a dead end —
         // it's a local street no through-plan covers. Drive toward the nearest
@@ -488,7 +618,7 @@ impl FieldRouter {
     /// `dest` isn't tracked or `from` can't reach it.
     pub fn distance(&self, dest: LinkId, from: LinkId) -> Option<u64> {
         let &s = self.slot.get(&dest.0)?;
-        match self.dist[s].get(from.idx()).copied() {
+        match self.dist.get(s * self.adj.len() + from.idx()).copied() {
             Some(d) if d != u64::MAX => Some(d),
             // Trunk mode: rank uncovered locals by their distance to the trunk,
             // biased so any candidate a real field covers always outranks them —
@@ -736,15 +866,92 @@ mod tests {
             run_targeted(&mut r, &free, &targets);
             assert_eq!(r.last_cycle_stats(), (0, 1), "a clean field skips the cycle");
         }
-        // The skips age it out: the next cycle force-solves in full.
+        // The skips age it out: the next cycle force-refreshes (a trivial exact
+        // repair here — the costs never moved).
         run_targeted(&mut r, &free, &targets);
-        assert_eq!(r.last_cycle_stats(), (1, 0), "aging bounds staleness with a forced full solve");
+        assert_eq!(r.last_cycle_stats(), (1, 0), "aging bounds staleness with a forced refresh");
         // And a real cost change is dirty immediately, no aging needed.
         let mut jammed = free.clone();
         let liked = r.next_hop(dest, LinkId(0)).unwrap();
         jammed[liked.idx()] *= 40;
         run_targeted(&mut r, &jammed, &targets);
         assert_eq!(r.last_cycle_stats(), (1, 0), "a repriced route is dirty at once");
+    }
+
+    /// Grid network big enough that a few changed links sit under the ≤2%
+    /// repair gate: every incremental cycle must leave each field identical to
+    /// a from-scratch router built on the same costs.
+    fn grid_net(w: i64, h: i64) -> Network {
+        let mut nodes = Vec::new();
+        let mut links = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                nodes.push(NodeSpec::uncontrolled(y * w + x, x as f64 * 100.0, y as f64 * 100.0));
+            }
+        }
+        for y in 0..h {
+            for x in 0..w {
+                let id = y * w + x;
+                if x + 1 < w {
+                    links.push(LinkSpec::oneway(id, id + 1, 1, 15.0));
+                    links.push(LinkSpec::oneway(id + 1, id, 1, 15.0));
+                }
+                if y + 1 < h {
+                    links.push(LinkSpec::oneway(id, id + w, 1, 15.0));
+                    links.push(LinkSpec::oneway(id + w, id, 1, 15.0));
+                }
+            }
+        }
+        OsmMap { nodes, links }.build()
+    }
+
+    #[test]
+    fn repaired_router_matches_a_fresh_router_exactly() {
+        let net = grid_net(10, 8);
+        let n = net.links.len();
+        let mut cost = free_costs(&net);
+        let dests = [LinkId(0), LinkId((n / 2) as u32), LinkId((n - 1) as u32)];
+        let mut r = FieldRouter::new(&net, &dests, &cost);
+        let mut s = 0xFEED_u64;
+        let mut rng = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let all_targets: HashMap<u32, Vec<u32>> = dests.iter().map(|d| (d.0, vec![0u32, 5, 9])).collect();
+        for round in 0..30 {
+            for _ in 0..1 + rng() % 3 {
+                let l = (rng() % n as u64) as usize;
+                cost[l] = 1 + rng() % 2_000_000;
+            }
+            // First cycle repairs the dirty fields (a small diff on this graph);
+            // clean-skipped ones then age into their own refresh — after the
+            // age bound every field must match a from-scratch router exactly.
+            for _ in 0..AGE_FORCE + 2 {
+                run_targeted(&mut r, &cost, &all_targets);
+            }
+            let fresh = FieldRouter::new(&net, &dests, &cost);
+            for &d in &dests {
+                for l in 0..n as u32 {
+                    assert_eq!(
+                        r.distance(d, LinkId(l)),
+                        fresh.distance(d, LinkId(l)),
+                        "distance to {d:?} from {l} (round {round})"
+                    );
+                    // Hops may tie between equal-cost successors; compare the
+                    // priced outcome, which is what routing behaviour reads.
+                    let price = |router: &FieldRouter, hop: Option<LinkId>| {
+                        hop.map(|h| cost[h.idx()].saturating_add(router.distance(d, h).unwrap_or(u64::MAX)))
+                    };
+                    assert_eq!(
+                        price(&r, r.next_hop(d, LinkId(l))),
+                        price(&fresh, fresh.next_hop(d, LinkId(l))),
+                        "hop price to {d:?} from {l} (round {round})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

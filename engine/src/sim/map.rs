@@ -149,6 +149,11 @@ impl ImportedMap {
     pub fn build(&self) -> Network {
         self.map.build_with_restrictions(&self.restrictions)
     }
+
+    /// [`build`] with live stage reporting (see [`OsmMap::build_with_progress`]).
+    pub fn build_with_progress(&self, cb: &mut dyn FnMut(&str, u32, u32)) -> Network {
+        self.map.build_with_progress(&self.restrictions, cb)
+    }
 }
 
 impl OsmMap {
@@ -465,6 +470,18 @@ impl OsmMap {
     /// error, or exits lost to bbox clipping) is ignored, because stranding
     /// every driver on the link models nothing real.
     pub fn build_with_restrictions(&self, restrictions: &[RestrictionSpec]) -> Network {
+        self.build_with_progress(restrictions, &mut |_, _, _| {})
+    }
+
+    /// [`build_with_restrictions`], reporting `(stage, done, total)` at the
+    /// build's internal boundaries (and inside its two longest loops) so a
+    /// county-scale load can show live progress instead of one silent stall.
+    /// `total == 0` marks an indeterminate boundary.
+    pub fn build_with_progress(
+        &self,
+        restrictions: &[RestrictionSpec],
+        cb: &mut dyn FnMut(&str, u32, u32),
+    ) -> Network {
         let mut net = Network::default();
         let mut id_of: HashMap<i64, NodeId> = HashMap::new();
 
@@ -604,6 +621,9 @@ impl OsmMap {
             .collect();
 
         for (li, spec) in self.links.iter().enumerate() {
+            if li % 8192 == 0 {
+                cb("links", li as u32, self.links.len() as u32);
+            }
             let lanes = eff_lanes[li];
             let from = id_of[&spec.from_osm];
             let to = id_of[&spec.to_osm];
@@ -691,6 +711,9 @@ impl OsmMap {
         }
         let mut movements: Vec<Movement> = Vec::new();
         for in_li in 0..net.links.len() {
+            if in_li % 8192 == 0 {
+                cb("movements", in_li as u32, net.links.len() as u32);
+            }
             let link = net.links[in_li];
             let node = link.to;
             let arr = net.arrival_dir(LinkId(in_li as u32));
@@ -856,9 +879,11 @@ impl OsmMap {
         retarget_pocket_landings(&mut net);
         untangle_parallel_movements(&mut net);
         align_through_seams(&mut net);
+        cb("lane-bounds", 0, 0);
         net.build_lane_bounds();
         stitch_seam_bounds(&mut net);
         enforce_mouth_ordering(&mut net);
+        cb("interiors", 0, 0);
         net.build_interiors();
 
         let mut plans = relocate_signals_to_junctions(&net, &self.nodes);
@@ -875,6 +900,7 @@ impl OsmMap {
             }
         }
         net.build_hov_lanes();
+        cb("junctions", 0, 0);
         net.build_junctions();
         relax_junction_interior_storage(&mut net);
         // Stop control is a property of the *intersection*: OSM surveys the sign
@@ -946,6 +972,7 @@ impl OsmMap {
             }
             aw
         };
+        cb("conflicts", 0, 0);
         net.build_cross_junction_conflicts();
         net.build_conflict_index();
         // Real traffic engineering signalizes crossings of two major roads; OSM
@@ -954,6 +981,7 @@ impl OsmMap {
         // streams gap-accept against each other and starve under heavy flow — a
         // false gridlock. Promote those (only) to a default-timed signal here,
         // where the conflict index exists to identify a genuine crossing.
+        cb("signals", 0, 0);
         promote_major_crossings(&net, &mut plans);
         coordinate_junction_signals(&mut net, &plans);
         coordinate_green_waves(&mut net);
@@ -2976,11 +3004,25 @@ impl OsmMap {
     /// large surface junctions stay split into aligned sub-nodes (see `merge_split_intersections`).
     #[cfg(feature = "import")]
     pub fn from_json_opts(s: &str, split_junctions: bool) -> Result<ImportedMap, String> {
+        Self::from_json_opts_with_progress(s, split_junctions, &mut |_, _, _| {})
+    }
+
+    /// [`from_json_opts`] reporting each preprocessing pass, so a big map's
+    /// parse phase shows movement instead of one silent stall.
+    #[cfg(feature = "import")]
+    pub fn from_json_opts_with_progress(
+        s: &str,
+        split_junctions: bool,
+        cb: &mut dyn FnMut(&str, u32, u32),
+    ) -> Result<ImportedMap, String> {
         let (map, mut restrictions) = json::parse(s)?;
-        let map = map
-            .relocate_sign_nodes()
-            .collapse_pass_through_nodes_with(&mut restrictions)
-            .merge_split_intersections_with(split_junctions, &mut restrictions);
+        cb("parse", 1, 1);
+        let map = map.relocate_sign_nodes();
+        cb("simplify", 1, 3);
+        let map = map.collapse_pass_through_nodes_with(&mut restrictions);
+        cb("simplify", 2, 3);
+        let map = map.merge_split_intersections_with(split_junctions, &mut restrictions);
+        cb("simplify", 3, 3);
         Ok(ImportedMap { map, restrictions })
     }
 

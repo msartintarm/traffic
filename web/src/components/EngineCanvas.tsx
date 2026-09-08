@@ -108,6 +108,11 @@ export default function EngineCanvas() {
   const statsRef = useRef<HTMLSpanElement>(null);
   // Glides the HUD's jittery per-frame counts (EMA + deadband) across frames.
   const smootherRef = useRef(new StatsSmoother());
+  // Loading-screen live counts, glided through their own smoother by a rAF loop
+  // (worker progress messages land in bursts; raw numbers would teleport).
+  const loadingCountsRef = useRef<{ done: number; total: number; unit: string } | null>(null);
+  const loadingDetailRef = useRef<HTMLSpanElement>(null);
+  const loadingSmootherRef = useRef(new StatsSmoother());
   const tipRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const asciiRef = useRef<HTMLPreElement>(null); // the ASCII "terminal" overlay (shown when asciiMode is on)
@@ -200,6 +205,24 @@ export default function EngineCanvas() {
       document.body.style.overflow = prev;
     };
   }, [pseudoFs]);
+
+  // While loading, glide the stage's item counter through the same EMA+deadband
+  // the live HUD uses, so bursty worker progress reads as steady motion.
+  useEffect(() => {
+    if (ready || route !== "sim") return;
+    let raf = 0;
+    const tick = () => {
+      const c = loadingCountsRef.current;
+      const el = loadingDetailRef.current;
+      if (el && c) {
+        const shown = loadingSmootherRef.current.count(`load:${c.unit}`, c.done, 0.15);
+        el.textContent = `${shown.toLocaleString()} of ${c.total.toLocaleString()} ${c.unit}`;
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [ready, route]);
 
   useEffect(() => {
     if (route !== "sim") return; // splash / undetermined: no scene to boot
@@ -455,9 +478,11 @@ export default function EngineCanvas() {
               }
             }
           },
-          onProgress: (fraction, stage) => {
+          onProgress: (fraction, stage, counts) => {
             setLoadingFraction(fraction);
             setLoadingStage(stage);
+            loadingCountsRef.current = counts ?? null;
+            if (!counts && loadingDetailRef.current) loadingDetailRef.current.textContent = "";
           },
           onHover: (name, x, y) => {
             const tip = tipRef.current;
@@ -560,6 +585,9 @@ export default function EngineCanvas() {
               <div className={styles.loadingFill} style={{ width: `${Math.round(loadingFraction * 100)}%` }} />
             </div>
             <div className={styles.loadingStage}>{loadingStage}</div>
+            <div className={styles.loadingDetail}>
+              <span ref={loadingDetailRef} />
+            </div>
           </div>
         </div>
       )}

@@ -208,18 +208,113 @@ impl PartialField {
     }
 }
 
+/// Incrementally repair `dist` — a complete whole-graph fixpoint under some
+/// previous cost vector — to the exact fixpoint under `cost`, given the links
+/// whose cost changed. LPA* (Ramalingam–Reps) on the reverse graph: work scales
+/// with the region the changes actually affect, not the graph, so a reroute
+/// cycle where a handful of links crossed a congestion band no longer re-solves
+/// the whole component per destination. Returns the links whose distance
+/// changed — or `None` after rolling `dist` back untouched when the affected
+/// region exceeds `budget` settles (the caller then schedules an ordinary
+/// budgeted solve instead of stalling a frame on a giant repair). The input
+/// must be a *complete* fixpoint (not a targeted/merged patchwork) or the
+/// repair propagates from stale values.
+pub fn repair_field(
+    adj: &[Vec<u32>],
+    pred: &[Vec<u32>],
+    dest: LinkId,
+    cost: &[u64],
+    changed_costs: &[u32],
+    dist: &mut [u64],
+    budget: usize,
+) -> Option<Vec<u32>> {
+    use crate::sim::hash::IntMap;
+    fn rhs_of(adj: &[Vec<u32>], cost: &[u64], g: &[u64], v: u32) -> u64 {
+        adj[v as usize]
+            .iter()
+            .map(|&b| cost[b as usize].saturating_add(g[b as usize]))
+            .min()
+            .unwrap_or(UNREACHABLE)
+    }
+    // `rhs` overlays the locally-consistent default (rhs == g) only where a
+    // vertex has been touched; `old` journals first-seen distances so the
+    // changed set falls out at the end.
+    let mut rhs: IntMap<u64> = IntMap::default();
+    let mut old: IntMap<u64> = IntMap::default();
+    let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(u64, u32)>> = std::collections::BinaryHeap::new();
+    fn update(
+        v: u32,
+        dest: u32,
+        adj: &[Vec<u32>],
+        cost: &[u64],
+        g: &[u64],
+        rhs: &mut IntMap<u64>,
+        heap: &mut std::collections::BinaryHeap<std::cmp::Reverse<(u64, u32)>>,
+    ) {
+        if v == dest {
+            return;
+        }
+        let r = rhs_of(adj, cost, g, v);
+        rhs.insert(v, r);
+        let gv = g[v as usize];
+        if gv != r {
+            heap.push(std::cmp::Reverse((gv.min(r), v)));
+        }
+    }
+    for &c in changed_costs {
+        for &p in &pred[c as usize] {
+            update(p, dest.0, adj, cost, dist, &mut rhs, &mut heap);
+        }
+    }
+    let mut settles = 0usize;
+    while let Some(std::cmp::Reverse((k, v))) = heap.pop() {
+        let gv = dist[v as usize];
+        let rv = rhs.get(&v).copied().unwrap_or(gv);
+        if gv == rv || k != gv.min(rv) {
+            continue; // already consistent, or a superseded entry
+        }
+        settles += 1;
+        if settles > budget {
+            for (&l, &og) in &old {
+                dist[l as usize] = og;
+            }
+            return None;
+        }
+        old.entry(v).or_insert(gv);
+        if gv > rv {
+            dist[v as usize] = rv;
+        } else {
+            // Under-consistent: invalidate, then let it (and its dependents)
+            // re-derive from surviving alternatives.
+            dist[v as usize] = UNREACHABLE;
+            update(v, dest.0, adj, cost, dist, &mut rhs, &mut heap);
+        }
+        for &p in &pred[v as usize] {
+            update(p, dest.0, adj, cost, dist, &mut rhs, &mut heap);
+        }
+    }
+    Some(old.iter().filter(|&(&v, &og)| dist[v as usize] != og).map(|(&v, _)| v).collect())
+}
+
 /// The next link to take from each link toward the destination whose distances
 /// these are (`None` if the destination is unreachable from that link).
 pub fn next_hops(adj: &[Vec<u32>], dist: &[u64], cost: &[u64]) -> Vec<Option<LinkId>> {
-    adj.iter()
-        .map(|outs| {
-            outs.iter()
-                .copied()
-                .filter(|&b| dist[b as usize] != UNREACHABLE)
-                .min_by_key(|&b| cost[b as usize].saturating_add(dist[b as usize]))
-                .map(LinkId)
-        })
-        .collect()
+    let mut out = vec![u32::MAX; adj.len()];
+    next_hops_into(adj, dist, cost, &mut out);
+    out.into_iter().map(|h| (h != u32::MAX).then_some(LinkId(h))).collect()
+}
+
+/// [`next_hops`] into a caller-owned row (`u32::MAX` = unreachable) — the form
+/// the router's flat slot×link table uses.
+pub fn next_hops_into(adj: &[Vec<u32>], dist: &[u64], cost: &[u64], out: &mut [u32]) {
+    for (o, outs) in out.iter_mut().zip(adj) {
+        *o = outs
+            .iter()
+            .copied()
+            .filter(|&b| dist[b as usize] != UNREACHABLE)
+            .min_by_key(|&b| cost[b as usize].saturating_add(dist[b as usize]))
+            .unwrap_or(u32::MAX);
+    }
 }
 
 /// Follow the next-hop field from `from` to `to` (inclusive), for validating the
@@ -315,6 +410,65 @@ mod tests {
             naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
                 .validate(&module)
                 .expect("flow-field kernel should type-check");
+        }
+    }
+
+    /// Deterministic xorshift for the randomized repair trials.
+    fn xorshift(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    #[test]
+    fn repair_matches_fresh_solve_over_random_perturbations() {
+        // A random directed graph (cycles, dead ends, an unreachable pocket) —
+        // repair after arbitrary cost changes must land on the exact fixpoint a
+        // from-scratch solve produces, every time.
+        let mut s = 0x5EED_u64;
+        let n = 250usize;
+        let adj: Vec<Vec<u32>> = (0..n)
+            .map(|i| {
+                let deg = 1 + (xorshift(&mut s) % 4) as usize;
+                (0..deg)
+                    .map(|_| (xorshift(&mut s) % n as u64) as u32)
+                    .filter(|&b| b as usize != i)
+                    .collect()
+            })
+            .collect();
+        let pred = reverse(&adj);
+        let mut cost: Vec<u64> = (0..n).map(|_| 1 + xorshift(&mut s) % 1000).collect();
+        let dest = LinkId((xorshift(&mut s) % n as u64) as u32);
+        let mut dist = distances_to_with(&pred, dest, &cost);
+        for round in 0..200 {
+            let k = 1 + (xorshift(&mut s) % 6) as usize;
+            let changed: Vec<u32> = (0..k).map(|_| (xorshift(&mut s) % n as u64) as u32).collect();
+            for &c in &changed {
+                // Mix raises, drops, and extreme jumps.
+                cost[c as usize] = match xorshift(&mut s) % 3 {
+                    0 => 1 + xorshift(&mut s) % 1000,
+                    1 => 1,
+                    _ => 1_000_000,
+                };
+            }
+            let before = dist.clone();
+            // An over-budget repair must roll back to exactly the pre-repair field.
+            let mut tiny = dist.clone();
+            if repair_field(&adj, &pred, dest, &cost, &changed, &mut tiny, 0).is_none() {
+                assert_eq!(tiny, before, "an aborted repair leaves the field untouched (round {round})");
+            }
+            let touched = repair_field(&adj, &pred, dest, &cost, &changed, &mut dist, usize::MAX)
+                .expect("unbounded repair always completes");
+            let fresh = distances_to_with(&pred, dest, &cost);
+            assert_eq!(dist, fresh, "repair diverged from the fresh solve (round {round})");
+            // The reported changed set is exactly the links whose distance moved.
+            let mut expect: Vec<u32> =
+                (0..n as u32).filter(|&l| before[l as usize] != dist[l as usize]).collect();
+            let mut got = touched;
+            expect.sort_unstable();
+            got.sort_unstable();
+            assert_eq!(got, expect, "changed-set mismatch (round {round})");
         }
     }
 
