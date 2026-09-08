@@ -1,6 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { countyRect, outlineToWorld, projectLatLon, rectToCss, worldToCssMatrix } from "./countyOverlay.ts";
+import {
+  countyOverlayOpacity,
+  countyRect,
+  outlineToWorld,
+  projectLatLon,
+  rectToCss,
+  worldToCssMatrix,
+} from "./countyOverlay.ts";
 import { type MapMeta } from "./loadMap.ts";
 
 test("the origin projects to (0,0) and north/east are positive", () => {
@@ -59,6 +66,14 @@ test("worldToCssMatrix agrees with rectToCss on the same corner", () => {
   const m = worldToCssMatrix(cam, 500, 400);
   assert.ok(Math.abs(m.a * r.x0 + m.e - css.left) < 1e-9);
   assert.ok(Math.abs(m.d * r.y1 + m.f - css.top) < 1e-9, "north edge maps to the top");
+});
+
+test("the overlay hides at street zoom and is full at county zoom", () => {
+  assert.equal(countyOverlayOpacity(1), 0, "street level: invisible");
+  assert.equal(countyOverlayOpacity(8), 0, "fade threshold: still invisible");
+  assert.ok(countyOverlayOpacity(16) > 0.4 && countyOverlayOpacity(16) < 0.6, "mid-fade");
+  assert.equal(countyOverlayOpacity(24), 1, "county scale: full");
+  assert.equal(countyOverlayOpacity(120), 1, "fit zoom: full");
 });
 
 test("the chip stays on-screen when the rect hangs off an edge", () => {

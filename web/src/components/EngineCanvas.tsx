@@ -18,6 +18,7 @@ import { createSession, type Session } from "../lib/session";
 import { COUNTY_MAPS, REAL_MAPS, SCENARIOS, scenarioName } from "../lib/maps";
 import { fetchCountyOutline, fetchMapMeta } from "../lib/loadMap";
 import {
+  countyOverlayOpacity,
   countyRect,
   outlinePath,
   outlineToWorld,
@@ -269,6 +270,11 @@ export default function EngineCanvas() {
       const canvas = canvasRef.current;
       const layer = countyLayerRef.current;
       if (cam && canvas && layer) {
+        // Region-scale affordance: invisible while studying traffic up close,
+        // fading in as the view pulls back toward county scale.
+        const fade = countyOverlayOpacity(cam.mpp);
+        layer.style.opacity = String(fade);
+        layer.style.visibility = fade === 0 ? "hidden" : "visible";
         const box = canvas.getBoundingClientRect();
         const m = worldToCssMatrix(cam, box.width, box.height);
         for (const r of countyRects) {
@@ -676,56 +682,66 @@ export default function EngineCanvas() {
           through) — only the labelled chip is clickable. */}
       {ready && countyRects.length > 0 && (
         <div ref={countyLayerRef} className={styles.countyLayer}>
-          {countyRects.map((r) => (
-            <div key={r.key}>
-              {r.outline ? (
-                <svg className={styles.countySvg} aria-hidden="true">
-                  {countyClip && (
-                    <defs>
-                      {/* This map's own footprint, cut out of the neighbour's
-                          shape (mask content shares the <g>'s world frame): a
-                          county never overlays the roads being simulated. */}
-                      <mask
-                        id={`county-cut-${scenario}-${r.key}`}
-                        maskUnits="userSpaceOnUse"
-                        x={r.x0 - 10000}
-                        y={r.y0 - 10000}
-                        width={r.x1 - r.x0 + 20000}
-                        height={r.y1 - r.y0 + 20000}
-                      >
-                        <rect
+          {countyRects.map((r, i) => {
+            // Cut this county's shape by everything already claiming pixels:
+            // the current map's own footprint plus every earlier-listed
+            // neighbour. The build-time partition already tiles the shapes;
+            // this absorbs the sub-cell seams its per-county simplification
+            // leaves, so shared boundaries stay exactly shared.
+            const cuts = [
+              ...(countyClip ? [countyClip] : []),
+              ...countyRects.slice(0, i).flatMap((o) => (o.outline ? [o.outline] : [])),
+            ];
+            return (
+              <div key={r.key}>
+                {r.outline ? (
+                  <svg className={styles.countySvg} aria-hidden="true">
+                    {cuts.length > 0 && (
+                      <defs>
+                        <mask
+                          id={`county-cut-${scenario}-${r.key}`}
+                          maskUnits="userSpaceOnUse"
                           x={r.x0 - 10000}
                           y={r.y0 - 10000}
                           width={r.x1 - r.x0 + 20000}
                           height={r.y1 - r.y0 + 20000}
-                          fill="#fff"
-                        />
-                        <path d={outlinePath(countyClip)} fill="#000" />
-                      </mask>
-                    </defs>
-                  )}
-                  <g data-county-shape={r.key}>
-                    <path
-                      className={styles.countyShape}
-                      d={outlinePath(r.outline)}
-                      vectorEffect="non-scaling-stroke"
-                      mask={countyClip ? `url(#county-cut-${scenario}-${r.key})` : undefined}
-                    />
-                  </g>
-                </svg>
-              ) : (
-                <div className={styles.countyRegion} data-county-region={r.key} />
-              )}
-              <button
-                type="button"
-                className={styles.countyChip}
-                data-county-chip={r.key}
-                onClick={() => setPendingJump(r)}
-              >
-                {r.name} →
-              </button>
-            </div>
-          ))}
+                        >
+                          <rect
+                            x={r.x0 - 10000}
+                            y={r.y0 - 10000}
+                            width={r.x1 - r.x0 + 20000}
+                            height={r.y1 - r.y0 + 20000}
+                            fill="#fff"
+                          />
+                          {cuts.map((c, k) => (
+                            <path key={k} d={outlinePath(c)} fill="#000" />
+                          ))}
+                        </mask>
+                      </defs>
+                    )}
+                    <g data-county-shape={r.key}>
+                      <path
+                        className={styles.countyShape}
+                        d={outlinePath(r.outline)}
+                        vectorEffect="non-scaling-stroke"
+                        mask={cuts.length > 0 ? `url(#county-cut-${scenario}-${r.key})` : undefined}
+                      />
+                    </g>
+                  </svg>
+                ) : (
+                  <div className={styles.countyRegion} data-county-region={r.key} />
+                )}
+                <button
+                  type="button"
+                  className={styles.countyChip}
+                  data-county-chip={r.key}
+                  onClick={() => setPendingJump(r)}
+                >
+                  {r.name} →
+                </button>
+              </div>
+            );
+          })}
         </div>
       )}
       {pendingJump && (

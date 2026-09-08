@@ -50,6 +50,17 @@ export function outlinePath(points: [number, number][]): string {
   return points.map(([x, y], i) => `${i === 0 ? "M" : "L"}${x} ${y}`).join(" ") + " Z";
 }
 
+// Zoom gate: the overlay is a region-scale affordance, so it stays out of the
+// way at street zoom and fades in as the view pulls back. Fully hidden below
+// `COUNTY_FADE_MIN_MPP` (viewport ≲ 7 km on a 900-px canvas), fully visible
+// past `COUNTY_FADE_FULL_MPP` (≳ 22 km — county context).
+export const COUNTY_FADE_MIN_MPP = 8;
+export const COUNTY_FADE_FULL_MPP = 24;
+
+export function countyOverlayOpacity(mpp: number): number {
+  return Math.min(1, Math.max(0, (mpp - COUNTY_FADE_MIN_MPP) / (COUNTY_FADE_FULL_MPP - COUNTY_FADE_MIN_MPP)));
+}
+
 // The affine world→CSS-pixel transform under the camera, as SVG matrix terms
 // (negative `d` flips world-north to screen-up).
 export function worldToCssMatrix(
