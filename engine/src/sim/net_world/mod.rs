@@ -2133,11 +2133,13 @@ impl NetWorld {
     /// Per-link travel time (ms) inflated by current occupancy — the live edge
     /// weights that make routing congestion-reactive. A jammed link costs several
     /// times its free-flow time, so routes computed with these steer around it.
-    /// Occupancy is quantized to the same quarter-jam bands the reroute
-    /// fingerprint triggers on: costs are stable under per-car jitter and only
-    /// move when a link genuinely changes congestion regime — which keeps the
-    /// cycle-to-cycle cost diff to the actual band-crossers, the set the
-    /// incremental field repair patches.
+    /// Occupancy is quantized to sixteenth-jam bands (rounded, not floored):
+    /// coarse enough that per-car jitter doesn't reprice links every cycle —
+    /// keeping the cost diff sparse for the incremental field repair — and fine
+    /// enough that light congestion still prices in. Quarter-jam FLOORED bands
+    /// zeroed everything under 25% of jam and dropped the validation scorecard's
+    /// GEH pass share from 5/72 to 3/72 (the 2026-09-08 deploy failures);
+    /// sixteenth-rounded scores 6/72 with repair still viable.
     pub fn live_link_costs(&self) -> Vec<u64> {
         let mut count = vec![0u32; self.network.links.len()];
         for v in &self.fleet.rows {
@@ -2148,7 +2150,7 @@ impl NetWorld {
                 let link = self.network.link(LinkId(i));
                 let lane = self.network.lane(link.lane_start);
                 let jam = (lane.length / 7.0 * link.lane_count as f64).max(1.0);
-                let ratio = ((count[i as usize] as f64 / jam).min(3.0) * 4.0).floor() / 4.0;
+                let ratio = ((count[i as usize] as f64 / jam).min(3.0) * 16.0).round() / 16.0;
                 let base = self.network.link_travel_time_ms(LinkId(i)) as f64;
                 let ctrl = if self.control_aware_routing {
                     match self.network.node(link.to).control {
