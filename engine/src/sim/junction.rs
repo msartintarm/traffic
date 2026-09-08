@@ -30,8 +30,7 @@ fn all_red_of(program: &SignalProgram, phase: usize) -> f64 {
 
 /// Reusable flat set of demanded lane ids: unhashed insert/contains over a
 /// lane-indexed bit array, cleared via the touched list so a steady-state tick
-/// allocates nothing. Replaces a per-tick `HashSet` whose O(cars) hashed
-/// inserts were a flat tax at county fleet sizes.
+/// allocates nothing.
 #[derive(Default)]
 pub struct LaneSet {
     bits: Vec<bool>,

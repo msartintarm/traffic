@@ -32,6 +32,13 @@ export const COUNTY_MAPS: string[] = Object.entries(REAL_MAPS)
   .filter(([, m]) => m.county)
   .map(([k]) => k);
 
+// Combined scenarios: every part is downloaded and merged into one network
+// engine-side (`Simulation.from_map_jsons`). The whole-Bay-Area run is the
+// scale frontier — expect a long load and a heavy sim.
+export const COMBINED_MAPS: Record<string, { name: string; parts: string[] }> = {
+  bayarea: { name: "SF Bay Area (all 9 counties)", parts: COUNTY_MAPS },
+};
+
 // The display name for a scenario key (real map or test scene), falling back to the key.
 export function scenarioName(key: string): string {
   return SCENARIOS.find((s) => s.key === key)?.name ?? REAL_MAPS[key]?.name ?? key;
@@ -56,6 +63,7 @@ export const SCENARIOS: { key: string; name: string; kind: "Real map" | "Test" }
   { key: "napa", name: "Napa County, CA", kind: "Real map" },
   { key: "sonoma", name: "Sonoma County, CA", kind: "Real map" },
   { key: "solano", name: "Solano County, CA", kind: "Real map" },
+  { key: "bayarea", name: "SF Bay Area (all 9 counties)", kind: "Real map" },
   { key: "arterial", name: "Arterial junction", kind: "Test" },
   { key: "corridor", name: "Signal corridor", kind: "Test" },
   { key: "gridlock", name: "Gridlock", kind: "Test" },

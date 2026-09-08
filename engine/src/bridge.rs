@@ -174,10 +174,9 @@ pub struct Simulation {
     prev_crossing: IntMap<bool>,
     /// The link the user has selected (clicked), highlighted in the density pass.
     selected: Option<usize>,
-    /// Per-frame memo for the instance buffers: the renderer fetches each
-    /// buffer's bytes and count as *separate* calls, which used to rebuild the
-    /// whole vec twice per frame (and scan the timetable four times). The
-    /// serial bumps in `advance`, which the draw loop calls before any export.
+    /// Per-frame memo for the instance buffers, shared by each buffer's
+    /// separate bytes and count calls. The serial bumps in `advance`, which
+    /// the draw loop calls before any export.
     frame_serial: u64,
     frame_cache: std::cell::RefCell<FrameCache>,
     /// Last known fleet index of the followed vehicle (see `followed_vehicle`).
@@ -317,6 +316,42 @@ impl Simulation {
         sim.transit_lines = lines;
         sim.demand.set_transit_lines(sim.transit_lines.clone());
         Ok(sim)
+    }
+
+    /// Load SEVERAL scraper extracts as one network: each part is parsed and
+    /// re-framed into the first's projection, then merged by shared OSM node
+    /// ids (boundary-clipped county scrapes reconnect at the county line — see
+    /// [`map::ImportedMap::merge`]). Transit and commute overlays are per-map
+    /// artifacts and are skipped; demand is sampled across the merged network.
+    #[cfg(feature = "import")]
+    pub fn from_map_jsons(
+        jsons: js_sys::Array,
+        seed: u32,
+        split_junctions: bool,
+        progress: Option<js_sys::Function>,
+    ) -> Result<Simulation, JsValue> {
+        let mut report = |stage: &str, done: u32, total: u32| {
+            if let Some(f) = &progress {
+                let _ = f.call3(
+                    &JsValue::NULL,
+                    &JsValue::from_str(stage),
+                    &JsValue::from_f64(done as f64),
+                    &JsValue::from_f64(total as f64),
+                );
+            }
+        };
+        let n = jsons.length();
+        let mut parts = Vec::new();
+        for (i, j) in jsons.iter().enumerate() {
+            report("part", i as u32, n);
+            let s = j.as_string().ok_or_else(|| JsValue::from_str("map json must be a string"))?;
+            let origin = map::json_origin(&s).ok_or_else(|| JsValue::from_str("map missing meta.origin"))?;
+            let im = map::OsmMap::from_json_opts(&s, split_junctions).map_err(|e| JsValue::from_str(&e))?;
+            parts.push((im, origin));
+        }
+        let merged = map::ImportedMap::merge(parts);
+        let net = merged.build_with_progress(&mut report);
+        Ok(Self::assemble_with_progress(net, seed, &mut report))
     }
 
     fn assemble(network: Network, seed: u32) -> Simulation {

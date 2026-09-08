@@ -13,25 +13,12 @@
 //! then gives a tight lower bound `dist(from → dest) ≥ maxₗ dist(from→l) −
 //! dist(dest→l)` with no per-destination field. Precompute is O(K · links) ONCE
 //! (K a small constant, ~16), not per tick and not per destination; each
-//! `next_hop` is O(out-degree · K) ≈ O(1), independent of map size. Landmark
-//! distances are free-flow (congestion-blind) — this prototype trades the
-//! flow-field's live reroute-around-jams for map-size independence.
-//!
-//! # Prototype outcome (measured 2026-09-02) — NOT VIABLE as built
-//! Both variants were measured on Columbus (120k links) and FAILED:
-//! - Greedy `next_hop` (hill-climb on the ALT bound): cars LOOP/strand on real
-//!   topology (one-ways, dead-ends, unreachable components) — 0 exits, fleet
-//!   explodes. Greedy on a lower-bound heuristic isn't loop-free.
-//! - Spawn-time A* `route()` + follow (this file's `route`): routes are
-//!   link-level but navigation is LANE-level (turn lanes, movements), so cars
-//!   diverge off the plan on nearly every link; re-planning each divergence is
-//!   O(cars · A*)/tick — catastrophic (worse than the flow-field it replaces).
-//! CONCLUSION: per-driver local routing can't cheaply self-heal against
-//! lane-level execution on complex maps. The flow-field's stateless O(1)
-//! `next_hop`, re-queried from wherever the car *is*, is self-healing by
-//! construction — its O(map×dests) maintenance (amortized, async) is the price
-//! of that robustness, and a good trade. Kept as reference ALT infrastructure
-//! (`LocalRouter` is default-off, not UI-exposed); do not enable on real maps.
+//! `next_hop` is O(out-degree · K) ≈ O(1), independent of map size. The
+//! bounded ALT-guided search (`SEARCH_CAP`) with live congestion penalties is
+//! stateless and re-queried from wherever the car is, so it self-heals against
+//! lane-level divergence the way the flow-field does. This is the browser
+//! default (`set_local_routing(true)` in the bridge); the engine default stays
+//! the flow-field for tests and native baselines.
 
 use super::network::{LinkId, Network};
 
@@ -47,14 +34,11 @@ struct Scratch {
 const MEMO_CAP: usize = 1 << 20;
 
 /// Cached hops expire in rotating cohorts as the congestion generation
-/// advances (each bump expires exactly the one cohort matching its index).
-/// A generation bump used to flush every thread's whole memo at once, so one
-/// quarter-band crossing anywhere re-ran thousands of ALT searches on the next
-/// tick — a visible hitch every reroute interval at county scale. With
-/// cohorts, each bump re-searches 1/`MEMO_SPREAD` of the cache: unchanged
-/// regions re-derive the same hop, and a new jam reaches every driver within
-/// `MEMO_SPREAD` reroute intervals — staggered discovery, the way real
-/// drivers learn of a backup.
+/// advances: each bump re-searches 1/`MEMO_SPREAD` of the cache instead of
+/// flushing it wholesale (which stalls a tick on thousands of simultaneous ALT
+/// searches at scale). A new jam reaches every driver within `MEMO_SPREAD`
+/// reroute intervals — staggered discovery, the way real drivers learn of a
+/// backup.
 const MEMO_SPREAD: u64 = 4;
 
 struct Memo {
@@ -90,8 +74,8 @@ pub struct LocalRouter {
     jammed: Vec<u32>,
     /// Jam capacity (vehicles at jam density) per link.
     jam: Vec<f64>,
-    /// Bumped when `penalty` changes; the per-thread memo clears when it differs,
-    /// so cached hops never route on stale congestion.
+    /// Bumped when `penalty` changes; drives the memo's rotating cohort
+    /// expiry (see [`MEMO_SPREAD`] — staleness is bounded, not zero).
     generation: u64,
 }
 
@@ -212,9 +196,8 @@ impl LocalRouter {
             let ans = self.next_hop_search(dest, from);
             if m.map.len() >= MEMO_CAP {
                 // Evict only pairs no query has refreshed for several
-                // generations (exited cars, recycled destinations) — a blanket
-                // clear would recreate the very re-search burst the cohorts
-                // exist to prevent.
+                // generations — a blanket clear would recreate the re-search
+                // burst the cohorts exist to prevent.
                 let gen = self.generation;
                 m.map.retain(|_, &mut (_, g)| gen.wrapping_sub(g) <= MEMO_SPREAD);
             }

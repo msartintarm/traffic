@@ -138,8 +138,8 @@ pub struct NetWorld {
     lane_demand: junction::LaneSet,
     /// Scratch neighbor index for `explain` (capacity reuse only).
     explain_nb: Neighbors,
-    /// Per-node "any outgoing link" bit — the leak-vs-arrived test in
-    /// `resolve_boundary` was an O(all links) scan per dead-end car.
+    /// Per-node "any outgoing link" bit for `resolve_boundary`'s
+    /// leak-vs-arrived test.
     node_has_outgoing: Vec<bool>,
     /// Periodically permute the fleet into (lane, position) order so the per-car
     /// passes' neighbor reads walk adjacent memory instead of pointer-chasing a
@@ -2131,15 +2131,11 @@ impl NetWorld {
     }
 
     /// Per-link travel time (ms) inflated by current occupancy — the live edge
-    /// weights that make routing congestion-reactive. A jammed link costs several
-    /// times its free-flow time, so routes computed with these steer around it.
-    /// Occupancy is quantized to sixteenth-jam bands (rounded, not floored):
-    /// coarse enough that per-car jitter doesn't reprice links every cycle —
-    /// keeping the cost diff sparse for the incremental field repair — and fine
-    /// enough that light congestion still prices in. Quarter-jam FLOORED bands
-    /// zeroed everything under 25% of jam and dropped the validation scorecard's
-    /// GEH pass share from 5/72 to 3/72 (the 2026-09-08 deploy failures);
-    /// sixteenth-rounded scores 6/72 with repair still viable.
+    /// weights that make routing congestion-reactive. Occupancy is quantized to
+    /// sixteenth-jam bands, rounded: coarse enough that per-car jitter doesn't
+    /// reprice links every cycle (the cost diff stays sparse for the
+    /// incremental field repair), fine enough that light congestion still
+    /// prices in — coarser floored bands fail the GEH validation floor.
     pub fn live_link_costs(&self) -> Vec<u64> {
         let mut count = vec![0u32; self.network.links.len()];
         for v in &self.fleet.rows {
@@ -2570,13 +2566,11 @@ impl NetWorld {
         // Flat sort keys (contiguous, cache-friendly) precomputed once: each group
         // comparison reads an 8-byte key instead of chasing a ~230-byte row.
         let (pos, cpos) = (self.position_keys(), self.corridor_keys());
-        // Per-group sorts, kept serial — measured repeatedly, including against a
-        // single global parallel key sort (2026-09): in-lane order is invariant
-        // (no overtaking within a lane) and the fleet is locality-ordered, so the
+        // Per-group sorts, kept serial: in-lane order is invariant (no
+        // overtaking within a lane) and the fleet is locality-ordered, so the
         // groups arrive nearly sorted and pdqsort's sorted-run best case makes
-        // these near-O(members). Both the tiny-sort fan-out AND the fleet-wide
-        // packed-key par_sort lost to it (the global sort re-orders from scratch
-        // and its memory traffic beat the win, serial and threaded alike).
+        // these near-O(members) — parallel and fleet-wide-sort alternatives
+        // both lose to that.
         // The leader chain runs along the whole corridor (grade-separated 1:1 through-lanes
         // coalesced), so `leader_of` never loses the car ahead at a segment boundary.
         for gi in 0..nb.by_corridor.len() {
@@ -6269,12 +6263,10 @@ impl NetWorld {
     }
 }
 
-/// Per-entry-lane occupancy for a burst of spawn attempts (one demand step):
-/// the admission checks (`entrance_clear`, `safe_entry_speed`) are full-fleet
-/// scans, and the demand loop was running dozens of them per tick — the
-/// dominant county-scale demand-generation cost. Built in one fleet pass over
-/// the gateway lanes and updated on each spawn, so a burst of attempts sees
-/// exactly what the per-attempt scans saw.
+/// Per-entry-lane occupancy for a burst of spawn attempts (one demand step),
+/// replacing the per-attempt full-fleet admission scans: built in one fleet
+/// pass over the gateway lanes and updated on each spawn, so a burst of
+/// attempts sees exactly what the per-attempt scans saw.
 pub struct EntryOccupancy {
     /// Lanes the snapshot covers (every lane of the links it was built over).
     marked: Vec<bool>,

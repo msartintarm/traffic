@@ -154,6 +154,105 @@ impl ImportedMap {
     pub fn build_with_progress(&self, cb: &mut dyn FnMut(&str, u32, u32)) -> Network {
         self.map.build_with_progress(&self.restrictions, cb)
     }
+
+    /// Merge several extracts into one map in the FIRST entry's frame (each
+    /// paired with its scraper projection origin). Boundary-clipped county
+    /// scrapes keep the real OSM node at each county-line crossing, so deduping
+    /// nodes by id stitches the road network back together across the line;
+    /// duplicate links (a segment lying on the boundary in both extracts)
+    /// collapse by their (from, to) pair, first occurrence winning.
+    pub fn merge(parts: Vec<(ImportedMap, [f64; 2])>) -> ImportedMap {
+        let frame = parts[0].1;
+        let mut out = ImportedMap::default();
+        let mut seen_nodes: HashSet<i64> = HashSet::new();
+        let mut seen_links: HashSet<(i64, i64)> = HashSet::new();
+        for (part, origin) in parts {
+            for mut n in part.map.nodes {
+                if !seen_nodes.insert(n.osm_id) {
+                    continue;
+                }
+                [n.x, n.y] = reframe(n.x, n.y, origin, frame);
+                out.map.nodes.push(n);
+            }
+            for mut l in part.map.links {
+                if !seen_links.insert((l.from_osm, l.to_osm)) {
+                    continue;
+                }
+                for g in &mut l.geometry {
+                    *g = reframe(g[0], g[1], origin, frame);
+                }
+                out.map.links.push(l);
+            }
+            out.restrictions.extend(part.restrictions);
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    #[test]
+    fn merge_stitches_shared_boundary_nodes_and_reframes() {
+        // Map A: 0→1→2 heading east. Map B (origin 0.01° north of A's): its
+        // local frame sees the shared node 2 and continues 2→3. After the
+        // merge, node 2 exists once, B's nodes land re-framed into A's metres,
+        // and a route runs A-side to B-side across the stitch.
+        let a = ImportedMap {
+            map: OsmMap {
+                nodes: vec![
+                    NodeSpec::uncontrolled(0, 0.0, 0.0),
+                    NodeSpec::uncontrolled(1, 100.0, 0.0),
+                    NodeSpec::uncontrolled(2, 200.0, 0.0),
+                ],
+                links: vec![LinkSpec::oneway(0, 1, 1, 15.0), LinkSpec::oneway(1, 2, 1, 15.0)],
+            },
+            restrictions: vec![],
+        };
+        let rad = std::f64::consts::PI / 180.0;
+        let dy = 0.01 * rad * 6371000.0; // B's origin sits this many metres north
+        let b = ImportedMap {
+            map: OsmMap {
+                nodes: vec![
+                    NodeSpec::uncontrolled(2, 200.0, -dy), // the shared boundary node, in B's frame
+                    NodeSpec::uncontrolled(3, 300.0, -dy),
+                ],
+                links: vec![LinkSpec::oneway(2, 3, 1, 15.0)],
+            },
+            restrictions: vec![],
+        };
+        let origin_a = [37.0, -122.0];
+        let origin_b = [37.01, -122.0];
+        let merged = ImportedMap::merge(vec![(a, origin_a), (b, origin_b)]);
+        assert_eq!(merged.map.nodes.len(), 4, "shared node 2 deduped");
+        let n3 = merged.map.nodes.iter().find(|n| n.osm_id == 3).unwrap();
+        assert!((n3.y - 0.0).abs() < 1.0 && (n3.x - 300.0).abs() < 1.0, "B re-framed into A's metres: {:?}", (n3.x, n3.y));
+        let net = merged.build();
+        let route = net.route_links(LinkId(0), LinkId(2));
+        assert!(route.is_some(), "routes cross the county stitch");
+    }
+}
+
+/// A point in one scraper extract's local frame, re-projected into another's
+/// (local metres → GPS via `from`'s origin → local metres via `to`'s).
+fn reframe(x: f64, y: f64, from: [f64; 2], to: [f64; 2]) -> [f64; 2] {
+    const R: f64 = 6371000.0;
+    let rad = std::f64::consts::PI / 180.0;
+    let lat = from[0] + y / (rad * R);
+    let lon = from[1] + x / (rad * R * (from[0] * rad).cos());
+    [(lon - to[1]) * rad * (to[0] * rad).cos() * R, (lat - to[0]) * rad * R]
+}
+
+/// The scraper projection origin (`meta.origin`, [lat, lon]) of a raw map
+/// JSON, read from the document head (meta leads the file) so a merge doesn't
+/// re-lex a 30 MB body per part.
+pub fn json_origin(s: &str) -> Option<[f64; 2]> {
+    let head = &s[..s.len().min(4096)];
+    let rest = &head[head.find("\"origin\"")?..];
+    let coords = &rest[rest.find('[')? + 1..rest.find(']')?];
+    let mut it = coords.split(',').map(|t| t.trim().parse::<f64>());
+    Some([it.next()?.ok()?, it.next()?.ok()?])
 }
 
 impl OsmMap {

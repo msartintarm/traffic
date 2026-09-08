@@ -1037,8 +1037,7 @@ impl DemandGenerator {
         self.update_calibration(world);
         // Live link costs feed only the no-field routing fallback in `launch`;
         // with a router installed they are never read, so the O(links) build is
-        // deferred until a launch actually needs it (at county scale the eager
-        // build was several ms per tick, all discarded).
+        // deferred until a launch actually needs it.
         let mut costs: Option<Vec<u64>> = None;
         // One gateway-occupancy snapshot for this tick's whole burst of spawn
         // attempts, in place of per-attempt full-fleet admission scans.

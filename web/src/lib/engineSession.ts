@@ -16,7 +16,7 @@ import {
 import { type BuildCounts } from "./protocol.ts";
 import { fetchMapText } from "./loadMap.ts";
 import { nearestLink } from "./hitTest.ts";
-import { REAL_MAPS } from "./maps.ts";
+import { COMBINED_MAPS, REAL_MAPS } from "./maps.ts";
 import { rescaleMpp } from "./camera.ts";
 import { buildScene, render2d } from "./render2d.ts";
 import {
@@ -120,7 +120,11 @@ async function threadsMemory(config: InitConfig): Promise<WebAssembly.Memory | u
 }
 
 async function loadEngine(config: InitConfig): Promise<{ mod: EngineModule; threadsReady: boolean }> {
-  const wantThreads = config.compute === "threads";
+  // Combined scenarios exceed the threads build's declared 2 GiB memory
+  // ceiling (the merged Bay Area peaks ~2.4 GB); the single-threaded build's
+  // 4 GiB ceiling carries them, so they skip the threads module rather than
+  // OOM mid-build with no fallback.
+  const wantThreads = config.compute === "threads" && !COMBINED_MAPS[config.scenario];
   const isolated = !!globalThis.crossOriginIsolated;
   if (wantThreads && isolated) {
     try {
@@ -209,9 +213,48 @@ export async function startEngineSession(
   // The download drives the bar 0.1→0.6; the parse (a single blocking wasm call the main
   // thread can't watch) then sits at "Building road network…" until it returns.
   const realMap = REAL_MAPS[config.scenario];
+  const combined = COMBINED_MAPS[config.scenario];
   let sim: Sim;
   let mapLabel: string;
-  if (realMap && mod.Simulation.from_map_json) {
+  if (combined && mod.Simulation.from_map_jsons) {
+    // Every part downloads, then the engine parses each and merges them into
+    // one network (counties reconnect at their shared boundary nodes). No
+    // commute/transit overlays — those are per-map artifacts.
+    const parts = combined.parts;
+    const texts: string[] = [];
+    for (const [i, key] of parts.entries()) {
+      const at = (f: number) => 0.06 + 0.48 * ((i + f) / parts.length);
+      cb.onProgress(at(0), `Downloading ${REAL_MAPS[key].name}…`);
+      texts.push(await fetchMapText(`${config.basePath}/${REAL_MAPS[key].file}`, (f) =>
+        cb.onProgress(at(f), `Downloading ${REAL_MAPS[key].name}…`),
+      ));
+      if (disposed) throw new Error("disposed during boot");
+    }
+    let fraction = 0.56;
+    let partLabel = "Merging counties…";
+    cb.onProgress(fraction, partLabel);
+    sim = mod.Simulation.from_map_jsons(texts, 0xc0ffee, config.splitJunctions, (key, done, total) => {
+      let label = partLabel;
+      if (key === "part") {
+        partLabel = label = `Parsing ${REAL_MAPS[parts[done]]?.name ?? "county"} (${done + 1} of ${total})…`;
+        fraction = Math.max(fraction, 0.56 + 0.08 * (done / Math.max(1, total)));
+      } else if (key === "parse" || key === "simplify") {
+        return; // per-part sub-steps ride the part label
+      } else {
+        const span = buildStageSpan(key);
+        if (!span) return;
+        label = span.label;
+        const pos = span.start + (total > 0 ? done / total : 0) * (span.end - span.start);
+        fraction = Math.max(fraction, 0.64 + ((pos - 0.6) / 0.12) * 0.08);
+        if (total > 0 && span.unit) {
+          cb.onProgress(fraction, label, { done, total, unit: span.unit });
+          return;
+        }
+      }
+      cb.onProgress(fraction, label);
+    });
+    mapLabel = combined.name;
+  } else if (realMap && mod.Simulation.from_map_json) {
     try {
       cb.onProgress(0.1, "Downloading map…");
       const text = await fetchMapText(`${config.basePath}/${realMap.file}`, (f) =>

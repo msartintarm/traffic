@@ -32,10 +32,19 @@ fn main() {
             other => panic!("unknown arg {other}"),
         }
     }
-    let raw = std::fs::read_to_string(&map_path).expect("read map");
-    let map = OsmMap::from_json(&raw).expect("parse map");
+    // `--map` accepts a comma-separated list; several maps merge into one
+    // network the way the browser's combined scenario does.
+    let parts: Vec<_> = map_path
+        .split(',')
+        .map(|p| {
+            let raw = std::fs::read_to_string(p).expect("read map");
+            let origin = engine::sim::map::json_origin(&raw).expect("meta.origin");
+            (OsmMap::from_json(&raw).expect("parse map"), origin)
+        })
+        .collect();
+    let merged = engine::sim::map::ImportedMap::merge(parts);
     let cfg = SimConfig { sleep_scheduler: true, ..SimConfig::default_config() };
-    let mut world = NetWorld::new(map.build(), cfg);
+    let mut world = NetWorld::new(merged.build(), cfg);
     world.set_local_routing(true); // the browser default — the config that hitches
 
     let commute = lodes_path.as_ref().map(|p| {

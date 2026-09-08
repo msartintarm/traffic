@@ -208,17 +208,14 @@ impl PartialField {
     }
 }
 
-/// Incrementally repair `dist` — a complete whole-graph fixpoint under some
+/// Incrementally repair `dist` — a complete whole-graph fixpoint under a
 /// previous cost vector — to the exact fixpoint under `cost`, given the links
-/// whose cost changed. LPA* (Ramalingam–Reps) on the reverse graph: work scales
-/// with the region the changes actually affect, not the graph, so a reroute
-/// cycle where a handful of links crossed a congestion band no longer re-solves
-/// the whole component per destination. Returns the links whose distance
-/// changed — or `None` after rolling `dist` back untouched when the affected
-/// region exceeds `budget` settles (the caller then schedules an ordinary
-/// budgeted solve instead of stalling a frame on a giant repair). The input
-/// must be a *complete* fixpoint (not a targeted/merged patchwork) or the
-/// repair propagates from stale values.
+/// whose cost changed (LPA*/Ramalingam–Reps on the reverse graph; work scales
+/// with the affected region, not the graph). Returns the links whose distance
+/// changed, or `None` after rolling `dist` back untouched when the region
+/// exceeds `budget` settles — the caller schedules an ordinary budgeted solve
+/// instead. The input must be a *complete* fixpoint (not a targeted/merged
+/// patchwork) or the repair propagates from stale values.
 pub fn repair_field(
     adj: &[Vec<u32>],
     pred: &[Vec<u32>],

@@ -276,11 +276,10 @@ impl FieldRouter {
         if self.dests.is_empty() {
             return;
         }
-        // Repair setup: with a small cost diff since the base, a slot the lazy
-        // machinery below decides to SOLVE can instead be patched in place to
-        // the exact new fixpoint (work ∝ affected region, capped — an
-        // over-budget repair rolls back and takes the budgeted solve). The
-        // clean-skip laziness is untouched: repair replaces solves, not skips.
+        // With a small cost diff since the base, a slot the lazy machinery
+        // below decides to SOLVE is instead patched in place to the exact new
+        // fixpoint (over-budget repairs roll back and take the budgeted
+        // solve). Repair replaces solves, never the clean-skip laziness.
         let n = self.adj.len();
         let changed: Option<Vec<u32>> = (self.trunk.is_none() && self.repair_base.len() == n)
             .then(|| (0..n as u32).filter(|&l| cost[l as usize] != self.repair_base[l as usize]).collect());

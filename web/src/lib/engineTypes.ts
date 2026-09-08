@@ -177,6 +177,12 @@ export type EngineModule = {
       splitJunctions: boolean,
       progress?: (stage: string, done: number, total: number) => void,
     ): Sim;
+    from_map_jsons?(
+      jsons: string[],
+      seed: number,
+      splitJunctions: boolean,
+      progress?: (stage: string, done: number, total: number) => void,
+    ): Sim;
   };
   Renderer: {
     create(canvas: HTMLCanvasElement): Promise<Renderer>;
